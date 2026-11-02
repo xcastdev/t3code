@@ -1,13 +1,29 @@
 import * as Schema from "effect/Schema";
 import { ChevronRightIcon } from "lucide-react";
-import type { ComponentProps, ReactNode } from "react";
+import { createContext, type ComponentProps, type ReactNode, useContext } from "react";
 
 import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { cn } from "../../lib/utils";
 
 const COLLAPSED_SECTIONS_KEY = "t3code:thread-details:collapsed-sections";
-const CollapsedSections = Schema.Array(Schema.String);
-const NO_COLLAPSED_SECTIONS: ReadonlyArray<string> = [];
+// Sections opened while the card was too short for them; they stay open and the card scrolls.
+const EXPANDED_SECTIONS_KEY = "t3code:thread-details:expanded-sections";
+const SectionIds = Schema.Array(Schema.String);
+const NO_SECTIONS: ReadonlyArray<string> = [];
+
+const AutoCollapseContext = createContext(false);
+
+/** Collapses the sections inside to their headings while the card lacks room for them. */
+export function ThreadDetailsAutoCollapse(props: {
+  readonly collapsed: boolean;
+  readonly children: ReactNode;
+}) {
+  return (
+    <AutoCollapseContext.Provider value={props.collapsed}>
+      {props.children}
+    </AutoCollapseContext.Provider>
+  );
+}
 
 export function ThreadDetailsSection({
   headingId,
@@ -30,10 +46,29 @@ export function ThreadDetailsSection({
   // Keyed by heading id, so a section stays collapsed across threads and reloads.
   const [collapsedSections, setCollapsedSections] = useLocalStorage(
     COLLAPSED_SECTIONS_KEY,
-    NO_COLLAPSED_SECTIONS,
-    CollapsedSections,
+    NO_SECTIONS,
+    SectionIds,
   );
-  const collapsed = showHeading && collapsedSections.includes(headingId);
+  const [expandedSections, setExpandedSections] = useLocalStorage(
+    EXPANDED_SECTIONS_KEY,
+    NO_SECTIONS,
+    SectionIds,
+  );
+  const autoCollapsed = useContext(AutoCollapseContext);
+  const collapsed =
+    showHeading &&
+    (collapsedSections.includes(headingId) ||
+      (autoCollapsed && !expandedSections.includes(headingId)));
+  const toggle = () => {
+    const without = (current: ReadonlyArray<string>) => current.filter((id) => id !== headingId);
+    if (collapsed) {
+      setCollapsedSections(without);
+      if (autoCollapsed) setExpandedSections((current) => [...without(current), headingId]);
+    } else {
+      setCollapsedSections((current) => [...without(current), headingId]);
+      setExpandedSections(without);
+    }
+  };
   const contentId = `${headingId}-content`;
   return (
     <section
@@ -59,13 +94,7 @@ export function ThreadDetailsSection({
             type="button"
             aria-expanded={!collapsed}
             aria-controls={contentId}
-            onClick={() =>
-              setCollapsedSections((current) =>
-                current.includes(headingId)
-                  ? current.filter((id) => id !== headingId)
-                  : [...current, headingId],
-              )
-            }
+            onClick={toggle}
             className="group/section-toggle flex min-w-0 items-center gap-0.5 rounded-md py-0.5 ps-1.5 pe-1 text-2xs font-medium text-muted-foreground outline-none select-none hover:text-foreground/80 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
           >
             <span className="min-w-0 truncate">{title}</span>

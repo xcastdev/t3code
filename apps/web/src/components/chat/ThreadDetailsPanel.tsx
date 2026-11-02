@@ -27,7 +27,11 @@ import {
 import { ThreadDetailsCard } from "./ThreadDetailsCard";
 import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import { ThreadDetailsItemsMenuItems } from "./ThreadDetailsItemsMenu";
-import { ThreadDetailsSection, ThreadDetailsSummary } from "./ThreadDetailsSection";
+import {
+  ThreadDetailsAutoCollapse,
+  ThreadDetailsSection,
+  ThreadDetailsSummary,
+} from "./ThreadDetailsSection";
 import {
   ThreadDetailsProcessesSection,
   ThreadDetailsContextSection,
@@ -151,33 +155,37 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
         props.agent ? (
           <>
             <ThreadDetailsAgentStatusSection agent={props.agent} />
-            {density !== "essential" && serverThread ? (
-              <ThreadDetailsTasksSection
-                environmentId={props.environmentId}
-                threadId={props.threadId}
-                plans={props.plans}
-                runs={props.runs}
-              />
+            {serverThread ? (
+              <ThreadDetailsAutoCollapse collapsed={density === "essential"}>
+                <ThreadDetailsTasksSection
+                  environmentId={props.environmentId}
+                  threadId={props.threadId}
+                  plans={props.plans}
+                  runs={props.runs}
+                />
+              </ThreadDetailsAutoCollapse>
             ) : null}
-            {density !== "essential" && serverThread ? (
-              <ThreadDetailsProcessesSection
-                environmentId={props.environmentId}
-                threadId={props.threadId}
-                projectId={props.projectId}
-                pendingBackgroundTasks={props.pendingBackgroundTasks}
-                showServers={!props.draftId && visible.servers}
-              />
+            {serverThread ? (
+              <ThreadDetailsAutoCollapse collapsed={density === "essential"}>
+                <ThreadDetailsProcessesSection
+                  environmentId={props.environmentId}
+                  threadId={props.threadId}
+                  projectId={props.projectId}
+                  pendingBackgroundTasks={props.pendingBackgroundTasks}
+                  showServers={!props.draftId && visible.servers}
+                />
+              </ThreadDetailsAutoCollapse>
             ) : null}
-            {density !== "essential" ? (
+            <ThreadDetailsAutoCollapse collapsed={density === "essential"}>
               <ThreadDetailsAgentActivitySection agent={props.agent} />
-            ) : null}
-            {density !== "essential" ? (
+            </ThreadDetailsAutoCollapse>
+            <ThreadDetailsAutoCollapse collapsed={density === "essential"}>
               <ThreadDetailsAgentRoutinesSection agent={props.agent} />
-            ) : null}
-            {density === "full" ? (
+            </ThreadDetailsAutoCollapse>
+            <ThreadDetailsAutoCollapse collapsed={density !== "full"}>
               <ThreadDetailsContextSection {...props.context} separated />
-            ) : null}
-            {density === "full" ? (
+            </ThreadDetailsAutoCollapse>
+            <ThreadDetailsAutoCollapse collapsed={density !== "full"}>
               <Suspense fallback={null}>
                 <ThreadDetailsUsageSection
                   environmentId={props.environmentId}
@@ -186,14 +194,14 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                   providerInstanceId={props.providerInstanceId}
                 />
               </Suspense>
-            ) : null}
+            </ThreadDetailsAutoCollapse>
           </>
         ) : (
           <>
             <div className="group/details-items">
               <ThreadDetailsContextSection {...props.context} />
 
-              {density !== "essential" ? (
+              <ThreadDetailsAutoCollapse collapsed={density === "essential"}>
                 <Suspense fallback={null}>
                   <ThreadDetailsUsageSection
                     environmentId={props.environmentId}
@@ -202,7 +210,7 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                     providerInstanceId={props.providerInstanceId}
                   />
                 </Suspense>
-              ) : null}
+              </ThreadDetailsAutoCollapse>
 
               {props.gitCwd &&
               ((props.isGitRepo && visible.branch) ||
@@ -244,50 +252,60 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                 </ThreadDetailsSection>
               ) : null}
 
-              {density === "full" && !props.draftId && (visible.lineage || visible.sideChats) ? (
-                <ThreadRelationshipsPanel
-                  environmentId={props.environmentId}
-                  threadId={props.threadId}
-                  showLineage={visible.lineage}
-                  showSideChats={visible.sideChats}
-                />
-              ) : null}
-
-              {density !== "essential" && serverThread ? (
-                <ThreadDetailsTasksSection
-                  environmentId={props.environmentId}
-                  threadId={props.threadId}
-                  plans={props.plans}
-                  runs={props.runs}
-                />
-              ) : null}
-
-              {density === "full" && serverThread ? (
-                <ThreadDetailsProcessesSection
-                  environmentId={props.environmentId}
-                  threadId={props.threadId}
-                  projectId={props.projectId}
-                  pendingBackgroundTasks={props.pendingBackgroundTasks}
-                  showServers={!props.draftId && visible.servers}
-                />
-              ) : null}
-
-              {density === "full" && serverThread ? (
-                <Suspense fallback={null}>
-                  <ThreadDetailsMcpSection
+              {!props.draftId && (visible.lineage || visible.sideChats) ? (
+                <ThreadDetailsAutoCollapse collapsed={density !== "full"}>
+                  <ThreadRelationshipsPanel
                     environmentId={props.environmentId}
-                    projectId={props.projectId}
                     threadId={props.threadId}
-                    providerInstanceId={props.providerInstanceId}
+                    showLineage={visible.lineage}
+                    showSideChats={visible.sideChats}
                   />
-                </Suspense>
+                </ThreadDetailsAutoCollapse>
               ) : null}
 
-              {density === "full" && !props.draftId && visible.automations ? (
-                <ThreadAutomationsPanel
-                  environmentId={props.environmentId}
-                  threadId={props.threadId}
-                />
+              {serverThread ? (
+                <ThreadDetailsAutoCollapse collapsed={density === "essential"}>
+                  <ThreadDetailsTasksSection
+                    environmentId={props.environmentId}
+                    threadId={props.threadId}
+                    plans={props.plans}
+                    runs={props.runs}
+                  />
+                </ThreadDetailsAutoCollapse>
+              ) : null}
+
+              {serverThread ? (
+                <ThreadDetailsAutoCollapse collapsed={density !== "full"}>
+                  <ThreadDetailsProcessesSection
+                    environmentId={props.environmentId}
+                    threadId={props.threadId}
+                    projectId={props.projectId}
+                    pendingBackgroundTasks={props.pendingBackgroundTasks}
+                    showServers={!props.draftId && visible.servers}
+                  />
+                </ThreadDetailsAutoCollapse>
+              ) : null}
+
+              {serverThread ? (
+                <ThreadDetailsAutoCollapse collapsed={density !== "full"}>
+                  <Suspense fallback={null}>
+                    <ThreadDetailsMcpSection
+                      environmentId={props.environmentId}
+                      projectId={props.projectId}
+                      threadId={props.threadId}
+                      providerInstanceId={props.providerInstanceId}
+                    />
+                  </Suspense>
+                </ThreadDetailsAutoCollapse>
+              ) : null}
+
+              {!props.draftId && visible.automations ? (
+                <ThreadDetailsAutoCollapse collapsed={density !== "full"}>
+                  <ThreadAutomationsPanel
+                    environmentId={props.environmentId}
+                    threadId={props.threadId}
+                  />
+                </ThreadDetailsAutoCollapse>
               ) : null}
 
               {/* Shown only when no section above has content, so an emptied card can be refilled. */}
