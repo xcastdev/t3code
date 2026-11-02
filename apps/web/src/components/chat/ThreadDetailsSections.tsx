@@ -272,7 +272,10 @@ export function ThreadDetailsBackgroundShellsSection(props: {
     threadId: props.threadId,
   });
   const shells = (terminals ?? []).filter((session) => session.state.status !== "closed");
-  const backgroundWork = presentPendingBackgroundWork(props.pendingBackgroundTasks);
+  // Subagents are listed under Agents, so this section keeps to shells and commands.
+  const backgroundWork = presentPendingBackgroundWork(
+    props.pendingBackgroundTasks.filter((task) => task.kind !== "subagent"),
+  );
   const running =
     shells.filter((session) => session.state.hasRunningSubprocess).length +
     (backgroundWork?.items.length ?? 0);
