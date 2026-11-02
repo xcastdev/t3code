@@ -10,7 +10,7 @@ import { useState } from "react";
 import { Collapsible, CollapsibleTrigger, CollapsiblePanel } from "../ui/collapsible";
 import { WorkStatus } from "./WorkStatus";
 import { Button } from "../ui/button";
-import { WorkEmpty, WorkMeta, WorkRevision, WorkRow, WorkSection } from "./WorkLayout";
+import { WorkMeta, WorkRevision, WorkRow, WorkSection } from "./WorkLayout";
 import { WorkNotice, WorkPager } from "./WorkNotice";
 import { WorkTaskLink } from "./WorkTaskRefs";
 import { WorkInbox, WorkSupervision, WorkProgress } from "./WorkSupervision";
@@ -62,8 +62,10 @@ export function WorkOverview({
   });
 
   return (
-    <div className="grid min-w-0 items-start gap-6 @5xl/work:grid-cols-[minmax(0,1fr)_19rem]">
-      <div className="min-w-0 @5xl/work:col-start-1 @5xl/work:row-start-1">
+    // Capped and split early, so a wide panel never stretches a few rows across the screen.
+    <div className="mx-auto grid w-full max-w-6xl min-w-0 items-start gap-6 @3xl/work:grid-cols-[minmax(0,1fr)_17rem] @5xl/work:grid-cols-[minmax(0,1fr)_19rem]">
+      <div className="flex min-w-0 flex-col gap-6">
+        <WorkProgress scope={scope} />
         <WorkSupervision scope={scope} onOpenTask={onOpenTask}>
           {attention.view.status !== "ready" ? (
             <WorkRow>
@@ -84,18 +86,7 @@ export function WorkOverview({
           ) : null}
           <WorkPager pager={attention} noun="Decisions" />
         </WorkSupervision>
-      </div>
-      <aside
-        className="flex min-w-0 flex-col gap-6 @5xl/work:col-start-2 @5xl/work:row-span-2 @5xl/work:row-start-1"
-        aria-label="Team and progress"
-      >
-        <WorkTeamRail scope={scope} onManage={onOpenTeam} onOpenTask={onOpenTask} />
-        <WorkProgress scope={scope} />
-      </aside>
-      <div className="min-w-0 @5xl/work:col-start-1 @5xl/work:row-start-2">
         <WorkInbox scope={scope} writer={writer} onOpenTask={onOpenTask} />
-      </div>
-      <div className="min-w-0 @5xl/work:col-span-2">
         <WorkSection
           title="Missions"
           description="Groups of tasks toward one outcome. New missions come from refining an issue in Intake."
@@ -106,7 +97,11 @@ export function WorkOverview({
             </WorkRow>
           ) : null}
           {missionItems.length === 0 && missions.view.page !== null ? (
-            <WorkEmpty title={missions.offset === 0 ? "No missions" : "No more missions"} />
+            <WorkRow>
+              <WorkMeta>
+                {missions.offset === 0 ? "No missions yet." : "No more missions."}
+              </WorkMeta>
+            </WorkRow>
           ) : null}
           {missionItems.map((mission) => (
             <MissionRow
@@ -118,36 +113,39 @@ export function WorkOverview({
           ))}
           <WorkPager pager={missions} noun="Missions" />
         </WorkSection>
-      </div>
-      <div className="min-w-0 rounded-xl border border-border/60 bg-card/40 @5xl/work:col-span-2">
-        <Collapsible open={briefOpen} onOpenChange={setBriefOpen}>
-          <div className="flex flex-wrap items-center justify-between gap-2 p-4">
-            <CollapsibleTrigger render={<Button size="sm" variant="ghost" />}>
-              {briefOpen ? "Hide project brief" : "Project brief"}
-            </CollapsibleTrigger>
-            {briefing ? (
-              <WorkMeta>
-                Generated from project <WorkRevision>r{briefing.sourceRevision}</WorkRevision>
-              </WorkMeta>
-            ) : null}
-          </div>
-          {!briefOpen && briefing ? (
-            <p className="line-clamp-2 px-4 pb-4 text-sm text-muted-foreground">
-              {briefing.narrative ?? briefing.text}
-            </p>
-          ) : null}
-          <CollapsiblePanel animate={false}>
-            <div className="px-4 pb-4">
-              <WorkNotice view={briefingView} subject="the brief" />
+        <div className="min-w-0 rounded-xl border border-border/60 bg-card/40">
+          <Collapsible open={briefOpen} onOpenChange={setBriefOpen}>
+            <div className="flex flex-wrap items-center justify-between gap-2 p-4">
+              <CollapsibleTrigger render={<Button size="sm" variant="ghost" />}>
+                {briefOpen ? "Hide project brief" : "Project brief"}
+              </CollapsibleTrigger>
               {briefing ? (
-                <p className="max-w-3xl text-sm whitespace-pre-wrap break-words text-muted-foreground">
-                  {briefing.narrative ?? briefing.text}
-                </p>
+                <WorkMeta>
+                  Generated from project <WorkRevision>r{briefing.sourceRevision}</WorkRevision>
+                </WorkMeta>
               ) : null}
             </div>
-          </CollapsiblePanel>
-        </Collapsible>
+            {!briefOpen && briefing ? (
+              <p className="line-clamp-2 px-4 pb-4 text-sm text-muted-foreground">
+                {briefing.narrative ?? briefing.text}
+              </p>
+            ) : null}
+            <CollapsiblePanel animate={false}>
+              <div className="px-4 pb-4">
+                <WorkNotice view={briefingView} subject="the brief" />
+                {briefing ? (
+                  <p className="max-w-3xl text-sm whitespace-pre-wrap break-words text-muted-foreground">
+                    {briefing.narrative ?? briefing.text}
+                  </p>
+                ) : null}
+              </div>
+            </CollapsiblePanel>
+          </Collapsible>
+        </div>
       </div>
+      <aside className="flex min-w-0 flex-col gap-6" aria-label="Team">
+        <WorkTeamRail scope={scope} onManage={onOpenTeam} onOpenTask={onOpenTask} />
+      </aside>
     </div>
   );
 }

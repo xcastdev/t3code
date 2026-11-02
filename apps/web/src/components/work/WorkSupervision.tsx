@@ -8,7 +8,7 @@ import type { ProjectTeamRecordRead, ProjectWorkTaskId } from "@t3tools/contract
 
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
-import { WorkEmpty, WorkFormStatus, WorkMeta, WorkRow, WorkSection, WorkTime } from "./WorkLayout";
+import { WorkFormStatus, WorkMeta, WorkRow, WorkSection, WorkTime } from "./WorkLayout";
 import { WorkNotice, WorkPager } from "./WorkNotice";
 import { workWriteBlockedReason } from "./useWorkRead";
 import { useWorkPage } from "./useWorkRecords";
@@ -22,7 +22,7 @@ import {
   type WorkMessageRecord,
 } from "./workPresentation";
 import { WorkTaskLink } from "./WorkTaskRefs";
-import { WorkStatus } from "./WorkStatus";
+import { WorkStatus, WorkStatusGlyph } from "./WorkStatus";
 import { WorkMemberAvatar } from "./WorkMemberAvatar";
 import { useWorkTeamRoster } from "./useWorkTeamRoster";
 import { newCommandId } from "./workTaskSurface";
@@ -31,7 +31,7 @@ const COUNT_LABELS = [
   ["open", "Open", "draft"],
   ["active", "In progress", "in-progress"],
   ["review", "In review", "in-review"],
-  ["blocked", "Blocked or failed", "blocked"],
+  ["blocked", "Blocked", "blocked"],
   ["done", "Done", "completed"],
 ] as const;
 
@@ -47,23 +47,23 @@ export function WorkProgress({ scope }: { scope: ProjectWorkScope }) {
     );
   const counts = supervisionCounts(summary);
   return (
-    <WorkSection title="Progress">
-      <div className="grid grid-cols-2 gap-px">
-        {COUNT_LABELS.map(([key, label, state]) => (
-          <div key={key} className="flex flex-col gap-2 p-4">
-            <span className="text-2xl font-semibold tabular-nums tracking-tight">
-              {counts[key]}
-            </span>
-            <WorkStatus state={state} label={label} />
-          </div>
-        ))}
-        {counts.unknown > 0 ? (
-          <WorkRow>
-            <WorkMeta>{counts.unknown} unrecognized</WorkMeta>
-          </WorkRow>
-        ) : null}
-      </div>
-    </WorkSection>
+    <section aria-label="Progress" className="grid min-w-0 grid-cols-3 gap-2 @md/work:grid-cols-5">
+      {COUNT_LABELS.map(([key, label, state]) => (
+        <div
+          key={key}
+          className="flex min-w-0 flex-col gap-0.5 rounded-lg border border-border/60 bg-card/40 px-2.5 py-2"
+        >
+          <span className="flex items-center gap-1.5">
+            <WorkStatusGlyph state={state} />
+            <span className="text-lg leading-6 font-semibold tabular-nums">{counts[key]}</span>
+          </span>
+          <span className="truncate text-xs text-muted-foreground">{label}</span>
+        </div>
+      ))}
+      {counts.unknown > 0 ? (
+        <WorkMeta className="col-span-full">{counts.unknown} unrecognized</WorkMeta>
+      ) : null}
+    </section>
   );
 }
 
@@ -194,9 +194,11 @@ export function WorkInbox({
         </WorkRow>
       ) : null}
       {messages.length === 0 && page !== null ? (
-        <WorkEmpty
-          title={pager.offset === 0 ? "No open messages" : "No open messages on this page"}
-        />
+        <WorkRow>
+          <WorkMeta>
+            {pager.offset === 0 ? "No open messages." : "No open messages on this page."}
+          </WorkMeta>
+        </WorkRow>
       ) : null}
       {messages.map((message) => (
         <InboxRow
