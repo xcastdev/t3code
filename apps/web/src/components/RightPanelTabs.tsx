@@ -360,6 +360,15 @@ function RightPanelEmptyState(props: {
         ]
       : []),
     {
+      label: "Files",
+      group: "chat",
+      icon: Files,
+      shortcut: "F",
+      available: props.filesAvailable,
+      disabledReason: SURFACE_UNAVAILABLE_HINTS.files,
+      onClick: props.onAddFiles,
+    },
+    {
       label: "Diff",
       group: "git",
       icon: FileDiff,
@@ -415,15 +424,6 @@ function RightPanelEmptyState(props: {
       available: props.onAddWork !== undefined,
       disabledReason: SURFACE_UNAVAILABLE_HINTS.work,
       onClick: () => props.onAddWork?.("knowledge"),
-    },
-    {
-      label: "Files",
-      group: "workspace",
-      icon: Files,
-      shortcut: "F",
-      available: props.filesAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.files,
-      onClick: props.onAddFiles,
     },
     {
       label: "Browser",
@@ -1300,6 +1300,14 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
         ]
       : []),
     {
+      label: "Files",
+      icon: Files,
+      shortcut: "F",
+      available: props.filesAvailable,
+      disabledReason: SURFACE_DISABLED_REASONS.files,
+      onClick: props.onAddFiles,
+    },
+    {
       label: "Diff",
       icon: FileDiff,
       shortcut: "D",
@@ -1330,14 +1338,6 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       available: props.onAddWork !== undefined,
       disabledReason: SURFACE_DISABLED_REASONS.work,
       onClick: () => props.onAddWork?.("tasks"),
-    },
-    {
-      label: "Files",
-      icon: Files,
-      shortcut: "F",
-      available: props.filesAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.files,
-      onClick: props.onAddFiles,
     },
     {
       label: "Browser",
