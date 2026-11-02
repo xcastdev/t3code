@@ -1,10 +1,18 @@
-import type {
-  ProjectId,
-  ProjectWorkAttentionItem,
-  ProjectWorkAttentionSummary,
-  ProjectWorkTaskId,
+import {
+  type ProjectId,
+  type ProjectWorkActivitySummary,
+  type ProjectWorkActivityTask,
+  type ProjectWorkActivityWorker,
+  type ProjectWorkAttentionItem,
+  type ProjectWorkAttentionSummary,
+  type ProjectWorkTaskId,
+  ProjectTeamAvatar,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import type * as SqlClient from "effect/sql/SqlClient";
 
 const MAX_ITEMS = 200;
@@ -209,12 +217,166 @@ export function deriveProjectWorkAttention(source: AttentionSource): ProjectWork
   return { items: items.slice(0, MAX_ITEMS), truncated: items.length > MAX_ITEMS };
 }
 
+const ACTIVE_LIMIT = 60;
+const RECENT_LIMIT = 20;
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+export interface ActivityCountRow {
+  readonly projectId: string;
+  readonly open: number;
+  readonly running: number;
+  readonly inReview: number;
+  readonly doneThisWeek: number;
+  readonly lastChangedAt: string | null;
+}
+export interface ActivityTaskRow {
+  readonly projectId: string;
+  readonly taskId: string;
+  readonly title: string;
+  readonly state: string;
+  readonly updatedAt: string;
+  readonly assigneeId: string | null;
+  readonly assigneeName: string | null;
+}
+export interface ActivityBindingRow {
+  readonly taskId: string;
+  readonly memberId: string;
+}
+export interface ActivityMemberRow {
+  readonly recordId: string;
+  readonly name: string | null;
+  readonly avatarJson: string | null;
+  readonly roleRevisionId: string | null;
+}
+export interface ActivityRoleRow {
+  readonly recordId: string;
+  readonly role: string | null;
+}
+export interface ActivitySource {
+  readonly counts: ReadonlyArray<ActivityCountRow>;
+  readonly active: ReadonlyArray<ActivityTaskRow>;
+  readonly recent: ReadonlyArray<ActivityTaskRow>;
+  readonly bindings: ReadonlyArray<ActivityBindingRow>;
+  readonly members: ReadonlyArray<ActivityMemberRow>;
+  readonly roles: ReadonlyArray<ActivityRoleRow>;
+}
+
+const decodeAvatar = Schema.decodeUnknownOption(Schema.fromJsonString(ProjectTeamAvatar));
+
+/**
+ * What is moving across projects: per-project counts, the in-progress and in-review tasks, and
+ * other recent changes, each with the member on it. A running member wins over the assignee.
+ */
+export function deriveProjectWorkActivity(source: ActivitySource): ProjectWorkActivitySummary {
+  const roles = new Map(source.roles.map((role) => [role.recordId, role.role]));
+  const workers = new Map<string, ProjectWorkActivityWorker>();
+  for (const member of source.members) {
+    const role = (member.roleRevisionId && roles.get(member.roleRevisionId)) || "member";
+    const name = member.name?.trim() || role;
+    const avatar = member.avatarJson === null ? Option.none() : decodeAvatar(member.avatarJson);
+    workers.set(member.recordId, {
+      name: clip(name, 128),
+      role: clip(role, 64),
+      ...(Option.isSome(avatar) ? { avatar: avatar.value } : {}),
+    });
+  }
+  const running = new Map(source.bindings.map((binding) => [binding.taskId, binding.memberId]));
+  const toTask = (row: ActivityTaskRow): ProjectWorkActivityTask => {
+    const worker =
+      workers.get(running.get(row.taskId) ?? "") ??
+      (row.assigneeId === null ? undefined : workers.get(row.assigneeId));
+    return {
+      projectId: row.projectId as ProjectId,
+      taskId: row.taskId as ProjectWorkTaskId,
+      title: clip(row.title, 240),
+      state: row.state,
+      at: row.updatedAt,
+      ...(worker ? { worker } : {}),
+      ...(worker === undefined && row.assigneeName
+        ? { assignee: clip(row.assigneeName, 128) }
+        : {}),
+    };
+  };
+  return {
+    projects: source.counts.slice(0, 500).map((row) => ({
+      projectId: row.projectId as ProjectId,
+      open: row.open,
+      running: row.running,
+      inReview: row.inReview,
+      doneThisWeek: row.doneThisWeek,
+      ...(row.lastChangedAt === null ? {} : { lastChangedAt: row.lastChangedAt }),
+    })),
+    active: source.active.slice(0, ACTIVE_LIMIT).map(toTask),
+    recent: source.recent.slice(0, RECENT_LIMIT).map(toTask),
+  };
+}
+
+/** Bounded reads behind {@link deriveProjectWorkActivity}; counts aggregate in SQL. */
+const readProjectWorkActivity = Effect.fn("ProjectWorkAttention.readActivity")(function* (
+  sql: SqlClient.SqlClient,
+  projectIds: ReadonlyArray<string>,
+) {
+  const weekAgo = DateTime.formatIso(
+    DateTime.makeUnsafe((yield* Clock.currentTimeMillis) - WEEK_MS),
+  );
+  const counts = yield* sql<ActivityCountRow>`
+    SELECT project_id AS projectId,
+      SUM(state IN ('draft','specified','ready','blocked','failed')) AS open,
+      SUM(state = 'in-progress') AS running,
+      SUM(state = 'in-review') AS inReview,
+      SUM(state = 'completed' AND completed_at >= ${weekAgo}) AS doneThisWeek,
+      MAX(updated_at) AS lastChangedAt
+    FROM t3_workflow_v2_work_tasks
+    WHERE ${sql.in("project_id", projectIds)}
+    GROUP BY project_id
+  `;
+  const active = yield* sql<ActivityTaskRow>`
+    SELECT project_id AS projectId, task_id AS taskId, title, state, updated_at AS updatedAt,
+      json_extract(assignee_json, '$.id') AS assigneeId,
+      json_extract(assignee_json, '$.displayName') AS assigneeName
+    FROM t3_workflow_v2_work_tasks
+    WHERE ${sql.in("project_id", projectIds)} AND state IN ('in-progress','in-review')
+    ORDER BY updated_at DESC, task_id
+    LIMIT ${ACTIVE_LIMIT}
+  `;
+  const recent = yield* sql<ActivityTaskRow>`
+    SELECT project_id AS projectId, task_id AS taskId, title, state, updated_at AS updatedAt,
+      json_extract(assignee_json, '$.id') AS assigneeId,
+      json_extract(assignee_json, '$.displayName') AS assigneeName
+    FROM t3_workflow_v2_work_tasks
+    WHERE ${sql.in("project_id", projectIds)}
+      AND state NOT IN ('in-progress','in-review') AND updated_at >= ${weekAgo}
+    ORDER BY updated_at DESC, task_id
+    LIMIT ${RECENT_LIMIT}
+  `;
+  const bindings = yield* sql<ActivityBindingRow>`
+    SELECT task_id AS taskId, json_extract(payload_json, '$.memberId') AS memberId
+    FROM t3_workflow_v2_team_records
+    WHERE ${sql.in("project_id", projectIds)} AND kind = 'run-binding' AND task_id IS NOT NULL
+      AND json_extract(payload_json, '$.status') IN ('reserved','running','stopping')
+  `;
+  const members = yield* sql<ActivityMemberRow>`
+    SELECT record_id AS recordId, json_extract(payload_json, '$.name') AS name,
+      json_extract(payload_json, '$.avatar') AS avatarJson,
+      json_extract(payload_json, '$.roleRevisionId') AS roleRevisionId
+    FROM t3_workflow_v2_team_records
+    WHERE ${sql.in("project_id", projectIds)} AND kind = 'member'
+  `;
+  const roles = yield* sql<ActivityRoleRow>`
+    SELECT record_id AS recordId, json_extract(payload_json, '$.role') AS role
+    FROM t3_workflow_v2_team_records
+    WHERE ${sql.in("project_id", projectIds)} AND kind = 'role-revision'
+  `;
+  return deriveProjectWorkActivity({ counts, active, recent, bindings, members, roles });
+});
+
 /** Reads the projection rows behind {@link deriveProjectWorkAttention} for the given projects. */
 export const readProjectWorkAttention = Effect.fn("ProjectWorkAttention.read")(function* (
   sql: SqlClient.SqlClient,
   projectIds: ReadonlyArray<string>,
 ) {
-  if (projectIds.length === 0) return { items: [], truncated: false };
+  if (projectIds.length === 0)
+    return { items: [], truncated: false, activity: { projects: [], active: [], recent: [] } };
   const tasks = yield* sql<AttentionTaskRow>`
     SELECT project_id AS projectId, task_id AS taskId, title, state,
       spec_revision AS specRevision,
@@ -252,5 +414,6 @@ export const readProjectWorkAttention = Effect.fn("ProjectWorkAttention.read")(f
       AND json_extract(payload_json, '$.status') IN
         ('pending','proposed','queued','delivered','acknowledged','uncertain')
   `;
-  return deriveProjectWorkAttention({ tasks, attention, blockers, decisions, records });
+  const summary = deriveProjectWorkAttention({ tasks, attention, blockers, decisions, records });
+  return { ...summary, activity: yield* readProjectWorkActivity(sql, projectIds) };
 });

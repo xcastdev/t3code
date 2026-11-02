@@ -2,7 +2,12 @@ import { ProjectWorkAttentionSummary } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { type AttentionSource, deriveProjectWorkAttention } from "./ProjectWorkAttention.ts";
+import {
+  type ActivitySource,
+  type AttentionSource,
+  deriveProjectWorkActivity,
+  deriveProjectWorkAttention,
+} from "./ProjectWorkAttention.ts";
 
 const task = (
   taskId: string,
@@ -141,5 +146,93 @@ describe("deriveProjectWorkAttention", () => {
       "tasks:Needs approval",
     ]);
     expect(() => decodeSummary(summary)).not.toThrow();
+  });
+});
+
+describe("deriveProjectWorkActivity", () => {
+  const row = (
+    taskId: string,
+    state: string,
+    extra: Partial<ActivitySource["active"][number]> = {},
+  ) => ({
+    projectId: "p1",
+    taskId,
+    title: `Task ${taskId}`,
+    state,
+    updatedAt: "2026-11-01T00:00:00.000Z",
+    assigneeId: null,
+    assigneeName: null,
+    ...extra,
+  });
+  const team: Pick<ActivitySource, "members" | "roles"> = {
+    members: [
+      {
+        recordId: "m-iris",
+        name: "Iris",
+        avatarJson: JSON.stringify({
+          kind: "generated",
+          version: 1,
+          seed: 3,
+          tone: "sage",
+          expression: "curious",
+          motion: true,
+        }),
+        roleRevisionId: "r-inv",
+      },
+      { recordId: "m-otto", name: "Otto", avatarJson: null, roleRevisionId: "r-impl" },
+    ],
+    roles: [
+      { recordId: "r-inv", role: "investigator" },
+      { recordId: "r-impl", role: "implementer" },
+    ],
+  };
+
+  it("names the running member over the assignee, then an assigned member, then a person", () => {
+    const activity = deriveProjectWorkActivity({
+      counts: [],
+      recent: [],
+      ...team,
+      bindings: [{ taskId: "a", memberId: "m-otto" }],
+      active: [
+        row("a", "in-progress", { assigneeId: "m-iris" }),
+        row("b", "in-review", { assigneeId: "m-iris" }),
+        row("c", "in-progress", { assigneeName: "Dana Okafor" }),
+      ],
+    });
+    expect(activity.active.map((task) => [task.taskId, task.worker?.name, task.assignee])).toEqual([
+      ["a", "Otto", undefined],
+      ["b", "Iris", undefined],
+      ["c", undefined, "Dana Okafor"],
+    ]);
+    expect(activity.active[1]?.worker).toMatchObject({ role: "investigator", avatar: { seed: 3 } });
+  });
+
+  it("keeps per-project counts and decodes as the wire summary", () => {
+    const activity = deriveProjectWorkActivity({
+      ...team,
+      bindings: [],
+      active: [],
+      recent: [row("d", "completed")],
+      counts: [
+        {
+          projectId: "p1",
+          open: 4,
+          running: 1,
+          inReview: 2,
+          doneThisWeek: 3,
+          lastChangedAt: "2026-11-01T00:00:00.000Z",
+        },
+      ],
+    });
+    expect(decodeSummary({ items: [], truncated: false, activity }).activity?.projects).toEqual([
+      {
+        projectId: "p1",
+        open: 4,
+        running: 1,
+        inReview: 2,
+        doneThisWeek: 3,
+        lastChangedAt: "2026-11-01T00:00:00.000Z",
+      },
+    ]);
   });
 });

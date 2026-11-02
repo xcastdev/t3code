@@ -19,6 +19,7 @@ import {
   ProjectTeamIntegrationSources,
   ProjectTeamIntegrationSource,
   ProjectTeamIntegrationSourceRef,
+  ProjectTeamAvatar,
 } from "./projectTeams.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -583,11 +584,56 @@ export const ProjectWorkAttentionItem = Schema.Struct({
 });
 export type ProjectWorkAttentionItem = typeof ProjectWorkAttentionItem.Type;
 
+/** The team member on a task, resolved on the server so a cross-project view needs no roster. */
+export const ProjectWorkActivityWorker = Schema.Struct({
+  name: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  role: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+  avatar: Schema.optionalKey(ProjectTeamAvatar),
+});
+export type ProjectWorkActivityWorker = typeof ProjectWorkActivityWorker.Type;
+
+/** A task that is moving: in progress, in review, or recently changed. */
+export const ProjectWorkActivityTask = Schema.Struct({
+  projectId: ProjectId,
+  taskId: ProjectWorkTaskId,
+  title: TrimmedNonEmptyString.check(Schema.isMaxLength(240)),
+  state: ProjectWorkTaskStateRead,
+  at: IsoDateTime,
+  /** A member running it, else the member it is assigned to. */
+  worker: Schema.optionalKey(ProjectWorkActivityWorker),
+  /** A person it is assigned to who is not a team member. */
+  assignee: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(128))),
+});
+export type ProjectWorkActivityTask = typeof ProjectWorkActivityTask.Type;
+
+export const ProjectWorkProjectActivity = Schema.Struct({
+  projectId: ProjectId,
+  open: NonNegativeInt,
+  running: NonNegativeInt,
+  inReview: NonNegativeInt,
+  doneThisWeek: NonNegativeInt,
+  /** Newest change to any of the project's tasks. */
+  lastChangedAt: Schema.optionalKey(IsoDateTime),
+});
+export type ProjectWorkProjectActivity = typeof ProjectWorkProjectActivity.Type;
+
+/** What is moving across this environment's projects; bounded so it stays a summary. */
+export const ProjectWorkActivitySummary = Schema.Struct({
+  projects: Schema.Array(ProjectWorkProjectActivity).check(Schema.isMaxLength(500)),
+  /** In-progress and in-review tasks, newest first. */
+  active: Schema.Array(ProjectWorkActivityTask).check(Schema.isMaxLength(60)),
+  /** Other tasks changed in the last week, newest first. */
+  recent: Schema.Array(ProjectWorkActivityTask).check(Schema.isMaxLength(20)),
+});
+export type ProjectWorkActivitySummary = typeof ProjectWorkActivitySummary.Type;
+
 /** Everything waiting on a person across this environment's projects, newest first. */
 export const ProjectWorkAttentionSummary = Schema.Struct({
   items: Schema.Array(ProjectWorkAttentionItem).check(Schema.isMaxLength(200)),
   /** More items exist than were sent. */
   truncated: Schema.Boolean,
+  /** Absent from servers that predate the Work home overview. */
+  activity: Schema.optionalKey(ProjectWorkActivitySummary),
 });
 export type ProjectWorkAttentionSummary = typeof ProjectWorkAttentionSummary.Type;
 
