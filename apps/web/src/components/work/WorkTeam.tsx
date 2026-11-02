@@ -84,7 +84,7 @@ export function WorkTeam({
   writer: WorkWriter;
   onOpenTask: (id: ProjectWorkTaskId) => void;
 }) {
-  const { limits, roles, members, records } = useWorkTeamRoster(scope);
+  const { limits, roles, members, records, roster } = useWorkTeamRoster(scope);
   const providersByEnvironment = useEnvironmentProviders();
   const [draft, setDraft] = useState<Draft | null>(null);
   const key = "team:configure";
@@ -155,6 +155,7 @@ export function WorkTeam({
     <WorkSection
       title="Team"
       grouped={false}
+      className="mx-auto w-full max-w-6xl gap-3"
       description="Roles, models and limits for managed work. Saving records them only; nothing starts."
       actions={
         draft === null && recorded !== null && recorded.kind !== "unreadable" ? (
@@ -183,39 +184,56 @@ export function WorkTeam({
         ) : null
       }
     >
-      <WorkRow>
-        <WorkRecordsNotice set={limits} subject="team limits" />
-        <WorkRecordsNotice set={roles} subject="role profiles" />
-        <WorkRecordsNotice set={members} subject="team members" />
-        {recorded === null ? null : recorded.kind === "none" ? (
-          <p className="text-sm">
-            Meet Quinn, Iris, Sage, Otto, Vera and Wren. Set up a provider and models, then override
-            any name or role instructions.
-          </p>
-        ) : recorded.kind === "unreadable" ? (
-          <WorkFormStatus tone="muted" message={recorded.reason} />
-        ) : (
-          <div className="flex flex-col gap-1.5">
-            <div className="flex flex-wrap items-center gap-2">
-              <Badge variant={recorded.values.enabled ? "success" : "outline"}>
-                {recorded.values.enabled ? "Enabled" : "Disabled"}
-              </Badge>
-              <span className="text-sm">{providerLabel(recorded.values.providerInstanceId)}</span>
-              <WorkRevision className="text-muted-foreground">
-                generation {recorded.generation}
-              </WorkRevision>
-            </div>
-            <WorkMeta>
-              {LIMIT_FIELDS.map(([field, label]) => `${label} ${recorded.values[field] ?? 0}`).join(
-                " · ",
-              )}
-            </WorkMeta>
+      <WorkRecordsNotice set={limits} subject="team limits" />
+      <WorkRecordsNotice set={roles} subject="role profiles" />
+      <WorkRecordsNotice set={members} subject="team members" />
+      {recorded === null ? null : recorded.kind === "none" ? (
+        <p className="m-0 rounded-xl border border-dashed border-border/70 px-4 py-3 text-sm text-muted-foreground">
+          Meet Quinn, Iris, Sage, Otto, Vera and Wren. Set up a provider and models, then override
+          any name or role instructions.
+        </p>
+      ) : recorded.kind === "unreadable" ? (
+        <WorkFormStatus tone="muted" message={recorded.reason} />
+      ) : (
+        <div className="flex min-w-0 flex-col gap-3 rounded-xl border border-border/70 bg-card/40 p-4">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <Badge variant={recorded.values.enabled ? "success" : "outline"}>
+              {recorded.values.enabled ? "Enabled" : "Disabled"}
+            </Badge>
+            <span className="min-w-0 truncate text-sm font-medium">
+              {providerLabel(recorded.values.providerInstanceId)}
+            </span>
+            <WorkRevision className="ms-auto text-muted-foreground">
+              generation {recorded.generation}
+            </WorkRevision>
           </div>
-        )}
-        <WorkMeta>
-          Enabling a team doesn't start anything. Each worker starts from an approved task.
-        </WorkMeta>
-      </WorkRow>
+          <div className="grid min-w-0 grid-cols-2 gap-2 @2xl/work:grid-cols-4">
+            {LIMIT_FIELDS.map(([field, label]) => (
+              <div
+                key={field}
+                className="flex min-w-0 flex-col gap-0.5 rounded-lg border border-border/60 bg-background/40 px-3 py-2"
+              >
+                <span className="text-lg leading-6 font-semibold tabular-nums">
+                  {recorded.values[field] ?? 0}
+                </span>
+                <span className="truncate text-xs text-muted-foreground">{label}</span>
+              </div>
+            ))}
+          </div>
+          <WorkMeta>
+            Enabling a team doesn't start anything. Each worker starts from an approved task.
+          </WorkMeta>
+        </div>
+      )}
+      {configured && roster.length > 0 ? (
+        <div className="flex min-w-0 items-baseline gap-2 px-1 pt-2">
+          <h3 className="m-0 text-sm font-medium">Members</h3>
+          <span className="text-xs tabular-nums text-muted-foreground">{roster.length}</span>
+          <WorkMeta className="ms-auto tabular-nums">
+            {roster.filter((member) => member.activity.state === "running").length} working
+          </WorkMeta>
+        </div>
+      ) : null}
       {configured ? <WorkTeamMembers scope={scope} onOpenTask={onOpenTask} /> : null}
       {draft !== null ? (
         <WorkRow className="gap-4 rounded-xl border border-border/60 bg-card/40 py-4">
