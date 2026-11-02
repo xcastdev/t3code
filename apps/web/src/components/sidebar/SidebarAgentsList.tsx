@@ -8,10 +8,11 @@ import type {
   EnvironmentMachineKind,
   ThreadId,
 } from "@t3tools/contracts";
-import { useLocation, useNavigate, useParams } from "@tanstack/react-router";
+import { useLocation, useNavigate } from "@tanstack/react-router";
 import { AgentAvatar } from "../assistants/AgentAvatar";
 import * as Schema from "effect/Schema";
 import {
+  BotIcon,
   BotMessageSquareIcon,
   ChevronRightIcon,
   ListFilterIcon,
@@ -19,7 +20,7 @@ import {
   PlusIcon,
   SquarePenIcon,
 } from "lucide-react";
-import { useState } from "react";
+import { type RefObject, useRef, useState } from "react";
 
 import { openCommandPalette } from "~/commandPaletteBus";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
@@ -31,21 +32,25 @@ import {
   type EnvironmentPresentation,
 } from "~/state/environments";
 
-import { useAssistantConnection, useAssistantRoster } from "../assistants/useAssistants";
+import {
+  useAllAgents,
+  useAssistantConnection,
+  useAssistantRoster,
+} from "../assistants/useAssistants";
 import { useCreateAgentChat } from "../assistants/useCreateAgentChat";
 import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
 import { ThreadHoverCard, ThreadHoverCardPopup } from "../ThreadHoverCard";
 import { Tooltip, TooltipTrigger } from "../ui/tooltip";
 import {
-  Menu,
-  MenuCheckboxItem,
-  MenuGroup,
-  MenuGroupLabel,
-  MenuItem,
-  MenuPopup,
-  MenuSeparator,
-  MenuTrigger,
-} from "../ui/menu";
+  Combobox,
+  ComboboxEmpty,
+  ComboboxItem,
+  ComboboxList,
+  ComboboxPopup,
+  ComboboxSearchInput,
+  ComboboxTrigger,
+  useComboboxFilter,
+} from "../ui/combobox";
 import {
   SidebarGroup,
   SidebarMenuButton,
@@ -60,11 +65,12 @@ import {
   agentChats,
   agentFilterIsActive,
   agentKey,
-  agentOwningThread,
   agentPassesFilter,
   environmentsWithAgents,
+  NO_AGENT_FILTER,
   toggleAgentFilterValue,
 } from "./SidebarAgentsList.logic";
+import { SidebarScopeRowIcon } from "./SidebarScopeRowIcon";
 import { SidebarHeaderIconButton } from "./SidebarThreadHeader";
 import { RelativeTimeLabel } from "./SidebarThreadRow";
 
@@ -364,154 +370,201 @@ function SidebarAgent(props: {
   );
 }
 
-/** Filter, New chat and New agent, shown in the sidebar header while the Agents view is open. */
+/** Filter, New agent and New chat, shown in the sidebar header while the Agents view is open. */
 export function SidebarAgentsHeaderActions(props: {
+  /** The header search field the filter popup lines up with, like the Projects filter. */
+  readonly filterAnchor: RefObject<HTMLDivElement | null>;
   readonly filter: AgentSidebarFilter;
   readonly onFilterChange: (filter: AgentSidebarFilter) => void;
   readonly onNewAgent: () => void;
   readonly onNavigate: () => void;
 }) {
-  const { environments } = useEnvironments();
   return (
     <>
-      <Menu>
-        <MenuTrigger
-          render={
-            <SidebarMenuButton
-              size="icon"
-              type="button"
-              aria-label="Filter agents"
-              className="relative size-7 shrink-0"
-            />
-          }
-        >
-          <ListFilterIcon />
-          {agentFilterIsActive(props.filter) ? (
-            <span aria-hidden className="absolute top-1 right-1 size-1.5 rounded-full bg-primary" />
-          ) : null}
-        </MenuTrigger>
-        <MenuPopup align="end" className="min-w-48">
-          <MenuGroup>
-            <MenuGroupLabel>Agents</MenuGroupLabel>
-            {environments.map((environment) => (
-              <AgentFilterItems
-                key={environment.environmentId}
-                environment={environment}
-                showEnvironment={environments.length > 1}
-                filter={props.filter}
-                onFilterChange={props.onFilterChange}
-              />
-            ))}
-          </MenuGroup>
-          {environments.length > 1 ? (
-            <>
-              <MenuSeparator />
-              <MenuGroup>
-                <MenuGroupLabel>Environments</MenuGroupLabel>
-                {environments.map((environment) => (
-                  <MenuCheckboxItem
-                    key={environment.environmentId}
-                    checked={props.filter.environments.includes(environment.environmentId)}
-                    onCheckedChange={() =>
-                      props.onFilterChange(
-                        toggleAgentFilterValue(
-                          props.filter,
-                          "environments",
-                          environment.environmentId,
-                        ),
-                      )
-                    }
-                  >
-                    {environment.label}
-                  </MenuCheckboxItem>
-                ))}
-              </MenuGroup>
-            </>
-          ) : null}
-          {agentFilterIsActive(props.filter) ? (
-            <>
-              <MenuSeparator />
-              <MenuItem onClick={() => props.onFilterChange({ agents: [], environments: [] })}>
-                Show all agents
-              </MenuItem>
-            </>
-          ) : null}
-        </MenuPopup>
-      </Menu>
+      <AgentFilter
+        anchor={props.filterAnchor}
+        filter={props.filter}
+        onFilterChange={props.onFilterChange}
+      />
       <SidebarHeaderIconButton label="New agent" onClick={props.onNewAgent}>
         <BotMessageSquareIcon />
       </SidebarHeaderIconButton>
-      <NewChatButton onNavigate={props.onNavigate} />
+      <PickAgentNewChatButton onNavigate={props.onNavigate} />
     </>
   );
 }
 
-function AgentFilterItems(props: {
-  readonly environment: EnvironmentPresentation;
-  readonly showEnvironment: boolean;
+type AgentFilterItem =
+  | { readonly value: "all"; readonly label: string; readonly kind: "all" }
+  | {
+      readonly value: string;
+      readonly label: string;
+      readonly kind: "agent";
+      readonly agent: AssistantSummary;
+    }
+  | {
+      readonly value: string;
+      readonly label: string;
+      readonly kind: "environment";
+      readonly environmentId: EnvironmentId;
+      readonly machine: EnvironmentMachineKind;
+    };
+
+/**
+ * The same search popup as the Projects filter: select one row, or Shift-select to add
+ * more. Environments join the list when more than one is connected.
+ */
+function AgentFilter(props: {
+  readonly anchor: RefObject<HTMLDivElement | null>;
   readonly filter: AgentSidebarFilter;
   readonly onFilterChange: (filter: AgentSidebarFilter) => void;
 }) {
-  const roster = useAssistantRoster(props.environment.environmentId, false);
-  return (roster.data?.assistants ?? []).map((agent) => (
-    <MenuCheckboxItem
-      key={agent.assistantId}
-      checked={props.filter.agents.includes(agentKey(agent))}
-      onCheckedChange={() =>
-        props.onFilterChange(toggleAgentFilterValue(props.filter, "agents", agentKey(agent)))
-      }
-    >
-      <AgentAvatar agent={agent} size="icon" />
-      <span className="min-w-0 truncate">{agent.name}</span>
-      {props.showEnvironment ? (
-        <span className="ms-auto shrink-0 text-xs text-muted-foreground">
-          {props.environment.label}
-        </span>
-      ) : null}
-    </MenuCheckboxItem>
-  ));
-}
-
-/**
- * Starts a chat with the agent you're in. Anywhere else it asks which agent, since every
- * chat belongs to one.
- */
-function NewChatButton(props: { readonly onNavigate: () => void }) {
-  const params = useParams({ strict: false }) as {
-    readonly environmentId?: EnvironmentId;
-    readonly threadId?: ThreadId;
-  };
-  return params.environmentId !== undefined && params.threadId !== undefined ? (
-    <RouteNewChatButton
-      environmentId={params.environmentId}
-      threadId={params.threadId}
-      onNavigate={props.onNavigate}
-    />
-  ) : (
-    <PickAgentNewChatButton onNavigate={props.onNavigate} />
+  const { environments } = useEnvironments();
+  const machines = useEnvironmentMachines();
+  const agents = useAllAgents(environments.map((environment) => environment.environmentId));
+  const comboboxFilter = useComboboxFilter();
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const highlighted = useRef<AgentFilterItem | null>(null);
+  const { filter, onFilterChange } = props;
+  const items: AgentFilterItem[] = [
+    { value: "all", label: "All agents", kind: "all" },
+    ...agents.map((agent) => ({
+      value: `agent:${agentKey(agent)}`,
+      label: agent.name,
+      kind: "agent" as const,
+      agent,
+    })),
+    ...(environments.length > 1
+      ? environments.map((environment) => ({
+          value: `environment:${environment.environmentId}`,
+          label: environment.label,
+          kind: "environment" as const,
+          environmentId: environment.environmentId,
+          machine: machines.get(environment.environmentId) ?? "server",
+        }))
+      : []),
+  ];
+  const filteredItems = items.filter((item) =>
+    comboboxFilter.contains(item, query, (candidate) => candidate.label),
   );
-}
-
-function RouteNewChatButton(props: {
-  readonly environmentId: EnvironmentId;
-  readonly threadId: ThreadId;
-  readonly onNavigate: () => void;
-}) {
-  const roster = useAssistantRoster(props.environmentId, false);
-  const thread =
-    useQuietThreadShells().find(
-      (shell) => shell.environmentId === props.environmentId && shell.id === props.threadId,
-    ) ?? null;
-  const agent = agentOwningThread(roster.data?.assistants ?? [], thread);
-  const createChat = useCreateAgentChat(props.onNavigate);
-  if (agent === null) return <PickAgentNewChatButton onNavigate={props.onNavigate} />;
+  const isSelected = (item: AgentFilterItem) =>
+    item.kind === "all"
+      ? !agentFilterIsActive(filter)
+      : item.kind === "agent"
+        ? filter.agents.includes(agentKey(item.agent))
+        : filter.environments.includes(item.environmentId);
+  const only = (item: AgentFilterItem): AgentSidebarFilter =>
+    item.kind === "all"
+      ? NO_AGENT_FILTER
+      : item.kind === "agent"
+        ? { agents: [agentKey(item.agent)], environments: [] }
+        : { agents: [], environments: [item.environmentId] };
+  const toggle = (item: AgentFilterItem) => {
+    if (item.kind === "all") onFilterChange(NO_AGENT_FILTER);
+    else if (item.kind === "agent")
+      onFilterChange(toggleAgentFilterValue(filter, "agents", agentKey(item.agent)));
+    else onFilterChange(toggleAgentFilterValue(filter, "environments", item.environmentId));
+  };
+  const selectedAgents = agents.filter((agent) => filter.agents.includes(agentKey(agent)));
+  const label = agentFilterIsActive(filter)
+    ? `Filter agents: ${items
+        .filter((item) => item.kind !== "all" && isSelected(item))
+        .map((item) => item.label)
+        .join(", ")}`
+    : "Filter agents";
   return (
-    <SidebarHeaderIconButton
-      label={`New chat with ${agent.name}`}
-      onClick={() => void createChat(agent)}
+    <Combobox
+      items={items}
+      filteredItems={filteredItems}
+      autoHighlight
+      itemToStringLabel={(item) => item.label}
+      isItemEqualToValue={(a, b) => a.value === b.value}
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) setQuery("");
+      }}
+      onItemHighlighted={(item) => {
+        highlighted.current = item ?? null;
+      }}
+      value={null}
+      onValueChange={(item, eventDetails) => {
+        if (!item) return;
+        if (eventDetails.event instanceof MouseEvent && eventDetails.event.shiftKey) {
+          // Canceling keeps the popup open and its query, so several rows can be picked.
+          eventDetails.cancel();
+          toggle(item);
+          return;
+        }
+        onFilterChange(only(item));
+      }}
     >
-      <SquarePenIcon />
-    </SidebarHeaderIconButton>
+      <ComboboxTrigger render={<SidebarHeaderIconButton label={label} />}>
+        {selectedAgents.length > 1 ? (
+          <span className="flex shrink-0 -space-x-1.5">
+            {selectedAgents.slice(0, 2).map((agent) => (
+              <AgentAvatar key={agentKey(agent)} agent={agent} size="icon" />
+            ))}
+          </span>
+        ) : selectedAgents[0] ? (
+          <AgentAvatar agent={selectedAgents[0]} size="icon" />
+        ) : filter.environments.length > 0 ? (
+          <EnvironmentMachineIcon
+            kind={machines.get(filter.environments[0] as EnvironmentId) ?? "server"}
+            className="size-4"
+          />
+        ) : (
+          <ListFilterIcon className="size-4" />
+        )}
+      </ComboboxTrigger>
+      <ComboboxPopup
+        align="start"
+        anchor={props.anchor}
+        className="max-w-[min(18rem,var(--available-width))] overflow-hidden"
+        finalFocus={(closeType) => closeType === "keyboard"}
+      >
+        <ComboboxSearchInput
+          aria-label="Search agents"
+          placeholder="Search agents..."
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.shiftKey && event.key === "Enter" && highlighted.current) {
+              event.preventDefault();
+              toggle(highlighted.current);
+            }
+          }}
+        />
+        <ComboboxEmpty>No matching agents.</ComboboxEmpty>
+        <ComboboxList aria-multiselectable>
+          {(item: AgentFilterItem) => (
+            <ComboboxItem
+              key={item.value}
+              hideIndicator
+              value={item}
+              aria-selected={isSelected(item)}
+              // The icon badge marks selection; Base UI's single value would shade one row.
+              data-selected={undefined}
+            >
+              <SidebarScopeRowIcon isSelected={isSelected(item)}>
+                {item.kind === "agent" ? (
+                  <AgentAvatar agent={item.agent} size="icon" />
+                ) : item.kind === "environment" ? (
+                  <EnvironmentMachineIcon kind={item.machine} className="size-4 shrink-0" />
+                ) : (
+                  <BotIcon className="size-4 shrink-0" />
+                )}
+              </SidebarScopeRowIcon>
+              <span className="min-w-0 flex-1 truncate text-sm">{item.label}</span>
+              {item.kind === "environment" ? (
+                <span className="shrink-0 text-xs text-muted-foreground">Environment</span>
+              ) : null}
+            </ComboboxItem>
+          )}
+        </ComboboxList>
+      </ComboboxPopup>
+    </Combobox>
   );
 }
 

@@ -62,14 +62,7 @@ import {
 } from "@t3tools/contracts";
 import type { OlderSettledScope } from "@t3tools/client-runtime/state/threads";
 
-import {
-  CheckIcon,
-  ChevronDownIcon,
-  FolderIcon,
-  ListFilterIcon,
-  PlusIcon,
-  SettingsIcon,
-} from "lucide-react";
+import { ChevronDownIcon, FolderIcon, ListFilterIcon, PlusIcon, SettingsIcon } from "lucide-react";
 import {
   useEffect,
   useLayoutEffect,
@@ -260,6 +253,7 @@ import {
 } from "./sidebar/SidebarThreadHeader";
 import { SidebarAgentsHeaderActions, SidebarAgentsList } from "./sidebar/SidebarAgentsList";
 import { AgentSidebarFilter, NO_AGENT_FILTER } from "./sidebar/SidebarAgentsList.logic";
+import { SidebarScopeRowIcon } from "./sidebar/SidebarScopeRowIcon";
 import { CreateAgentDialog } from "./assistants/CreateAgentDialog";
 import { TooltipProvider } from "./ui/tooltip";
 import { composerDraftHasUserContent, DraftId, useComposerDraftStore } from "../composerDraftStore";
@@ -869,19 +863,6 @@ function useSidebarLookups() {
     projectGroupByScopeKey,
     projectScopeItems,
   };
-}
-
-function ProjectScopeRowIcon(props: { isSelected: boolean; children: ReactNode }) {
-  return (
-    <span className="relative flex shrink-0">
-      {props.children}
-      {props.isSelected ? (
-        <span className="pointer-events-none absolute -right-1 -bottom-1 grid size-3 place-items-center rounded-full bg-primary ring-2 ring-popover">
-          <CheckIcon className="size-2 text-primary-foreground" strokeWidth={4} aria-hidden />
-        </span>
-      ) : null}
-    </span>
-  );
 }
 
 function canOperateThreads(
@@ -3188,13 +3169,13 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                               if (project) handleProjectSettings(event, project);
                             }}
                           >
-                            <ProjectScopeRowIcon isSelected={isSelected}>
+                            <SidebarScopeRowIcon isSelected={isSelected}>
                               {project ? (
                                 <ProjectFavicon project={project} className="size-4 shrink-0" />
                               ) : (
                                 <FolderIcon className="size-4 shrink-0" />
                               )}
-                            </ProjectScopeRowIcon>
+                            </SidebarScopeRowIcon>
                             <span className="min-w-0 flex-1 truncate text-sm">{item.label}</span>
                             {project && showProjectEnvironments ? (
                               <ProjectEnvironmentBadge
@@ -3237,6 +3218,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
               onNewProject={openAddProjectCommandPalette}
               agentActions={
                 <SidebarAgentsHeaderActions
+                  filterAnchor={headerSearchRef}
                   filter={agentFilter}
                   onFilterChange={setAgentFilter}
                   onNewAgent={() => {

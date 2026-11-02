@@ -901,6 +901,12 @@ function OpenCommandPaletteDialog(props: {
   const createAgentChat = useCreateAgentChat(() => {});
   const agentChatItems: CommandPaletteActionItem[] = agents
     .filter((agent) => agent.provisioningState === "ready")
+    // The agent you're talking to leads, so Enter starts a chat with it.
+    .toSorted(
+      (left, right) =>
+        Number(right.assistantId === activeAssistant?.assistantId) -
+        Number(left.assistantId === activeAssistant?.assistantId),
+    )
     .map((agent) => {
       const environmentLabel = environmentLabelById.get(agent.environmentId) ?? "";
       return {
