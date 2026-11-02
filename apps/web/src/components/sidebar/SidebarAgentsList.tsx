@@ -185,58 +185,60 @@ function SidebarAgent(props: {
   const chats = showAll ? props.chats : props.chats.slice(0, VISIBLE_CHATS);
   const hiddenChats = props.chats.length - chats.length;
   return (
-    <div className="relative">
-      <SidebarMenuButton
-        isActive={pathname === `/${home.environmentId}/${home.threadId}`}
-        onClick={() => {
-          // An agent still being set up has no chat yet; its page shows the progress.
-          if (!ready) {
-            props.onNavigate();
-            void navigate({
-              to: "/agents/$environmentId/$assistantId",
-              params: { environmentId: agent.environmentId, assistantId: agent.assistantId },
-              search: { section: "overview" },
-            });
-            return;
-          }
-          if (!props.expanded) props.onToggle();
-          openThread(home.threadId);
-        }}
-      >
-        <AgentAvatar agent={agent} size="icon" />
-        <span className="min-w-0 flex-1 truncate font-medium">{agent.name}</span>
-        {status.tone === "neutral" || status.tone === "success" ? (
-          <span className="sr-only">{status.label}</span>
-        ) : (
-          <span
-            className={cn(
-              "shrink-0 text-2xs",
-              status.tone === "info"
-                ? "text-info"
-                : status.tone === "warning"
-                  ? "text-warning"
-                  : "text-destructive",
-            )}
-          >
-            {status.label}
-          </span>
-        )}
-        {ready ? <span aria-hidden className="size-5 shrink-0" /> : null}
-      </SidebarMenuButton>
-      {ready ? (
-        <button
-          type="button"
-          aria-expanded={props.expanded}
-          aria-label={props.expanded ? `Collapse ${agent.name}` : `Expand ${agent.name}`}
-          className="absolute end-(--sidebar-row-content-inset) top-1/2 grid size-5 -translate-y-1/2 cursor-pointer place-items-center rounded-md text-sidebar-muted-foreground outline-hidden ring-ring hover:bg-sidebar-row-hover hover:text-sidebar-foreground focus-visible:ring-2 focus-visible:ring-inset"
-          onClick={props.onToggle}
+    <div>
+      <div className="relative">
+        <SidebarMenuButton
+          isActive={pathname === `/${home.environmentId}/${home.threadId}`}
+          onClick={() => {
+            // An agent still being set up has no chat yet; its page shows the progress.
+            if (!ready) {
+              props.onNavigate();
+              void navigate({
+                to: "/agents/$environmentId/$assistantId",
+                params: { environmentId: agent.environmentId, assistantId: agent.assistantId },
+                search: { section: "overview" },
+              });
+              return;
+            }
+            if (!props.expanded) props.onToggle();
+            openThread(home.threadId);
+          }}
         >
-          <ChevronRightIcon
-            aria-hidden
-            className={cn("size-3.5 transition-transform", props.expanded && "rotate-90")}
-          />
-        </button>
-      ) : null}
+          <AgentAvatar agent={agent} size="icon" />
+          <span className="min-w-0 flex-1 truncate font-medium">{agent.name}</span>
+          {status.tone === "neutral" || status.tone === "success" ? (
+            <span className="sr-only">{status.label}</span>
+          ) : (
+            <span
+              className={cn(
+                "shrink-0 text-2xs",
+                status.tone === "info"
+                  ? "text-info"
+                  : status.tone === "warning"
+                    ? "text-warning"
+                    : "text-destructive",
+              )}
+            >
+              {status.label}
+            </span>
+          )}
+          {ready ? <span aria-hidden className="size-5 shrink-0" /> : null}
+        </SidebarMenuButton>
+        {ready ? (
+          <button
+            type="button"
+            aria-expanded={props.expanded}
+            aria-label={props.expanded ? `Collapse ${agent.name}` : `Expand ${agent.name}`}
+            className="absolute end-(--sidebar-row-content-inset) top-1/2 grid size-5 -translate-y-1/2 cursor-pointer place-items-center rounded-md text-sidebar-muted-foreground outline-hidden ring-ring hover:bg-sidebar-row-hover hover:text-sidebar-foreground focus-visible:ring-2 focus-visible:ring-inset"
+            onClick={props.onToggle}
+          >
+            <ChevronRightIcon
+              aria-hidden
+              className={cn("size-3.5 transition-transform", props.expanded && "rotate-90")}
+            />
+          </button>
+        ) : null}
+      </div>
       {props.expanded && ready ? (
         <SidebarMenuSub>
           {chats.map((chat) => (
