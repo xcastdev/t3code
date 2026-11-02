@@ -780,6 +780,7 @@ export const CoreServerWsRpcGroup = ServerWsRpcGroup.omit(
   WS_METHODS.projectWorkRead,
   WS_METHODS.projectWorkWrite,
   WS_METHODS.projectWorkSubscribe,
+  WS_METHODS.projectWorkSubscribeAttention,
 );
 export const PullRequestServerWsRpcGroup = ServerWsRpcGroup.omit(
   ...[...ServerWsRpcGroup.requests.keys()].filter(
@@ -4317,6 +4318,9 @@ export const layerWsRpc = (
     ),
     ServerWsRpcGroup.toLayerHandler(WS_METHODS.projectWorkSubscribe, (input) =>
       projectWork.subscribe(input),
+    ),
+    ServerWsRpcGroup.toLayerHandler(WS_METHODS.projectWorkSubscribeAttention, () =>
+      projectWork.subscribeAttention(),
     ),
   );
 };

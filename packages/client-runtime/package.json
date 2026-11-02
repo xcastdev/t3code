@@ -351,6 +351,10 @@
       "types": "./src/state/threadSort.ts",
       "default": "./src/state/threadSort.ts"
     },
+    "./state/attention": {
+      "types": "./src/state/attention.ts",
+      "default": "./src/state/attention.ts"
+    },
     "./state/thread-inbox": {
       "types": "./src/state/threadInbox.ts",
       "default": "./src/state/threadInbox.ts"

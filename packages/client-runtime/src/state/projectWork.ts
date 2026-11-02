@@ -285,6 +285,12 @@ export function createProjectWorkEnvironmentAtoms<R, E>(
         Stream.changes,
       ),
   });
+  // One stream per environment; the server re-reads it after each Work commit.
+  const attentionStream = createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+    label: "environment-data:project-work:attention",
+    tag: WS_METHODS.projectWorkSubscribeAttention,
+  });
+  const attention = (environmentId: EnvironmentId) => attentionStream({ environmentId, input: {} });
   const projectStream = (environmentId: EnvironmentId, projectId: ProjectId) =>
     stream({
       environmentId,
@@ -422,6 +428,7 @@ export function createProjectWorkEnvironmentAtoms<R, E>(
       ),
   });
   return {
+    attention,
     issue,
     delivery: {
       ...delivery,

@@ -143,6 +143,8 @@ import {
   ProjectWorkWriteResult,
   ProjectWorkStreamInput,
   ProjectWorkStreamItem,
+  ProjectWorkAttentionSubscribeInput,
+  ProjectWorkAttentionSummary,
   ProjectWorkDeliveryRequest,
   ProjectWorkDeliveryResult,
 } from "./projectWork.ts";
@@ -616,6 +618,7 @@ export const WS_METHODS = {
   assistantsUpdateConfiguration: "assistants.updateConfiguration",
   assistantsLifecycle: "assistants.lifecycle",
   projectWorkSubscribe: "projectWork.subscribe",
+  projectWorkSubscribeAttention: "projectWork.subscribeAttention",
   projectsListEntries: "projects.listEntries",
   projectsListIgnoredFiles: "projects.listIgnoredFiles",
   projectsReadFile: "projects.readFile",
@@ -2396,6 +2399,13 @@ const WsProjectWorkSubscribeRpc = Rpc.make(WS_METHODS.projectWorkSubscribe, {
   error: Schema.Union([ProjectWorkRpcError, EnvironmentAuthorizationError]),
 });
 
+const WsProjectWorkSubscribeAttentionRpc = Rpc.make(WS_METHODS.projectWorkSubscribeAttention, {
+  payload: ProjectWorkAttentionSubscribeInput,
+  success: ProjectWorkAttentionSummary,
+  stream: true,
+  error: Schema.Union([ProjectWorkRpcError, EnvironmentAuthorizationError]),
+});
+
 const WsScheduledTasksSubscribeRpc = Rpc.make(WS_METHODS.scheduledTasksSubscribe, {
   payload: ScheduledTaskListInput,
   success: ScheduledTaskListResult,
@@ -2857,6 +2867,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsProjectWorkReadRpc,
   WsProjectWorkWriteRpc,
   WsProjectWorkSubscribeRpc,
+  WsProjectWorkSubscribeAttentionRpc,
   WsScheduledTasksSubscribeRpc,
   WsScheduledTasksUpsertRpc,
   WsScheduledTasksSetEnabledRpc,

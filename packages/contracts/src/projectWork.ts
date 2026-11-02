@@ -563,6 +563,37 @@ export const ProjectWorkDeltaRead = Schema.Struct({
 });
 export type ProjectWorkDeltaRead = typeof ProjectWorkDeltaRead.Type;
 
+/** Where in Work an attention item is answered: the Overview, or the task itself. */
+export const ProjectWorkAttentionSurface = Schema.Literals(["overview", "tasks"]);
+export type ProjectWorkAttentionSurface = typeof ProjectWorkAttentionSurface.Type;
+
+/** One thing in a project's Work that waits on a person. */
+export const ProjectWorkAttentionItem = Schema.Struct({
+  projectId: ProjectId,
+  /** Stable while the item is unresolved; a new key means a new item. */
+  key: TrimmedNonEmptyString.check(Schema.isMaxLength(512)),
+  surface: ProjectWorkAttentionSurface,
+  kind: Schema.Literals(["task", "decision", "question", "message", "blocker"]),
+  /** Short reason shown before the title, e.g. "Needs approval". */
+  reason: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+  title: TrimmedNonEmptyString.check(Schema.isMaxLength(240)),
+  detail: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(240))),
+  taskId: Schema.optionalKey(ProjectWorkTaskId),
+  at: IsoDateTime,
+});
+export type ProjectWorkAttentionItem = typeof ProjectWorkAttentionItem.Type;
+
+/** Everything waiting on a person across this environment's projects, newest first. */
+export const ProjectWorkAttentionSummary = Schema.Struct({
+  items: Schema.Array(ProjectWorkAttentionItem).check(Schema.isMaxLength(200)),
+  /** More items exist than were sent. */
+  truncated: Schema.Boolean,
+});
+export type ProjectWorkAttentionSummary = typeof ProjectWorkAttentionSummary.Type;
+
+export const ProjectWorkAttentionSubscribeInput = Schema.Struct({});
+export type ProjectWorkAttentionSubscribeInput = typeof ProjectWorkAttentionSubscribeInput.Type;
+
 /**
  * Cursor used by the project-work stream.  This is the durable event-log
  * sequence, rather than the project revision: unrelated project events may

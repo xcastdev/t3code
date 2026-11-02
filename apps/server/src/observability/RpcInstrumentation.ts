@@ -154,6 +154,7 @@ const RPC_AGGREGATES = {
   [WS_METHODS.projectWorkDelivery]: "projectWork",
   [WS_METHODS.projectWorkWrite]: "projectWork",
   [WS_METHODS.projectWorkSubscribe]: "projectWork",
+  [WS_METHODS.projectWorkSubscribeAttention]: "projectWork",
   [WS_METHODS.scheduledTasksSubscribe]: "scheduledTasks",
   [WS_METHODS.scheduledTasksUpsert]: "scheduledTasks",
   [WS_METHODS.scheduledTasksSetEnabled]: "scheduledTasks",

@@ -32,6 +32,7 @@ import {
   ProjectWorkReadIntent,
   ProjectWorkStreamInput,
   ProjectWorkStreamItem,
+  type ProjectWorkAttentionSummary,
   ProjectWorkWriteIntent,
   ProjectWorkWriteResult,
   type ProjectId,
@@ -56,6 +57,8 @@ import * as Search from "./ProjectWorkSearch.ts";
 import * as Briefing from "./ProjectWorkBriefing.ts";
 import * as Export from "./ProjectWorkExport.ts";
 import * as WorkStream from "./ProjectWorkStream.ts";
+import * as WorkEventBus from "./ProjectWorkEventBus.ts";
+import { readProjectWorkAttention } from "./ProjectWorkAttention.ts";
 
 /** Transport-owned authority; never decoded from a command or tool's parameters. */
 export interface ProjectWorkPrincipal {
@@ -97,6 +100,11 @@ export class ProjectWorkGateway extends Context.Service<
       input: ProjectWorkStreamInput,
       principal?: ProjectWorkPrincipal,
     ) => Stream.Stream<ProjectWorkStreamItem, ProjectWorkRpcError>;
+    /** What waits on a person across this environment's projects, re-read after each Work commit. */
+    readonly subscribeAttention: () => Stream.Stream<
+      ProjectWorkAttentionSummary,
+      ProjectWorkRpcError
+    >;
   }
 >()("t3/projectWork/ProjectWorkGateway") {}
 
@@ -144,6 +152,7 @@ const make = Effect.gen(function* () {
   const briefing = yield* Briefing.ProjectWorkBriefing;
   const exporter = yield* Export.ProjectWorkExport;
   const stream = yield* WorkStream.ProjectWorkStream;
+  const workBus = yield* Effect.serviceOption(WorkEventBus.ProjectWorkEventBus);
   const authorize = Effect.fn("ProjectWorkGateway.authorize")(function* (
     projectId: ProjectId,
     operation: "read" | "write" | "subscribe",
@@ -877,7 +886,39 @@ const make = Effect.gen(function* () {
         ),
       ),
     );
-  return ProjectWorkGateway.of({ read, write, subscribe, issue, delivery });
+  const readAttention = projects.list().pipe(
+    Effect.flatMap((rows) =>
+      readProjectWorkAttention(
+        sql,
+        rows.map((row) => row.projectId),
+      ),
+    ),
+    Effect.mapError(() => failure("subscribe", "unavailable")),
+  );
+  const subscribeAttention = () =>
+    Stream.unwrap(
+      Effect.gen(function* () {
+        // Subscribe before the first read so a commit racing it still wakes a re-read.
+        const hints = Option.isSome(workBus) ? yield* workBus.value.subscribe : Stream.empty;
+        const first = yield* readAttention;
+        // Hints coalesce and only say "something changed"; each wake re-reads the projections.
+        const live = hints.pipe(
+          Stream.debounce("150 millis"),
+          Stream.mapEffect(() => readAttention),
+        );
+        return Stream.concat(Stream.make(first), live).pipe(
+          Stream.changesWith((a, b) => JSON.stringify(a) === JSON.stringify(b)),
+        );
+      }),
+    );
+  return ProjectWorkGateway.of({
+    read,
+    write,
+    subscribe,
+    subscribeAttention,
+    issue,
+    delivery,
+  });
 });
 
 export const layer = Layer.effect(ProjectWorkGateway, make);
