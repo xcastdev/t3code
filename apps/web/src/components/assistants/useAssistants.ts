@@ -48,6 +48,32 @@ export function useAssistantRoster(
   );
 }
 
+const rosterAtom = (environmentId: EnvironmentId) =>
+  assistantsEnvironment.roster({
+    environmentId,
+    input: { environmentId, includeArchived: false, limit: ROSTER_LIMIT },
+  });
+
+// Keyed by the joined environment ids, so the same set of environments shares one atom.
+const allAgentsAtom = Atom.family((environmentIds: string) =>
+  Atom.make((get) =>
+    environmentIds === ""
+      ? []
+      : environmentIds
+          .split("\n")
+          .flatMap(
+            (id) =>
+              AsyncResult.getOrElse(get(rosterAtom(id as EnvironmentId)), () => null)?.assistants ??
+              [],
+          ),
+  ),
+);
+
+/** Every environment's current agents, from the same rosters the sidebar reads. */
+export function useAllAgents(environmentIds: ReadonlyArray<EnvironmentId>) {
+  return useAtomValue(allAgentsAtom(environmentIds.join("\n")));
+}
+
 export function useAssistantDetail(environmentId: EnvironmentId, assistantId: AssistantId) {
   return useEnvironmentQuery(
     assistantsEnvironment.detail({ environmentId, input: { environmentId, assistantId } }),

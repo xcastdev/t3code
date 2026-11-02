@@ -3,11 +3,16 @@
 Open **Agents** in the sidebar to see each assistant with its chats. Select an assistant's name to
 open its **Home**, the long-lived conversation that always returns to the same one; use the arrow
 beside it to show or hide its chats without leaving the current one. Start a
-separate chat for a topic you want to keep apart, with **New chat** under the assistant or in the
-sidebar header. A chat starts with a clean conversation but works as the same assistant, with its
+separate chat for a topic you want to keep apart, with **New chat** under the assistant, in the
+sidebar header, or with **New chat with agent…** in the command palette; outside an assistant's
+conversation, it asks which assistant. A chat starts with a clean conversation but works as the same assistant, with its
 project, settings and memory. Use the filter in the sidebar header to show only some assistants, or
 only one environment's. Use **Stop** in a conversation to stop its active work.
 From the assistant's Home, open its agent page to change its setup.
+
+Create one with **New agent** in the Agents sidebar header. It walks through three steps: a face or
+initials and a name, then the model and how much it may do without asking, then optional
+personality, rules and a standing prompt.
 
 ## Memory
 

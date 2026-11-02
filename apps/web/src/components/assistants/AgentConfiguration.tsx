@@ -349,7 +349,7 @@ function SwitchRow({
   );
 }
 
-function ChoiceSelect<T extends string>({
+export function ChoiceSelect<T extends string>({
   id,
   value,
   labels,

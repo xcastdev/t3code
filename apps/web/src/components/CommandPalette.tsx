@@ -98,7 +98,10 @@ import { useDesktopLocalBootstraps } from "../connection/useDesktopLocalBootstra
 import { useHandleNewThread } from "../hooks/useHandleNewThread";
 import { useProjectWorkTarget } from "../hooks/useProjectWorkTarget";
 import { ProjectWorkShortcut } from "./work/ProjectWorkShortcut";
+import { AgentAvatar } from "./assistants/AgentAvatar";
 import { AgentsShortcut } from "./assistants/AgentsShortcut";
+import { useAllAgents } from "./assistants/useAssistants";
+import { useCreateAgentChat } from "./assistants/useCreateAgentChat";
 import { useAssistantThreadOwner } from "./assistants/useAssistantHome";
 import { useOpenPanelPullRequestUrl } from "../hooks/useOpenPanelPullRequestUrl";
 import { copyThreadReference } from "../lib/copyThreadReference";
@@ -272,6 +275,7 @@ import { threadRecentUse } from "@t3tools/shared/paletteSearch";
 const EMPTY_BROWSE_ENTRIES: FilesystemBrowseResult["entries"] = [];
 const ADD_PROJECT_ENTRY_GROUP = "add-project";
 const NEW_THREAD_IN_GROUP = "projects";
+const NEW_AGENT_CHAT_GROUP = "agents";
 
 /** The submenu an open intent starts in; its groups resolve while rendering. */
 function openIntentView(intent: CommandPaletteOpenIntent | null): CommandPaletteView | null {
@@ -285,6 +289,11 @@ function openIntentView(intent: CommandPaletteOpenIntent | null): CommandPalette
       return {
         addonIcon: <SquarePenIcon className={ADDON_ICON_CLASS} />,
         groups: [{ value: NEW_THREAD_IN_GROUP, label: "Projects", items: [] }],
+      };
+    case "new-agent-chat":
+      return {
+        addonIcon: <SquarePenIcon className={ADDON_ICON_CLASS} />,
+        groups: [{ value: NEW_AGENT_CHAT_GROUP, label: "New chat with", items: [] }],
       };
     case "change-theme":
       return {
@@ -887,6 +896,23 @@ function OpenCommandPaletteDialog(props: {
   const projectThreadItems = openingOrderThreadItems.map(
     (item) => projectJumpItems.get(item.value) ?? item,
   );
+
+  const agents = useAllAgents(environments.map((environment) => environment.environmentId));
+  const createAgentChat = useCreateAgentChat(() => {});
+  const agentChatItems: CommandPaletteActionItem[] = agents
+    .filter((agent) => agent.provisioningState === "ready")
+    .map((agent) => {
+      const environmentLabel = environmentLabelById.get(agent.environmentId) ?? "";
+      return {
+        kind: "action",
+        value: `agent-chat:${agent.environmentId}:${agent.assistantId}`,
+        searchTerms: [agent.name, environmentLabel],
+        title: agent.name,
+        ...(environments.length > 1 ? { description: environmentLabel } : {}),
+        icon: <AgentAvatar agent={agent} size="icon" />,
+        run: () => createAgentChat(agent),
+      };
+    });
 
   const {
     threadItems: allThreadItems,
@@ -1669,6 +1695,18 @@ function OpenCommandPaletteDialog(props: {
     });
   }
 
+  if (agentChatItems.length > 0) {
+    actionItems.push({
+      kind: "submenu",
+      value: "action:new-agent-chat",
+      searchTerms: ["new chat", "agent", "assistant", "chat with"],
+      title: "New chat with agent...",
+      icon: <SquarePenIcon className={ITEM_ICON_CLASS} />,
+      addonIcon: <SquarePenIcon className={ADDON_ICON_CLASS} />,
+      groups: [{ value: NEW_AGENT_CHAT_GROUP, label: "New chat with", items: agentChatItems }],
+    });
+  }
+
   actionItems.push({
     kind: "action",
     value: "action:agents",
@@ -1836,20 +1874,22 @@ function OpenCommandPaletteDialog(props: {
         )
       : currentView?.groups[0]?.value === ADD_PROJECT_ENTRY_GROUP
         ? addProjectEntryGroups()
-        : currentView?.groups[0]?.value === NEW_THREAD_IN_GROUP
-          ? [
-              {
-                value: NEW_THREAD_IN_GROUP,
-                label: "Projects",
-                // Every project archived and no "No project" home leaves only adding one.
-                items: projectThreadItems.length > 0 ? projectThreadItems : [addProjectAction],
-              },
-            ]
-          : currentView?.groups[0]?.value === "themes"
-            ? changeThemeItem.groups
-            : currentView?.groups[0]?.value === "appearance"
-              ? changeAppearanceItem.groups
-              : (currentView?.groups ?? rootGroups);
+        : currentView?.groups[0]?.value === NEW_AGENT_CHAT_GROUP
+          ? [{ value: NEW_AGENT_CHAT_GROUP, label: "New chat with", items: agentChatItems }]
+          : currentView?.groups[0]?.value === NEW_THREAD_IN_GROUP
+            ? [
+                {
+                  value: NEW_THREAD_IN_GROUP,
+                  label: "Projects",
+                  // Every project archived and no "No project" home leaves only adding one.
+                  items: projectThreadItems.length > 0 ? projectThreadItems : [addProjectAction],
+                },
+              ]
+            : currentView?.groups[0]?.value === "themes"
+              ? changeThemeItem.groups
+              : currentView?.groups[0]?.value === "appearance"
+                ? changeAppearanceItem.groups
+                : (currentView?.groups ?? rootGroups);
 
   const isLinkedThreadSearch =
     linkedThreadSearch?.linkedThreads !== undefined && deferredQuery === linkedThreadSearch.query;

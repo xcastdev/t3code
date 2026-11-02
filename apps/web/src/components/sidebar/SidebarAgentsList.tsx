@@ -21,18 +21,18 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 
+import { openCommandPalette } from "~/commandPaletteBus";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
-import { cn, newThreadId } from "~/lib/utils";
+import { cn } from "~/lib/utils";
 import { useQuietThreadShells } from "~/state/entities";
 import {
   useEnvironmentMachines,
   useEnvironments,
   type EnvironmentPresentation,
 } from "~/state/environments";
-import { threadEnvironment } from "~/state/threads";
-import { useOrchestrationCommand } from "~/state/use-orchestration-command";
 
 import { useAssistantConnection, useAssistantRoster } from "../assistants/useAssistants";
+import { useCreateAgentChat } from "../assistants/useCreateAgentChat";
 import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
 import { ThreadHoverCard, ThreadHoverCardPopup } from "../ThreadHoverCard";
 import { Tooltip, TooltipTrigger } from "../ui/tooltip";
@@ -364,42 +364,6 @@ function SidebarAgent(props: {
   );
 }
 
-/** Starts a chat under an agent's home, with the agent's model and modes, and opens it. */
-function useCreateAgentChat(onNavigate: () => void) {
-  const navigate = useNavigate();
-  const threads = useQuietThreadShells();
-  const createThread = useOrchestrationCommand(threadEnvironment.create, {
-    label: "start a chat",
-  });
-  return async (agent: AssistantSummary) => {
-    const { environmentId } = agent;
-    const home = threads.find(
-      (thread) =>
-        thread.environmentId === environmentId && thread.id === agent.binding.canonicalThreadId,
-    );
-    if (home === undefined) return;
-    const threadId = newThreadId();
-    const result = await createThread({
-      environmentId,
-      input: {
-        threadId,
-        projectId: agent.binding.backingProjectId,
-        title: "New thread",
-        modelSelection: home.modelSelection,
-        runtimeMode: home.runtimeMode,
-        interactionMode: home.interactionMode,
-        branch: home.branch,
-        worktreePath: home.worktreePath,
-        parentThreadId: home.id,
-        createdAt: new Date().toISOString(),
-      },
-    });
-    if (result._tag === "Failure") return;
-    onNavigate();
-    void navigate({ to: "/$environmentId/$threadId", params: { environmentId, threadId } });
-  };
-}
-
 /** Filter, New chat and New agent, shown in the sidebar header while the Agents view is open. */
 export function SidebarAgentsHeaderActions(props: {
   readonly filter: AgentSidebarFilter;
@@ -474,10 +438,10 @@ export function SidebarAgentsHeaderActions(props: {
           ) : null}
         </MenuPopup>
       </Menu>
-      <NewChatButton onNavigate={props.onNavigate} />
       <SidebarHeaderIconButton label="New agent" onClick={props.onNewAgent}>
         <BotMessageSquareIcon />
       </SidebarHeaderIconButton>
+      <NewChatButton onNavigate={props.onNavigate} />
     </>
   );
 }
@@ -552,49 +516,15 @@ function RouteNewChatButton(props: {
 }
 
 function PickAgentNewChatButton(props: { readonly onNavigate: () => void }) {
-  const { environments } = useEnvironments();
-  const createChat = useCreateAgentChat(props.onNavigate);
   return (
-    <Menu>
-      <MenuTrigger
-        render={
-          <SidebarMenuButton
-            size="icon"
-            type="button"
-            aria-label="New chat"
-            className="relative size-7 shrink-0"
-          />
-        }
-      >
-        <SquarePenIcon />
-      </MenuTrigger>
-      <MenuPopup align="end" className="min-w-48">
-        <MenuGroup>
-          <MenuGroupLabel>New chat with</MenuGroupLabel>
-          {environments.map((environment) => (
-            <AgentChatItems
-              key={environment.environmentId}
-              environmentId={environment.environmentId}
-              onPick={(agent) => void createChat(agent)}
-            />
-          ))}
-        </MenuGroup>
-      </MenuPopup>
-    </Menu>
+    <SidebarHeaderIconButton
+      label="New chat"
+      onClick={() => {
+        props.onNavigate();
+        openCommandPalette({ open: "new-agent-chat" });
+      }}
+    >
+      <SquarePenIcon />
+    </SidebarHeaderIconButton>
   );
-}
-
-function AgentChatItems(props: {
-  readonly environmentId: EnvironmentId;
-  readonly onPick: (agent: AssistantSummary) => void;
-}) {
-  const roster = useAssistantRoster(props.environmentId, false);
-  return (roster.data?.assistants ?? [])
-    .filter((agent) => agent.provisioningState === "ready")
-    .map((agent) => (
-      <MenuItem key={agent.assistantId} onClick={() => props.onPick(agent)}>
-        <AgentAvatar agent={agent} size="icon" />
-        {agent.name}
-      </MenuItem>
-    ));
 }
