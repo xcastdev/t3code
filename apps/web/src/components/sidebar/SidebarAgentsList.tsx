@@ -66,6 +66,7 @@ import {
   toggleAgentFilterValue,
 } from "./SidebarAgentsList.logic";
 import { SidebarHeaderIconButton } from "./SidebarThreadHeader";
+import { RelativeTimeLabel } from "./SidebarThreadRow";
 
 const VISIBLE_CHATS = 5;
 const COLLAPSED_AGENTS_KEY = "t3code:sidebar:collapsed-agents";
@@ -98,9 +99,7 @@ export function SidebarAgentsList(props: {
           <EnvironmentAgents
             key={environment.environmentId}
             environment={environment}
-            machine={
-              environments.length > 1 ? (machines.get(environment.environmentId) ?? "server") : null
-            }
+            machine={machines.get(environment.environmentId) ?? "server"}
             threads={threads}
             query={props.query}
             filter={props.filter}
@@ -116,8 +115,7 @@ export function SidebarAgentsList(props: {
 
 function EnvironmentAgents(props: {
   readonly environment: EnvironmentPresentation;
-  /** Shown only when several environments are connected. */
-  readonly machine: EnvironmentMachineKind | null;
+  readonly machine: EnvironmentMachineKind;
   readonly threads: ReadonlyArray<EnvironmentThreadShell>;
   readonly query: string;
   readonly filter: AgentSidebarFilter;
@@ -143,6 +141,7 @@ function EnvironmentAgents(props: {
       key={agent.assistantId}
       agent={agent}
       chats={chats}
+      lastActivityAt={agentLastActivityAt(props.threads, agent)}
       environment={{ label: props.environment.label, machine: props.machine }}
       connected={connection.connected}
       expanded={query.length > 0 || !props.collapsed.includes(agentKey(agent))}
@@ -152,10 +151,29 @@ function EnvironmentAgents(props: {
   ));
 }
 
+/** The newest update across the agent's Home and its chats. */
+function agentLastActivityAt(
+  threads: ReadonlyArray<EnvironmentThreadShell>,
+  agent: AssistantSummary,
+): string {
+  let latest = agent.updatedAt;
+  for (const thread of threads) {
+    if (
+      thread.environmentId === agent.environmentId &&
+      thread.projectId === agent.binding.backingProjectId &&
+      thread.updatedAt > latest
+    ) {
+      latest = thread.updatedAt;
+    }
+  }
+  return latest;
+}
+
 function SidebarAgent(props: {
   readonly agent: AssistantSummary;
   readonly chats: ReadonlyArray<EnvironmentThreadShell>;
-  readonly environment: { readonly label: string; readonly machine: EnvironmentMachineKind | null };
+  readonly environment: { readonly label: string; readonly machine: EnvironmentMachineKind };
+  readonly lastActivityAt: string;
   readonly connected: boolean;
   readonly expanded: boolean;
   readonly onToggle: () => void;
@@ -185,6 +203,7 @@ function SidebarAgent(props: {
           <TooltipTrigger
             render={
               <SidebarMenuButton
+                size="lg"
                 isActive={pathname === `/${home.environmentId}/${home.threadId}`}
                 onClick={() => {
                   // An agent still being set up has no chat yet; its page shows the progress.
@@ -204,31 +223,46 @@ function SidebarAgent(props: {
                   openThread(home.threadId);
                 }}
               >
-                <AgentAvatar agent={agent} size="icon" />
-                <span className="min-w-0 flex-1 truncate font-medium">{agent.name}</span>
-                {status.tone === "neutral" || status.tone === "success" ? (
-                  <span className="sr-only">{status.label}</span>
-                ) : (
-                  <span
-                    className={cn(
-                      "shrink-0 text-2xs",
-                      status.tone === "info"
-                        ? "text-info"
-                        : status.tone === "warning"
-                          ? "text-warning"
-                          : "text-destructive",
-                    )}
-                  >
-                    {status.label}
+                <AgentAvatar agent={agent} size="row" />
+                <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <span className="flex min-w-0 items-baseline gap-2">
+                    <span className="min-w-0 flex-1 truncate font-medium">{agent.name}</span>
+                    <span
+                      className={cn(
+                        "shrink-0 text-2xs tabular-nums",
+                        status.tone === "info"
+                          ? "text-info"
+                          : status.tone === "warning"
+                            ? "text-warning"
+                            : status.tone === "danger"
+                              ? "text-destructive"
+                              : "text-sidebar-muted-foreground",
+                      )}
+                    >
+                      {status.label} · <RelativeTimeLabel timestamp={props.lastActivityAt} />
+                    </span>
                   </span>
-                )}
-                {props.environment.machine === null ? null : (
-                  <EnvironmentMachineIcon
-                    aria-hidden
-                    kind={props.environment.machine}
-                    className="size-3.5 shrink-0 text-sidebar-muted-foreground"
-                  />
-                )}
+                  <span className="flex min-w-0 items-center gap-1 text-2xs text-sidebar-muted-foreground">
+                    <EnvironmentMachineIcon
+                      aria-hidden
+                      kind={props.environment.machine}
+                      className="size-3 shrink-0"
+                    />
+                    <span className="min-w-0 truncate">
+                      {[
+                        props.environment.label,
+                        props.chats.length > 0
+                          ? `${props.chats.length} ${props.chats.length === 1 ? "chat" : "chats"}`
+                          : null,
+                        agent.attention.waitingRuns > 0
+                          ? `${agent.attention.waitingRuns} waiting`
+                          : null,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </span>
+                  </span>
+                </span>
                 {ready ? <span aria-hidden className="size-5 shrink-0" /> : null}
               </SidebarMenuButton>
             }
@@ -237,7 +271,7 @@ function SidebarAgent(props: {
             <ThreadHoverCard title={agent.name}>
               <div className="flex min-w-0 items-center gap-2">
                 <EnvironmentMachineIcon
-                  kind={props.environment.machine ?? "server"}
+                  kind={props.environment.machine}
                   className="size-3 shrink-0 stroke-muted-foreground"
                 />
                 <div className="min-w-0 truncate text-foreground/75">{props.environment.label}</div>
