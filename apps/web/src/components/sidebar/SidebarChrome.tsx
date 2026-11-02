@@ -46,6 +46,10 @@ import { SidebarProviderUpdatePill } from "./SidebarProviderUpdatePill";
 import { SidebarUpdateArchitectureWarning, SidebarUpdatePill } from "./SidebarUpdatePill";
 import { PullRequestGlyph } from "~/components/pullRequest/pullRequestIcons";
 import { observeResize } from "~/lib/observeResize";
+import { AttentionDot } from "~/components/ui/attention-dot";
+import { AttentionBell } from "~/components/AttentionBell";
+import { useAttentionArrivals } from "~/hooks/useAttentionArrivals";
+import { useAllWorkAttentionKeys } from "~/state/attention";
 
 export const SidebarChromeHeader = memo(function SidebarChromeHeader({
   isElectron,
@@ -95,6 +99,9 @@ export const SidebarChromeHeader = memo(function SidebarChromeHeader({
             </Badge>
           </div>
         ) : null}
+      </div>
+      <div className="relative z-10 flex shrink-0 items-center">
+        <AttentionBell />
       </div>
     </div>
   );
@@ -203,10 +210,13 @@ function SidebarBrandMark({ onBackdrop }: { onBackdrop: boolean }) {
 function SidebarUtilityItem({
   icon,
   label,
+  indicator,
   onClick,
 }: {
   icon: ReactNode;
   label: string;
+  /** Sits over the button's corner; the button styles only direct-child icons. */
+  indicator?: ReactNode;
   onClick: () => void;
 }) {
   return (
@@ -221,7 +231,24 @@ function SidebarUtilityItem({
         />
         <TooltipPopup side="top">{label}</TooltipPopup>
       </Tooltip>
+      {indicator}
     </SidebarMenuItem>
+  );
+}
+
+/** The Work entry, with a red dot while any project's Work waits on the user. */
+function SidebarWorkItem(props: { readonly onClick: () => void }) {
+  const keys = useAllWorkAttentionKeys();
+  const pulse = useAttentionArrivals(keys);
+  return (
+    <SidebarUtilityItem
+      icon={<ListTodoIcon />}
+      label={keys.length > 0 ? `Work, ${keys.length} waiting on you` : "Work"}
+      {...(keys.length > 0
+        ? { indicator: <AttentionDot pulse={pulse} size="sm" placement="inset" /> }
+        : {})}
+      onClick={props.onClick}
+    />
   );
 }
 
@@ -292,9 +319,7 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu(props: {
               onClick={handlePullRequestsClick}
             />
           ) : null}
-          {showProjectTools ? (
-            <SidebarUtilityItem icon={<ListTodoIcon />} label="Work" onClick={handleWorkClick} />
-          ) : null}
+          {showProjectTools ? <SidebarWorkItem onClick={handleWorkClick} /> : null}
           {showUsage ? (
             <SidebarUtilityItem
               icon={<ChartNoAxesColumnIcon />}

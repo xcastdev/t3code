@@ -111,6 +111,8 @@ import { resolvePullRequestState } from "./pullRequest/pullRequestPresentation";
 import { PullRequestGlyph } from "~/components/pullRequest/pullRequestIcons";
 import { observeResize } from "~/lib/observeResize";
 import { surfaceShortcutKey } from "~/lib/surfaceShortcutKey";
+import { useAttentionArrivals } from "~/hooks/useAttentionArrivals";
+import { AttentionDot } from "~/components/ui/attention-dot";
 
 export interface RightPanelTabsProps {
   mode: PreviewPanelMode;
@@ -124,6 +126,8 @@ export interface RightPanelTabsProps {
   layoutControls?: ReactNode;
   surfaces: readonly RightPanelSurface[];
   environmentId: EnvironmentId | null;
+  /** Keys of the current project's Work items waiting on the user, by where they're answered. */
+  workAttention?: WorkAttentionKeys | undefined;
   activeSurfaceId: string | null;
   pendingSurfaceIds: ReadonlySet<string>;
   previewSessions: Readonly<Record<string, PreviewSessionSnapshot>>;
@@ -341,6 +345,7 @@ function RightPanelEmptyState(props: {
   deviceAvailable: boolean;
   sideChatAvailable: boolean;
   sideChatDisabledReason: string | null;
+  workAttention?: WorkAttentionKeys | undefined;
 }) {
   const [highlight, setHighlight] = useState(-1);
 
@@ -404,6 +409,7 @@ function RightPanelEmptyState(props: {
       available: props.onAddWork !== undefined,
       disabledReason: SURFACE_UNAVAILABLE_HINTS.work,
       onClick: () => props.onAddWork?.("overview"),
+      attention: props.workAttention?.overview ?? NO_ATTENTION,
     },
     {
       label: "Tasks",
@@ -414,6 +420,7 @@ function RightPanelEmptyState(props: {
       available: props.onAddWork !== undefined,
       disabledReason: SURFACE_UNAVAILABLE_HINTS.work,
       onClick: () => props.onAddWork?.("tasks"),
+      attention: props.workAttention?.tasks ?? NO_ATTENTION,
     },
     {
       label: "Knowledge",
@@ -501,9 +508,9 @@ function RightPanelEmptyState(props: {
   const actionIcon = (action: SurfaceAction, iconClassName = "size-4") => {
     const Icon = action.icon;
     return (
-      <span className="relative inline-flex shrink-0">
+      <AttentionIcon attention={"attention" in action ? action.attention : NO_ATTENTION}>
         <Icon className={iconClassName} />
-      </span>
+      </AttentionIcon>
     );
   };
 
@@ -627,6 +634,28 @@ interface RailSurfaceAction {
   readonly available: boolean;
   readonly disabledReason: string;
   readonly onClick: () => void;
+  readonly attention?: ReadonlyArray<string>;
+}
+
+type WorkAttentionKeys = {
+  readonly overview: ReadonlyArray<string>;
+  readonly tasks: ReadonlyArray<string>;
+};
+const NO_ATTENTION: ReadonlyArray<string> = [];
+
+/** An icon with a red dot while something it opens waits on the user. */
+function AttentionIcon(props: {
+  readonly children: ReactNode;
+  readonly attention: ReadonlyArray<string> | undefined;
+}) {
+  const keys = props.attention ?? NO_ATTENTION;
+  const pulse = useAttentionArrivals(keys);
+  return (
+    <span className="relative inline-flex shrink-0">
+      {props.children}
+      {keys.length > 0 ? <AttentionDot pulse={pulse} size="sm" /> : null}
+    </span>
+  );
 }
 
 function RightPanelSurfaceRail(props: {
@@ -709,7 +738,9 @@ function RightPanelSurfaceRail(props: {
                       />
                     }
                   >
-                    <Icon className="size-5.5" />
+                    <AttentionIcon attention={action.attention}>
+                      <Icon className="size-5.5" />
+                    </AttentionIcon>
                   </TooltipTrigger>
                   <TooltipPopup side="left" sideOffset={8} variant="soft">
                     <div className="flex flex-col gap-0.5 py-0.5">
@@ -1072,6 +1103,7 @@ function RightPanelTab(
     theme: "light" | "dark";
     environmentId: EnvironmentId | null;
     pullRequestStatusSeed: PullRequestTabStatusSeed | undefined;
+    attention: ReadonlyArray<string>;
     renaming: boolean;
     canRename: boolean;
     ownsDesktopTitleBar: boolean;
@@ -1102,14 +1134,16 @@ function RightPanelTab(
   const content = (
     <>
       <PanelTabCloseButton label={`Close ${title}`} onClick={() => onClose(surface)}>
-        <SurfaceIcon
-          surface={surface}
-          previewUrl={props.previewUrl}
-          previewCapturedUrl={props.previewCapturedUrl}
-          theme={props.theme}
-          environmentId={props.environmentId}
-          pullRequestStatusSeed={props.pullRequestStatusSeed}
-        />
+        <AttentionIcon attention={props.attention}>
+          <SurfaceIcon
+            surface={surface}
+            previewUrl={props.previewUrl}
+            previewCapturedUrl={props.previewCapturedUrl}
+            theme={props.theme}
+            environmentId={props.environmentId}
+            pullRequestStatusSeed={props.pullRequestStatusSeed}
+          />
+        </AttentionIcon>
         {props.pending ? (
           <span
             className="absolute -right-0.5 -bottom-0.5 size-1.5 rounded-full bg-current"
@@ -1575,6 +1609,15 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                       theme={resolvedTheme}
                       environmentId={props.environmentId}
                       pullRequestStatusSeed={props.pullRequestStatusSeeds?.[surface.id]}
+                      attention={
+                        surface.kind !== "work"
+                          ? NO_ATTENTION
+                          : surface.view === "overview"
+                            ? (props.workAttention?.overview ?? NO_ATTENTION)
+                            : surface.view === "tasks"
+                              ? (props.workAttention?.tasks ?? NO_ATTENTION)
+                              : NO_ATTENTION
+                      }
                       renaming={renamingDevice === surface.id}
                       canRename={props.onRenameDevice !== undefined}
                       ownsDesktopTitleBar={ownsDesktopTitleBar}
@@ -1769,6 +1812,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             deviceAvailable={props.deviceAvailable}
             sideChatAvailable={props.sideChatAvailable === true}
             sideChatDisabledReason={props.sideChatDisabledReason ?? null}
+            workAttention={props.workAttention}
           />
         ) : (
           props.children

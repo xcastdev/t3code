@@ -257,6 +257,7 @@ import {
   useQuietThreadShell,
   useThreadCheckpointSummaries,
 } from "../state/entities";
+import { useProjectWorkAttention } from "../state/attention";
 import { useEnvironmentShellHasSnapshot } from "../state/shell";
 import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
 import { DraftHeroHeadline } from "./chat/DraftHeroHeadline";
@@ -1115,6 +1116,10 @@ export default function ChatView(props: ChatViewProps) {
       ? scopeProjectRef(activeThreadEnvironmentId, activeThreadProjectId)
       : null;
   const activeProject = useProject(activeProjectRef);
+  const workAttention = useProjectWorkAttention(
+    activeProject?.environmentId ?? null,
+    activeProject?.id ?? null,
+  );
   const activeProjectSettings = resolveProjectSettings(
     settings,
     activeProject?.id ?? null,
@@ -4086,6 +4091,7 @@ export default function ChatView(props: ChatViewProps) {
               }
             : {})}
           onAddSideChat={sideChatsOffered ? openSideChatStable : undefined}
+          workAttention={workAttention}
           browserAvailable={canOperatePreview && browserAvailable}
           diffAvailable={isServerThread && isGitRepo}
           filesAvailable={activeProject !== null}

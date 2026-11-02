@@ -29,6 +29,7 @@ import { isTerminalFocused } from "../lib/terminalFocus";
 import { isModelPickerOpen } from "../modelPickerVisibility";
 import { selectActiveRightPanel, useRightPanelStore } from "../rightPanelStore";
 import { selectThreadTerminalUiState, useTerminalUiStateStore } from "../terminalUiStateStore";
+import { AttentionBell } from "./AttentionBell";
 import { cn, isMacPlatform } from "../lib/utils";
 import { primaryServerKeybindingsAtom } from "../state/server";
 import { useEnvironmentIdentificationMode } from "../hooks/useSettings";
@@ -397,6 +398,8 @@ function SidebarControl() {
           Toggle main sidebar{shortcutLabel ? ` (${shortcutLabel})` : ""}
         </TooltipPopup>
       </Tooltip>
+      {/* The sidebar header carries the bell; with the sidebar closed it rides here instead. */}
+      {isSidebarVisible ? null : <AttentionBell className="pointer-events-auto" />}
     </div>
   );
 }
