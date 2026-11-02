@@ -27,7 +27,6 @@ import { agentInitials, newAgentAvatar } from "./AgentAvatar";
 import { AgentResourceBindings } from "./AgentResourceBindings";
 import {
   INTERACTION_MODE_LABELS,
-  RUNTIME_MODE_LABELS,
   assistantConfigurationChanged,
   assistantConfigurationError,
   assistantDraftState,
@@ -222,22 +221,13 @@ function ConfigurationFields({
                 selection={configuration.modelSelection}
                 disabled={disabled || !context.connected}
                 onChange={(selection) => set("modelSelection", selection)}
+                runtimeMode={configuration.runtimeMode}
+                onRuntimeModeChange={(mode) => set("runtimeMode", mode)}
               />
             </div>
           )}
         </WorkField>
         <div className="grid gap-4 sm:grid-cols-2">
-          <WorkField label="Runtime mode">
-            {(id) => (
-              <ChoiceSelect
-                id={id}
-                value={configuration.runtimeMode}
-                labels={RUNTIME_MODE_LABELS}
-                disabled={disabled}
-                onChange={(value) => set("runtimeMode", value)}
-              />
-            )}
-          </WorkField>
           <WorkField label="Interaction">
             {(id) => (
               <ChoiceSelect
@@ -348,7 +338,7 @@ function SwitchRow({
   );
 }
 
-export function ChoiceSelect<T extends string>({
+function ChoiceSelect<T extends string>({
   id,
   value,
   labels,

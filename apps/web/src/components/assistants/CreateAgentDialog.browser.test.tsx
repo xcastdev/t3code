@@ -55,29 +55,22 @@ vi.mock(import("./useAssistants"), async (original) => ({
 }));
 
 describe("CreateAgentDialog", () => {
-  it("walks identity, model and personality, with each step waiting on the last", async () => {
+  it("asks for a model instead of showing an unchosen default", async () => {
     await using screen = await render(
       <CreateAgentDialog environmentId={EnvironmentId.make("local")} onClose={() => {}} />,
     );
-    const next = page.getByRole("button", { name: "Next" });
-    await expect.element(next).toBeDisabled();
     await userEvent.type(screen.getByLabelText("Name"), "Helper");
-    await userEvent.click(next);
+    const create = page.getByRole("button", { name: "Create agent" });
+    await expect.element(page.getByRole("button", { name: "Choose a model" })).toBeVisible();
+    await expect.element(create).toBeDisabled();
 
-    const picker = page.getByRole("button", { name: "Choose a model" });
-    await expect.element(picker).toBeVisible();
-    await expect.element(next).toBeDisabled();
-    await expect.element(page.getByRole("button", { name: /Personality/ })).toBeDisabled();
-
-    await userEvent.click(picker);
+    await userEvent.click(page.getByRole("button", { name: "Choose a model" }));
     await userEvent.click(page.getByRole("option", { name: /Fixture model/ }));
     await userEvent.keyboard("{Escape}");
-    await expect.element(page.getByRole("button", { name: /Fixture model/ })).toBeVisible();
-    await userEvent.click(next);
-    await expect.element(page.getByRole("button", { name: "Create agent" })).toBeEnabled();
+    await expect.element(create).toBeEnabled();
   });
 
-  it("creates the agent with its face, personality and runtime mode, or its initials once chosen", async () => {
+  it("creates the agent with its face and instructions, or its initials once chosen", async () => {
     writer.run.mockReset();
     writer.run.mockResolvedValue(null);
     await using screen = await render(
@@ -85,23 +78,22 @@ describe("CreateAgentDialog", () => {
     );
     await userEvent.type(screen.getByLabelText("Name"), "Helper");
     await userEvent.click(page.getByRole("button", { name: "Curious", exact: true }));
-    await userEvent.click(page.getByRole("button", { name: "Next" }));
+    await userEvent.type(screen.getByLabelText("Personality"), "Dry and brief.");
+    await userEvent.click(page.getByRole("button", { name: "Rules", exact: true }));
+    await userEvent.type(screen.getByLabelText("Rules"), "Never push.");
     await userEvent.click(page.getByRole("button", { name: "Choose a model" }));
     await userEvent.click(page.getByRole("option", { name: /Fixture model/ }));
     await userEvent.keyboard("{Escape}");
-    await userEvent.click(page.getByRole("button", { name: "Next" }));
-    await userEvent.type(screen.getByLabelText("Personality"), "Dry and brief.");
     await userEvent.click(page.getByRole("button", { name: "Create agent" }));
     expect(writer.run.mock.lastCall?.[2].configuration).toMatchObject({
       name: "Helper",
       personality: "Dry and brief.",
+      rules: "Never push.",
       runtimeMode: "approval-required",
       avatar: { kind: "generated", expression: "curious" },
     });
 
-    await userEvent.click(page.getByRole("button", { name: /Identity/ }));
     await userEvent.click(page.getByRole("button", { name: "Initials", exact: true }));
-    await userEvent.click(page.getByRole("button", { name: /Personality/ }));
     await userEvent.click(page.getByRole("button", { name: "Create agent" }));
     expect(writer.run.mock.lastCall?.[2].configuration).not.toHaveProperty("avatar");
   });

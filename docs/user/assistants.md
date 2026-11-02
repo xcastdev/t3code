@@ -10,9 +10,9 @@ project, settings and memory. Use the filter in the sidebar header to show only 
 only one environment's. Use **Stop** in a conversation to stop its active work.
 From the assistant's Home, open its agent page to change its setup.
 
-Create one with **New agent** in the Agents sidebar header. It walks through three steps: a face or
-initials and a name, then the model and how much it may do without asking, then optional
-personality, rules and a standing prompt.
+Create one with **New agent** in the Agents sidebar header: give it a face or initials and a name,
+then choose its model in the same picker as the composer, with its effort, speed and permissions.
+Personality, rules and a standing prompt are optional.
 
 ## Memory
 
