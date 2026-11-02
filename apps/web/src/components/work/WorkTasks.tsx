@@ -5,11 +5,25 @@ import {
 } from "@t3tools/client-runtime/project-work";
 import { ProjectWorkTaskId, type ProjectWorkTaskRead } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
-import { ChevronRightIcon, ListFilterIcon, ListTodoIcon, PlusIcon } from "lucide-react";
+import {
+  ChevronRightIcon,
+  CircleAlertIcon,
+  EyeIcon,
+  InboxIcon,
+  ListChecksIcon,
+  ListFilterIcon,
+  ListTodoIcon,
+  PlusIcon,
+  ShieldCheckIcon,
+  ShieldIcon,
+  UserRoundIcon,
+} from "lucide-react";
 import { useState } from "react";
 
 import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { cn, randomUUID } from "../../lib/utils";
+import { RelativeTime } from "../RelativeTime";
+import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
@@ -23,6 +37,8 @@ import { WorkNotice, WorkPager } from "./WorkNotice";
 import { WorkTaskDetail } from "./WorkTaskDetail";
 import { useWorkRead, WORK_PAGE_SIZE, workWriteBlockedReason } from "./useWorkRead";
 import { useWorkPage } from "./useWorkRecords";
+import { useWorkTeamRoster } from "./useWorkTeamRoster";
+import { WorkMemberAvatar } from "./WorkMemberAvatar";
 import type { WorkWriter } from "./useWorkWriter";
 import { workStateLabel } from "./workModel";
 import { WorkStatusGlyph } from "./WorkStatus";
@@ -55,10 +71,20 @@ type TaskCounts = Partial<Record<TaskFilter | "total", number>>;
 
 // Grouped by what the task needs from you; a state from a newer server waits in Up next.
 const TASK_GROUPS = [
-  { id: "needs-you", label: "Needs you", states: ["in-review", "blocked", "failed"] },
-  { id: "running", label: "Running", states: ["in-progress"] },
-  { id: "up-next", label: "Up next", states: ["ready", "specified", "draft"] },
-  { id: "done", label: "Done", states: ["completed", "canceled"] },
+  {
+    id: "needs-you",
+    label: "Needs you",
+    states: ["in-review", "blocked", "failed"],
+    dot: "bg-warning",
+  },
+  { id: "running", label: "Running", states: ["in-progress"], dot: "bg-info" },
+  {
+    id: "up-next",
+    label: "Up next",
+    states: ["ready", "specified", "draft"],
+    dot: "bg-muted-foreground/60",
+  },
+  { id: "done", label: "Done", states: ["completed", "canceled"], dot: "bg-success" },
 ] as const;
 type TaskGroup = (typeof TASK_GROUPS)[number];
 const taskGroupOf = (state: string): TaskGroup =>
@@ -210,6 +236,7 @@ function TaskList({
     WORK_PAGE_SIZE,
   );
   const view = pager.view;
+  const { roster } = useWorkTeamRoster(scope);
   const createBlocked = workWriteBlockedReason(view, writer.canWrite);
   const tasks = (view.page?.items ?? []).flatMap((item): ProjectWorkTaskRead[] => {
     const task = asProjectWorkTask(item.value);
@@ -315,7 +342,7 @@ function TaskList({
                 aria-label={group.label}
                 // Empty groups stay out of the list but keep their board column.
                 className={cn(
-                  "-mt-px flex min-w-0 flex-col border-t border-border/70 @3xl/work:mt-0 @3xl/work:gap-2 @3xl/work:rounded-xl @3xl/work:border @3xl/work:bg-card/30 @3xl/work:p-2",
+                  "-mt-px flex min-w-0 flex-col border-t border-border/70 @3xl/work:mt-0 @3xl/work:h-[min(40rem,calc(100dvh-10rem))] @3xl/work:overflow-hidden @3xl/work:rounded-xl @3xl/work:border @3xl/work:bg-card/30",
                   empty && "hidden @3xl/work:flex",
                 )}
               >
@@ -324,7 +351,7 @@ function TaskList({
                   aria-expanded={!collapsed}
                   onClick={() => toggleGroup(group.id)}
                   className={cn(
-                    "flex w-full items-center gap-1.5 px-4 py-2 text-left text-xs font-medium outline-none hover:bg-accent/30 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring @3xl/work:pointer-events-none @3xl/work:px-1.5 @3xl/work:py-0.5",
+                    "flex w-full shrink-0 items-center gap-1.5 px-4 py-2 text-left text-xs font-medium outline-none hover:bg-accent/30 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring @3xl/work:pointer-events-none @3xl/work:gap-2 @3xl/work:border-b @3xl/work:border-border/60 @3xl/work:px-3 @3xl/work:py-2.5",
                     group.id === "needs-you" ? "text-foreground" : "text-muted-foreground",
                   )}
                 >
@@ -332,20 +359,34 @@ function TaskList({
                     aria-hidden="true"
                     className={cn("size-3 shrink-0 @3xl/work:hidden", !collapsed && "rotate-90")}
                   />
-                  <span className="flex-1">{group.label}</span>
-                  <span className="tabular-nums">{group.count ?? group.tasks.length}</span>
+                  <span
+                    aria-hidden="true"
+                    className={cn("hidden size-2 shrink-0 rounded-full @3xl/work:block", group.dot)}
+                  />
+                  <span className="flex-1 @3xl/work:text-foreground">{group.label}</span>
+                  <span className="tabular-nums @3xl/work:rounded-full @3xl/work:bg-muted @3xl/work:px-1.5 @3xl/work:py-px @3xl/work:text-2xs @3xl/work:text-muted-foreground">
+                    {group.count ?? group.tasks.length}
+                  </span>
                 </button>
                 <div
                   className={cn(
-                    "flex min-w-0 flex-col @3xl/work:gap-2",
+                    "scrollbar-gutter-both flex min-w-0 flex-col @3xl/work:min-h-0 @3xl/work:flex-1 @3xl/work:gap-2 @3xl/work:overflow-y-auto @3xl/work:p-2",
                     collapsed && "hidden @3xl/work:flex",
                   )}
                 >
                   {group.tasks.map((task) => (
-                    <TaskItem key={task.taskId} task={task} onSelectTask={onSelectTask} />
+                    <TaskItem
+                      key={task.taskId}
+                      task={task}
+                      worker={roster.find((member) => member.taskId === task.taskId)}
+                      onSelectTask={onSelectTask}
+                    />
                   ))}
                   {empty ? (
-                    <span className="px-1.5 pb-1 text-xs text-muted-foreground/70">No tasks</span>
+                    <div className="m-auto hidden flex-col items-center gap-1 px-4 text-center text-xs text-muted-foreground/70 @3xl/work:flex">
+                      <InboxIcon aria-hidden="true" className="size-4" />
+                      No tasks
+                    </div>
                   ) : null}
                 </div>
               </section>
@@ -361,35 +402,128 @@ function TaskList({
   );
 }
 
-function TaskMeta({ task }: { readonly task: ProjectWorkTaskRead }) {
+type RosterMember = ReturnType<typeof useWorkTeamRoster>["roster"][number];
+
+/** Who is on the task: the team member working it, else whoever it is assigned to. */
+function TaskAssignee(props: {
+  readonly task: ProjectWorkTaskRead;
+  readonly worker: RosterMember | undefined;
+  readonly withName?: boolean;
+}) {
+  const name = props.worker?.name ?? props.task.assignee?.displayName ?? null;
   return (
-    <span className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
-      <span>{workStateLabel(task.state)}</span>
-      <span aria-hidden="true">·</span>
-      <WorkTime value={task.updatedAt} />
+    <span className="flex min-w-0 items-center gap-1.5">
+      {props.worker ? (
+        <WorkMemberAvatar member={props.worker} size="icon" />
+      ) : name ? (
+        <span
+          aria-hidden="true"
+          className="flex size-5 shrink-0 items-center justify-center rounded-full bg-muted text-2xs font-semibold text-muted-foreground"
+        >
+          {name.slice(0, 1).toUpperCase()}
+        </span>
+      ) : (
+        <span
+          aria-hidden="true"
+          className="flex size-5 shrink-0 items-center justify-center rounded-full border border-dashed border-muted-foreground/50"
+        >
+          <UserRoundIcon className="size-3 text-muted-foreground/70" />
+        </span>
+      )}
+      {props.withName === false ? null : (
+        <span className={cn("truncate", name === null && "text-muted-foreground/70")}>
+          {name ?? "Unassigned"}
+        </span>
+      )}
     </span>
   );
 }
 
 function TaskItem(props: {
   readonly task: ProjectWorkTaskRead;
+  readonly worker: RosterMember | undefined;
   readonly onSelectTask: (id: ProjectWorkTaskId, title?: string) => void;
 }) {
-  const { task } = props;
+  const { task, worker } = props;
+  const criteria = task.specification?.criterionIds.length ?? 0;
+  const approved = task.approval !== undefined && task.approval.specRevision === task.specRevision;
+  const awaitingApproval = !approved && task.state === "specified";
+  const name = worker?.name ?? task.assignee?.displayName;
   return (
     <button
       type="button"
       onClick={() => props.onSelectTask(task.taskId, task.title)}
-      className="flex w-full min-w-0 items-start gap-3 border-t border-border/50 px-4 py-3 text-left outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring @3xl/work:gap-2.5 @3xl/work:rounded-lg @3xl/work:border @3xl/work:border-border/70 @3xl/work:bg-card @3xl/work:px-3 @3xl/work:py-2.5"
+      className="group/task flex w-full min-w-0 shrink-0 flex-col gap-2 border-t border-border/50 px-4 py-3 text-left outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring @3xl/work:rounded-lg @3xl/work:border @3xl/work:border-border/70 @3xl/work:bg-card @3xl/work:p-3 @3xl/work:shadow-xs @3xl/work:hover:border-border @3xl/work:hover:bg-card"
     >
-      <span className="pt-0.5">
-        <WorkStatusGlyph state={task.state} />
-      </span>
-      <span className="flex min-w-0 flex-1 flex-col gap-1">
-        <span className="line-clamp-2 text-sm font-medium break-words @3xl/work:line-clamp-3">
-          {task.title}
+      <span className="flex min-w-0 items-start gap-2.5">
+        <span className="pt-0.5">
+          <WorkStatusGlyph state={task.state} />
         </span>
-        <TaskMeta task={task} />
+        <span className="flex min-w-0 flex-1 flex-col gap-1">
+          <span className="line-clamp-2 text-sm leading-5 font-medium break-words">
+            {task.title}
+          </span>
+          {/* The compact list keeps one meta line; the board spreads it over the card. */}
+          <span className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground @3xl/work:hidden">
+            <span>{workStateLabel(task.state)}</span>
+            {name ? (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className="truncate">{name}</span>
+              </>
+            ) : null}
+            <span aria-hidden="true">·</span>
+            <WorkTime value={task.updatedAt} />
+          </span>
+          {task.summary ? (
+            <span className="hidden line-clamp-2 text-xs leading-4 text-muted-foreground @3xl/work:block">
+              {task.summary}
+            </span>
+          ) : null}
+        </span>
+      </span>
+      {approved ||
+      awaitingApproval ||
+      criteria > 0 ||
+      task.failureKind ||
+      task.watchers.length > 0 ? (
+        <span className="hidden flex-wrap items-center gap-1 ps-6.5 @3xl/work:flex">
+          {task.failureKind ? (
+            <Badge size="sm" variant="error">
+              <CircleAlertIcon aria-hidden="true" />
+              {workStateLabel(task.failureKind)}
+            </Badge>
+          ) : null}
+          {approved ? (
+            <Badge size="sm" variant="success">
+              <ShieldCheckIcon aria-hidden="true" />
+              Approved
+            </Badge>
+          ) : awaitingApproval ? (
+            <Badge size="sm" variant="warning">
+              <ShieldIcon aria-hidden="true" />
+              Needs approval
+            </Badge>
+          ) : null}
+          {criteria > 0 ? (
+            <Badge size="sm" variant="outline">
+              <ListChecksIcon aria-hidden="true" />
+              {criteria} {criteria === 1 ? "criterion" : "criteria"}
+            </Badge>
+          ) : null}
+          {task.watchers.length > 0 ? (
+            <Badge size="sm" variant="outline">
+              <EyeIcon aria-hidden="true" />
+              {task.watchers.length}
+            </Badge>
+          ) : null}
+        </span>
+      ) : null}
+      <span className="hidden min-w-0 items-center justify-between gap-2 border-t border-border/50 pt-2 text-xs text-muted-foreground @3xl/work:flex">
+        <TaskAssignee task={task} worker={worker} />
+        <span className="shrink-0 tabular-nums">
+          <RelativeTime timestamp={task.updatedAt} />
+        </span>
       </span>
     </button>
   );
