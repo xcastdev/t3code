@@ -9,7 +9,7 @@ import {
   PROJECT_TEAM_PRESETS,
   type ProjectWorkTaskId,
 } from "@t3tools/contracts";
-import { ArrowLeftIcon, PencilIcon } from "lucide-react";
+import { ArrowLeftIcon, PencilIcon, PowerIcon, PowerOffIcon } from "lucide-react";
 import { useId, useState } from "react";
 
 import { deriveProviderInstanceEntries } from "../../providerInstances";
@@ -243,22 +243,61 @@ export function WorkTeam({
 
   return (
     <WorkSection
-      title="Team"
+      title={
+        <span className="flex min-w-0 items-center gap-2">
+          Team
+          {configured && !editing ? (
+            <>
+              <Badge variant={configured.enabled ? "success" : "outline"}>
+                {configured.enabled ? "Enabled" : "Disabled"}
+              </Badge>
+              <span className="min-w-0 truncate text-xs font-normal text-muted-foreground">
+                {[
+                  ...new Set(
+                    configured.profiles.map((profile) =>
+                      providerLabel(teamProviderOf(configured, profile)),
+                    ),
+                  ),
+                ].join(" · ")}
+              </span>
+            </>
+          ) : null}
+        </span>
+      }
       grouped={false}
       className="mx-auto w-full max-w-6xl gap-3"
-      description="Roles, models and limits for managed work. Saving records them only; nothing starts."
       actions={
         draft === null && recorded !== null && recorded.kind !== "unreadable" ? (
           configured ? (
-            <Button
-              size="xs"
-              variant="ghost"
-              disabled={blocked !== null}
-              title={blocked ?? undefined}
-              onClick={() => open({ kind: "toggle" })}
-            >
-              {configured.enabled ? "Disable team…" : "Enable team…"}
-            </Button>
+            <>
+              <EditIconButton
+                label="Edit team settings"
+                disabled={blocked !== null}
+                reason={blocked}
+                onClick={() => open({ kind: "settings" })}
+              />
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Button
+                      size="icon-xs"
+                      variant="ghost"
+                      aria-label={configured.enabled ? "Disable team" : "Enable team"}
+                      disabled={blocked !== null}
+                      onClick={() => open({ kind: "toggle" })}
+                    />
+                  }
+                >
+                  {configured.enabled ? <PowerOffIcon /> : <PowerIcon />}
+                </TooltipTrigger>
+                <TooltipPopup>
+                  {blocked ??
+                    (configured.enabled
+                      ? "Disable team"
+                      : "Enable team. Nothing starts until you start an approved task.")}
+                </TooltipPopup>
+              </Tooltip>
+            </>
           ) : (
             <Button
               size="xs"
@@ -301,46 +340,18 @@ export function WorkTeam({
       ) : recorded.kind === "unreadable" ? (
         <WorkFormStatus tone="muted" message={recorded.reason} />
       ) : (
-        <div className="flex min-w-0 flex-col gap-3 rounded-xl border border-border/70 bg-card/40 p-4">
-          <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <Badge variant={recorded.values.enabled ? "success" : "outline"}>
-              {recorded.values.enabled ? "Enabled" : "Disabled"}
-            </Badge>
-            <span className="min-w-0 truncate text-sm font-medium">
-              {[
-                ...new Set(
-                  recorded.values.profiles.map((profile) =>
-                    providerLabel(teamProviderOf(recorded.values, profile)),
-                  ),
-                ),
-              ].join(" · ")}
-            </span>
-            <WorkRevision className="ms-auto text-muted-foreground">
-              generation {recorded.generation}
-            </WorkRevision>
-            <EditIconButton
-              label="Edit team settings"
-              disabled={blocked !== null || draft !== null}
-              reason={blocked}
-              onClick={() => open({ kind: "settings" })}
-            />
-          </div>
-          <div className="grid min-w-0 grid-cols-2 gap-2 @2xl/work:grid-cols-4">
-            {LIMIT_FIELDS.map(([field, label]) => (
-              <div
-                key={field}
-                className="flex min-w-0 flex-col gap-0.5 rounded-lg border border-border/60 bg-background/40 px-3 py-2"
-              >
-                <span className="text-lg leading-6 font-semibold tabular-nums">
-                  {recorded.values[field] ?? 0}
-                </span>
-                <span className="truncate text-xs text-muted-foreground">{label}</span>
-              </div>
-            ))}
-          </div>
-          <WorkMeta>
-            Enabling a team doesn't start anything. Each worker starts from an approved task.
-          </WorkMeta>
+        <div className="grid min-w-0 grid-cols-2 gap-2 @2xl/work:grid-cols-4">
+          {LIMIT_FIELDS.map(([field, label]) => (
+            <div
+              key={field}
+              className="flex min-w-0 flex-col gap-0.5 rounded-lg border border-border/60 bg-card/40 px-3 py-2"
+            >
+              <span className="text-lg leading-6 font-semibold tabular-nums">
+                {recorded.values[field] ?? 0}
+              </span>
+              <span className="truncate text-xs text-muted-foreground">{label}</span>
+            </div>
+          ))}
         </div>
       )}
       {configured && !editing && roster.length > 0 ? (
