@@ -6,7 +6,7 @@ import {
 import { ProjectWorkTaskId, type ProjectWorkTaskRead } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import { ChevronRightIcon, ListFilterIcon, ListTodoIcon, PlusIcon } from "lucide-react";
-import { type ReactNode, useState } from "react";
+import { useState } from "react";
 
 import { useLocalStorage } from "../../hooks/useLocalStorage";
 import { cn, randomUUID } from "../../lib/utils";
@@ -74,14 +74,11 @@ export function WorkTasks({
   writer,
   taskId,
   onSelectTask,
-  fullscreen,
 }: {
   readonly scope: ProjectWorkScope;
   readonly writer: WorkWriter;
   readonly taskId: ProjectWorkTaskId | undefined;
   readonly onSelectTask: (taskId: ProjectWorkTaskId | undefined, title?: string) => void;
-  /** The panel's full screen control, shown with the list's own actions. */
-  readonly fullscreen?: ReactNode;
 }) {
   const [filter, setFilter] = useState<TaskFilter>("all");
   const view = useWorkRead(scope.environmentId, {
@@ -112,7 +109,6 @@ export function WorkTasks({
       writer={writer}
       filter={filter}
       counts={counts}
-      fullscreen={fullscreen}
       onFilterChange={setFilter}
       onSelectTask={onSelectTask}
     />
@@ -188,7 +184,6 @@ function TaskList({
   writer,
   filter,
   counts,
-  fullscreen,
   onFilterChange,
   onSelectTask,
 }: {
@@ -196,7 +191,6 @@ function TaskList({
   writer: WorkWriter;
   filter: TaskFilter;
   counts: TaskCounts | null;
-  fullscreen: ReactNode;
   onFilterChange: (filter: TaskFilter) => void;
   onSelectTask: (id: ProjectWorkTaskId, title?: string) => void;
 }) {
@@ -248,7 +242,6 @@ function TaskList({
           )}
         </h2>
         <TaskFilterMenu filter={filter} counts={counts} onFilterChange={onFilterChange} />
-        {fullscreen}
         <Tooltip>
           <TooltipTrigger
             render={
