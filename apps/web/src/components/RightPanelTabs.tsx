@@ -111,7 +111,7 @@ import { resolvePullRequestState } from "./pullRequest/pullRequestPresentation";
 import { PullRequestGlyph } from "~/components/pullRequest/pullRequestIcons";
 import { observeResize } from "~/lib/observeResize";
 import { surfaceShortcutKey } from "~/lib/surfaceShortcutKey";
-import { useAttentionArrivals } from "~/hooks/useAttentionArrivals";
+import { useAttentionArrivals, useAttentionPulseContinuous } from "~/hooks/useAttentionArrivals";
 import { AttentionDot } from "~/components/ui/attention-dot";
 
 export interface RightPanelTabsProps {
@@ -650,10 +650,11 @@ function AttentionIcon(props: {
 }) {
   const keys = props.attention ?? NO_ATTENTION;
   const pulse = useAttentionArrivals(keys);
+  const continuous = useAttentionPulseContinuous();
   return (
     <span className="relative inline-flex shrink-0">
       {props.children}
-      {keys.length > 0 ? <AttentionDot pulse={pulse} size="sm" /> : null}
+      {keys.length > 0 ? <AttentionDot pulse={pulse} continuous={continuous} size="sm" /> : null}
     </span>
   );
 }

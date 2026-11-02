@@ -19,16 +19,22 @@ const attentionDotVariants = cva("pointer-events-none rounded-full bg-destructiv
 
 /**
  * A red dot for something waiting on the user. Each new `pulse` value pings it three times;
- * between arrivals it holds still, so it never repaints continuously.
+ * between arrivals it holds still. `continuous` (an opt-in setting) keeps it pinging.
  */
 export function AttentionDot({
   pulse,
+  continuous = false,
   size,
   placement,
-}: VariantProps<typeof attentionDotVariants> & { readonly pulse: number }) {
+}: VariantProps<typeof attentionDotVariants> & {
+  readonly pulse: number;
+  readonly continuous?: boolean;
+}) {
   return (
     <span aria-hidden className={attentionDotVariants({ size, placement })}>
-      {pulse > 0 ? (
+      {continuous ? (
+        <span className="absolute inset-0 rounded-full bg-destructive opacity-0 motion-safe:animate-attention-ping-loop" />
+      ) : pulse > 0 ? (
         <span
           key={pulse}
           className="absolute inset-0 rounded-full bg-destructive opacity-0 motion-safe:animate-attention-ping"

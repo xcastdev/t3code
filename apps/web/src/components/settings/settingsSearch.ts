@@ -543,6 +543,12 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["notification toast popup completion input approval failure"],
   },
   {
+    id: "attention-pulse-continuous",
+    title: "Keep attention dots pulsing",
+    to: "/settings/general",
+    searchTerms: ["attention dot red pulse flash blink bell badge continuous notification"],
+  },
+  {
     id: "time-format",
     title: "Time format",
     to: "/settings/general",

@@ -489,6 +489,9 @@ export function useSettingsRestore(onRestored?: () => void) {
     ...(settings.inAppNotificationsEnabled !== DEFAULT_UNIFIED_SETTINGS.inAppNotificationsEnabled
       ? ["In-app notifications"]
       : []),
+    ...(settings.attentionPulseContinuous !== DEFAULT_UNIFIED_SETTINGS.attentionPulseContinuous
+      ? ["Keep attention dots pulsing"]
+      : []),
     ...(settings.sidebarProjectGroupingMode !== DEFAULT_UNIFIED_SETTINGS.sidebarProjectGroupingMode
       ? ["Project Grouping"]
       : []),
@@ -659,6 +662,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       timestampFormat: DEFAULT_UNIFIED_SETTINGS.timestampFormat,
       notificationMode: DEFAULT_UNIFIED_SETTINGS.notificationMode,
       inAppNotificationsEnabled: DEFAULT_UNIFIED_SETTINGS.inAppNotificationsEnabled,
+      attentionPulseContinuous: DEFAULT_UNIFIED_SETTINGS.attentionPulseContinuous,
       wordWrap: DEFAULT_UNIFIED_SETTINGS.wordWrap,
       persistComposerContextStrip: DEFAULT_UNIFIED_SETTINGS.persistComposerContextStrip,
       diffFilesCollapsed: DEFAULT_UNIFIED_SETTINGS.diffFilesCollapsed,
@@ -828,6 +832,19 @@ export function GeneralSettingsPanel() {
               checked={settings.inAppNotificationsEnabled}
               onCheckedChange={(checked) => updateSettings({ inAppNotificationsEnabled: checked })}
               aria-label="In-app notifications"
+            />
+          }
+        />
+        <SettingsRow
+          {...searchableSetting("attention-pulse-continuous")}
+          description="Red dots on the bell, Work and Tasks keep pulsing while something waits on you, instead of pulsing three times when it arrives. Uses more GPU on high-refresh displays."
+          control={
+            <Switch
+              checked={settings.attentionPulseContinuous}
+              onCheckedChange={(checked) =>
+                updateSettings({ attentionPulseContinuous: Boolean(checked) })
+              }
+              aria-label="Keep attention dots pulsing"
             />
           }
         />

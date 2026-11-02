@@ -4,7 +4,7 @@ import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import { BellIcon, ListTodoIcon, MessageSquareIcon } from "lucide-react";
 
-import { useAttentionArrivals } from "../hooks/useAttentionArrivals";
+import { useAttentionArrivals, useAttentionPulseContinuous } from "../hooks/useAttentionArrivals";
 import { cn } from "../lib/utils";
 import { useRightPanelStore } from "../rightPanelStore";
 import { useAttentionEntries } from "../state/attention";
@@ -22,6 +22,7 @@ const SHOWN = 30;
 export function AttentionBell(props: { readonly className?: string }) {
   const entries = useAttentionEntries();
   const pulse = useAttentionArrivals(entries.map((entry) => entry.key));
+  const continuous = useAttentionPulseContinuous();
   const projects = useProjects();
   const navigate = useNavigate();
   const params = useParams({ strict: false }) as {
@@ -80,7 +81,7 @@ export function AttentionBell(props: { readonly className?: string }) {
             <MenuTrigger
               render={
                 <Button
-                  size="icon-sm"
+                  size="icon"
                   variant="ghost"
                   aria-label={label}
                   className={cn("relative [-webkit-app-region:no-drag]", props.className)}
@@ -89,8 +90,8 @@ export function AttentionBell(props: { readonly className?: string }) {
             />
           }
         >
-          <BellIcon className="size-4" />
-          {entries.length > 0 ? <AttentionDot pulse={pulse} /> : null}
+          <BellIcon className="size-5" />
+          {entries.length > 0 ? <AttentionDot pulse={pulse} continuous={continuous} /> : null}
         </TooltipTrigger>
         <TooltipPopup side="bottom">{label}</TooltipPopup>
       </Tooltip>

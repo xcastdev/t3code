@@ -230,6 +230,8 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   --animate-status-ping: status-ping 2s infinite;
   /* Attention dots ping three times when something new arrives, then hold still. */
   --animate-attention-ping: status-ping 1.2s 3;
+  /* Opt-in (attentionPulseContinuous): repaints for as long as something waits on the user. */
+  --animate-attention-ping-loop: status-ping 1.2s infinite;
   /* Stash pulses hold a highlight for 1.2s; the row then eases back over 200ms, the count snaps.
      The row alternates two identical keyframes so each stash restarts it without a remount. */
   --animate-stash-pulse-row: stash-pulse-row 1400ms;

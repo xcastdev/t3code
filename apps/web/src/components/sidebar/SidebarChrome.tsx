@@ -48,7 +48,7 @@ import { PullRequestGlyph } from "~/components/pullRequest/pullRequestIcons";
 import { observeResize } from "~/lib/observeResize";
 import { AttentionDot } from "~/components/ui/attention-dot";
 import { AttentionBell } from "~/components/AttentionBell";
-import { useAttentionArrivals } from "~/hooks/useAttentionArrivals";
+import { useAttentionArrivals, useAttentionPulseContinuous } from "~/hooks/useAttentionArrivals";
 import { useAllWorkAttentionKeys } from "~/state/attention";
 
 export const SidebarChromeHeader = memo(function SidebarChromeHeader({
@@ -240,12 +240,17 @@ function SidebarUtilityItem({
 function SidebarWorkItem(props: { readonly onClick: () => void }) {
   const keys = useAllWorkAttentionKeys();
   const pulse = useAttentionArrivals(keys);
+  const continuous = useAttentionPulseContinuous();
   return (
     <SidebarUtilityItem
       icon={<ListTodoIcon />}
       label={keys.length > 0 ? `Work, ${keys.length} waiting on you` : "Work"}
       {...(keys.length > 0
-        ? { indicator: <AttentionDot pulse={pulse} size="sm" placement="inset" /> }
+        ? {
+            indicator: (
+              <AttentionDot pulse={pulse} continuous={continuous} size="sm" placement="inset" />
+            ),
+          }
         : {})}
       onClick={props.onClick}
     />
