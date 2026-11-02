@@ -105,10 +105,14 @@ interface BranchToolbarProps {
   envLocked: boolean;
   onCheckoutPullRequestRequest?: (reference: string) => void;
   onComposerFocusRequest?: () => void;
+  /** Panel branch row only; see BranchToolbarBranchSelector. */
+  onOpenSourceControl?: (() => void) | undefined;
   availableEnvironments?: readonly EnvironmentOption[];
   onEnvironmentChange?: (environmentId: EnvironmentId) => void;
   composerControlsHostRef?: (element: HTMLDivElement | null) => void;
   contextStripVisible?: boolean;
+  /** Composer strip for a running thread: the machine and workspace as plain labels instead of pickers. */
+  readOnly?: boolean;
 }
 
 function showWorkspaceContextMenu(event: ReactMouseEvent, workspacePath: string) {
@@ -640,10 +644,12 @@ export const BranchToolbar = memo(function BranchToolbar({
   envLocked,
   onCheckoutPullRequestRequest,
   onComposerFocusRequest,
+  onOpenSourceControl,
   availableEnvironments,
   onEnvironmentChange,
   composerControlsHostRef,
   contextStripVisible = true,
+  readOnly = false,
 }: BranchToolbarProps) {
   const branchSelectorRef = useRef<BranchToolbarBranchSelectorHandle>(null);
   const threadRef = scopeThreadRef(environmentId, threadId);
@@ -756,6 +762,7 @@ export const BranchToolbar = memo(function BranchToolbar({
             onStartFromOriginChange={onStartFromOriginChange}
             {...(onCheckoutPullRequestRequest ? { onCheckoutPullRequestRequest } : {})}
             {...(onComposerFocusRequest ? { onComposerFocusRequest } : {})}
+            {...(onOpenSourceControl ? { onOpenSourceControl } : {})}
           />
         ) : null}
       </div>
@@ -772,7 +779,16 @@ export const BranchToolbar = memo(function BranchToolbar({
         !contextStripVisible && "pointer-events-none invisible absolute inset-x-0 top-full",
       )}
     >
-      {showGitControls ? (
+      {readOnly ? (
+        <div className="flex min-h-7 min-w-10 shrink items-center sm:min-h-6">
+          <BranchToolbarEnvironmentSelector
+            envLocked
+            environmentId={environmentId}
+            availableEnvironments={availableEnvironments ?? []}
+          />
+        </div>
+      ) : null}
+      {showGitControls && !readOnly ? (
         <div className="contents @3xl/composer-surface:hidden">
           <RunContextSelector
             forceNewWorktree={forceNewWorktree}
@@ -796,7 +812,7 @@ export const BranchToolbar = memo(function BranchToolbar({
           />
         </div>
       ) : null}
-      {showGitControls || showEnvironmentIndicator ? (
+      {!readOnly && (showGitControls || showEnvironmentIndicator) ? (
         <div
           className={cn(
             "min-h-7 min-w-10 items-center gap-1 sm:min-h-6",
@@ -848,7 +864,9 @@ export const BranchToolbar = memo(function BranchToolbar({
         />
       ) : null}
 
-      {showGitControls ? (
+      {readOnly ? (
+        <ComposerWorkspaceLabel worktreePath={activeWorktreePath} />
+      ) : showGitControls ? (
         <BranchToolbarBranchSelector
           forceNewWorktree={forceNewWorktree}
           ref={branchSelectorRef}
@@ -869,3 +887,28 @@ export const BranchToolbar = memo(function BranchToolbar({
     </ComposerSurface.ContextStrip>
   );
 });
+
+function ComposerWorkspaceLabel(props: { readonly worktreePath: string | null }) {
+  const name =
+    props.worktreePath === null
+      ? "Local checkout"
+      : (props.worktreePath.split(/[\\/]/).findLast((part) => part.length > 0) ??
+        props.worktreePath);
+  const Icon = props.worktreePath === null ? FolderIcon : FolderGitIcon;
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <span
+            className="ml-auto inline-flex h-7 min-w-0 items-center gap-1 border border-transparent px-1.75 font-normal text-muted-foreground/70 text-xs sm:h-6"
+            data-composer-context-control
+          />
+        }
+      >
+        <Icon className="size-3 shrink-0" />
+        <ComposerContextLabel>{name}</ComposerContextLabel>
+      </TooltipTrigger>
+      <TooltipPopup>{props.worktreePath ?? "Local checkout"}</TooltipPopup>
+    </Tooltip>
+  );
+}

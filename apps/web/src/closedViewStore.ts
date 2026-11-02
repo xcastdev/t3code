@@ -12,6 +12,7 @@ import { createJSONStorage, persist } from "zustand/middleware";
 import { resolveStorage } from "./lib/storage";
 import { randomUUID } from "./lib/utils";
 import { type RightPanelSurface } from "./rightPanelStore";
+import { WORK_SECTIONS } from "./routes/-workSearch";
 
 export type ClosedView =
   | {
@@ -93,6 +94,14 @@ const isClosedViewEntry = (entry: unknown): entry is ClosedViewEntry => {
         (surface.environmentId === undefined || typeof surface.environmentId === "string") &&
         (surface.host === undefined || typeof surface.host === "string") &&
         (surface.url === undefined || typeof surface.url === "string")
+      );
+    case "work":
+      return WORK_SECTIONS.includes(surface.view) && surface.id === `work:${surface.view}`;
+    case "work-task":
+      return (
+        typeof surface.taskId === "string" &&
+        surface.id === `work-task:${surface.taskId}` &&
+        (surface.title === undefined || typeof surface.title === "string")
       );
     default:
       return false;

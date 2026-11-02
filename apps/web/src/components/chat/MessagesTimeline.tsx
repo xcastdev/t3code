@@ -79,7 +79,9 @@ import { WorktreeSetupCard } from "./WorktreeSetupCard";
 import { useOpenPrLink } from "~/lib/openPullRequestLink";
 import { useMediaQuery } from "~/hooks/useMediaQuery";
 import { cn } from "~/lib/utils";
-import { type TimestampFormat } from "@t3tools/contracts/settings";
+import { type ClientSettings, type TimestampFormat } from "@t3tools/contracts/settings";
+import { useClientSettings } from "../../hooks/useSettings";
+import { DiffStatLabel, hasNonZeroStat } from "./DiffStatLabel";
 import { type HandoffTimelineRun } from "./V2LifecycleRow";
 import { TimelineSystemDivider } from "./TimelineSystemDivider";
 
@@ -98,6 +100,7 @@ import {
   WorkGroupSection,
   WorkingTimelineRow,
   ThinkingTimelineRow,
+  ThoughtsTimelineRow,
   LiveWorkEntryTimelineRow,
   WorkGroupToggleTimelineRow,
 } from "./TimelineWorkGroupRows";
@@ -291,6 +294,8 @@ interface MessagesTimelineProps {
   findQuery?: string;
   activeFindMatch?: ThreadFindMatch | null;
   findNavigationId?: number;
+  turnChecklists?: TimelineRowSharedState["turnChecklists"];
+  backgroundWorkRunning?: number;
 }
 
 export function MessagesTimeline(props: MessagesTimelineProps) {
@@ -304,6 +309,13 @@ export function MessagesTimeline(props: MessagesTimelineProps) {
     />
   );
 }
+
+const NO_TURN_CHECKLISTS: TimelineRowSharedState["turnChecklists"] = new Map();
+
+const selectTimelineDisplay = (settings: ClientSettings) => ({
+  liveActivity: settings.timelineLiveActivity,
+  turnEnd: settings.timelineTurnEnd,
+});
 
 const ConversationTimeline = memo(function ConversationTimeline({
   citationRequest = null,
@@ -340,6 +352,8 @@ const ConversationTimeline = memo(function ConversationTimeline({
   displayThreadKey,
   announceTurnStatus = true,
   onOpenTurnDiff,
+  turnChecklists = NO_TURN_CHECKLISTS,
+  backgroundWorkRunning = 0,
   onOpenThread,
   renderHtmlRender,
   turnItemSource,
@@ -380,6 +394,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
   topFadeEnabled = false,
   historyControls,
 }: MessagesTimelineProps) {
+  const { liveActivity, turnEnd } = useClientSettings(selectTimelineDisplay);
   const listIdentityKey = displayThreadKey ?? routeThreadKey;
   // Snapshot restore positions on identity changes; ongoing scroll writes must not move them.
   // Find open at the opening is part of the snapshot: opening find later
@@ -576,6 +591,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
         runningRunId,
         isWorking,
         runlessWorkActive,
+        turnEnd,
       })
     : null;
   const activeFindRunId =
@@ -617,6 +633,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
         runningRunId,
         isWorking,
         runlessWorkActive,
+        turnEnd,
       })
     ).get(citedEntry.id);
     setCitationExpandedFor(citationRequest.key);
@@ -669,6 +686,8 @@ const ConversationTimeline = memo(function ConversationTimeline({
     threadStartCheckpointReady,
     availableRevertTurnCounts,
     worktreeSetup,
+    liveActivity,
+    turnEnd,
   });
   const rows = useStableRows(rawRows, listIdentityKey);
   // Run status/timestamps change per stream event; keep them out of shared row context.
@@ -1044,6 +1063,8 @@ const ConversationTimeline = memo(function ConversationTimeline({
     onWorktreeSetupWorkLocally: onWorktreeSetupWorkLocally ?? null,
     onOpenWorktreeSetupTerminal: onOpenWorktreeSetupTerminal ?? null,
     workGroupViewState,
+    turnChecklists,
+    backgroundWorkRunning,
   };
   const compactionAwaitingRow =
     isCompacting &&
@@ -1400,7 +1421,8 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
     row.kind === "work" ||
     row.kind === "work-live" ||
     row.kind === "work-toggle" ||
-    row.kind === "thinking";
+    row.kind === "thinking" ||
+    row.kind === "thoughts";
   const isExpandedToolGroupHeader =
     (row.kind === "work-toggle" || row.kind === "work-live" || row.kind === "thinking") &&
     row.expanded === true;
@@ -1456,6 +1478,7 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
           {row.kind === "work-live" ? <LiveWorkEntryTimelineRow row={row} /> : null}
           {row.kind === "work-toggle" ? <WorkGroupToggleTimelineRow row={row} /> : null}
           {row.kind === "thinking" ? <ThinkingTimelineRow row={row} /> : null}
+          {row.kind === "thoughts" ? <ThoughtsTimelineRow row={row} /> : null}
         </WorkLogBlock>
       ) : null}
       {row.kind === "turn-fold" ? <TurnFoldTimelineRow row={row} /> : null}
@@ -1552,25 +1575,113 @@ function ContextCompactionTimelineRow({
 
 function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-fold" }> }) {
   const ctx = use(TimelineRowCtx);
+  const { isWorking } = use(TimelineRowActivityCtx);
+  const report = row.report;
+  const checklist = ctx.turnChecklists.get(row.runId);
+  const stillRunning = report?.latest && !isWorking ? ctx.backgroundWorkRunning : 0;
+  const onOpenTurnDiff = ctx.onOpenTurnDiff;
 
   return (
     <div className="group/timeline-row relative flex items-center gap-1 border-b border-border/60 pb-2 pe-0.5 pt-1">
-      <button
-        type="button"
-        aria-expanded={row.expanded}
-        data-scroll-anchor-ignore
-        onClick={() => ctx.onToggleTurnFold(row.runId)}
-        className="flex cursor-pointer select-none items-center gap-1 rounded-md px-1 text-sm leading-relaxed text-muted-foreground tabular-nums transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
-      >
-        <span>{row.label}</span>
-        <MorphIcon className="size-3.5" icon={row.expanded ? ChevronDown : ChevronRight} />
-      </button>
+      <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1">
+        <button
+          type="button"
+          aria-expanded={row.expanded}
+          data-scroll-anchor-ignore
+          onClick={() => ctx.onToggleTurnFold(row.runId)}
+          className="flex cursor-pointer select-none items-center gap-1 rounded-md px-1 text-sm leading-relaxed text-muted-foreground tabular-nums transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
+        >
+          <span>{row.label}</span>
+          {report && report.steps > 0 ? (
+            <span className="text-muted-foreground/80">
+              · {report.steps} {report.steps === 1 ? "step" : "steps"}
+            </span>
+          ) : null}
+          <MorphIcon className="size-3.5" icon={row.expanded ? ChevronDown : ChevronRight} />
+        </button>
+        {report?.files ? (
+          <TurnReportChip
+            label={`${report.files.count} ${report.files.count === 1 ? "file" : "files"} changed, open the diff`}
+            onClick={onOpenTurnDiff ? () => onOpenTurnDiff(row.runId) : undefined}
+          >
+            {report.files.count} {report.files.count === 1 ? "file" : "files"}
+            {hasNonZeroStat(report.files) ? (
+              <DiffStatLabel
+                additions={report.files.additions}
+                deletions={report.files.deletions}
+                layout="inline"
+              />
+            ) : null}
+          </TurnReportChip>
+        ) : null}
+        {report && report.subagents > 0 ? (
+          <TurnReportChip>
+            {report.subagents} {report.subagents === 1 ? "subagent" : "subagents"}
+          </TurnReportChip>
+        ) : null}
+        {report && report.failed > 0 ? (
+          <TurnReportChip
+            tone="failed"
+            label={`${report.failed} failed, show the steps`}
+            onClick={row.expanded ? undefined : () => ctx.onToggleTurnFold(row.runId)}
+          >
+            {report.failed} failed
+          </TurnReportChip>
+        ) : null}
+        {checklist && checklist.total > 0 ? (
+          <TurnReportChip tone={checklist.done < checklist.total ? "warning" : "neutral"}>
+            Checklist {checklist.done}/{checklist.total}
+          </TurnReportChip>
+        ) : null}
+        {stillRunning > 0 ? (
+          <TurnReportChip tone="warning">{stillRunning} still running</TurnReportChip>
+        ) : null}
+      </div>
       <TimelineRowTimestamp
         createdAt={row.createdAt}
         timestampFormat={ctx.timestampFormat}
-        className="ms-auto"
+        className="ms-auto shrink-0"
       />
     </div>
+  );
+}
+
+const TURN_REPORT_CHIP_TONES = {
+  neutral: "border-border/70 text-muted-foreground",
+  failed: "border-destructive/40 text-destructive",
+  warning: "border-warning/40 text-warning",
+} as const;
+
+function TurnReportChip({
+  tone = "neutral",
+  label,
+  onClick,
+  children,
+}: {
+  tone?: keyof typeof TURN_REPORT_CHIP_TONES;
+  label?: string;
+  onClick?: (() => void) | undefined;
+  children: ReactNode;
+}) {
+  const className = cn(
+    "inline-flex h-5 items-center gap-1 rounded-full border px-1.5 text-xs tabular-nums",
+    TURN_REPORT_CHIP_TONES[tone],
+  );
+  return onClick ? (
+    <button
+      type="button"
+      aria-label={label}
+      data-scroll-anchor-ignore
+      onClick={onClick}
+      className={cn(
+        className,
+        "cursor-pointer transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70",
+      )}
+    >
+      {children}
+    </button>
+  ) : (
+    <span className={className}>{children}</span>
   );
 }
 

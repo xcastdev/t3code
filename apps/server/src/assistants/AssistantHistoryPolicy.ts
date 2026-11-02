@@ -37,7 +37,7 @@ export const makeAssistantHistoryPolicy = Effect.gen(function* () {
     function* (input: { threadId: ThreadId; items: ReadonlyArray<OrchestrationV2TurnItem> }) {
       return yield* sql.withTransaction(
         Effect.gen(function* () {
-          const record = yield* repository.findByThread(input.threadId);
+          const record = yield* repository.findByConversation(input.threadId);
           if (record === null) return { items: input.items, omittedItems: 0 };
           const current = yield* context(record);
           const stamp = {

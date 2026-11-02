@@ -284,6 +284,16 @@ describe("orchestration V2 wire projection", () => {
     expect(failed).not.toHaveProperty("newStr");
   });
 
+  it("sends a file change's diff when its row asks for the detail", () => {
+    const item = {
+      ...base,
+      type: "file_change" as const,
+      fileName: "src/main.ts",
+      diffStr: "@@ -1 +1 @@\n-old code\n+new code",
+    };
+    expect(projectTurnItemForDetail(item)).toMatchObject({ diffStr: item.diffStr });
+  });
+
   it("retains only result identities and failure metadata in live tool events", () => {
     const output = {
       isError: true,

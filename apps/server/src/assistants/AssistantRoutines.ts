@@ -1,14 +1,14 @@
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- Stable routine IDs are pure hashes of retained command identity.
 import * as NodeCrypto from "node:crypto";
 import {
+  CommandId,
   ScheduledTaskId,
+  ThreadId,
   canonicalProjectWorkPayload,
   type AssistantGetInput,
-  type CommandId,
   type ScheduledTask,
   type ScheduledTaskUpsertInput,
   type ScheduledTaskUpsertSchedule,
-  type ThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -17,6 +17,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import { ScheduledTaskService } from "../scheduledTasks/ScheduledTaskService.ts";
+import { ThreadManagementService } from "../orchestration-v2/ThreadManagementService.ts";
 import { AssistantError, AssistantRepository } from "./AssistantRepository.ts";
 import { assistantThreadIsCurrent } from "./AssistantThreadAuthority.ts";
 import { AssistantRoutineMutation } from "./AssistantRoutineMutation.ts";
@@ -76,6 +77,7 @@ const make = Effect.gen(function* () {
   const assistants = yield* AssistantRepository;
   const routines = yield* AssistantRoutineRepository;
   const scheduler = yield* ScheduledTaskService;
+  const threads = yield* ThreadManagementService;
   const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const transaction = Effect.fn("AssistantRoutines.transaction")(
     function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
@@ -102,7 +104,51 @@ const make = Effect.gen(function* () {
     const bindings = yield* routines.list(input);
     return yield* Effect.forEach(bindings, task);
   });
+  // A routine's standing chat is a Home child; the command id makes a retry reuse it.
+  const openChat = Effect.fn("AssistantRoutines.openChat")(
+    function* (input: Upsert, taskId: ScheduledTaskId) {
+      const record = yield* assistants.get(input);
+      const binding = record.detail.summary.binding;
+      const home = yield* threads.getThreadShell(binding.canonicalThreadId);
+      if (home === null) return yield* new AssistantError({ reason: "needs-repair" });
+      const config = record.detail.configuration.configuration;
+      const threadId = ThreadId.make(`${taskId}-chat`);
+      yield* threads.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`${taskId}:chat`),
+        threadId,
+        projectId: binding.backingProjectId,
+        parentThreadId: home.id,
+        title: input.title,
+        modelSelection: config.modelSelection,
+        runtimeMode: config.runtimeMode,
+        interactionMode: config.interactionMode,
+        branch: home.branch,
+        worktreePath: home.worktreePath,
+        createdBy: "system",
+        creationSource: "server",
+      });
+      return threadId;
+    },
+    Effect.mapError((cause) =>
+      isAssistantError(cause) ? cause : new AssistantError({ reason: "unavailable", cause }),
+    ),
+  );
   const upsert = Effect.fn("AssistantRoutines.upsert")(function* (input: Upsert) {
+    const id =
+      input.taskId ??
+      ScheduledTaskId.make(
+        `assistant-routine-${NodeCrypto.createHash("sha256")
+          .update(
+            canonicalProjectWorkPayload([input.environmentId, input.assistantId, input.commandId]),
+          )
+          .digest("hex")}`,
+      );
+    // Dispatch commits its own transaction, so the chat exists before the routine row does.
+    const chatThreadId =
+      input.taskId === undefined && (yield* routines.find(id)) === null
+        ? yield* openChat(input, id)
+        : undefined;
     return yield* transaction(
       Effect.gen(function* () {
         const record = yield* assistants.get(input);
@@ -111,19 +157,6 @@ const make = Effect.gen(function* () {
           return yield* new AssistantError({
             reason: summary.provisioningState !== "ready" ? "needs-repair" : "forbidden",
           });
-        const id =
-          input.taskId ??
-          ScheduledTaskId.make(
-            `assistant-routine-${NodeCrypto.createHash("sha256")
-              .update(
-                canonicalProjectWorkPayload([
-                  input.environmentId,
-                  input.assistantId,
-                  input.commandId,
-                ]),
-              )
-              .digest("hex")}`,
-          );
         const existing = yield* routines.find(id);
         if (input.taskId || existing) yield* routines.assertOwned(input, id);
         if (existing?.deleted) return yield* new AssistantError({ reason: "not-found" });
@@ -138,6 +171,8 @@ const make = Effect.gen(function* () {
         )
           return yield* new AssistantError({ reason: "conflict" });
         if (input.taskId === undefined && existing !== null) return yield* task(existing);
+        const threadId = existing?.threadId ?? chatThreadId;
+        if (threadId === undefined) return yield* new AssistantError({ reason: "needs-repair" });
         const config = record.detail.configuration.configuration;
         const data: ScheduledTaskUpsertInput = {
           id,
@@ -148,7 +183,7 @@ const make = Effect.gen(function* () {
           enabled: input.enabled,
           schedule: input.schedule,
           projectId: summary.binding.backingProjectId,
-          threadId: summary.binding.canonicalThreadId,
+          threadId,
           workspaceStrategy: { type: "root" },
           modelSelection: config.modelSelection,
           runtimeMode: config.runtimeMode,
@@ -222,8 +257,7 @@ const make = Effect.gen(function* () {
           task === null ||
           task.projectId !== binding.projectId ||
           task.threadId !== binding.threadId ||
-          binding.projectId !== current.backingProjectId ||
-          binding.threadId !== current.canonicalThreadId
+          binding.projectId !== current.backingProjectId
         )
           return yield* new AssistantError({ reason: "needs-repair" });
         const projects =

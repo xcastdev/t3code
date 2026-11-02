@@ -651,6 +651,7 @@ function runBrowserAccessScenario(input: {
   readonly deviceOverride?: boolean;
   readonly createThread?: boolean;
   readonly projectExists?: boolean;
+  readonly capabilities?: OrchestrationV2ProviderCapabilities;
 }) {
   return Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
@@ -691,6 +692,7 @@ function runBrowserAccessScenario(input: {
           state,
           idleTimeoutMs: 1_000,
           mcpConfigs,
+          ...(input.capabilities === undefined ? {} : { capabilities: input.capabilities }),
           projectServiceLayer: layerProjectService,
           serverSettingsLayer: ServerSettings.layerTest({
             enableAgentBrowserAccess: input.enableAgentBrowserAccess,
@@ -3559,6 +3561,25 @@ it.effect(
       });
       assert.isFalse(denied?.capabilities?.has("device"));
     }),
+);
+
+it.effect("issues T3's checklist only to harnesses without a checklist of their own", () =>
+  Effect.gen(function* () {
+    const native = yield* runBrowserAccessScenario({
+      enableAgentBrowserAccess: false,
+      projectOverride: false,
+    });
+    assert.isFalse(native?.capabilities?.has("checklist"));
+    const withoutChecklist = yield* runBrowserAccessScenario({
+      enableAgentBrowserAccess: false,
+      projectOverride: false,
+      capabilities: {
+        ...CodexCapabilities,
+        planning: { ...CodexCapabilities.planning, emitsTodoList: false },
+      },
+    });
+    assert.isTrue(withoutChecklist?.capabilities?.has("checklist"));
+  }),
 );
 
 it.effect("replaces a session-scoped instruction process before a changed next turn", () =>

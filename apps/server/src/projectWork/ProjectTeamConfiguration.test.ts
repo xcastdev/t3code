@@ -17,6 +17,7 @@ import {
   ProjectWorkTaskId,
   ProjectWorkCriterionId,
   ProjectTeamConfigurationIntent,
+  ProjectWorkRpcError,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -31,6 +32,7 @@ import * as Gateway from "./ProjectWorkGateway.ts";
 import * as Runtime from "./ProjectWorkRuntime.ts";
 import { readCurrentState } from "./ProjectWorkRepository.ts";
 
+const encodeWorkError = Schema.encodeSync(ProjectWorkRpcError);
 const decodeConfiguration = Schema.decodeEffect(ProjectTeamConfigurationIntent);
 const decodeTeamRecords = Schema.decodeUnknownEffect(Schema.Array(ProjectTeamRecord));
 const decodeEnvelope = Schema.decodeUnknownEffect(ProjectWorkBoundedReadEnvelope);
@@ -669,4 +671,37 @@ it.effect(
       });
       assert.equal((yield* gateway.write(command, human).pipe(Effect.flip)).reason, "forbidden");
     }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("issue identity failures retain the repository prerequisite over RPC", () =>
+  Effect.gen(function* () {
+    const gateway = yield* seed;
+    const result = yield* Effect.result(
+      gateway.issue({ operation: "identity", input: { projectId } }, human),
+    );
+    assert.equal(result._tag, "Failure");
+    if (result._tag === "Failure") {
+      assert.deepStrictEqual(encodeWorkError(result.failure), {
+        _tag: "ProjectWorkRpcError",
+        operation: "write",
+        reason: "rejected",
+        issueReason: "repository-mismatch",
+      });
+    }
+  }).pipe(
+    Effect.provide(
+      Runtime.layer.pipe(
+        Layer.provide(Layer.mock(GitHubIssueApi.GitHubIssueApi)({})),
+        Layer.provide(
+          Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
+            resolve: () => Effect.succeed(null),
+          }),
+        ),
+        Layer.provideMerge(ProjectStore.layer),
+        Layer.provideMerge(AuthSessions.layer),
+        Layer.provide(environment),
+        Layer.provideMerge(Sqlite.layerMemory),
+      ),
+    ),
+  ),
 );

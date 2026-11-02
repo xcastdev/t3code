@@ -1,13 +1,18 @@
 # Assistants
 
-Open **Agents** and select an assistant to start or continue its chat. Each assistant has one main
-conversation; opening its chat returns to that same conversation. Messages there use the assistant's
-project and settings. Use **Stop** in that conversation to stop active work.
-From the assistant's main chat, open its agent page to change its setup.
+Open **Agents** in the sidebar to see each assistant with its chats. Select an assistant's name to
+open its **Home**, the long-lived conversation that always returns to the same one; use the arrow
+beside it to show or hide its chats without leaving the current one. Start a
+separate chat for a topic you want to keep apart, with **New chat** under the assistant or in the
+sidebar header. A chat starts with a clean conversation but works as the same assistant, with its
+project, settings and memory. Use the filter in the sidebar header to show only some assistants, or
+only one environment's. Use **Stop** in a conversation to stop its active work.
+From the assistant's Home, open its agent page to change its setup.
 
 ## Memory
 
-With automatic memory enabled, an assistant can retain useful details from its own conversation.
+With automatic memory enabled, an assistant can retain useful details from its Home and its chats,
+and every chat can use what it learned.
 Memory stays private unless you explicitly share it. Review an item in the assistant's memory, edit it
 to correct it, or forget it to keep it out of future T3-managed recall and context. Forgetting does
 not remove the source messages from chat history or retract context already sent to a provider.
@@ -16,7 +21,9 @@ indexing remains off until enabled.
 
 ## Routines
 
-Create a routine with a prompt and schedule, then enable it when you want it to run. You can change
+Create a routine with a prompt and schedule, then enable it when you want it to run. Each new
+routine runs in its own chat under the assistant, named after the routine, so its runs stay out of
+Home. Routines created before this keep running in Home. You can change
 its schedule, disable or delete it, or run it now. Check its time zone and next run, then use the
 routine's activity for its actual status; a recorded attempt or dispatch does not mean the work
 completed.

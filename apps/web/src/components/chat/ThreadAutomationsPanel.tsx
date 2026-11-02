@@ -14,7 +14,7 @@ import {
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 
-import { ThreadDetailsSection } from "./ThreadDetailsSection";
+import { ThreadDetailsSection, ThreadDetailsSummary } from "./ThreadDetailsSection";
 import { cn } from "../../lib/utils";
 import { ScheduledRelativeLabel, scheduleLabel } from "../settings/ScheduledTasksSettings";
 import { useEnvironmentQuery } from "../../state/query";
@@ -129,6 +129,11 @@ export function ThreadAutomationsPanel(props: {
       headingId="thread-details-automations-heading"
       title="Automations"
       data-thread-automations-panel
+      collapsedSummary={
+        <ThreadDetailsSummary>
+          {boundTasks.filter((task) => task.enabled).length} of {boundTasks.length} on
+        </ThreadDetailsSummary>
+      }
       actions={
         <Tooltip>
           <TooltipTrigger

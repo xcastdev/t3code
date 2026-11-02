@@ -2360,6 +2360,49 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       }),
   );
 
+  it.effect("generates a commit message from only what is staged", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      NodeFS.writeFileSync(NodePath.join(repoDir, "staged.txt"), "staged\n");
+      NodeFS.writeFileSync(NodePath.join(repoDir, "unstaged.txt"), "unstaged\n");
+      yield* runGit(repoDir, ["add", "staged.txt"]);
+      let stagedSummary = "";
+      const { manager } = yield* makeManager({
+        textGeneration: {
+          generateCommitMessage: (input) => {
+            stagedSummary = input.stagedSummary;
+            return Effect.succeed({ subject: "Add staged file", body: "Explain why." });
+          },
+        },
+      });
+
+      const result = yield* manager.generateStagedCommitMessage({ cwd: repoDir });
+
+      expect(result.message).toBe("Add staged file\n\nExplain why.");
+      expect(stagedSummary).toContain("staged.txt");
+      expect(stagedSummary).not.toContain("unstaged.txt");
+      expect(
+        yield* runGit(repoDir, ["diff", "--cached", "--name-only"]).pipe(
+          Effect.map((output) => output.stdout.trim()),
+        ),
+      ).toBe("staged.txt");
+    }),
+  );
+
+  it.effect("refuses to generate a commit message when nothing is staged", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      NodeFS.writeFileSync(NodePath.join(repoDir, "unstaged.txt"), "unstaged\n");
+      const { manager } = yield* makeManager();
+
+      const error = yield* Effect.flip(manager.generateStagedCommitMessage({ cwd: repoDir }));
+
+      expect(error._tag).toBe("GitManagerError");
+    }),
+  );
+
   it.effect("creates a commit when working tree is dirty", () =>
     Effect.gen(function* () {
       const repoDir = yield* makeTempDir("t3code-git-manager-");

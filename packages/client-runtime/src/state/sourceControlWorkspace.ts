@@ -183,6 +183,11 @@ export function createSourceControlWorkspaceAtoms<R, E>(
       concurrency,
       onSettled,
     }),
+    // Not on the VCS scheduler: generation waits on a model and changes no repository state.
+    generateStagedCommitMessage: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:source-control:generate-staged-commit-message",
+      tag: WS_METHODS.gitGenerateStagedCommitMessage,
+    }),
     commitStaged: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:source-control:commit-staged",
       tag: WS_METHODS.gitCommitStaged,

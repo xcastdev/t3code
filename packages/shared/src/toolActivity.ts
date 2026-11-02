@@ -44,11 +44,24 @@ export function dynamicToolSurface(toolName: string | null | undefined, input: u
     : undefined;
 }
 
+// Each provider names its agent checklist tool differently; users see one name for all of them.
+const CHECKLIST_TOOL_TITLES: ReadonlyMap<string, string> = new Map([
+  ["todowrite", "Updated checklist"],
+  ["todo_write", "Updated checklist"],
+  ["write_todos", "Updated checklist"],
+  ["update_plan", "Updated checklist"],
+  ["todoread", "Read checklist"],
+  ["todo_read", "Read checklist"],
+  ["read_todos", "Read checklist"],
+]);
+
 export function dynamicToolTitle(
   toolName: string | null | undefined,
   input: unknown,
   retainedTitle?: string | null,
 ): string | undefined {
+  const checklistTitle = toolName ? CHECKLIST_TOOL_TITLES.get(toolName.toLowerCase()) : undefined;
+  if (checklistTitle !== undefined) return checklistTitle;
   if (isJavaScriptReplTool(toolName)) {
     const title = asTrimmedString(retainedTitle);
     const meaningfulTitle =

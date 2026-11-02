@@ -25,3 +25,21 @@ export const assistantThreadIsCurrent = Effect.fn("AssistantThreadAuthority.isCu
     }
   },
 );
+
+// Home and its chats speak as the agent; delegated children and forks do not get its memory.
+export const assistantConversationIsCurrent = Effect.fn(
+  "AssistantThreadAuthority.isCurrentConversation",
+)(function* (input: {
+  threadId: ThreadId;
+  canonicalThreadId: ThreadId;
+  backingProjectId: ProjectId;
+}) {
+  if (input.threadId !== input.canonicalThreadId) {
+    const sql = yield* SqlClient.SqlClient;
+    const rows = yield* sql<{
+      relationship: string | null;
+    }>`SELECT json_extract(payload_json,'$.lineage.relationshipToParent') AS relationship FROM orchestration_v2_projection_threads WHERE thread_id=${input.threadId} AND project_id=${input.backingProjectId}`;
+    if (rows[0]?.relationship !== "chat") return false;
+  }
+  return yield* assistantThreadIsCurrent(input);
+});

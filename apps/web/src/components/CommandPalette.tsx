@@ -1510,6 +1510,18 @@ function OpenCommandPaletteDialog(props: {
     });
   }
 
+  actionItems.push({
+    kind: "action",
+    value: "action:project-work-portfolio",
+    searchTerms: ["work", "portfolio", "all projects", "workers", "questions", "inbox"],
+    title: "Open Work across projects",
+    description: "Team Work in every connected environment",
+    icon: <ListTodoIcon className={ITEM_ICON_CLASS} />,
+    run: async () => {
+      await navigate({ to: "/work" });
+    },
+  });
+
   if (projectWorkTarget) {
     actionItems.push({
       kind: "action",
@@ -1527,24 +1539,6 @@ function OpenCommandPaletteDialog(props: {
             projectId: projectWorkTarget.projectId,
           },
           search: { section: "overview" },
-        });
-      },
-    });
-    actionItems.push({
-      kind: "action",
-      value: "action:project-work-portfolio",
-      searchTerms: ["work", "portfolio", "all projects", "workers", "questions", "inbox"],
-      title: "Open Work across projects",
-      description: "Team Work in every connected environment",
-      icon: <ListTodoIcon className={ITEM_ICON_CLASS} />,
-      run: async () => {
-        await navigate({
-          to: "/work/$environmentId/$projectId",
-          params: {
-            environmentId: projectWorkTarget.environmentId,
-            projectId: projectWorkTarget.projectId,
-          },
-          search: { section: "portfolio" },
         });
       },
     });

@@ -1,6 +1,8 @@
 import { AssistantRoutineToolkit } from "./toolkits/assistantRoutines/tools.ts";
 import * as AssistantRoutineHandlers from "./toolkits/assistantRoutines/handlers.ts";
 import { AssistantMemoryToolkit } from "./toolkits/assistantMemory/tools.ts";
+import * as ChecklistHandlers from "./toolkits/checklist/handlers.ts";
+import { ChecklistToolkit } from "./toolkits/checklist/tools.ts";
 import * as AssistantMemoryHandlers from "./toolkits/assistantMemory/handlers.ts";
 import { TerminalToolkit } from "./toolkits/terminal/tools.ts";
 import * as TerminalHandlers from "./toolkits/terminal/handlers.ts";
@@ -1051,6 +1053,8 @@ export const layerTerminalToolkit = toolkitRegistration(TerminalToolkit, Termina
 
 export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer);
 
+export const layerChecklistToolkit = toolkitRegistration(ChecklistToolkit, ChecklistHandlers.layer);
+
 const layerWorktreeToolkitRegistration = toolkitRegistration(
   WorktreeToolkit,
   WorktreeHandlers.layer,
@@ -1106,6 +1110,7 @@ export const layerTools = Layer.mergeAll(
   layerPreviewToolkit,
   layerOrchestratorToolkit,
   layerThreadToolkit,
+  layerChecklistToolkit,
   layerTerminalToolkit,
   layerAttachmentToolkit,
   toolkitRegistration(ProjectWorkToolkit, ProjectWorkHandlers.layer),

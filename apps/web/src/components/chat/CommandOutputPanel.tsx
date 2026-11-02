@@ -64,7 +64,7 @@ export function CommandOutputPanel(props: {
           followRef.current =
             element.scrollHeight - element.scrollTop - element.clientHeight <= FOLLOW_SLACK_PX;
         }}
-        className="max-h-80 overflow-auto text-muted-foreground"
+        className="max-h-80 overflow-auto whitespace-pre-wrap break-words"
       >
         {spans.map((span, index) =>
           span.style === null ? (

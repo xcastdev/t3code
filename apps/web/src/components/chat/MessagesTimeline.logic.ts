@@ -62,6 +62,7 @@ import {
   type TurnItemId,
 } from "@t3tools/contracts";
 import type { ThreadRunSummary } from "@t3tools/client-runtime/state/shell";
+import type { TimelineLiveActivity, TimelineTurnEnd } from "@t3tools/contracts/settings";
 import {
   resolveT3McpToolDefinition,
   type T3McpToolPresentation,
@@ -571,6 +572,16 @@ type MessagesTimelineRowContent =
       runId: RunId;
       label: string;
       expanded: boolean;
+      report?: TurnFoldReport;
+    }
+  | {
+      kind: "thoughts";
+      id: string;
+      createdAt: string;
+      /** Consecutive thoughts of a running turn, drawn as one block. */
+      entries: WorkLogEntry[];
+      /** The last thought is still being written. */
+      streaming: boolean;
     }
   | {
       kind: "attempt-fold";
@@ -741,6 +752,24 @@ interface TurnFold {
   /** Every entry in the segment, including the cards a fold never hides. */
   entryIds: ReadonlySet<string>;
   label: string;
+  report?: TurnFoldStepCounts;
+}
+
+interface TurnFoldStepCounts {
+  readonly steps: number;
+  readonly failed: number;
+  readonly subagents: number;
+}
+
+/** What a folded turn did, shown on its fold row. */
+export interface TurnFoldReport extends TurnFoldStepCounts {
+  readonly files: {
+    readonly count: number;
+    readonly additions: number;
+    readonly deletions: number;
+  } | null;
+  /** The thread's latest run, the only one whose leftover background work is its own. */
+  readonly latest: boolean;
 }
 
 interface SupersededAttemptFold {
@@ -987,6 +1016,48 @@ function failedTimelineRunIds(
   return failed;
 }
 
+function countTurnSteps(entries: ReadonlyArray<TimelineEntry>): TurnFoldStepCounts {
+  let steps = 0;
+  let failed = 0;
+  let subagents = 0;
+  for (const entry of entries) {
+    if (entry.kind === "event" && entry.projectedItem.item.type === "subagent") subagents += 1;
+    if (
+      entry.kind !== "work" ||
+      entry.entry.itemType === "reasoning" ||
+      !workLogEntryIsToolLike(entry.entry)
+    ) {
+      continue;
+    }
+    steps += 1;
+    if (workEntryDisplayIndicatesToolFailure(entry.entry)) failed += 1;
+  }
+  return { steps, failed, subagents };
+}
+
+function filesChangedByRunId(summaries: ReadonlyArray<TurnDiffSummary>) {
+  const byRunId = new Map<RunId, Map<string, { additions: number; deletions: number }>>();
+  for (const summary of summaries) {
+    if (summary.files.length === 0) continue;
+    const files = byRunId.get(summary.runId) ?? new Map();
+    for (const file of summary.files) {
+      files.set(file.path, { additions: file.additions, deletions: file.deletions });
+    }
+    byRunId.set(summary.runId, files);
+  }
+  const totals = new Map<RunId, NonNullable<TurnFoldReport["files"]>>();
+  for (const [runId, files] of byRunId) {
+    let additions = 0;
+    let deletions = 0;
+    for (const file of files.values()) {
+      additions += file.additions;
+      deletions += file.deletions;
+    }
+    totals.set(runId, { count: files.size, additions, deletions });
+  }
+  return totals;
+}
+
 function deriveTurnFolds(input: {
   timelineEntries: ReadonlyArray<TimelineEntry>;
   terminalAssistantMessageIds: ReadonlySet<string>;
@@ -1183,6 +1254,7 @@ function deriveTurnFolds(input: {
       hiddenEntryIds: segmentHiddenIds(firstSegment),
       entryIds: new Set(firstSegment.map((entry) => entry.id)),
       label,
+      report: countTurnSteps(group.entries),
     });
     for (const [index, { startIndex, steer }] of group.steerSegments.entries()) {
       const entries = group.entries.slice(startIndex, group.steerSegments[index + 1]?.startIndex);
@@ -1357,9 +1429,10 @@ function timelineRowEntries(entries: ReadonlyArray<TimelineEntry>) {
 function deriveTimelineTurnFolds(
   input: Pick<
     MessagesTimelineRowsInput,
-    "timelineEntries" | "latestRun" | "isWorking" | "runlessWorkActive" | "runningRunId"
+    "timelineEntries" | "latestRun" | "isWorking" | "runlessWorkActive" | "runningRunId" | "turnEnd"
   >,
 ) {
+  if (input.turnEnd === "keep") return new Map<string, TurnFold>();
   const timelineEntries = timelineRowEntries(input.timelineEntries);
   const unsettledRunId = deriveUnsettledRunId(input.latestRun ?? null, input.runningRunId ?? null);
   const failedRunIds = failedTimelineRunIds(timelineEntries, input.latestRun ?? null);
@@ -1396,6 +1469,9 @@ export function deriveMessagesTimelineRows(input: {
   availableRevertTurnCounts?: ReadonlySet<number> | undefined;
   liveAgentTaskIds?: ReadonlySet<string> | undefined;
   worktreeSetup?: WorktreeSetupSnapshot | null;
+  /** Unset keeps each running batch of steps behind one live row. */
+  liveActivity?: TimelineLiveActivity;
+  turnEnd?: TimelineTurnEnd;
 }): MessagesTimelineRow[] {
   const timelineEntries = timelineRowEntries(input.timelineEntries);
   const turnDiffSummaryByAssistantMessageId = new Map<MessageId, TurnDiffSummary>();
@@ -1434,15 +1510,18 @@ export function deriveMessagesTimelineRows(input: {
     isWorking: input.isWorking,
   });
   const runlessWorkActive = input.isWorking && input.runlessWorkActive === true;
-  const foldsByAnchorEntryId = deriveTurnFolds({
-    timelineEntries: timelineEntries,
-    terminalAssistantMessageIds,
-    latestRun: input.latestRun ?? null,
-    unfoldedRunIds: new Set([...activeVisualResponseRunIds, ...failedRunIds]),
-    runlessWorkActive,
-    liveSubagentEntryIds,
-    completeSupersededReplyEntryIds: completeSupersededReplyIds,
-  });
+  const foldsByAnchorEntryId: ReadonlyMap<string, TurnFold> =
+    input.turnEnd === "keep"
+      ? new Map()
+      : deriveTurnFolds({
+          timelineEntries: timelineEntries,
+          terminalAssistantMessageIds,
+          latestRun: input.latestRun ?? null,
+          unfoldedRunIds: new Set([...activeVisualResponseRunIds, ...failedRunIds]),
+          runlessWorkActive,
+          liveSubagentEntryIds,
+          completeSupersededReplyEntryIds: completeSupersededReplyIds,
+        });
   const collapsedEntryIds = new Set<string>();
   const collapsedFoldMemberIds = new Set<string>();
   for (const fold of foldsByAnchorEntryId.values()) {
@@ -1474,8 +1553,11 @@ export function deriveMessagesTimelineRows(input: {
     ? lastResponseBoundaryIndex(timelineEntries) + 1
     : timelineEntries.length;
 
+  // "latest" and "all" give every step of a running turn its own row instead of one live row.
+  const liveSteps = input.liveActivity === "latest" || input.liveActivity === "all";
+  const liveBoxOpensByDefault = input.liveActivity === "box";
   const activeToolEntries: Array<Extract<TimelineEntry, { kind: "work" }>> = [];
-  if (input.isWorking && (unsettledRunId !== null || runlessWorkActive)) {
+  if (!liveSteps && input.isWorking && (unsettledRunId !== null || runlessWorkActive)) {
     let tailAttemptId: string | null | undefined;
     for (let index = timelineEntries.length - 1; index >= activeTurnHeaderIndex; index -= 1) {
       const entry = timelineEntries[index]!;
@@ -1539,7 +1621,8 @@ export function deriveMessagesTimelineRows(input: {
             entry: (latestRunningToolEntry ?? latestVisibleToolEntry).entry,
             groupedEntries: visibleActiveToolEntries.map((entry) => entry.entry),
             groupId,
-            expanded: input.expandedWorkGroupIds?.has(groupId) ?? false,
+            // In "box" mode the toggle set records the batches the reader closed.
+            expanded: (input.expandedWorkGroupIds?.has(groupId) ?? false) !== liveBoxOpensByDefault,
             active: latestToolKeepsActivityLive,
             ...(latestThoughtEntry ? { thought: latestThoughtEntry.entry } : {}),
           };
@@ -1650,6 +1733,69 @@ export function deriveMessagesTimelineRows(input: {
     );
   };
 
+  const liveStepRowIds = new Set<string>();
+  let filesChangedByRun: ReturnType<typeof filesChangedByRunId> | undefined;
+  const appendLiveSteps = (entries: ReadonlyArray<WorkLogEntry>) => {
+    let thoughts: WorkLogEntry[] = [];
+    const flushThoughts = () => {
+      const first = thoughts[0];
+      if (first === undefined) return;
+      const streaming = workEntryIsInActiveRun(thoughts.at(-1)!);
+      nextRows.push({
+        kind: "thoughts",
+        id: `thoughts:${first.id}`,
+        createdAt: first.createdAt,
+        entries: thoughts,
+        streaming,
+      });
+      liveStepRowIds.add(`thoughts:${first.id}`);
+      hasActivityRow ||= streaming;
+      thoughts = [];
+    };
+    for (const entry of entries) {
+      if (entry.itemType === "reasoning") {
+        thoughts.push(entry);
+        continue;
+      }
+      flushThoughts();
+      if (workEntryIsInActiveRun(entry)) {
+        const groupId = workGroupId(entry.id);
+        const expanded = input.expandedWorkGroupIds?.has(groupId) ?? false;
+        nextRows.push({
+          kind: "work-live",
+          id: `work-live:${entry.id}`,
+          createdAt: entry.createdAt,
+          entry,
+          groupedEntries: [entry],
+          groupId,
+          expanded,
+          active: true,
+        });
+        liveStepRowIds.add(`work-live:${entry.id}`);
+        hasActivityRow = true;
+        if (expanded) nextRows.push(expandedWorkGroupRow(groupId, entry.createdAt, [entry]));
+        continue;
+      }
+      nextRows.push({
+        kind: "work",
+        id: `step:${entry.id}`,
+        createdAt: entry.createdAt,
+        groupedEntries: [entry],
+        isExpandedToolGroup: false,
+        ...(workLogEntryIsToolLike(entry)
+          ? {
+              displayLabel:
+                toolGroupAction(entry) === "edit"
+                  ? summarizeToolGroup([entry]).summary
+                  : singleToolCallLabel(entry),
+            }
+          : {}),
+      });
+      liveStepRowIds.add(`step:${entry.id}`);
+    }
+    flushThoughts();
+  };
+
   for (let index = 0; index < timelineEntries.length; index += 1) {
     const timelineEntry = timelineEntries[index];
     if (!timelineEntry) {
@@ -1685,6 +1831,18 @@ export function deriveMessagesTimelineRows(input: {
         runId: turnFold.runId,
         label: turnFold.label,
         expanded: input.expandedRunIds?.has(turnFold.runId) ?? false,
+        ...(turnFold.report
+          ? {
+              report: {
+                ...turnFold.report,
+                files:
+                  (filesChangedByRun ??= filesChangedByRunId(input.turnDiffSummaries)).get(
+                    turnFold.runId,
+                  ) ?? null,
+                latest: turnFold.runId === input.latestRun?.runId,
+              },
+            }
+          : {}),
       });
     }
 
@@ -1806,7 +1964,13 @@ export function deriveMessagesTimelineRows(input: {
       );
       if (visibleGroupedEntries.length > 0) {
         const activeInProgressToolEntries = visibleGroupedEntries.filter(workEntryIsInActiveRun);
-        if (activeInProgressToolEntries.length > 0) {
+        if (
+          (liveSteps || liveBoxOpensByDefault) &&
+          input.isWorking &&
+          runIdIsActiveResponse(timelineEntry.entry.runId)
+        ) {
+          appendLiveSteps(visibleGroupedEntries);
+        } else if (activeInProgressToolEntries.length > 0) {
           const groupId = workGroupId(timelineEntry.id);
           const expanded = input.expandedWorkGroupIds?.has(groupId) ?? false;
           const latestActiveToolEntry = activeInProgressToolEntries.at(-1)!;
@@ -2023,6 +2187,14 @@ export function deriveMessagesTimelineRows(input: {
     });
   }
 
+  if (input.liveActivity === "latest") {
+    keepLatestLiveSteps(nextRows, liveStepRowIds, {
+      groupId: `live-earlier:${unsettledRunId ?? "runless"}`,
+      runId: unsettledRunId,
+      expandedWorkGroupIds: input.expandedWorkGroupIds,
+    });
+  }
+
   const setupHandedOff =
     input.worktreeSetup !== null &&
     input.worktreeSetup !== undefined &&
@@ -2117,13 +2289,57 @@ export function deriveMessagesTimelineRows(input: {
   );
 }
 
+const LIVE_VISIBLE_STEPS = 7;
+
+/** Folds a running turn's older steps into one row so only the latest stay in view. */
+function keepLatestLiveSteps(
+  rows: MessagesTimelineRow[],
+  stepRowIds: ReadonlySet<string>,
+  fold: {
+    readonly groupId: string;
+    readonly runId: RunId | null;
+    readonly expandedWorkGroupIds: ReadonlySet<string> | undefined;
+  },
+) {
+  const steps = rows.filter((row) => stepRowIds.has(row.id));
+  const hiddenCount = steps.length - LIVE_VISIBLE_STEPS;
+  const first = steps[0];
+  if (hiddenCount <= 0 || first === undefined) return;
+  const hidden = steps.slice(0, hiddenCount);
+  const hiddenIds = new Set(hidden.map((row) => row.id));
+  for (const row of hidden) {
+    if (row.kind === "work-live") hiddenIds.add(`${row.groupId}:details`);
+  }
+  const expanded = fold.expandedWorkGroupIds?.has(fold.groupId) ?? false;
+  const toggle: MessagesTimelineRow = {
+    kind: "work-toggle",
+    id: `work-toggle:${fold.groupId}`,
+    createdAt: first.createdAt ?? "",
+    runId: fold.runId,
+    groupId: fold.groupId,
+    hiddenCount,
+    expanded,
+    summary: `${hiddenCount} earlier ${hiddenCount === 1 ? "step" : "steps"}`,
+    summaryKind: "mixed",
+    hasFailure: hidden.some(
+      (row) => row.kind === "work" && row.groupedEntries.some(workEntryDisplayIndicatesToolFailure),
+    ),
+  };
+  const kept = rows.flatMap((row) => {
+    if (row === first) return expanded ? [toggle, row] : [toggle];
+    return !expanded && hiddenIds.has(row.id) ? [] : [row];
+  });
+  rows.splice(0, rows.length, ...kept);
+}
+
 function timelineRowIsWorkLog(row: MessagesTimelineRow | undefined): boolean {
   return (
     row !== undefined &&
     (row.kind === "work" ||
       row.kind === "work-toggle" ||
       row.kind === "work-live" ||
-      row.kind === "thinking")
+      row.kind === "thinking" ||
+      row.kind === "thoughts")
   );
 }
 
@@ -2193,7 +2409,7 @@ export interface MessagesTimelineRowsProjection {
 export function timelineEntryTurnFoldRunId(
   input: Pick<
     MessagesTimelineRowsInput,
-    "timelineEntries" | "latestRun" | "isWorking" | "runlessWorkActive" | "runningRunId"
+    "timelineEntries" | "latestRun" | "isWorking" | "runlessWorkActive" | "runningRunId" | "turnEnd"
   >,
   entryId: string,
 ): RunId | null {
@@ -2203,7 +2419,7 @@ export function timelineEntryTurnFoldRunId(
 export function timelineTurnFoldRunIdsByEntryId(
   input: Pick<
     MessagesTimelineRowsInput,
-    "timelineEntries" | "latestRun" | "isWorking" | "runlessWorkActive" | "runningRunId"
+    "timelineEntries" | "latestRun" | "isWorking" | "runlessWorkActive" | "runningRunId" | "turnEnd"
   >,
 ): ReadonlyMap<string, RunId> {
   const byEntryId = new Map<string, RunId>();
@@ -2366,7 +2582,25 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
 
     case "turn-fold": {
       const bf = b as typeof a;
-      return a.createdAt === bf.createdAt && a.label === bf.label && a.expanded === bf.expanded;
+      return (
+        a.createdAt === bf.createdAt &&
+        a.label === bf.label &&
+        a.expanded === bf.expanded &&
+        a.report?.steps === bf.report?.steps &&
+        a.report?.failed === bf.report?.failed &&
+        a.report?.subagents === bf.report?.subagents &&
+        a.report?.latest === bf.report?.latest &&
+        shallow(a.report?.files ?? null, bf.report?.files ?? null)
+      );
+    }
+
+    case "thoughts": {
+      const bt = b as typeof a;
+      return (
+        a.createdAt === bt.createdAt &&
+        a.streaming === bt.streaming &&
+        Equal.equals(a.entries, bt.entries)
+      );
     }
 
     case "attempt-fold": {

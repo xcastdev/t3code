@@ -117,7 +117,8 @@ export type OrchestrationV2ProviderRef = typeof OrchestrationV2ProviderRef.Type;
 
 export const OrchestrationV2AppThreadLineage = Schema.Struct({
   parentThreadId: Schema.NullOr(ThreadId),
-  relationshipToParent: Schema.NullOr(Schema.Literals(["fork", "subagent"])),
+  /** "chat" is a fresh conversation under its parent, like an agent's chat under its home. */
+  relationshipToParent: Schema.NullOr(Schema.Literals(["fork", "subagent", "chat"])),
   rootThreadId: ThreadId,
 });
 export type OrchestrationV2AppThreadLineage = typeof OrchestrationV2AppThreadLineage.Type;
@@ -2810,6 +2811,8 @@ export const OrchestrationV2Command = Schema.Union([
     interactionMode: ProviderInteractionMode,
     branch: Schema.NullOr(TrimmedNonEmptyString),
     worktreePath: Schema.NullOr(TrimmedNonEmptyString),
+    /** Starts the thread as a chat under this thread of the same project, with its own context. */
+    parentThreadId: Schema.optional(ThreadId),
     importedNativeThread: Schema.optional(
       Schema.Struct({
         ref: Schema.Struct({
@@ -3183,6 +3186,19 @@ export const OrchestrationV2Command = Schema.Union([
     commandId: CommandId,
     threadId: ThreadId,
     requestId: RuntimeRequestId,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("thread.todo-list.clear"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    planId: PlanId,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("thread.todo-list.set"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    planId: PlanId,
+    steps: Schema.Array(OrchestrationV2PlanStep),
   }),
   Schema.Struct({
     type: Schema.Literal("checkpoint.rollback"),

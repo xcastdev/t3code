@@ -19,6 +19,7 @@ import { ManagedTextResourceId, ManagedTextResourceRevision } from "./managedTex
 import { McpDefinitionId } from "./mcpCatalog.ts";
 import { AssistantId } from "./memoryOwner.ts";
 import { ModelSelection } from "./modelSelection.ts";
+import { ProjectTeamAvatar } from "./projectTeams.ts";
 import { ProviderInteractionMode, RuntimeMode } from "./providerPolicy.ts";
 import { ManagedSkillId, SkillRevisionRef } from "./skills.ts";
 
@@ -69,6 +70,8 @@ export type AssistantMemoryPolicy = typeof AssistantMemoryPolicy.Type;
 
 export const AssistantConfiguration = Schema.Struct({
   name: AssistantName,
+  // Absent shows the name's initials.
+  avatar: Schema.optionalKey(ProjectTeamAvatar),
   rules: AssistantText,
   prompt: AssistantText,
   personality: AssistantText,
@@ -196,6 +199,7 @@ export const AssistantSummary = Schema.Struct({
   environmentId: EnvironmentId,
   assistantId: AssistantId,
   name: AssistantName,
+  avatar: Schema.optionalKey(ProjectTeamAvatar),
   configurationRevision: AssistantConfigurationRevision,
   lifecycle: AssistantReadStatus,
   provisioningState: AssistantReadStatus,

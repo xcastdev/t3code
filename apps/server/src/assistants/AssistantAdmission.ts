@@ -29,7 +29,10 @@ import {
   assistantConfigurationHash,
   assistantMemoryContextHash,
 } from "./AssistantResources.ts";
-import { assistantThreadIsCurrent } from "./AssistantThreadAuthority.ts";
+import {
+  assistantConversationIsCurrent,
+  assistantThreadIsCurrent,
+} from "./AssistantThreadAuthority.ts";
 
 // Only the checked lifecycle service supplies this scope; no wire input carries it.
 export class AssistantLifecycleMutation extends Context.Reference<string>(
@@ -162,6 +165,18 @@ const make = Effect.gen(function* () {
       ...record.detail.summary.binding,
     }).pipe(Effect.provideService(SqlClient.SqlClient, sql));
   });
+  const conversation = Effect.fn("AssistantAdmission.conversation")(function* (
+    record: AssistantRecord,
+    threadId: ThreadId,
+  ) {
+    return (
+      threadId === record.detail.summary.binding.canonicalThreadId ||
+      (yield* assistantConversationIsCurrent({
+        threadId,
+        ...record.detail.summary.binding,
+      }).pipe(Effect.provideService(SqlClient.SqlClient, sql)))
+    );
+  });
   const admitted = (
     record: AssistantRecord,
     input: { threadId: ThreadId; runId?: RunId; runAttemptId?: RunAttemptId },
@@ -265,8 +280,8 @@ const make = Effect.gen(function* () {
       (input.operation === "start" ||
         input.operation === "preparation" ||
         (input.operation === "continue" && !inFlight)) &&
-      input.threadId === record.detail.summary.binding.canonicalThreadId &&
-      Option.isSome(memoryContext)
+      Option.isSome(memoryContext) &&
+      (yield* conversation(record, input.threadId))
     ) {
       const latestMemory = yield* memoryContext.value.context(record);
       if (
@@ -386,15 +401,32 @@ const make = Effect.gen(function* () {
           const isolated =
             event.payload.worktreePath !== null &&
             event.payload.worktreePath !== record.workspaceRoot;
+          const configured = record.detail.configuration.configuration;
+          const chat =
+            input.commandType === "thread.create" &&
+            event.payload.lineage.relationshipToParent === "chat" &&
+            !isolated &&
+            modelSelectionsEqual(event.payload.modelSelection, configured.modelSelection) &&
+            event.payload.runtimeMode === configured.runtimeMode &&
+            event.payload.interactionMode === configured.interactionMode;
           if (
             input.commandType !== "delegated_task.request" &&
-            !(input.commandType === "thread.fork" && isolated)
+            !(input.commandType === "thread.fork" && isolated) &&
+            !chat
           )
             return yield* fail();
         }
-      } else if (event.type === "thread.archived") {
-        return yield* fail();
-      } else if (event.type === "thread.deleted" || event.type === "thread.unarchived") {
+      } else if (
+        event.type === "thread.archived" ||
+        event.type === "thread.deleted" ||
+        event.type === "thread.unarchived"
+      ) {
+        const shell =
+          event.threadId === binding.canonicalThreadId
+            ? null
+            : yield* projections.getThreadShell(event.threadId);
+        if (shell?.lineage.relationshipToParent === "chat") continue;
+        if (event.type === "thread.archived") return yield* fail();
         if (
           (yield* AssistantLifecycleMutation) !== binding.assistantId ||
           event.type !== "thread.unarchived"
@@ -415,9 +447,9 @@ const make = Effect.gen(function* () {
         event.type === "thread.interaction-mode-updated" ||
         event.type === "thread.provider-switched"
       ) {
-        if (event.threadId !== binding.canonicalThreadId) return yield* fail();
-        if (changed.has(binding.assistantId)) continue;
-        changed.add(binding.assistantId);
+        if (!(yield* conversation(record, event.threadId))) return yield* fail();
+        if (changed.has(event.threadId)) continue;
+        changed.add(event.threadId);
         const configured = record.detail.configuration.configuration;
         if (
           ((event.type === "thread.model-selection-updated" ||

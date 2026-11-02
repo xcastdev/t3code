@@ -13,7 +13,9 @@ import {
   type AssistantLifecycleInput,
   type AssistantListInput,
   AssistantProvisioning as AssistantProvisioningSchema,
+  type AssistantConfiguration,
   type AssistantProvisioning,
+  type AssistantSummary,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -23,6 +25,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Environment from "../environment/ServerEnvironment.ts";
+import { assistantConversationIsCurrent } from "./AssistantThreadAuthority.ts";
 
 export class AssistantError extends Schema.TaggedError<AssistantError>()("AssistantError", {
   reason: Schema.Literals(["not-found", "forbidden", "conflict", "unavailable", "needs-repair"]),
@@ -64,6 +67,8 @@ const unavailable = (cause: unknown) =>
 const encodeUnknown = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const fingerprint = (value: unknown) =>
   NodeCrypto.createHash("sha256").update(encodeUnknown(value)).digest("hex");
+const summaryAvatar = ({ avatar }: AssistantConfiguration) => (avatar ? { avatar } : {});
+const withoutAvatar = ({ avatar: _avatar, ...summary }: AssistantSummary) => summary;
 
 export class AssistantRepository extends Context.Service<
   AssistantRepository,
@@ -73,6 +78,9 @@ export class AssistantRepository extends Context.Service<
       projectId: ProjectId,
     ) => Effect.Effect<AssistantRecord | null, AssistantError>;
     readonly findByThread: (
+      threadId: ThreadId,
+    ) => Effect.Effect<AssistantRecord | null, AssistantError>;
+    readonly findByConversation: (
       threadId: ThreadId,
     ) => Effect.Effect<AssistantRecord | null, AssistantError>;
     readonly list: (
@@ -173,6 +181,7 @@ const make = Effect.gen(function* () {
               environmentId: input.environmentId,
               assistantId,
               name: input.configuration.name,
+              ...summaryAvatar(input.configuration),
               configurationRevision: AssistantConfigurationRevision.make(0),
               lifecycle: "active",
               provisioningState: "provisioning",
@@ -233,8 +242,9 @@ const make = Effect.gen(function* () {
             ...record.detail,
             configuration: { ...record.detail.configuration, revision, configuration },
             summary: {
-              ...record.detail.summary,
+              ...withoutAvatar(record.detail.summary),
               name: configuration.name,
+              ...summaryAvatar(configuration),
               configurationRevision: revision,
               lifecycle,
               updatedAt: now,
@@ -323,6 +333,23 @@ const make = Effect.gen(function* () {
     }>`SELECT payload_json FROM t3_workflow_v2_assistants WHERE environment_id=${environmentId} AND thread_id=${threadId}`)[0];
     return row ? yield* decode(row.payload_json) : null;
   }, Effect.mapError(unavailable));
+  const findByConversation = Effect.fn("AssistantRepository.findByConversation")(function* (
+    threadId: ThreadId,
+  ) {
+    const home = yield* findByThread(threadId);
+    if (home !== null) return home;
+    const thread = (yield* sql<{
+      project_id: ProjectId;
+    }>`SELECT project_id FROM orchestration_v2_projection_threads WHERE thread_id=${threadId}`)[0];
+    const record = thread === undefined ? null : yield* findByProject(thread.project_id);
+    if (record === null) return null;
+    return (yield* assistantConversationIsCurrent({
+      threadId,
+      ...record.detail.summary.binding,
+    }).pipe(Effect.provideService(SqlClient.SqlClient, sql)))
+      ? record
+      : null;
+  }, Effect.mapError(unavailable));
   const list = Effect.fn("AssistantRepository.list")(function* (input: AssistantListInput) {
     yield* assertEnvironment(input.environmentId);
     const rows = yield* sql<{
@@ -334,6 +361,7 @@ const make = Effect.gen(function* () {
     get,
     findByProject,
     findByThread,
+    findByConversation,
     list,
     create,
     updateConfiguration: mutate,

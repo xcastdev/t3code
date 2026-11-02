@@ -166,6 +166,8 @@ it.live("runs and recovers real assistant routines without mutating copied sched
         sessionId,
       );
       const taskId = made.taskId;
+      const routineThreadId = (yield* owned.find(taskId))!.threadId;
+      assert.notEqual(routineThreadId, created.summary.binding.canonicalThreadId);
       yield* isolation.assertCopiedUnchanged;
       const fireCommand = CommandId.make("routine-fire-one");
       const threads = yield* ThreadManagementService;
@@ -176,7 +178,7 @@ it.live("runs and recovers real assistant routines without mutating copied sched
         { ...scope, taskId, operation: "run-now", commandId: fireCommand },
         sessionId,
       );
-      assert.equal(launched.threadId, created.summary.binding.canonicalThreadId);
+      assert.equal(launched.threadId, routineThreadId);
       yield* worker.drain();
       const terminals = yield* sink.stream({ afterSequence }).pipe(
         Stream.filter(
@@ -190,9 +192,7 @@ it.live("runs and recovers real assistant routines without mutating copied sched
       const firstFire = (yield* routines.fires({ ...scope, taskId }))[0]!;
       assert.equal(firstFire.status, "completed");
       assert.isNotNull(firstFire.runId);
-      const completed = yield* threads.getThreadProjection(
-        created.summary.binding.canonicalThreadId,
-      );
+      const completed = yield* threads.getThreadProjection(routineThreadId);
       assert.equal(completed.runs.length, 1);
       assert.equal(completed.runs[0]!.status, "completed");
       assert.isTrue(completed.messages.some((message) => message.text === controlledResponse));
@@ -226,7 +226,7 @@ it.live("runs and recovers real assistant routines without mutating copied sched
         { ...scope, taskId, operation: "run-now", commandId: fireCommand },
         sessionId,
       );
-      assert.equal(replay.threadId, created.summary.binding.canonicalThreadId);
+      assert.equal(replay.threadId, routineThreadId);
       assert.equal((yield* routines.fires({ ...scope, taskId })).length, 1);
       assert.equal((yield* transcript.turns).length, 1);
       yield* isolation.assertCopiedUnchanged;
@@ -236,9 +236,7 @@ it.live("runs and recovers real assistant routines without mutating copied sched
         { ...scope, taskId, operation: "run-now", commandId: CommandId.make("routine-fire-two") },
         sessionId,
       );
-      const beforeDisable = yield* threads.getThreadProjection(
-        created.summary.binding.canonicalThreadId,
-      );
+      const beforeDisable = yield* threads.getThreadProjection(routineThreadId);
       const pending = beforeDisable.runs.find((run) => run.id !== firstFire.runId)!;
       assert.isDefined(pending);
       assert.include(["queued", "starting"], pending.status);
@@ -261,7 +259,7 @@ it.live("runs and recovers real assistant routines without mutating copied sched
       const admission = yield* RunAdmission;
       const denied = yield* admission
         .check({
-          threadId: created.summary.binding.canonicalThreadId,
+          threadId: routineThreadId,
           runId: pending.id,
           operation: "start",
           now: DateTime.formatIso(yield* DateTime.now),

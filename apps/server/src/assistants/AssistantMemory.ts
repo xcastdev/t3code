@@ -116,7 +116,8 @@ export const makeAssistantMemorySourceAuthority = Effect.gen(function* () {
     if (
       !row ||
       record.ownerRevision !== input.ownerRevision ||
-      record.detail.summary.binding.canonicalThreadId !== span.threadId
+      (yield* repository.findByConversation(span.threadId))?.detail.summary.assistantId !==
+        record.detail.summary.assistantId
     )
       return yield* new ProjectMemoryError({ reason: "forbidden" });
     const expected = yield* decodeSource(row.source_json);
@@ -259,7 +260,8 @@ const make = Effect.gen(function* () {
         const record = yield* repository.get(evidence);
         if (
           record.ownerRevision !== evidence.ownerRevision ||
-          record.detail.summary.binding.canonicalThreadId !== evidence.threadId ||
+          (yield* repository.findByConversation(evidence.threadId))?.detail.summary.assistantId !==
+            record.detail.summary.assistantId ||
           (!options?.reteach &&
             options?.editedContent === undefined &&
             !record.detail.configuration.configuration.memory.automaticCapture) ||

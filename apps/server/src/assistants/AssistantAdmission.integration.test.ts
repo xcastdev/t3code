@@ -529,6 +529,146 @@ it.live(
     }).pipe(Effect.provide(testLayer)),
 );
 
+it.live(
+  "a chat under Home is admitted as the agent while chats outside its workspace or lineage are refused",
+  () =>
+    Effect.gen(function* () {
+      const { home, binding, workspaceRoot } = yield* setup();
+      const now = yield* DateTime.now;
+      const chatOf = (
+        id: string,
+        parentThreadId: ThreadId,
+        projectId = binding.backingProjectId,
+      ) => ({
+        ...thread(ThreadId.make(id), projectId, now),
+        lineage: {
+          parentThreadId,
+          relationshipToParent: "chat" as const,
+          rootThreadId: home.id,
+        },
+      });
+      const create = (payload: OrchestrationV2AppThread) =>
+        commit(payload.id, payload.id, [
+          {
+            id: EventId.make(`${payload.id}:created`),
+            type: "thread.created",
+            threadId: payload.id,
+            occurredAt: now,
+            payload,
+          },
+        ]).pipe(
+          Effect.map((result) => result.receipt.status),
+          Effect.orElseSucceed(() => "failed" as const),
+        );
+      const ordinary = thread(ThreadId.make("ordinary-parent"), ProjectId.make("ordinary"), now);
+      assert.equal(yield* create(ordinary), "accepted");
+
+      const chat = { ...chatOf("assistant-chat", home.id), worktreePath: workspaceRoot };
+      assert.equal(yield* create(chat), "accepted");
+      const nested = chatOf("assistant-chat-of-chat", chat.id);
+      assert.equal(yield* create(nested), "accepted");
+      for (const refused of [
+        chatOf("chat-under-ordinary", ordinary.id),
+        chatOf("chat-outside-project", home.id, ProjectId.make("ordinary")),
+        { ...chatOf("chat-in-worktree", home.id), worktreePath: `${workspaceRoot}-worktree` },
+        { ...chatOf("chat-with-own-model", home.id), runtimeMode: "full-access" as const },
+      ])
+        assert.notEqual(yield* create(refused), "accepted", refused.id);
+
+      const { run, result } = yield* createRun(chat, "chat-turn");
+      assert.equal(result.receipt.status, "accepted");
+      const admitted = yield* (yield* Admission.RunAdmission).check({
+        threadId: chat.id,
+        runId: run.id,
+        now: DateTime.formatIso(yield* DateTime.now),
+        operation: "preparation",
+      });
+      if (admitted._tag !== "admitted") return yield* Effect.die("Chat was not admitted");
+      assert.equal(admitted.owner.bindingId, binding.assistantId);
+      assert.equal(admitted.owner.threadId, chat.id);
+      assert.include(
+        admitted.owner.configuration.instructionSnapshot!.roleInstructions!,
+        configuration.prompt,
+      );
+
+      const status = (name: string, event: OrchestrationV2DomainEvent, commandType: string) =>
+        commit(name, event.threadId, [event], commandType).pipe(
+          Effect.map((value) => value.receipt.status),
+          Effect.orElseSucceed(() => "failed" as const),
+        );
+      assert.equal(
+        yield* status(
+          "chat-model-sync",
+          {
+            id: EventId.make("chat-model-sync"),
+            type: "thread.model-selection-updated",
+            threadId: chat.id,
+            occurredAt: now,
+            payload: chat,
+          },
+          "thread.model.set",
+        ),
+        "accepted",
+      );
+      assert.notEqual(
+        yield* status(
+          "chat-model-escape",
+          {
+            id: EventId.make("chat-model-escape"),
+            type: "thread.model-selection-updated",
+            threadId: chat.id,
+            occurredAt: now,
+            payload: { ...chat, modelSelection: { ...chat.modelSelection, model: "other" } },
+          },
+          "thread.model.set",
+        ),
+        "accepted",
+      );
+      assert.equal(
+        yield* status(
+          "chat-archive",
+          {
+            id: EventId.make("chat-archive"),
+            type: "thread.archived",
+            threadId: nested.id,
+            occurredAt: now,
+            payload: { ...nested, archivedAt: now },
+          },
+          "thread.archive",
+        ),
+        "accepted",
+      );
+      assert.equal(
+        yield* status(
+          "chat-unarchive",
+          {
+            id: EventId.make("chat-unarchive"),
+            type: "thread.unarchived",
+            threadId: nested.id,
+            occurredAt: now,
+            payload: nested,
+          },
+          "thread.unarchive",
+        ),
+        "accepted",
+      );
+      assert.notEqual(
+        yield* status(
+          "home-archive",
+          {
+            id: EventId.make("home-archive"),
+            type: "thread.archived",
+            threadId: home.id,
+            occurredAt: now,
+            payload: { ...home, archivedAt: now },
+          },
+          "thread.archive",
+        ),
+        "accepted",
+      );
+    }).pipe(Effect.provide(testLayer)),
+);
+
 it.live.each(["configuration", "disable"] as const)(
   "queued assistant start refuses %s drift without creating provider effects",
   (mode) =>

@@ -77,6 +77,8 @@ export interface CreateThreadInput extends CommandMetadata {
   readonly interactionMode: ProviderInteractionMode;
   readonly branch: string | null;
   readonly worktreePath: string | null;
+  /** Starts the thread as a chat under this thread, like an agent's chat under its home. */
+  readonly parentThreadId?: ThreadId;
 }
 
 export interface ThreadCommandInput extends CommandMetadata {
@@ -201,6 +203,10 @@ export interface RespondToThreadUserInputInput extends ThreadCommandInput {
 
 export interface DismissThreadUserInputInput extends ThreadCommandInput {
   readonly requestId: RuntimeRequestId;
+}
+
+export interface ClearThreadTodoListInput extends ThreadCommandInput {
+  readonly planId: PlanId;
 }
 
 export interface RevertThreadCheckpointInput extends ThreadCommandInput {
@@ -404,6 +410,7 @@ export const createThread = Effect.fn("EnvironmentCommands.createThread")(functi
     interactionMode: input.interactionMode,
     branch: input.branch,
     worktreePath: input.worktreePath,
+    ...(input.parentThreadId === undefined ? {} : { parentThreadId: input.parentThreadId }),
   });
 });
 
@@ -952,6 +959,17 @@ export const dismissThreadUserInput = Effect.fn("EnvironmentCommands.dismissThre
     });
   },
 );
+
+export const clearThreadTodoList = Effect.fn("EnvironmentCommands.clearThreadTodoList")(function* (
+  input: ClearThreadTodoListInput,
+) {
+  return yield* dispatch({
+    type: "thread.todo-list.clear",
+    commandId: yield* allocateCommandId(input),
+    threadId: input.threadId,
+    planId: input.planId,
+  });
+});
 
 export const revertThreadCheckpoint = Effect.fn("EnvironmentCommands.revertThreadCheckpoint")(
   function* (input: RevertThreadCheckpointInput) {

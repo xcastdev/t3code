@@ -44,7 +44,7 @@ import {
 } from "./MessagesTimeline.logic";
 import { cn } from "~/lib/utils";
 import { formatUpcomingTimestamp } from "../../timestampFormat";
-import { FetchedToolOutput, V2ItemInspector } from "./V2ItemInspector";
+import { FetchedToolDetail, ToolPaths, V2ItemInspector } from "./V2ItemInspector";
 import { SubagentNotificationLink } from "./V2LifecycleRow";
 import {
   TimelineRowCtx,
@@ -291,12 +291,19 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
     payload?.type === "dynamic_tool"
       ? claudeSkillInvocation(payload.toolName, payload.input)
       : undefined;
-  const plainOutput =
-    toolGroupAction(workEntry) === "read"
-      ? workEntryReadOutput(workEntry, workspaceRoot)
-      : skill
-        ? (skill.args ?? null)
-        : undefined;
+  const isRead = toolGroupAction(workEntry) === "read";
+  const plainOutput = isRead
+    ? workEntryReadOutput(workEntry, workspaceRoot)
+    : skill
+      ? (skill.args ?? null)
+      : undefined;
+  const readPaths = isRead && plainOutput ? plainOutput.split("\n") : [];
+  const plainInput =
+    readPaths.length > 0 ? (
+      <ToolPaths paths={readPaths} />
+    ) : plainOutput ? (
+      <div className="whitespace-pre-wrap break-words">{plainOutput}</div>
+    ) : null;
   const viewedImage =
     viewedImagePath && threadRef
       ? resolveViewedImageAsset(viewedImagePath, {
@@ -536,21 +543,18 @@ function WorkEntryLogRow(props: WorkEntryRowProps) {
               onImageExpand={ctx.onImageExpand}
               source={ctx.turnItemSource}
             />
-          ) : (
-            <>
-              {expandedBody ? (
-                <pre className={toolCallExpandedBodyClassName}>{expandedBody}</pre>
-              ) : null}
-              {plainOutputFetches && workEntry.projectedItem ? (
-                <FetchedToolOutput
-                  projectedItem={workEntry.projectedItem}
-                  environmentId={ctx.activeThreadEnvironmentId}
-                  onImageExpand={onImageExpand}
-                  source={ctx.turnItemSource}
-                />
-              ) : null}
-            </>
-          )}
+          ) : plainOutputFetches && workEntry.projectedItem ? (
+            <FetchedToolDetail
+              projectedItem={workEntry.projectedItem}
+              environmentId={ctx.activeThreadEnvironmentId}
+              input={plainInput}
+              codePath={readPaths[0]}
+              onImageExpand={onImageExpand}
+              source={ctx.turnItemSource}
+            />
+          ) : expandedBody ? (
+            <pre className={toolCallExpandedBodyClassName}>{expandedBody}</pre>
+          ) : null}
         </WorkLogDetails>
       ) : null}
     </WorkLogRow>

@@ -8,6 +8,7 @@ import {
 import { describe, expect, it, vi } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
 
+import "~/index.css";
 import { render } from "../../../test/render";
 import { CreateAgentDialog } from "./CreateAgentDialog";
 
@@ -70,5 +71,29 @@ describe("CreateAgentDialog", () => {
 
     await expect.element(page.getByRole("button", { name: /Fixture model/ })).toBeVisible();
     await expect.element(create).toBeEnabled();
+  });
+
+  it("creates the agent with its face and personality, or its initials once chosen", async () => {
+    writer.run.mockReset();
+    writer.run.mockResolvedValue(null);
+    await using screen = await render(
+      <CreateAgentDialog environmentId={EnvironmentId.make("local")} onClose={() => {}} />,
+    );
+    await userEvent.type(screen.getByLabelText("Name"), "Helper");
+    await userEvent.type(screen.getByLabelText("Personality"), "Dry and brief.");
+    await userEvent.click(page.getByRole("button", { name: "Curious", exact: true }));
+    await userEvent.click(page.getByRole("button", { name: "Choose a model" }));
+    await userEvent.click(page.getByText("Fixture model"));
+    await userEvent.keyboard("{Escape}");
+    await userEvent.click(page.getByRole("button", { name: "Create agent" }));
+    expect(writer.run.mock.lastCall?.[2].configuration).toMatchObject({
+      name: "Helper",
+      personality: "Dry and brief.",
+      avatar: { kind: "generated", expression: "curious" },
+    });
+
+    await userEvent.click(page.getByRole("button", { name: "Initials", exact: true }));
+    await userEvent.click(page.getByRole("button", { name: "Create agent" }));
+    expect(writer.run.mock.lastCall?.[2].configuration).not.toHaveProperty("avatar");
   });
 });

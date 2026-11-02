@@ -136,7 +136,7 @@ import {
   McpCatalogOAuthDisconnectInput,
 } from "./mcpCatalog.ts";
 import { ProjectMcpOAuthBeginResult } from "./projectMcp.ts";
-import { ProjectIssueRequest } from "./projectIssueIntake.ts";
+import { ProjectIssueFailureReason, ProjectIssueRequest } from "./projectIssueIntake.ts";
 import {
   ProjectWorkReadIntent,
   ProjectWorkWriteIntent,
@@ -275,6 +275,8 @@ import {
   GitMutateIndexInput,
   GitCommitStagedInput,
   GitCommitStagedResult,
+  GitGenerateStagedCommitMessageInput,
+  GitGenerateStagedCommitMessageResult,
   GitHistoryInput,
   GitHistoryResult,
   GitHistoryDiffInput,
@@ -545,6 +547,7 @@ export class ProjectWorkRpcError extends Schema.TaggedError<ProjectWorkRpcError>
   {
     operation: Schema.Literals(["read", "write", "subscribe"]),
     reason: Schema.Literals(["unavailable", "invalid-request", "forbidden", "rejected"]),
+    issueReason: Schema.optionalKey(ProjectIssueFailureReason),
   },
 ) {
   override get message(): string {
@@ -647,6 +650,7 @@ export const WS_METHODS = {
   gitIndexStatus: "git.indexStatus",
   gitMutateIndex: "git.mutateIndex",
   gitCommitStaged: "git.commitStaged",
+  gitGenerateStagedCommitMessage: "git.generateStagedCommitMessage",
   gitHistory: "git.history",
   gitHistoryDiff: "git.historyDiff",
   gitRunStackedAction: "git.runStackedAction",
@@ -1675,6 +1679,12 @@ const WsGitCommitStagedRpc = Rpc.make(WS_METHODS.gitCommitStaged, {
   payload: GitCommitStagedInput,
   success: GitCommitStagedResult,
   error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+const WsGitGenerateStagedCommitMessageRpc = Rpc.make(WS_METHODS.gitGenerateStagedCommitMessage, {
+  payload: GitGenerateStagedCommitMessageInput,
+  success: GitGenerateStagedCommitMessageResult,
+  error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
 });
 
 const WsGitHistoryRpc = Rpc.make(WS_METHODS.gitHistory, {
@@ -2856,6 +2866,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsGitIndexStatusRpc,
   WsGitMutateIndexRpc,
   WsGitCommitStagedRpc,
+  WsGitGenerateStagedCommitMessageRpc,
   WsGitHistoryRpc,
   WsGitHistoryDiffRpc,
   WsGitRunStackedActionRpc,

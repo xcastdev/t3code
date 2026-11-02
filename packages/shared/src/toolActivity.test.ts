@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { classifyToolActivity, dynamicToolSurface, mergeToolActivityData } from "./toolActivity.ts";
+import {
+  classifyToolActivity,
+  dynamicToolSurface,
+  dynamicToolTitle,
+  mergeToolActivityData,
+} from "./toolActivity.ts";
 
 describe("toolActivity", () => {
   it("classifies from kind and toolName without sniffing titles", () => {
@@ -44,5 +49,15 @@ describe("toolActivity", () => {
       expect(dynamicToolSurface(name, { code: "await fs.readFile(path);" })).toBeUndefined();
     }
     expect(dynamicToolSurface("github.js", { code: "await sky.click(app);" })).toBeUndefined();
+  });
+});
+
+describe("dynamicToolTitle", () => {
+  it("names every provider's checklist tool the same way", () => {
+    expect(dynamicToolTitle("TodoWrite", {})).toBe("Updated checklist");
+    expect(dynamicToolTitle("todowrite", {})).toBe("Updated checklist");
+    expect(dynamicToolTitle("update_plan", {})).toBe("Updated checklist");
+    expect(dynamicToolTitle("todoread", {})).toBe("Read checklist");
+    expect(dynamicToolTitle("Read", {})).toBeUndefined();
   });
 });

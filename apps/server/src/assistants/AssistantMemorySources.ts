@@ -49,7 +49,7 @@ const make = Effect.gen(function* () {
     messageId: MessageId;
     runId: RunId;
   }) {
-    const owner = yield* repository.findByThread(input.threadId);
+    const owner = yield* repository.findByConversation(input.threadId);
     if (
       owner === null ||
       owner.workspaceRoot === null ||
@@ -137,7 +137,7 @@ const make = Effect.gen(function* () {
       thread_id: ThreadId;
       message_id: MessageId;
       run_id: RunId;
-    }>`SELECT m.thread_id,m.message_id,m.run_id FROM orchestration_v2_projection_messages m JOIN t3_workflow_v2_assistants a ON a.thread_id=m.thread_id WHERE a.environment_id=${environmentId} AND m.message_id>${input.after ?? ""} AND m.run_id IS NOT NULL AND m.role='user' AND m.streaming=0 ORDER BY m.message_id LIMIT ${input.limit}`;
+    }>`SELECT m.thread_id,m.message_id,m.run_id FROM orchestration_v2_projection_messages m JOIN orchestration_v2_projection_threads t ON t.thread_id=m.thread_id JOIN t3_workflow_v2_assistants a ON a.project_id=t.project_id AND (a.thread_id=t.thread_id OR json_extract(t.payload_json,'$.lineage.relationshipToParent')='chat') WHERE a.environment_id=${environmentId} AND m.message_id>${input.after ?? ""} AND m.run_id IS NOT NULL AND m.role='user' AND m.streaming=0 ORDER BY m.message_id LIMIT ${input.limit}`;
     const items: AssistantMemoryEvidence[] = [];
     for (const row of rows) {
       const resolved = yield* resolve({

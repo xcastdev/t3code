@@ -5,12 +5,14 @@ import { userEvent } from "vite-plus/test/browser";
 import "~/index.css";
 import { render } from "../../../test/render";
 import { WorkAvatarEditor } from "./WorkAvatarEditor";
+import { memberAvatarIdentity } from "./workTeamView";
 
 function Editor({ initial = null }: { initial?: ProjectTeamAvatar | null }) {
   const [avatar, setAvatar] = useState(initial);
   return (
     <WorkAvatarEditor
-      role="implementer"
+      identity={memberAvatarIdentity("implementer", "Otto")}
+      preset={PROJECT_TEAM_PRESETS.implementer.avatar}
       name="Otto"
       avatar={avatar}
       recorded={initial}

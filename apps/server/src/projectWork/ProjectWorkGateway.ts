@@ -189,15 +189,18 @@ const make = Effect.gen(function* () {
               ? bindings.detach(input.input, human).pipe(Effect.as({ status: "detached" as const }))
               : sync.readOnce(input.input, human);
     return yield* operation.pipe(
-      Effect.mapError((error) =>
-        failure(
-          "write",
-          error.reason === "human-required"
-            ? "forbidden"
-            : error.reason === "unavailable" || error.reason === "storage"
-              ? "unavailable"
-              : "rejected",
-        ),
+      Effect.mapError(
+        (error) =>
+          new ProjectWorkRpcError({
+            operation: "write",
+            reason:
+              error.reason === "human-required"
+                ? "forbidden"
+                : error.reason === "unavailable" || error.reason === "storage"
+                  ? "unavailable"
+                  : "rejected",
+            issueReason: error.reason,
+          }),
       ),
     );
   });

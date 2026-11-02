@@ -87,6 +87,7 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.projectCloneRetry]: AuthSourceControlWriteScope,
   [WS_METHODS.gitMutateIndex]: AuthSourceControlWriteScope,
   [WS_METHODS.gitCommitStaged]: AuthSourceControlWriteScope,
+  [WS_METHODS.gitGenerateStagedCommitMessage]: AuthSourceControlWriteScope,
   [WS_METHODS.vcsPull]: AuthSourceControlWriteScope,
   [WS_METHODS.gitRunStackedAction]: AuthSourceControlWriteScope,
   [WS_METHODS.gitPreparePullRequestThread]: AuthSourceControlWriteScope,

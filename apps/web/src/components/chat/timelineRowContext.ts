@@ -88,6 +88,15 @@ export interface TimelineRowSharedState {
   onWorktreeSetupWorkLocally: (() => void) | null;
   onOpenWorktreeSetupTerminal: ((terminalId: string) => void) | null;
   workGroupViewState: WorkGroupViewState;
+  /** Checklist progress by the run that last updated it, for the turn report. */
+  turnChecklists: ReadonlyMap<RunId, TurnChecklistProgress>;
+  /** Background work the agent left running, which the latest turn's report mentions. */
+  backgroundWorkRunning: number;
+}
+
+export interface TurnChecklistProgress {
+  readonly done: number;
+  readonly total: number;
 }
 
 export interface TimelineRowActivityState {

@@ -29,7 +29,7 @@ import {
   isOrchestrationV2WorkActive,
   isProviderNativeSubagentThread,
   MessageId,
-  type NodeId,
+  NodeId,
   type ModelSelection,
   OrchestrationV2Command,
   type OrchestrationV2InternalCommand,
@@ -527,6 +527,8 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "runtime-request.respond":
     case "runtime-request.delivery.fail":
     case "thread.user-input.dismiss":
+    case "thread.todo-list.clear":
+    case "thread.todo-list.set":
     case "checkpoint.rollback":
     case "checkpoint.rollback.fail":
     case "thread.background-work.settle":
@@ -2568,6 +2570,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
     }
 
+    const parent =
+      command.parentThreadId === undefined
+        ? null
+        : yield* projectionStore.getThread(command.parentThreadId).pipe(
+            Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.succeed(null) }),
+            Effect.mapError(
+              (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+            ),
+          );
+    if (
+      command.parentThreadId !== undefined &&
+      (parent === null || parent.deletedAt !== null || parent.projectId !== command.projectId)
+    ) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "A chat's parent must be a thread in the same project.",
+      });
+    }
+
     const now = yield* DateTime.now;
     const emitEvent = emit(events, command);
     const thread: OrchestrationV2AppThread = {
@@ -2584,11 +2606,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       worktreePath: command.worktreePath,
       activeProviderThreadId: null,
       pullRequests: [],
-      lineage: {
-        parentThreadId: null,
-        relationshipToParent: null,
-        rootThreadId: command.threadId,
-      },
+      lineage:
+        parent === null
+          ? { parentThreadId: null, relationshipToParent: null, rootThreadId: command.threadId }
+          : {
+              parentThreadId: parent.id,
+              relationshipToParent: "chat",
+              rootThreadId: parent.lineage.rootThreadId,
+            },
       forkedFrom: null,
       createdAt: now,
       updatedAt: now,
@@ -8408,6 +8433,84 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     },
   );
 
+  // An emptied list, not a superseded one, so an older run's list can't resurface as the latest.
+  const dispatchThreadTodoListClear = Effect.fn("Orchestrator.dispatchThreadTodoListClear")(
+    function* (
+      command: Extract<OrchestrationV2Command, { readonly type: "thread.todo-list.clear" }>,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    ) {
+      const plan = yield* projectionStore
+        .getPlan(command.threadId, command.planId)
+        .pipe(
+          Effect.mapError(() => new OrchestratorProjectionError({ threadId: command.threadId })),
+        );
+      if (plan === undefined || plan.kind !== "todo_list" || plan.status === "superseded") {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "This task list was already replaced.",
+        });
+      }
+      if (plan.steps.length === 0) return;
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "plan.updated",
+        threadId: plan.threadId,
+        ...(plan.runId === null ? {} : { runId: plan.runId }),
+        nodeId: plan.nodeId,
+        occurredAt: yield* DateTime.now,
+        payload: { ...plan, steps: [], status: "completed" },
+      });
+    },
+  );
+
+  // T3's own checklist for harnesses without one. It joins the newest run so it reads as current.
+  const dispatchThreadTodoListSet = Effect.fn("Orchestrator.dispatchThreadTodoListSet")(function* (
+    command: Extract<OrchestrationV2Command, { readonly type: "thread.todo-list.set" }>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) {
+    const projection = yield* projectionStore
+      .getThreadRecords(command.threadId, ["runs"])
+      .pipe(Effect.mapError(() => new OrchestratorProjectionError({ threadId: command.threadId })));
+    const run = projection.runs.reduce<(typeof projection.runs)[number] | undefined>(
+      (latest, candidate) =>
+        candidate.status === "queued" ||
+        (latest !== undefined && latest.ordinal > candidate.ordinal)
+          ? latest
+          : candidate,
+      undefined,
+    );
+    if (run === undefined) {
+      return yield* new OrchestratorDispatchError({
+        commandId: command.commandId,
+        commandType: command.type,
+        cause: "A checklist needs a turn in this thread first.",
+      });
+    }
+    const nodeId = run.rootNodeId ?? NodeId.make(`checklist:${run.id}`);
+    yield* emit(
+      events,
+      command,
+    )({
+      type: "plan.updated",
+      threadId: command.threadId,
+      runId: run.id,
+      nodeId,
+      occurredAt: yield* DateTime.now,
+      payload: {
+        id: command.planId,
+        threadId: command.threadId,
+        runId: run.id,
+        nodeId,
+        kind: "todo_list",
+        status: command.steps.length === 0 ? "completed" : "active",
+        steps: command.steps,
+      },
+    });
+  });
+
   const dispatchQueuedMessagePromoteToSteer = Effect.fn(
     "Orchestrator.dispatchQueuedMessagePromoteToSteer",
   )(function* (
@@ -12096,6 +12199,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       case "thread.user-input.dismiss":
         yield* dispatchThreadUserInputDismiss(command, events, effects);
+        break;
+      case "thread.todo-list.clear":
+        yield* dispatchThreadTodoListClear(command, events);
+        break;
+      case "thread.todo-list.set":
+        yield* dispatchThreadTodoListSet(command, events);
         break;
       case "subagent.stop":
         yield* dispatchSubagentStop(command, events, effects);

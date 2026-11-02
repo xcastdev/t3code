@@ -136,6 +136,12 @@ export async function reopenClosedView(
     case "pull-request":
       panels.openPullRequest(ref, surface);
       break;
+    case "work":
+      panels.openWork(ref, surface.view);
+      break;
+    case "work-task":
+      panels.openWorkTask(ref, surface.taskId, surface.title);
+      break;
     default:
       panels.open(ref, surface.kind);
   }

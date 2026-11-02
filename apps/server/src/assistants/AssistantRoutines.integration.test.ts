@@ -312,26 +312,38 @@ const createRoutine = Effect.fn("AssistantRoutinesIntegration.createRoutine")(fu
     schedule: { type: "interval", everyMs: 60_000 },
   });
   assert.isNotNull(routine.task);
-  return { ...fixture, routines, scope, routine, taskId: routine.binding.taskId };
+  const chat = yield* (yield* Projections.ProjectionStoreV2).getThreadShell(
+    routine.binding.threadId,
+  );
+  if (chat === null) throw new Error("A new routine must open its own chat.");
+  return { ...fixture, routines, scope, routine, chat, taskId: routine.binding.taskId };
 });
 
-it.live("scheduler dispatches one canonical V2 routine run and retains late failure", () =>
+it.live("a new routine runs once in its own chat under Home and retains late failure", () =>
   Effect.gen(function* () {
-    const { routines, scope, taskId, home } = yield* createRoutine();
+    const { routines, scope, taskId, home, chat } = yield* createRoutine();
+    assert.notEqual(chat.id, home.id);
+    assert.deepStrictEqual(chat.lineage, {
+      parentThreadId: home.id,
+      relationshipToParent: "chat",
+      rootThreadId: home.id,
+    });
+    assert.equal(chat.title, "Daily check");
     const input = { ...scope, taskId, commandId: CommandId.make("manual-fire") };
-    assert.equal((yield* routines.runNow(input)).threadId, home.id);
+    assert.equal((yield* routines.runNow(input)).threadId, chat.id);
     const projection = yield* Projections.ProjectionStoreV2;
-    const before = yield* projection.getThreadRecords(home.id, ["runs"]);
+    assert.deepStrictEqual((yield* projection.getThreadRecords(home.id, ["runs"])).runs, []);
+    const before = yield* projection.getThreadRecords(chat.id, ["runs"]);
     assert.isDefined(before);
     const fires = yield* routines.fires({ ...scope, taskId });
     assert.equal(fires.length, 1);
     assert.isNotNull(fires[0]!.runId);
-    assert.equal((yield* routines.runNow(input)).threadId, home.id);
+    assert.equal((yield* routines.runNow(input)).threadId, chat.id);
     assert.equal((yield* routines.fires({ ...scope, taskId })).length, 1);
     const sql = yield* SqlClient.SqlClient;
     const counts = yield* sql<{
       count: number;
-    }>`SELECT count(*) AS count FROM orchestration_v2_projection_runs WHERE thread_id=${home.id}`;
+    }>`SELECT count(*) AS count FROM orchestration_v2_projection_runs WHERE thread_id=${chat.id}`;
     assert.equal(counts[0]!.count, 1);
     const runId = fires[0]!.runId;
     if (runId === null) throw new Error("Accepted fire must retain its actual V2 run.");
@@ -341,12 +353,12 @@ it.live("scheduler dispatches one canonical V2 routine run and retains late fail
     assert.equal(
       (yield* commit(
         "native-failure",
-        home.id,
+        chat.id,
         [
           {
             id: EventId.make("native-failure"),
             type: "run.updated",
-            threadId: home.id,
+            threadId: chat.id,
             runId,
             occurredAt: now,
             payload: { ...run, status: "failed", completedAt: now },
@@ -364,15 +376,85 @@ it.live("scheduler dispatches one canonical V2 routine run and retains late fail
   }).pipe(Effect.provide(workflow)),
 );
 
+it.live("a routine already bound to Home keeps running and editing there", () =>
+  Effect.gen(function* () {
+    const { routines, scope, taskId, home, routine } = yield* createRoutine();
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`UPDATE scheduled_tasks SET thread_id=${home.id} WHERE task_id=${taskId}`;
+    yield* sql`UPDATE t3_workflow_v2_assistant_routines SET thread_id=${home.id} WHERE task_id=${taskId}`;
+    const edited = yield* routines.upsert({
+      ...scope,
+      commandId: CommandId.make("edit-home-routine"),
+      taskId,
+      expectedRevision: routine.binding.revision,
+      title: "Daily check, renamed",
+      prompt: "Check progress",
+      enabled: true,
+      schedule: { type: "interval", everyMs: 60_000 },
+    });
+    assert.equal(edited.binding.threadId, home.id);
+    assert.equal(edited.task!.threadId, home.id);
+    assert.equal(
+      (yield* routines.runNow({ ...scope, taskId, commandId: CommandId.make("home-fire") }))
+        .threadId,
+      home.id,
+    );
+    const fires = yield* routines.fires({ ...scope, taskId });
+    assert.equal(fires.length, 1);
+    assert.equal(fires[0]!.threadId, home.id);
+    assert.isNotNull(fires[0]!.runId);
+  }).pipe(Effect.provide(workflow)),
+);
+
+it.live("a configuration change follows the agent into its chats so they stay runnable", () =>
+  Effect.gen(function* () {
+    const { routines, scope, taskId, chat, record } = yield* createRoutine();
+    const sessionId = AuthSessionId.make("configuration-owner");
+    yield* (yield* AuthSessions.AuthSessionRepository).create({
+      sessionId,
+      subject: "maintainer",
+      scopes: [AuthOrchestrationOperateScope],
+      method: "browser-session-cookie",
+      issuedAt: yield* DateTime.now,
+      expiresAt: DateTime.makeUnsafe("2100-01-01T00:00:00Z"),
+      client: {
+        label: null,
+        ipAddress: null,
+        userAgent: null,
+        deviceType: "unknown",
+        os: null,
+        browser: null,
+      },
+    });
+    yield* (yield* AssistantRuntime.AssistantRuntime).updateConfiguration(
+      {
+        ...scope,
+        commandId: CommandId.make("revise-runtime"),
+        expectedRevision: record.detail.configuration.revision,
+        configuration: { ...configuration, runtimeMode: "full-access" },
+      },
+      sessionId,
+    );
+    const synced = yield* (yield* Projections.ProjectionStoreV2).getThreadShell(chat.id);
+    assert.equal(synced!.runtimeMode, "full-access");
+    assert.equal(
+      (yield* routines.runNow({ ...scope, taskId, commandId: CommandId.make("after-revise") }))
+        .threadId,
+      chat.id,
+    );
+    assert.isNotNull((yield* routines.fires({ ...scope, taskId }))[0]!.runId);
+  }).pipe(Effect.provide(workflow)),
+);
+
 it.live.each(["disable", "archive"] as const)(
-  "%s suspends a queued routine without stopping the active canonical turn",
+  "%s suspends a queued routine without stopping the active turn in its chat",
   (action) =>
     Effect.gen(function* () {
-      const { routines, scope, taskId, home, record } = yield* createRoutine();
+      const { routines, scope, taskId, chat, record } = yield* createRoutine();
       const threads = yield* Threads.ThreadManagementService;
       yield* threads.sendToThread({
-        projectId: home.projectId,
-        threadId: home.id,
+        projectId: chat.projectId,
+        threadId: chat.id,
         commandId: CommandId.make("human-send"),
         messageId: MessageId.make("human-message"),
         text: "Keep working until I stop you",
@@ -382,7 +464,7 @@ it.live.each(["disable", "archive"] as const)(
         creationSource: "web",
       });
       const projection = yield* Projections.ProjectionStoreV2;
-      const initial = (yield* projection.getThreadRecords(home.id, ["runs"])).runs[0];
+      const initial = (yield* projection.getThreadRecords(chat.id, ["runs"])).runs[0];
       if (!initial || initial.activeAttemptId === null)
         throw new Error("Human dispatch must allocate an actual attempt.");
       const now = yield* DateTime.now;
@@ -390,12 +472,12 @@ it.live.each(["disable", "archive"] as const)(
       assert.equal(
         (yield* commit(
           "active-native",
-          home.id,
+          chat.id,
           [
             {
               id: EventId.make("active-native"),
               type: "run.updated",
-              threadId: home.id,
+              threadId: chat.id,
               runId: active.id,
               occurredAt: now,
               payload: active,
@@ -406,7 +488,7 @@ it.live.each(["disable", "archive"] as const)(
         "accepted",
       );
       yield* routines.runNow({ ...scope, taskId, commandId: CommandId.make("queued-fire") });
-      const facts = yield* projection.getThreadRecords(home.id, ["runs", "messages"]);
+      const facts = yield* projection.getThreadRecords(chat.id, ["runs", "messages"]);
       assert.equal(facts.runs.length, 2);
       assert.equal(facts.runs[0]!.id, active.id);
       const queued = facts.runs[1]!;
@@ -419,7 +501,7 @@ it.live.each(["disable", "archive"] as const)(
       const snapshots = yield* sql<{
         configuration_revision: number;
         configuration_json: string;
-      }>`SELECT configuration_revision,configuration_json FROM t3_workflow_v2_assistant_admissions WHERE thread_id=${home.id} ORDER BY created_at,run_id`;
+      }>`SELECT configuration_revision,configuration_json FROM t3_workflow_v2_assistant_admissions WHERE thread_id=${chat.id} ORDER BY created_at,run_id`;
       assert.equal(snapshots.length, 2);
       for (const row of snapshots) {
         const captured = yield* decodeAdmission(row.configuration_json);
@@ -466,7 +548,7 @@ it.live.each(["disable", "archive"] as const)(
       const admission = yield* Admission.RunAdmission;
       const blocked = yield* admission
         .check({
-          threadId: home.id,
+          threadId: chat.id,
           runId: queued.id,
           operation: "start",
           now: DateTime.formatIso(now),
@@ -476,12 +558,12 @@ it.live.each(["disable", "archive"] as const)(
       else assert.instanceOf(blocked.failure, Admission.RunAdmissionError);
       const promotion = yield* commit(
         "queued-after-lifecycle",
-        home.id,
+        chat.id,
         [
           {
             id: EventId.make("queued-after-lifecycle"),
             type: "run.updated",
-            threadId: home.id,
+            threadId: chat.id,
             runId: queued.id,
             occurredAt: now,
             payload: { ...queued, status: "starting", startedAt: now },
@@ -492,14 +574,14 @@ it.live.each(["disable", "archive"] as const)(
       if (promotion._tag === "Success") assert.equal(promotion.success.receipt.status, "rejected");
       else assert.instanceOf(promotion.failure, EventSink.EventSinkWriteError);
       assert.equal(
-        (yield* projection.getThreadRecords(home.id, ["runs"])).runs.find(
+        (yield* projection.getThreadRecords(chat.id, ["runs"])).runs.find(
           (run) => run.id === queued.id,
         )!.status,
         "queued",
       );
       assert.deepStrictEqual(
         yield* admission.observeNativeTurn({
-          threadId: home.id,
+          threadId: chat.id,
           runId: active.id,
           runAttemptId: initial.activeAttemptId,
           now: DateTime.formatIso(now),
@@ -508,7 +590,7 @@ it.live.each(["disable", "archive"] as const)(
         { stop: false, cancelControlIds: [] },
       );
       assert.equal(
-        (yield* projection.getThreadRecords(home.id, ["runs"])).runs.find(
+        (yield* projection.getThreadRecords(chat.id, ["runs"])).runs.find(
           (run) => run.id === active.id,
         )!.status,
         "running",
@@ -523,7 +605,7 @@ it.live.each(["disable", "archive"] as const)(
         yield* sql<{
           configuration_revision: number;
           configuration_json: string;
-        }>`SELECT configuration_revision,configuration_json FROM t3_workflow_v2_assistant_admissions WHERE thread_id=${home.id} ORDER BY created_at,run_id`,
+        }>`SELECT configuration_revision,configuration_json FROM t3_workflow_v2_assistant_admissions WHERE thread_id=${chat.id} ORDER BY created_at,run_id`,
         snapshots,
       );
     }).pipe(Effect.provide(workflow)),
@@ -533,7 +615,7 @@ it.live(
   "fresh scheduler recovers committed V2 acceptance while the old dispatch ACK is withheld",
   () =>
     Effect.gen(function* () {
-      const { routines, scope, taskId, home } = yield* createRoutine();
+      const { routines, scope, taskId, chat } = yield* createRoutine();
       const threads = yield* Threads.ThreadManagementService;
       const accepted = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
@@ -563,7 +645,7 @@ it.live(
         (yield* scheduler
           .runNow({ id: taskId, commandId: input.commandId })
           .pipe(Effect.provideService(AssistantRoutineMutation, { scope, taskId }))).threadId,
-        home.id,
+        chat.id,
       );
       assert.equal(spy.mock.calls.length, 1);
       assert.equal((yield* routines.fires({ ...scope, taskId }))[0]!.runId, originalFire.runId);
@@ -571,7 +653,7 @@ it.live(
       yield* Fiber.join(pending);
       assert.equal((yield* scheduler.get({ id: taskId }))!.runCount, 1);
       assert.equal(
-        (yield* (yield* Projections.ProjectionStoreV2).getThreadRecords(home.id, ["runs"])).runs
+        (yield* (yield* Projections.ProjectionStoreV2).getThreadRecords(chat.id, ["runs"])).runs
           .length,
         1,
       );
@@ -1106,7 +1188,7 @@ it.live.each(["acknowledgment-write", "postcommit-callback"] as const)(
   "accepted assistant webhook keeps its replay claim after %s failure",
   (fault) =>
     Effect.gen(function* () {
-      const { binding, home } = yield* setup();
+      const { binding } = yield* setup();
       const scope = { environmentId, assistantId: binding.assistantId };
       const routines = yield* Routines.AssistantRoutines;
       const routine = yield* routines.upsert({
@@ -1190,8 +1272,9 @@ it.live.each(["acknowledgment-write", "postcommit-callback"] as const)(
         keys,
       );
       assert.equal(
-        (yield* (yield* Projections.ProjectionStoreV2).getThreadRecords(home.id, ["runs"])).runs
-          .length,
+        (yield* (yield* Projections.ProjectionStoreV2).getThreadRecords(routine.binding.threadId, [
+          "runs",
+        ])).runs.length,
         1,
       );
       const delivery = (yield* scheduler.getWebhookDelivery({

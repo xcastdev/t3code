@@ -317,17 +317,6 @@ export function useChatTerminalActions(input: ChatTerminalActionsInput) {
     );
   };
   const runShellCommandStable = useStableCallback(runShellCommand);
-  const addTerminalSurface = () => {
-    if (!activeThreadRef) return;
-    const launched = terminalActions.launchTerminal({
-      place: (terminalId) =>
-        useRightPanelStore.getState().openTerminal(activeThreadRef, terminalId),
-    });
-    if (!launched) return;
-    focusTerminal(activeThreadRef, launched.terminalId);
-    void launched.result;
-  };
-  const addTerminalSurfaceStable = useStableCallback(addTerminalSurface);
   const splitPanelTerminal = (direction: "horizontal" | "vertical" = "horizontal") => {
     if (
       !activeThreadRef ||
@@ -400,6 +389,12 @@ export function useChatTerminalActions(input: ChatTerminalActionsInput) {
   const openTerminalIfClosed = () => {
     if (!terminalUiState.terminalOpen) setTerminalOpen(true);
   };
+  // The right panel no longer hosts new terminals; restored panel terminal tabs add theirs to the drawer.
+  const addDrawerTerminal = () => {
+    openTerminalIfClosed();
+    createNewTerminal();
+  };
+  const addDrawerTerminalStable = useStableCallback(addDrawerTerminal);
   // A focused right-panel terminal takes the split/new/close chords; otherwise they act on the drawer.
   const shortcuts = {
     "terminal.toggle": () => {
@@ -431,18 +426,16 @@ export function useChatTerminalActions(input: ChatTerminalActionsInput) {
       }
       if (terminalUiState.terminalOpen) requestCloseTerminal(terminalUiState.activeTerminalId);
     },
-    "terminal.new": ({ terminalFocusOwner }) => {
+    "terminal.new": () => {
       if (!hasTerminalWriteAccess()) return false;
-      if (terminalFocusOwner === "right-panel") return void addTerminalSurface();
-      openTerminalIfClosed();
-      createNewTerminal();
+      addDrawerTerminal();
     },
   } satisfies ChatShortcutCommands;
   return {
     shortcuts,
     activatePanelTerminalStable,
     addTerminalContextToDraftStable,
-    addTerminalSurfaceStable,
+    addDrawerTerminalStable,
     closePanelTerminalStable,
     createNewTerminalStable,
     lastInvokedScriptByProjectId,

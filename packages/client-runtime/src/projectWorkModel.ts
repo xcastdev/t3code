@@ -292,6 +292,25 @@ export function workStateVariant(
   }
 }
 
+const ISSUE_FAILURE_MESSAGES: Record<string, string> = {
+  "human-required": "Only a person can manage issue intake. Open Work from a client to continue.",
+  "invalid-input": "The repository request is invalid. Review its details and try again.",
+  "inactive-project":
+    "This project is no longer available. Open an active project to manage issue intake.",
+  "repository-mismatch":
+    "This checkout's GitHub repository could not be verified. Check its Git remote and try again.",
+  "account-mismatch":
+    "The GitHub account changed. Check the signed-in account and find the repository again.",
+  "stale-binding":
+    "The repository binding changed. Reload it and review the current binding before trying again.",
+  detached: "This repository is detached. Bind it again before syncing issues.",
+  "invalid-storage":
+    "The saved repository binding could not be read. Check the environment's logs before trying again.",
+  storage: "The environment could not save the issue request. Check its storage and try again.",
+  unavailable:
+    "GitHub issue intake is unavailable. Check the environment's GitHub connection and try again.",
+};
+
 const FAILURE_MESSAGES: Record<string, string> = {
   forbidden: "This connection is not allowed to change Work here.",
   rejected: "The server rejected this change. Someone may have changed the task; review it again.",
@@ -302,8 +321,11 @@ const FAILURE_MESSAGES: Record<string, string> = {
 /** Error text that says what happened and what the user can do next. */
 export function describeWorkFailure(error: unknown): string {
   if (error !== null && typeof error === "object" && "_tag" in error) {
-    if (error._tag === "ProjectWorkRpcError" && "reason" in error)
-      return FAILURE_MESSAGES[String(error.reason)] ?? "The change failed.";
+    if (error._tag === "ProjectWorkRpcError" && "reason" in error) {
+      const issueMessage =
+        "issueReason" in error ? ISSUE_FAILURE_MESSAGES[String(error.issueReason)] : undefined;
+      return issueMessage ?? FAILURE_MESSAGES[String(error.reason)] ?? "The change failed.";
+    }
     if (error._tag === "EnvironmentAuthorizationError")
       return "This connection lacks permission to change Work on this environment.";
   }

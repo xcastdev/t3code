@@ -553,6 +553,7 @@ export const layerAssistantRoutines = AssistantRoutines.layer.pipe(
       layerAssistantPersistence,
       layerAssistantRoutinePersistence,
       layerScheduledTaskProvided,
+      layerThreadManagementProvided,
     ),
   ),
 );

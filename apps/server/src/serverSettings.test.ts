@@ -545,6 +545,21 @@ it.layer(NodeServices.layer)("server settings", (it) => {
     ).pipe(Effect.provide(layerServerSettings())),
   );
 
+  it.effect("saves a usage limit mapping per instance and clears it", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+
+      yield* serverSettings.updateSettings({
+        usageLimitMappings: { pi: "codex", opencode: "claudeAgent" },
+      });
+      const cleared = yield* serverSettings.updateSettings({
+        usageLimitMappings: { opencode: null },
+      });
+
+      assert.deepStrictEqual(cleared.usageLimitMappings, { pi: "codex" });
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
   it.effect("preserves model when switching providers via textGenerationModelSelection", () =>
     Effect.gen(function* () {
       const serverSettings = yield* ServerSettingsModule.ServerSettingsService;

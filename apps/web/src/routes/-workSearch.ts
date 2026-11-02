@@ -1,15 +1,16 @@
 import { ProjectWorkTaskId } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
-export const WORK_SECTIONS = [
-  "overview",
-  "tasks",
-  "team",
-  "knowledge",
-  "intake",
-  "portfolio",
-] as const;
+export const WORK_SECTIONS = ["overview", "tasks", "team", "knowledge", "intake"] as const;
 export type WorkSection = (typeof WORK_SECTIONS)[number];
+
+export const WORK_SECTION_LABELS: Record<WorkSection, string> = {
+  overview: "Overview",
+  tasks: "Tasks",
+  team: "Team",
+  knowledge: "Knowledge",
+  intake: "Intake",
+};
 
 export interface WorkRouteSearch {
   readonly section: WorkSection;

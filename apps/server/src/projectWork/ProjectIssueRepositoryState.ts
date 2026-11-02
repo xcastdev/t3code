@@ -1,5 +1,9 @@
 import { assertOrdinaryAssistantDestination } from "../assistants/AssistantGuards.ts";
-import { ProjectId, ProjectIssueRepositoryKey } from "@t3tools/contracts";
+import {
+  ProjectId,
+  ProjectIssueFailureReason,
+  ProjectIssueRepositoryKey,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -10,18 +14,7 @@ import { RepositoryIdentityResolver } from "../project/RepositoryIdentityResolve
 export class IssueBindingGatewayError extends Schema.TaggedError<IssueBindingGatewayError>()(
   "IssueBindingGatewayError",
   {
-    reason: Schema.Literals([
-      "human-required",
-      "invalid-input",
-      "inactive-project",
-      "repository-mismatch",
-      "account-mismatch",
-      "stale-binding",
-      "detached",
-      "invalid-storage",
-      "storage",
-      "unavailable",
-    ]),
+    reason: ProjectIssueFailureReason,
   },
 ) {
   override get message() {

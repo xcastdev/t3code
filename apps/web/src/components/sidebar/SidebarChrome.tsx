@@ -1,15 +1,8 @@
-import {
-  ArrowLeftIcon,
-  BotIcon,
-  ChartNoAxesColumnIcon,
-  ListTodoIcon,
-  SettingsIcon,
-} from "lucide-react";
+import { ArrowLeftIcon, ChartNoAxesColumnIcon, ListTodoIcon, SettingsIcon } from "lucide-react";
 import type { ReactNode } from "react";
 import { memo } from "react";
 import { Link, useLocation, useNavigate } from "@tanstack/react-router";
 
-import { useProjectWorkTarget } from "../../hooks/useProjectWorkTarget";
 import { useEnvironmentIdentificationMode } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
 import { usePullRequestsSupported } from "../../state/environments";
@@ -30,6 +23,7 @@ import {
   useSidebar,
 } from "../ui/sidebar";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import type { SidebarView } from "./SidebarThreadHeader";
 import { readPullRequestListPreferences } from "../pullRequest/pullRequestListPreferences";
 import { isSidebarUtilityPage, useNavigateToMainApp } from "./mainAppLocation";
 import { SidebarThreadUndoNotice } from "./SidebarThreadUndoNotice";
@@ -163,7 +157,11 @@ function SidebarUtilityItem({
   );
 }
 
-const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
+const SidebarUtilityMenu = memo(function SidebarUtilityMenu(props: {
+  readonly view: SidebarView | undefined;
+}) {
+  const showProjectTools = props.view !== "agents";
+  const showUsage = props.view !== "projects";
   const navigate = useNavigate();
   const navigateToMainApp = useNavigateToMainApp();
   const { isMobile, setOpenMobile } = useSidebar();
@@ -171,7 +169,6 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
     select: (location) => isSidebarUtilityPage(location.pathname),
   });
   const pullRequestsSupported = usePullRequestsSupported();
-  const workTarget = useProjectWorkTarget();
   const closeMobileSidebar = () => {
     if (isMobile) {
       setOpenMobile(false);
@@ -185,23 +182,13 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
     });
   };
   const handleWorkClick = () => {
-    if (workTarget === null) return;
     closeMobileSidebar();
-    void navigate({
-      to: "/work/$environmentId/$projectId",
-      params: { environmentId: workTarget.environmentId, projectId: workTarget.projectId },
-      search: { section: "overview" },
-    });
+    void navigate({ to: "/work" });
   };
   const handleSettingsClick = () => {
     closeMobileSidebar();
     void navigate({ to: "/settings" });
   };
-  const handleAgentsClick = () => {
-    closeMobileSidebar();
-    void navigate({ to: "/agents" });
-  };
-
   const handleUsageClick = () => {
     if (isMobile) {
       setOpenMobile(false);
@@ -230,26 +217,23 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
             label="Settings"
             onClick={handleSettingsClick}
           />
-          {pullRequestsSupported ? (
+          {showProjectTools && pullRequestsSupported ? (
             <SidebarUtilityItem
               icon={<PullRequestGlyph.pullRequest />}
               label="Pull requests"
               onClick={handlePullRequestsClick}
             />
           ) : null}
-          {workTarget ? (
+          {showProjectTools ? (
+            <SidebarUtilityItem icon={<ListTodoIcon />} label="Work" onClick={handleWorkClick} />
+          ) : null}
+          {showUsage ? (
             <SidebarUtilityItem
-              icon={<ListTodoIcon />}
-              label={`Work · ${workTarget.title}`}
-              onClick={handleWorkClick}
+              icon={<ChartNoAxesColumnIcon />}
+              label="Usage"
+              onClick={handleUsageClick}
             />
           ) : null}
-          <SidebarUtilityItem icon={<BotIcon />} label="Agents" onClick={handleAgentsClick} />
-          <SidebarUtilityItem
-            icon={<ChartNoAxesColumnIcon />}
-            label="Usage"
-            onClick={handleUsageClick}
-          />
         </>
       )}
       <SidebarUpdatePill />
@@ -259,15 +243,18 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
 
 export const SidebarChromeFooter = memo(function SidebarChromeFooter({
   showUndoNotice = false,
+  view,
 }: {
   showUndoNotice?: boolean;
+  /** Projects keeps pull requests and work; agents keeps usage. Absent shows everything. */
+  view?: SidebarView;
 }) {
   return (
     <SidebarFooter>
       {showUndoNotice ? <SidebarThreadUndoNotice /> : null}
       <SidebarProviderUpdatePill />
       <SidebarUpdateArchitectureWarning />
-      <SidebarUtilityMenu />
+      <SidebarUtilityMenu view={view} />
     </SidebarFooter>
   );
 });

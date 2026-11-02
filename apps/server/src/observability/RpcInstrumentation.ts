@@ -247,6 +247,7 @@ const RPC_AGGREGATES = {
   [WS_METHODS.gitIndexStatus]: "git",
   [WS_METHODS.gitMutateIndex]: "git",
   [WS_METHODS.gitCommitStaged]: "git",
+  [WS_METHODS.gitGenerateStagedCommitMessage]: "git",
   [WS_METHODS.gitHistory]: "git",
   [WS_METHODS.gitHistoryDiff]: "git",
   [WS_METHODS.gitRunStackedAction]: "vcs",

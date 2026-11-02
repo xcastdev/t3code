@@ -24,6 +24,7 @@ import { ChevronDownIcon, FolderClosedIcon, SquareArrowOutUpRightIcon } from "lu
 import { Group, GroupSeparator } from "../ui/group";
 import {
   Menu,
+  MenuGroup,
   MenuItem,
   MenuItemLabel,
   MenuPopup,
@@ -220,7 +221,8 @@ export const OpenInPicker = memo(function OpenInPicker({
   availableEditors: ReadonlyArray<EditorId>;
   openInCwd: string | null;
   openInCwdIsFile?: boolean;
-  presentation?: "toolbar" | "menu";
+  /** `section`: bare "Open in …" items for another control's menu. */
+  presentation?: "toolbar" | "menu" | "section";
   compact?: boolean;
   enableShortcut?: boolean;
   displayMode?: "toolbar" | "panel";
@@ -305,15 +307,17 @@ export const OpenInPicker = memo(function OpenInPicker({
               disabled={!openInCwd || !canOpenEditor}
               key={value}
               onClick={() => {
-                if (presentation === "menu") {
-                  void openInEditor(value);
-                } else {
+                if (presentation === "toolbar") {
                   setPreferredEditor(value);
+                } else {
+                  void openInEditor(value);
                 }
               }}
             >
               <Icon aria-hidden="true" className={getOpenInIconClass(kind)} />
-              <MenuItemLabel>{label}</MenuItemLabel>
+              <MenuItemLabel>
+                {presentation === "section" ? `Open in ${label}` : label}
+              </MenuItemLabel>
               {value === preferredEditor && openFavoriteEditorShortcutLabel && (
                 <MenuShortcut>{openFavoriteEditorShortcutLabel}</MenuShortcut>
               )}
@@ -328,6 +332,7 @@ export const OpenInPicker = memo(function OpenInPicker({
       )}
     </>
   );
+  if (presentation === "section") return <MenuGroup>{editorItems}</MenuGroup>;
   if (presentation === "menu") {
     return (
       <>

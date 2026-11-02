@@ -9,6 +9,7 @@ import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   CommandId,
+  type ThreadId,
   type AuthSessionId,
   type AssistantLifecycleInput,
 } from "@t3tools/contracts";
@@ -59,26 +60,33 @@ const make = Effect.gen(function* () {
   const synchronize = Effect.fn("AssistantRuntime.synchronize")(
     function* (detail: import("@t3tools/contracts").AssistantDetail, commandId: CommandId) {
       if (detail.summary.provisioningState !== "ready") return;
-      const threadId = detail.summary.binding.canonicalThreadId;
+      const binding = detail.summary.binding;
       const configuration = detail.configuration.configuration;
-      yield* threads.dispatch({
-        type: "thread.model-selection.set",
-        commandId: CommandId.make(`${commandId}:model`),
-        threadId,
-        modelSelection: configuration.modelSelection,
-      });
-      yield* threads.dispatch({
-        type: "thread.runtime-mode.set",
-        commandId: CommandId.make(`${commandId}:runtime`),
-        threadId,
-        runtimeMode: configuration.runtimeMode,
-      });
-      yield* threads.dispatch({
-        type: "thread.interaction-mode.set",
-        commandId: CommandId.make(`${commandId}:interaction`),
-        threadId,
-        interactionMode: configuration.interactionMode,
-      });
+      const chats = yield* sql<{
+        thread_id: ThreadId;
+      }>`SELECT thread_id FROM orchestration_v2_projection_threads WHERE project_id=${binding.backingProjectId} AND thread_id!=${binding.canonicalThreadId} AND deleted_at IS NULL AND archived_at IS NULL AND json_extract(payload_json,'$.lineage.relationshipToParent')='chat'`;
+      for (const threadId of [binding.canonicalThreadId, ...chats.map((row) => row.thread_id)]) {
+        const prefix =
+          threadId === binding.canonicalThreadId ? commandId : `${commandId}:${threadId}`;
+        yield* threads.dispatch({
+          type: "thread.model-selection.set",
+          commandId: CommandId.make(`${prefix}:model`),
+          threadId,
+          modelSelection: configuration.modelSelection,
+        });
+        yield* threads.dispatch({
+          type: "thread.runtime-mode.set",
+          commandId: CommandId.make(`${prefix}:runtime`),
+          threadId,
+          runtimeMode: configuration.runtimeMode,
+        });
+        yield* threads.dispatch({
+          type: "thread.interaction-mode.set",
+          commandId: CommandId.make(`${prefix}:interaction`),
+          threadId,
+          interactionMode: configuration.interactionMode,
+        });
+      }
     },
     Effect.mapError((cause) =>
       isAssistantError(cause) ? cause : new AssistantError({ reason: "unavailable", cause }),

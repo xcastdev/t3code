@@ -4,9 +4,15 @@ Work keeps durable tasks, scope, plans, approvals, assignments, evidence, knowle
 for one project checkout. Approving a scope or plan records your decision; it never starts a
 worker.
 
-On web and desktop, choose **Open Work** in the command palette or use the configured Work shortcut
-when the terminal is not focused. **Settings → General → Projects & threads** also opens Work when
-its scope selects one project checkout. On mobile, open the **Work** tab, **Settings → Work**, or
+On web and desktop, choose **Work** at the bottom of the sidebar to see every project, then open a
+project or one of its tasks. **Open Work** in the command palette or the configured Work shortcut
+(when the terminal is not focused) opens the current project's Work. **Settings → General →
+Projects & threads** also opens Work when its scope selects one project checkout.
+
+To keep Work beside a thread, choose **+ → Work** in the thread's right panel and pick a view:
+Overview, Tasks, Team, Knowledge or Intake. Each view opens as its own tab for the thread's project,
+and a task you select opens in a tab of its own. **Full page** opens the same view on the Work
+page. On mobile, open the **Work** tab, **Settings → Work**, or
 **Open Work** from a project's overview. Work shows the environment and checkout path it acts on, so
 two checkouts of the same project stay distinct.
 
@@ -71,8 +77,9 @@ or rejects them; an accepted decision can be superseded by a new proposal.
 
 ## All projects
 
-On web and desktop, choose **Work** in the breadcrumb to see **All projects** across connected environments. Open a project to return
-to its Work overview.
+On web and desktop, choose **Work** at the bottom of the sidebar, or **Work** in a project's
+breadcrumb, to see **All projects** across connected environments. Open a project to see its Work
+overview.
 
 ## GitHub issue intake
 

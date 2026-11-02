@@ -77,7 +77,8 @@ interface BranchToolbarBranchSelectorProps {
   forceNewWorktree?: boolean;
   ref?: Ref<BranchToolbarBranchSelectorHandle>;
   className?: string;
-  displayMode?: "toolbar" | "panel";
+  /** `header`: the toolbar trigger without the PR badge, opening downward from a panel header. */
+  displayMode?: "toolbar" | "panel" | "header";
   environmentId: EnvironmentId;
   threadId: ThreadId;
   draftId?: DraftId;
@@ -89,6 +90,8 @@ interface BranchToolbarBranchSelectorProps {
   onStartFromOriginChange: (startFromOrigin: boolean) => void;
   onCheckoutPullRequestRequest?: (reference: string) => void;
   onComposerFocusRequest?: () => void;
+  /** Panel only: the branch row opens the source control panel instead of the branch picker. */
+  onOpenSourceControl?: () => void;
 }
 
 function toBranchActionErrorMessage(error: unknown): string {
@@ -111,6 +114,7 @@ export function BranchToolbarBranchSelector({
   onStartFromOriginChange,
   onCheckoutPullRequestRequest,
   onComposerFocusRequest,
+  onOpenSourceControl,
 }: BranchToolbarBranchSelectorProps) {
   const composerFloatingLayerProps = useComposerMenuProps();
   const canWriteSourceControl = useEnvironmentScope(environmentId, AuthSourceControlWriteScope);
@@ -671,8 +675,8 @@ export function BranchToolbarBranchSelector({
           : undefined
       }
       popupProps={{
-        align: displayMode === "panel" ? "start" : "end",
-        side: displayMode === "panel" ? "bottom" : "top",
+        align: displayMode === "toolbar" ? "end" : "start",
+        side: displayMode === "toolbar" ? "top" : "bottom",
         className: cn("flex flex-col", displayMode === "panel" ? "w-(--anchor-width)" : "w-80"),
         ...(displayMode === "toolbar" ? composerFloatingLayerProps : {}),
       }}
@@ -684,7 +688,7 @@ export function BranchToolbarBranchSelector({
           className,
         )}
       >
-        {displayMode !== "panel" ? (
+        {displayMode === "toolbar" ? (
           <ThreadPullRequestBadgeControl
             render={<ComposerControl size="xs" />}
             badge={prBadge}
@@ -707,32 +711,52 @@ export function BranchToolbarBranchSelector({
           }}
           onContextMenu={(event) => handleBranchContextMenu(event, resolvedActiveBranch)}
         >
-          <ComboboxTrigger
-            render={
-              displayMode === "panel" ? (
-                <ThreadDetailsControl part="select" />
-              ) : (
-                <ComposerControl size="xs" />
-              )
-            }
-            className="min-w-0 max-w-full active:scale-100"
-            disabled={isInitialBranchesLoadPending || isBranchActionPending}
-          >
-            <GitBranchIcon
-              className={cn(
-                "size-3 shrink-0",
-                displayMode === "panel" && THREAD_DETAILS_PANEL_ICON_CLASS,
-              )}
-            />
-            <ComposerContextLabel displayMode={displayMode}>
-              <MiddleTruncate
-                value={triggerLabel}
-                variant={displayMode === "panel" ? "cap-aligned" : "default"}
-                className="w-full"
+          {displayMode === "panel" && onOpenSourceControl ? (
+            <ThreadDetailsControl
+              part="row"
+              variant="ghost"
+              size="sm"
+              aria-label={`Open source control for ${triggerLabel}`}
+              onClick={onOpenSourceControl}
+            >
+              <GitBranchIcon className={THREAD_DETAILS_PANEL_ICON_CLASS} />
+              <ComposerContextLabel displayMode="panel">
+                <MiddleTruncate value={triggerLabel} variant="cap-aligned" className="w-full" />
+              </ComposerContextLabel>
+            </ThreadDetailsControl>
+          ) : (
+            <ComboboxTrigger
+              render={
+                displayMode === "panel" ? (
+                  <ThreadDetailsControl part="select" />
+                ) : (
+                  <ComposerControl size={displayMode === "header" ? "sm" : "xs"} />
+                )
+              }
+              className="min-w-0 max-w-full active:scale-100"
+              disabled={isInitialBranchesLoadPending || isBranchActionPending}
+            >
+              <GitBranchIcon
+                className={cn(
+                  "shrink-0",
+                  displayMode === "header" ? "size-4" : "size-3",
+                  displayMode === "panel" && THREAD_DETAILS_PANEL_ICON_CLASS,
+                )}
               />
-            </ComposerContextLabel>
-            {displayMode !== "panel" ? <ChevronDownIcon className="size-3 shrink-0" /> : null}
-          </ComboboxTrigger>
+              <ComposerContextLabel displayMode={displayMode === "panel" ? "panel" : "toolbar"}>
+                <MiddleTruncate
+                  value={triggerLabel}
+                  variant={displayMode === "panel" ? "cap-aligned" : "default"}
+                  className="w-full"
+                />
+              </ComposerContextLabel>
+              {displayMode !== "panel" ? (
+                <ChevronDownIcon
+                  className={cn("shrink-0", displayMode === "header" ? "size-3.5" : "size-3")}
+                />
+              ) : null}
+            </ComboboxTrigger>
+          )}
         </span>
         {displayMode === "panel" && prNumber !== undefined && prUrl !== undefined ? (
           <ThreadDetailsPrRows

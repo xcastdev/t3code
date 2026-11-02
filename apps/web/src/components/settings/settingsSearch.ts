@@ -534,6 +534,22 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["enter return command ctrl multiline prompt new line composer"],
   },
   {
+    id: "timeline-live-activity",
+    title: "While a turn runs",
+    to: "/settings/chat",
+    searchTerms: [
+      "turn activity steps tool calls thoughts thinking reasoning live working timeline latest scrolling box every step collapse expand detail",
+    ],
+  },
+  {
+    id: "timeline-turn-end",
+    title: "When a turn ends",
+    to: "/settings/chat",
+    searchTerms: [
+      "turn activity fold report worked for duration steps changed files diff collapse keep finished response",
+    ],
+  },
+  {
     id: "follow-up-behavior",
     title: "Follow-up behavior",
     to: "/settings/chat",
@@ -771,7 +787,7 @@ export const SETTINGS_SEARCH_ITEMS = [
     title: "Usage providers",
     to: "/settings/providers",
     searchTerms: [
-      "usage sources CLIProxyAPI CLI proxy hub quota subscription limits management key add remove",
+      "usage sources CLIProxyAPI CLI proxy hub quota subscription limits management key add remove harness pi opencode mapping",
     ],
     providerSettingsOnly: true,
   },

@@ -31,7 +31,12 @@ const DevicePanel = lazy(() =>
   import("../device/DevicePanel").then((module) => ({ default: module.DevicePanel })),
 );
 const FilePreviewPanel = lazy(() => import("../files/FilePreviewPanel"));
+import type { SourceControlPanelProps } from "../sourceControl/SourceControlPanel";
+
 const SourceControlPanel = lazy(() => import("../sourceControl/SourceControlPanel"));
+const WorkPanel = lazy(() =>
+  import("../work/WorkPanel").then((module) => ({ default: module.WorkPanel })),
+);
 
 export type RightPanelTerminalProps = Omit<
   PersistentThreadTerminalPanelProps,
@@ -62,6 +67,8 @@ export function RightPanelSurfaceContent(props: {
   readonly activeSurfaceId: string | null;
   readonly threadRef: ScopedThreadRef;
   readonly environmentId: EnvironmentId;
+  /** The thread's project; Work tabs show its Work. */
+  readonly projectId: ProjectId | null;
   readonly visible: boolean;
   readonly composerDraftTarget: ScopedThreadRef | DraftId;
   readonly keybindings: ResolvedKeybindingsConfig;
@@ -76,6 +83,7 @@ export function RightPanelSurfaceContent(props: {
   readonly terminal: RightPanelTerminalProps;
   readonly pullRequest: RightPanelPullRequestProps;
   readonly files: RightPanelFileProps;
+  readonly sourceControlBranchControl?: SourceControlPanelProps["branchControl"];
 }) {
   const { surface, threadRef, visible } = props;
   if (surface === null) return null;
@@ -174,13 +182,28 @@ export function RightPanelSurfaceContent(props: {
           <SourceControlPanel
             key={`${props.environmentId}:${files.workspaceRoot}`}
             environmentId={props.environmentId}
+            threadRef={threadRef}
             workspaceRoot={files.workspaceRoot}
             availableEditors={files.availableEditors}
             onOpenFile={files.onOpenFile}
+            branchControl={props.sourceControlBranchControl}
           />
         </Suspense>
       );
     }
+    case "work":
+    case "work-task":
+      if (props.projectId === null) return null;
+      return (
+        <Suspense fallback={null}>
+          <WorkPanel
+            threadRef={threadRef}
+            environmentId={props.environmentId}
+            projectId={props.projectId}
+            surface={surface}
+          />
+        </Suspense>
+      );
     case "device":
       return (
         <Suspense fallback={null}>

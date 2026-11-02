@@ -21,7 +21,14 @@ import type {
 } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
 import * as Option from "effect/Option";
-import { type MouseEvent, useEffect, useEffectEvent, useRef, useState } from "react";
+import {
+  type MouseEvent,
+  type ReactNode,
+  useEffect,
+  useEffectEvent,
+  useRef,
+  useState,
+} from "react";
 import { useDeadlinePassed } from "../hooks/useDeadline";
 import { useNowSecond } from "../hooks/useNowSecond";
 import { flushSync } from "react-dom";
@@ -132,6 +139,15 @@ interface GitActionsControlProps {
   displayMode?: "toolbar" | "panel";
   compact?: boolean;
   onOpenChanges?: () => void;
+  /**
+   * Toolbar only: replaces the quick action beside the actions menu; progress still shows there.
+   * While it is disabled, a quick action that commits nothing (push, PR, pull) takes its place.
+   */
+  primaryControl?: { readonly node: ReactNode; readonly disabled: boolean };
+  /** False hides the quick action and its menu, leaving the changes row and repository setup. */
+  showActions?: boolean;
+  /** Toolbar only: the fill of the quick action and menu buttons. */
+  toolbarVariant?: "outline" | "default";
 }
 
 interface PendingDefaultBranchAction {
@@ -965,6 +981,9 @@ export default function GitActionsControl({
   displayMode = "toolbar",
   compact = false,
   onOpenChanges,
+  primaryControl,
+  toolbarVariant = "outline",
+  showActions = true,
 }: GitActionsControlProps) {
   const isPanel = displayMode === "panel";
   const ActionGroup = isPanel ? "div" : Group;
@@ -1148,6 +1167,19 @@ export default function GitActionsControl({
       ? (quickAction.hint ?? "This action is currently unavailable.")
       : null;
   const gitActionProgress = resolveGitActionProgressPresentation(vcsActionState);
+  const quickActionCommits =
+    quickAction.kind === "run_action" &&
+    (quickAction.action === "commit" ||
+      quickAction.action === "commit_push_pr" ||
+      (quickAction.action === "commit_push" &&
+        gitStatusForActions?.hasWorkingTreeChanges === true));
+  const showPrimaryControl =
+    primaryControl !== undefined &&
+    (!primaryControl.disabled ||
+      quickAction.disabled ||
+      quickAction.kind === "show_hint" ||
+      quickActionCommits);
+  const menuLockedByPrimary = showPrimaryControl && primaryControl.disabled;
   // A fresh draft or a thread with no turns hides commit, push, and diff rows until there is work.
   const quietEmptyDraft =
     isPanel &&
@@ -1674,7 +1706,9 @@ export default function GitActionsControl({
             {initAction.isPending ? "Initializing..." : "Initialize Git"}
           </span>
         </ThreadDetailsControl>
-      ) : quietEmptyDraft || (compact && !gitActionProgress && !visibleInlineSuccess) ? null : (
+      ) : !showActions ||
+        quietEmptyDraft ||
+        (compact && !gitActionProgress && !visibleInlineSuccess) ? null : (
         <ActionGroup
           role="group"
           aria-label="Git actions"
@@ -1698,10 +1732,12 @@ export default function GitActionsControl({
               className={isPanel ? undefined : "max-w-72"}
               disabled
               size="xs"
-              variant={isPanel ? "ghost" : "outline"}
+              variant={isPanel ? "ghost" : toolbarVariant}
             >
               <GitActionProgressButtonContent isPanel={isPanel} progress={gitActionProgress} />
             </ThreadDetailsControl>
+          ) : !isPanel && showPrimaryControl ? (
+            primaryControl.node
           ) : isPanel && visibleInlineSuccess ? (
             <ThreadDetailsControl part="primary" multiline disabled size="xs" variant="ghost">
               <GitActionSuccessButtonContent success={visibleInlineSuccess} />
@@ -1716,7 +1752,7 @@ export default function GitActionsControl({
                     part="primary"
                     panel={isPanel}
                     size="xs"
-                    variant={isPanel ? "ghost" : "outline"}
+                    variant={isPanel ? "ghost" : toolbarVariant}
                   />
                 }
               >
@@ -1740,7 +1776,7 @@ export default function GitActionsControl({
             </Popover>
           ) : (
             <ThreadDetailsControl
-              variant={isPanel ? "ghost" : "outline"}
+              variant={isPanel ? "ghost" : toolbarVariant}
               size="xs"
               part="primary"
               panel={isPanel}
@@ -1772,7 +1808,11 @@ export default function GitActionsControl({
               {isPanel ? (
                 <span aria-hidden="true" className={THREAD_DETAILS_PANEL_SPLIT_SEPARATOR_CLASS} />
               ) : (
-                <GroupSeparator className="hidden @3xl/header-actions:block" />
+                <GroupSeparator
+                  {...(toolbarVariant === "default"
+                    ? {}
+                    : { className: "hidden @3xl/header-actions:block" })}
+                />
               )}
               <Menu
                 onOpenChange={(open) => {
@@ -1786,12 +1826,12 @@ export default function GitActionsControl({
                     <ThreadDetailsControl
                       aria-label="Git action options"
                       size={isPanel ? "sm" : "icon-xs"}
-                      variant={isPanel ? "ghost" : "outline"}
+                      variant={isPanel ? "ghost" : toolbarVariant}
                       part="secondary"
                       panel={isPanel}
                     />
                   }
-                  disabled={isGitActionRunning}
+                  disabled={isGitActionRunning || menuLockedByPrimary}
                 >
                   <ChevronDownIcon
                     aria-hidden="true"

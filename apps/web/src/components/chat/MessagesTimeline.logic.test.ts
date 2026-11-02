@@ -247,6 +247,108 @@ describe("deriveMessagesTimelineRows", () => {
     expect(first.kind === "work" && first.entry.toolLifecycleStatus).toBe("inProgress");
   });
 
+  describe("while a turn runs", () => {
+    const runId = RunId.make("live-run");
+    const at = "2026-10-01T06:19:10Z";
+    const tool = (id: string, status: "completed" | "inProgress" = "completed"): TimelineEntry => ({
+      kind: "work",
+      id,
+      createdAt: at,
+      entry: {
+        id,
+        runId,
+        createdAt: at,
+        label: `Ran ${id}`,
+        tone: "tool",
+        command: `echo ${id}`,
+        toolLifecycleStatus: status,
+      },
+    });
+    const thought = (
+      id: string,
+      status: "completed" | "inProgress" = "completed",
+    ): TimelineEntry => ({
+      kind: "work",
+      id,
+      createdAt: at,
+      entry: {
+        id,
+        runId,
+        createdAt: at,
+        label: "Thinking",
+        tone: "thinking",
+        itemType: "reasoning",
+        detail: `Thought ${id}`,
+        toolLifecycleStatus: status,
+      },
+    });
+    const rows = (
+      timelineEntries: ReadonlyArray<TimelineEntry>,
+      options: Partial<Parameters<typeof deriveMessagesTimelineRows>[0]> = {},
+    ) =>
+      deriveMessagesTimelineRows({
+        timelineEntries,
+        runningRunId: runId,
+        isWorking: true,
+        activeTurnStartedAt: at,
+        turnDiffSummaries: [],
+        supportsConversationRollback: false,
+        ...options,
+      });
+
+    it("shows only the latest 7 steps and folds the earlier ones into one row", () => {
+      const entries = [
+        ...Array.from({ length: 9 }, (_, i) => tool(`t${i}`)),
+        tool("t9", "inProgress"),
+      ];
+      const latest = rows(entries, { liveActivity: "latest" });
+      const toggle = latest.find((row) => row.kind === "work-toggle");
+      expect(toggle).toMatchObject({ summary: "3 earlier steps", expanded: false });
+      expect(latest.filter((row) => row.kind === "work").map((row) => row.id)).toEqual(
+        ["t3", "t4", "t5", "t6", "t7", "t8"].map((id) => `step:${id}`),
+      );
+      expect(latest.find((row) => row.kind === "work-live")).toMatchObject({
+        entry: { id: "t9" },
+        active: true,
+      });
+
+      const opened = rows(entries, {
+        liveActivity: "latest",
+        expandedWorkGroupIds: new Set([toggle!.kind === "work-toggle" ? toggle!.groupId : ""]),
+      });
+      expect(opened.filter((row) => row.kind === "work")).toHaveLength(9);
+    });
+
+    it('lists every step with "all", and joins consecutive thoughts into one block', () => {
+      const all = rows(
+        [tool("t0"), thought("a"), thought("b"), tool("t1"), thought("c", "inProgress")],
+        { liveActivity: "all" },
+      );
+      expect(
+        all
+          .filter((row) => row.kind === "work" || row.kind === "thoughts")
+          .map((row) =>
+            row.kind === "thoughts"
+              ? `thoughts:${row.entries.map((entry) => entry.id).join("+")}:${row.streaming}`
+              : row.id,
+          ),
+      ).toEqual(["step:t0", "thoughts:a+b:false", "step:t1", "thoughts:c:true"]);
+      expect(all.some((row) => row.kind === "work-toggle")).toBe(false);
+      expect(all.some((row) => row.kind === "thinking")).toBe(false);
+    });
+
+    it('opens the live batch by default in "box" mode, and closes it once toggled', () => {
+      const entries = [tool("t0"), tool("t1", "inProgress")];
+      const live = rows(entries, { liveActivity: "box" }).find((row) => row.kind === "work-live");
+      expect(live).toMatchObject({ expanded: true });
+      const closed = rows(entries, {
+        liveActivity: "box",
+        expandedWorkGroupIds: new Set([live?.kind === "work-live" ? live.groupId : ""]),
+      }).find((row) => row.kind === "work-live");
+      expect(closed).toMatchObject({ expanded: false });
+    });
+  });
+
   it("recovers the failed Sky call stored as a generic js integration", () => {
     const fixture = makeStreamingTimelineFixture();
     const source = fixture.visibleTurnItems.find((row) => row.item.type === "dynamic_tool")!;
@@ -980,6 +1082,163 @@ describe("deriveMessagesTimelineRows", () => {
 
     expect(userRow?.revertTurnCount).toBe(0);
     expect(assistantRow?.assistantTurnDiffSummary).toBe(assistantTurnDiffSummary);
+  });
+
+  it("keeps a page the agent rendered in view when its turn folds", () => {
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        {
+          id: "user-entry",
+          kind: "message" as const,
+          createdAt: "2026-01-01T00:00:00Z",
+          message: {
+            id: "user-1" as never,
+            role: "user" as const,
+            text: "Show me the timing",
+            runId: null,
+            createdAt: "2026-01-01T00:00:00Z",
+            updatedAt: "2026-01-01T00:00:00Z",
+            streaming: false,
+          },
+        },
+        {
+          id: "work-entry-1",
+          kind: "work" as const,
+          createdAt: "2026-01-01T00:00:02Z",
+          entry: {
+            id: "work-1",
+            createdAt: "2026-01-01T00:00:02Z",
+            runId: "turn-1" as never,
+            label: "Ran command",
+            tone: "tool" as const,
+          },
+        },
+        {
+          id: "page-entry",
+          kind: "html-render" as const,
+          createdAt: "2026-01-01T00:00:04Z",
+          runId: "turn-1" as never,
+          htmlRender: { attachmentId: "page-1", title: "Retry timing", height: 240 },
+        },
+        {
+          id: "assistant-final-entry",
+          kind: "message" as const,
+          createdAt: "2026-01-01T00:00:06Z",
+          message: {
+            id: "assistant-final" as never,
+            role: "assistant" as const,
+            text: "Done",
+            runId: "turn-1" as never,
+            createdAt: "2026-01-01T00:00:06Z",
+            updatedAt: "2026-01-01T00:00:07Z",
+            streaming: false,
+          },
+        },
+      ],
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+    });
+
+    expect(rows.map((row) => row.id)).toEqual([
+      "user-entry",
+      "turn-fold:turn-1",
+      "page-entry",
+      "assistant-final-entry",
+    ]);
+  });
+
+  describe("a finished turn", () => {
+    const work = (id: string, toolLifecycleStatus: "completed" | "failed") => ({
+      id,
+      kind: "work" as const,
+      createdAt: "2026-01-01T00:00:02Z",
+      entry: {
+        id,
+        createdAt: "2026-01-01T00:00:02Z",
+        runId: "turn-1" as never,
+        label: `Ran ${id}`,
+        tone: "tool" as const,
+        command: `echo ${id}`,
+        toolLifecycleStatus,
+      },
+    });
+    const timelineEntries = [
+      {
+        id: "user-entry",
+        kind: "message" as const,
+        createdAt: "2026-01-01T00:00:00Z",
+        message: {
+          id: "user-1" as never,
+          role: "user" as const,
+          text: "Fix it",
+          runId: null,
+          createdAt: "2026-01-01T00:00:00Z",
+          updatedAt: "2026-01-01T00:00:00Z",
+          streaming: false,
+        },
+      },
+      work("ok", "completed"),
+      work("broken", "failed"),
+      {
+        id: "assistant-final-entry",
+        kind: "message" as const,
+        createdAt: "2026-01-01T00:00:06Z",
+        message: {
+          id: "assistant-final" as never,
+          role: "assistant" as const,
+          text: "Done",
+          runId: "turn-1" as never,
+          createdAt: "2026-01-01T00:00:06Z",
+          updatedAt: "2026-01-01T00:00:07Z",
+          streaming: false,
+        },
+      },
+    ];
+    const summary = (path: string, additions: number, deletions: number) => ({
+      runId: "turn-1" as never,
+      completedAt: "2026-01-01T00:00:07Z",
+      assistantMessageId: "assistant-final" as never,
+      checkpointTurnCount: 1,
+      checkpointRef: "checkpoint-1" as never,
+      status: "ready" as const,
+      files: [{ path, kind: "modified", additions, deletions }],
+    });
+
+    it("reports its steps, failures and changed files on the fold", () => {
+      const rows = deriveMessagesTimelineRows({
+        timelineEntries,
+        isWorking: false,
+        activeTurnStartedAt: null,
+        turnDiffSummaries: [summary("src/a.ts", 3, 1), summary("src/b.ts", 8, 5)],
+        supportsConversationRollback: false,
+      });
+      expect(rows.find((row) => row.kind === "turn-fold")).toMatchObject({
+        report: {
+          steps: 2,
+          failed: 1,
+          subagents: 0,
+          files: { count: 2, additions: 11, deletions: 6 },
+        },
+      });
+    });
+
+    it("keeps every step in view when set to keep them", () => {
+      const rows = deriveMessagesTimelineRows({
+        timelineEntries,
+        isWorking: false,
+        activeTurnStartedAt: null,
+        turnDiffSummaries: [],
+        supportsConversationRollback: false,
+        turnEnd: "keep",
+      });
+      expect(rows.map((row) => row.id)).toEqual([
+        "user-entry",
+        "work-toggle:ok",
+        "assistant-final-entry",
+      ]);
+    });
   });
 
   it("folds the first assistant message and settled work before the terminal response", () => {

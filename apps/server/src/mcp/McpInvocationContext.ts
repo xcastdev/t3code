@@ -19,6 +19,8 @@ const ALL_MCP_CAPABILITIES = [
   "device",
   "pull-requests",
   "terminal",
+  // T3's checklist tool, for harnesses whose agent has no checklist of its own.
+  "checklist",
 ] as const;
 export type McpCapability = (typeof ALL_MCP_CAPABILITIES)[number];
 
@@ -63,6 +65,13 @@ export const hiddenFromSubagents = (): boolean => {
   const fiber = Fiber.getCurrent();
   const scope = fiber && Context.getOrUndefined(fiber.context, McpInvocationContext);
   return scope?.thread?.subagent !== true;
+};
+
+/** `McpSchema.EnabledWhen` for tools only some harnesses' sessions are issued, such as `checklist`. */
+export const visibleWithCapability = (capability: McpCapability) => (): boolean => {
+  const fiber = Fiber.getCurrent();
+  const scope = fiber && Context.getOrUndefined(fiber.context, McpInvocationContext);
+  return scope?.capabilities.has(capability) === true;
 };
 
 export type McpCapabilityError<C extends McpCapability> = C extends "preview"

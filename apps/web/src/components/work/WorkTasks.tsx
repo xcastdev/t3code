@@ -64,7 +64,7 @@ export function WorkTasks({
   readonly scope: ProjectWorkScope;
   readonly writer: WorkWriter;
   readonly taskId: ProjectWorkTaskId | undefined;
-  readonly onSelectTask: (taskId: ProjectWorkTaskId | undefined) => void;
+  readonly onSelectTask: (taskId: ProjectWorkTaskId | undefined, title?: string) => void;
 }) {
   const [filter, setFilter] = useState<TaskFilter>("all");
   const view = useWorkRead(scope.environmentId, {
@@ -166,7 +166,7 @@ function TaskList({
   writer: WorkWriter;
   taskId: ProjectWorkTaskId | undefined;
   filter: TaskFilter;
-  onSelectTask: (id: ProjectWorkTaskId) => void;
+  onSelectTask: (id: ProjectWorkTaskId, title?: string) => void;
   onShowAll: () => void;
 }) {
   const [creating, setCreating] = useState(false);
@@ -244,7 +244,7 @@ function TaskList({
           key={task.taskId}
           type="button"
           aria-current={task.taskId === taskId ? "page" : undefined}
-          onClick={() => onSelectTask(task.taskId)}
+          onClick={() => onSelectTask(task.taskId, task.title)}
           className={cn(
             "flex w-full min-w-0 items-start gap-3 px-4 py-3.5 text-left outline-none hover:bg-accent/40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
             task.taskId === taskId && "bg-accent/60",

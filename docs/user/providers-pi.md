@@ -72,6 +72,11 @@ installs Pi's example `subagent` extension, T3 Code also shows its task progress
 UI. Pi runs those children without a session, so they cannot be opened or resumed as T3 Code
 threads.
 
+## Checklists
+
+Pi has no checklist of its own, so T3 Code gives it one. For multi-step work, Pi can keep a checklist
+that shows in the thread details **Checklist** section and stays until Pi or you clear it.
+
 ## Troubleshooting
 
 - If Pi is unavailable, confirm that the configured binary runs on the server machine, then refresh

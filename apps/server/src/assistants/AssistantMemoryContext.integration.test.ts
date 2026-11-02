@@ -479,6 +479,62 @@ it.live(
   },
 );
 
+it.live("a chat under Home runs with the agent's memory and teaches it", () => {
+  const f = fixture();
+  return Effect.gen(function* () {
+    const { home, record } = yield* setup();
+    const sources = yield* Sources.AssistantSettledMemorySource;
+    const memory = yield* Memory.AssistantMemory;
+    const learn = Effect.fn("AssistantMemoryContextIntegration.learn")(function* (
+      threadId: ThreadId,
+      runId: RunId,
+    ) {
+      const evidence = yield* sources.forRun(threadId, runId);
+      if (evidence === null) return yield* Effect.die("Missing conversation source");
+      assert.equal(evidence.threadId, threadId);
+      yield* memory.process((yield* memory.capture(evidence)).operationKey);
+    });
+    const homeTurn = yield* settle(home, "home-memory", "I prefer the dark editor theme.");
+    yield* learn(home.id, homeTurn.run.id);
+    const chat: OrchestrationV2AppThread = {
+      ...thread(ThreadId.make("memory-chat"), home.projectId, yield* DateTime.now),
+      lineage: { parentThreadId: home.id, relationshipToParent: "chat", rootThreadId: home.id },
+    };
+    assert.equal(
+      (yield* commit("memory-chat", chat.id, [
+        {
+          id: EventId.make("memory-chat"),
+          type: "thread.created",
+          threadId: chat.id,
+          occurredAt: yield* DateTime.now,
+          payload: chat,
+        },
+      ])).receipt.status,
+      "accepted",
+    );
+    const chatTurn = yield* settle(chat, "chat-memory", "I write in British English.");
+    const retained = (yield* (yield* SqlClient.SqlClient)<{
+      configuration_json: string;
+    }>`SELECT configuration_json FROM t3_workflow_v2_assistant_admissions WHERE thread_id=${chat.id} AND run_id=${chatTurn.run.id}`)[0];
+    if (retained === undefined) return yield* Effect.die("Chat run was not admitted");
+    assert.include(
+      (yield* decodeRetainedInstruction(retained.configuration_json)).snapshot.roleInstructions!,
+      "dark editor",
+    );
+    yield* learn(chat.id, chatTurn.run.id);
+    const resources = yield* Resources.AssistantResources;
+    assert.include(
+      (yield* resources.prepare(record, home.id)).roleInstructions!,
+      "British English",
+    );
+    assert.include(
+      (yield* resources.prepare(record, chat.id)).roleInstructions!,
+      "British English",
+    );
+    assert.equal(f.inputs.length, 2);
+  }).pipe(Effect.provide(f.layer));
+});
+
 it.live(
   "correction and forget replace the next resource context while SQL recall survives model and index outage",
   () => {

@@ -84,7 +84,7 @@ export const layerHandoffEpoch = Layer.effect(
     return ContextHandoffEpoch.of({
       capture,
       current: Effect.fn("AssistantMemory.handoffEpoch")(function* (threadId) {
-        const record = yield* repository.findByThread(threadId);
+        const record = yield* repository.findByConversation(threadId);
         if (record === null) return undefined;
         const current = yield* context(record).pipe(
           Effect.mapError((cause) => new AssistantError({ reason: "unavailable", cause })),

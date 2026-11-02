@@ -191,7 +191,6 @@ const make = Effect.gen(function* () {
       task.project_id !== binding.projectId ||
       task.thread_id !== binding.threadId ||
       binding.projectId !== owner.binding.backingProjectId ||
-      binding.threadId !== owner.binding.canonicalThreadId ||
       projects.length !== 1 ||
       !(yield* assistantThreadIsCurrent({ threadId: binding.threadId, ...owner.binding }).pipe(
         Effect.provideService(SqlClient.SqlClient, sql),
@@ -234,11 +233,16 @@ const make = Effect.gen(function* () {
     }>`SELECT project_id,thread_id FROM scheduled_tasks WHERE task_id=${input.taskId}`)[0];
     if (
       !task ||
+      task.thread_id === null ||
       task.project_id !== summary.binding.backingProjectId ||
-      task.thread_id !== summary.binding.canonicalThreadId
+      (old !== null && task.thread_id !== old.threadId) ||
+      !(yield* assistantThreadIsCurrent({
+        threadId: ThreadId.make(task.thread_id),
+        ...summary.binding,
+      }).pipe(Effect.provideService(SqlClient.SqlClient, sql)))
     )
       return yield* new AssistantError({ reason: "needs-repair" });
-    yield* sql`INSERT INTO t3_workflow_v2_assistant_routines(task_id,environment_id,assistant_id,project_id,thread_id,configuration_revision,enabled,deleted) VALUES(${input.taskId},${input.environmentId},${input.assistantId},${summary.binding.backingProjectId},${summary.binding.canonicalThreadId},${summary.configurationRevision},${Number(input.enabled)},0) ON CONFLICT(task_id) DO UPDATE SET configuration_revision=excluded.configuration_revision,enabled=excluded.enabled,revision=t3_workflow_v2_assistant_routines.revision+1`;
+    yield* sql`INSERT INTO t3_workflow_v2_assistant_routines(task_id,environment_id,assistant_id,project_id,thread_id,configuration_revision,enabled,deleted) VALUES(${input.taskId},${input.environmentId},${input.assistantId},${summary.binding.backingProjectId},${task.thread_id},${summary.configurationRevision},${Number(input.enabled)},0) ON CONFLICT(task_id) DO UPDATE SET configuration_revision=excluded.configuration_revision,enabled=excluded.enabled,revision=t3_workflow_v2_assistant_routines.revision+1`;
     return (yield* find(input.taskId))!;
   }, Effect.mapError(unavailable));
   const list = Effect.fn("AssistantRoutineRepository.list")(function* (input: Page) {

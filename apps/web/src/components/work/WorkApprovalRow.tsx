@@ -133,15 +133,7 @@ export function WorkApprovalRow({ surface }: { surface: WorkTaskSurface }) {
                   ))
                 : null}
             </div>
-            <WorkMeta>
-              {step.detail}
-              {step.id === "specification" &&
-              !model.guided &&
-              !approveAction.available &&
-              approveAction.reason
-                ? ` ${approveAction.reason}`
-                : ""}
-            </WorkMeta>
+            <WorkMeta>{step.detail}</WorkMeta>
             {deciding ? (
               <DecisionConfirmation
                 pending={deciding}

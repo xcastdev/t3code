@@ -21,6 +21,7 @@ import { Route as ChatUsageRouteImport } from './routes/_chat.usage'
 import { Route as ChatSettingsRouteImport } from './routes/_chat.settings'
 import { Route as ChatPullRequestsRouteImport } from './routes/_chat.pull-requests'
 import { Route as ChatNewRouteImport } from './routes/_chat.new'
+import { Route as ChatWorkIndexRouteImport } from './routes/_chat.work.index'
 import { Route as ChatAgentsIndexRouteImport } from './routes/_chat.agents.index'
 import { Route as ChatSettingsWorktreesRouteImport } from './routes/_chat.settings.worktrees'
 import { Route as ChatSettingsThreadsRouteImport } from './routes/_chat.settings.threads'
@@ -111,6 +112,11 @@ const ChatPullRequestsRoute = ChatPullRequestsRouteImport.update({
 const ChatNewRoute = ChatNewRouteImport.update({
   id: '/new',
   path: '/new',
+  getParentRoute: () => ChatRoute,
+} as any)
+const ChatWorkIndexRoute = ChatWorkIndexRouteImport.update({
+  id: '/work/',
+  path: '/work/',
   getParentRoute: () => ChatRoute,
 } as any)
 const ChatAgentsIndexRoute = ChatAgentsIndexRouteImport.update({
@@ -323,6 +329,7 @@ export interface FileRoutesByFullPath {
   '/settings/threads': typeof ChatSettingsThreadsRoute
   '/settings/worktrees': typeof ChatSettingsWorktreesRoute
   '/agents/': typeof ChatAgentsIndexRoute
+  '/work/': typeof ChatWorkIndexRoute
   '/agents/$environmentId/$assistantId': typeof ChatAgentsEnvironmentIdAssistantIdRoute
   '/terminals/$environmentId/$projectId': typeof ChatTerminalsEnvironmentIdProjectIdRoute
   '/work/$environmentId/$projectId': typeof ChatWorkEnvironmentIdProjectIdRoute
@@ -368,6 +375,7 @@ export interface FileRoutesByTo {
   '/settings/threads': typeof ChatSettingsThreadsRoute
   '/settings/worktrees': typeof ChatSettingsWorktreesRoute
   '/agents': typeof ChatAgentsIndexRoute
+  '/work': typeof ChatWorkIndexRoute
   '/agents/$environmentId/$assistantId': typeof ChatAgentsEnvironmentIdAssistantIdRoute
   '/terminals/$environmentId/$projectId': typeof ChatTerminalsEnvironmentIdProjectIdRoute
   '/work/$environmentId/$projectId': typeof ChatWorkEnvironmentIdProjectIdRoute
@@ -415,6 +423,7 @@ export interface FileRoutesById {
   '/_chat/settings/threads': typeof ChatSettingsThreadsRoute
   '/_chat/settings/worktrees': typeof ChatSettingsWorktreesRoute
   '/_chat/agents/': typeof ChatAgentsIndexRoute
+  '/_chat/work/': typeof ChatWorkIndexRoute
   '/_chat/agents/$environmentId/$assistantId': typeof ChatAgentsEnvironmentIdAssistantIdRoute
   '/_chat/terminals/$environmentId/$projectId': typeof ChatTerminalsEnvironmentIdProjectIdRoute
   '/_chat/work/$environmentId/$projectId': typeof ChatWorkEnvironmentIdProjectIdRoute
@@ -462,6 +471,7 @@ export interface FileRouteTypes {
     | '/settings/threads'
     | '/settings/worktrees'
     | '/agents/'
+    | '/work/'
     | '/agents/$environmentId/$assistantId'
     | '/terminals/$environmentId/$projectId'
     | '/work/$environmentId/$projectId'
@@ -507,6 +517,7 @@ export interface FileRouteTypes {
     | '/settings/threads'
     | '/settings/worktrees'
     | '/agents'
+    | '/work'
     | '/agents/$environmentId/$assistantId'
     | '/terminals/$environmentId/$projectId'
     | '/work/$environmentId/$projectId'
@@ -553,6 +564,7 @@ export interface FileRouteTypes {
     | '/_chat/settings/threads'
     | '/_chat/settings/worktrees'
     | '/_chat/agents/'
+    | '/_chat/work/'
     | '/_chat/agents/$environmentId/$assistantId'
     | '/_chat/terminals/$environmentId/$projectId'
     | '/_chat/work/$environmentId/$projectId'
@@ -652,6 +664,13 @@ declare module '@tanstack/react-router' {
       path: '/new'
       fullPath: '/new'
       preLoaderRoute: typeof ChatNewRouteImport
+      parentRoute: typeof ChatRoute
+    }
+    '/_chat/work/': {
+      id: '/_chat/work/'
+      path: '/work'
+      fullPath: '/work/'
+      preLoaderRoute: typeof ChatWorkIndexRouteImport
       parentRoute: typeof ChatRoute
     }
     '/_chat/agents/': {
@@ -952,6 +971,7 @@ interface ChatRouteChildren {
   ChatEnvironmentIdThreadIdRoute: typeof ChatEnvironmentIdThreadIdRoute
   ChatDraftDraftIdRoute: typeof ChatDraftDraftIdRoute
   ChatAgentsIndexRoute: typeof ChatAgentsIndexRoute
+  ChatWorkIndexRoute: typeof ChatWorkIndexRoute
   ChatAgentsEnvironmentIdAssistantIdRoute: typeof ChatAgentsEnvironmentIdAssistantIdRoute
   ChatTerminalsEnvironmentIdProjectIdRoute: typeof ChatTerminalsEnvironmentIdProjectIdRoute
   ChatWorkEnvironmentIdProjectIdRoute: typeof ChatWorkEnvironmentIdProjectIdRoute
@@ -966,6 +986,7 @@ const ChatRouteChildren: ChatRouteChildren = {
   ChatEnvironmentIdThreadIdRoute: ChatEnvironmentIdThreadIdRoute,
   ChatDraftDraftIdRoute: ChatDraftDraftIdRoute,
   ChatAgentsIndexRoute: ChatAgentsIndexRoute,
+  ChatWorkIndexRoute: ChatWorkIndexRoute,
   ChatAgentsEnvironmentIdAssistantIdRoute:
     ChatAgentsEnvironmentIdAssistantIdRoute,
   ChatTerminalsEnvironmentIdProjectIdRoute:

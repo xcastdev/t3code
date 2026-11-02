@@ -20,6 +20,8 @@ import {
   paceOf,
   paceRemainingPercent,
   usesChatGptSharing,
+  findThreadLimitAccount,
+  resolveUsageLimitDriver,
 } from "./usageLimits.ts";
 
 const now = Date.parse("2026-09-03T12:00:00.000Z");
@@ -1288,5 +1290,60 @@ describe("ChatGPT sharing presentation", () => {
         auth: { status: "unauthenticated", subscriptionSharing: true },
       }),
     ).toBe(false);
+  });
+});
+
+describe("resolveUsageLimitDriver", () => {
+  const pi = provider({
+    instanceId: ProviderInstanceId.make("pi"),
+    driver: ProviderDriverKind.make("pi"),
+  });
+
+  it("uses a provider's own limits regardless of mapping", () => {
+    const claude = provider({
+      instanceId: ProviderInstanceId.make("claudeAgent"),
+      driver: ProviderDriverKind.make("claudeAgent"),
+      usageLimits: { checkedAt: "2026-09-03T11:00:00.000Z", windows: [window] },
+    });
+    expect(resolveUsageLimitDriver({ provider: claude, mapping: "codex" })).toBe("claudeAgent");
+  });
+
+  it("shows a universal harness's limits only once it is mapped", () => {
+    expect(resolveUsageLimitDriver({ provider: pi, mapping: "codex" })).toBe("codex");
+    expect(resolveUsageLimitDriver({ provider: pi, mapping: undefined })).toBeNull();
+  });
+});
+
+describe("findThreadLimitAccount", () => {
+  const environmentId = EnvironmentId.make("env");
+  const account = (key: string, driver: string): LimitAccount => ({
+    key,
+    driver: ProviderDriverKind.make(driver),
+    displayName: null,
+    email: undefined,
+    plan: undefined,
+    accentColor: undefined,
+    environments: [],
+    sourceLabel: null,
+    redeem: null,
+    limits: { checkedAt: "2026-09-03T11:00:00.000Z", windows: [window] },
+  });
+
+  it("prefers the thread's own login over another of the same driver", () => {
+    const accounts = [account("env:codex", "codex"), account("env:codex-work", "codex")];
+    expect(
+      findThreadLimitAccount(accounts, {
+        environmentId,
+        instanceId: ProviderInstanceId.make("codex-work"),
+        driver: ProviderDriverKind.make("codex"),
+      })?.key,
+    ).toBe("env:codex-work");
+    expect(
+      findThreadLimitAccount(accounts, {
+        environmentId,
+        instanceId: ProviderInstanceId.make("pi"),
+        driver: ProviderDriverKind.make("codex"),
+      })?.key,
+    ).toBe("env:codex");
   });
 });

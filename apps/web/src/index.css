@@ -122,6 +122,8 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   --workspace-controls-top: 0px;
   --workspace-controls-left: calc(env(safe-area-inset-left) + 0.75rem);
   --workspace-controls-right: calc(env(safe-area-inset-right) + 0.75rem);
+  /* Centers the 32px right panel toggle over the empty panel's 38px rail column. */
+  --workspace-rail-controls-right: calc(env(safe-area-inset-right) + 3px);
   --workspace-native-controls-inset: 0px;
   --workspace-titlebar-control-size: 1.75rem;
   --workspace-titlebar-control-gap: 0.75rem;
@@ -160,6 +162,7 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   --workspace-native-controls-inset: calc(
     100vw - env(titlebar-area-width, 100vw) - env(titlebar-area-x, 0px) + 0.75rem
   );
+  --workspace-rail-controls-right: var(--workspace-controls-right);
 }
 
 /* The font tokens are declared outside the inline theme so utilities reference
@@ -1522,6 +1525,22 @@ html[data-theme-id] [data-chat-header] [data-toolbar-control][data-pressed] {
 
 html[data-theme-id] [data-chat-header] [data-slot="separator"] {
   background-color: var(--contrast-toolbar-border);
+}
+
+/* The header's project scripts pill draws its own ghost halves; its chevron is a
+   menu trigger but must not take the filled toolbar control look. */
+html[data-theme-id] [data-chat-header] [data-titlebar-split] [data-slot="menu-trigger"] {
+  background-color: transparent;
+  color: inherit;
+}
+
+html[data-theme-id] [data-chat-header] [data-titlebar-split] [data-slot="menu-trigger"]:hover,
+html[data-theme-id]
+  [data-chat-header]
+  [data-titlebar-split]
+  [data-slot="menu-trigger"][data-popup-open] {
+  background-color: var(--accent);
+  color: var(--foreground);
 }
 
 /* Chat code blocks join the other code surfaces on the code tokens. The

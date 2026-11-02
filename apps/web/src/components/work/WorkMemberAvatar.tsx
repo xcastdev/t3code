@@ -1,5 +1,5 @@
 import { agentFace, type AgentAvatarShape } from "@t3tools/client-runtime/project-work";
-import type { ProjectTeamAvatar } from "@t3tools/contracts";
+import type { ProjectIconColor, ProjectTeamAvatar } from "@t3tools/contracts";
 import { ProjectMonogram } from "../ProjectMonogram";
 import { projectIconColorClassName } from "../../projectIconColors";
 import { cn } from "../../lib/utils";
@@ -48,16 +48,24 @@ export function WorkMemberAvatar({
   play = false,
   preview = 0,
 }: {
-  member: Pick<WorkMemberView, "monogram" | "color"> & {
+  member: {
+    monogram: string;
+    color: ProjectIconColor;
     avatar?: ProjectTeamAvatar | null | undefined;
   };
   large?: boolean;
-  size?: "row" | "card" | "preview";
+  size?: "icon" | "row" | "card" | "preview" | undefined;
   play?: boolean;
   preview?: number;
 }) {
   const dimensions =
-    size === "preview" ? "size-12 sm:size-16" : size === "card" || large ? "size-10" : "size-7";
+    size === "preview"
+      ? "size-12 sm:size-16"
+      : size === "card" || large
+        ? "size-10"
+        : size === "icon"
+          ? "size-5"
+          : "size-7";
   if (!member.avatar)
     return <ProjectMonogram text={member.monogram} color={member.color} className={dimensions} />;
   const face = agentFace(member.avatar);

@@ -201,8 +201,10 @@ export function projectTurnItemForDetail(item: OrchestrationV2TurnItem): Orchest
           item.result === null ? null : (truncateDetail(item.result, MAX_ON_DEMAND_BYTES) ?? null),
       };
     case "handoff":
-    case "file_change":
       return projectTurnItemForWire(item);
+    // Asked for when a row opens, so its diff can show inline at the stored bound.
+    case "file_change":
+      return boundFileChangeForStorage(item);
     default:
       return item;
   }

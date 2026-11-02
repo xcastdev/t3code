@@ -81,6 +81,8 @@ export function deriveThreadRelationshipGraph(input: {
   };
 
   for (const thread of threads) {
+    // An agent's chats list under the agent in the sidebar; they aren't forks of its home.
+    if (thread.lineage.relationshipToParent === "chat") continue;
     const parentThreadId =
       thread.forkedFrom?.type === "run"
         ? thread.forkedFrom.threadId

@@ -5,6 +5,8 @@ import {
   type ProviderConsumeResetCreditInput,
   type ServerProviderSlashCommand,
   isProviderAvailable,
+  isProviderDriverKind,
+  type ProviderDriverKind,
   type ServerProvider,
   type ServerProviderUsageLimits,
   type ServerProviderUsageWindow,
@@ -283,6 +285,40 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
     }
   }
   return [...accounts.values()];
+}
+
+/** False for universal harnesses (Pi, OpenCode, …) that run on another provider's login. */
+export function reportsOwnUsageLimits(provider: ServerProvider): boolean {
+  return (
+    provider.usageLimits !== undefined && provider.usageLimits.unavailable?.reason !== "unsupported"
+  );
+}
+
+/** The driver whose plan limits a thread spends: its own, or the one saved for a universal harness. */
+export function resolveUsageLimitDriver(input: {
+  readonly provider: ServerProvider | undefined;
+  readonly mapping: string | undefined;
+}): ProviderDriverKind | null {
+  if (input.provider && reportsOwnUsageLimits(input.provider)) return input.provider.driver;
+  return input.mapping !== undefined && isProviderDriverKind(input.mapping) ? input.mapping : null;
+}
+
+/** The thread's own instance first, so two logins of one driver show the one in use. */
+export function findThreadLimitAccount(
+  accounts: readonly LimitAccount[],
+  input: {
+    readonly environmentId: EnvironmentId;
+    readonly instanceId: ProviderInstanceId | null;
+    readonly driver: ProviderDriverKind | null;
+  },
+): LimitAccount | null {
+  if (input.driver === null) return null;
+  const ownKey = input.instanceId === null ? null : `${input.environmentId}:${input.instanceId}`;
+  return (
+    accounts.find((account) => account.key === ownKey && account.driver === input.driver) ??
+    accounts.find((account) => account.driver === input.driver) ??
+    null
+  );
 }
 
 export function collectLimitNotices(presentations: LimitPresentations): readonly string[] {

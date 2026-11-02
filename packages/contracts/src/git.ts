@@ -539,6 +539,10 @@ export const GitCommitStagedResult = Schema.Struct({
   recovery: Schema.NullOr(Schema.Literals(["push"])),
 });
 export type GitCommitStagedResult = typeof GitCommitStagedResult.Type;
+export const GitGenerateStagedCommitMessageInput = Schema.Struct({ cwd: TrimmedNonEmptyString });
+export type GitGenerateStagedCommitMessageInput = typeof GitGenerateStagedCommitMessageInput.Type;
+export const GitGenerateStagedCommitMessageResult = Schema.Struct({ message: Schema.String });
+export type GitGenerateStagedCommitMessageResult = typeof GitGenerateStagedCommitMessageResult.Type;
 export const GitDiscoverRepositoriesInput = Schema.Struct({ cwd: TrimmedNonEmptyString });
 export type GitDiscoverRepositoriesInput = typeof GitDiscoverRepositoriesInput.Type;
 export const GitDiscoverRepositoriesResult = Schema.Struct({

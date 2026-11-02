@@ -10,6 +10,7 @@ import { createJSONStorage, persist } from "zustand/middleware";
 import { useClosedViewStore } from "./closedViewStore";
 import { resolveStorage } from "./lib/storage";
 import type { ThreadPanelPresentation } from "./rightPanelLayout";
+import { WORK_SECTIONS, type WorkSection } from "./routes/-workSearch";
 import type { ChatFileAttachment } from "./types";
 
 const RIGHT_PANEL_KINDS = [
@@ -22,6 +23,8 @@ const RIGHT_PANEL_KINDS = [
   "pull-request",
   "pull-requests",
   "source-control",
+  "work",
+  "work-task",
 ] as const;
 export type RightPanelKind = (typeof RIGHT_PANEL_KINDS)[number];
 
@@ -76,7 +79,10 @@ export type RightPanelSurface =
       detailTab?: PullRequestDetailTab;
     }
   | { id: "pull-requests"; kind: "pull-requests" }
-  | { id: "source-control"; kind: "source-control" };
+  | { id: "source-control"; kind: "source-control" }
+  /** One view of the thread's project Work; each view is its own tab. */
+  | { id: `work:${WorkSection}`; kind: "work"; view: WorkSection }
+  | { id: `work-task:${string}`; kind: "work-task"; taskId: string; title?: string };
 
 const RIGHT_PANEL_STORAGE_KEY = "t3code:right-panel-state:v2";
 const RIGHT_PANEL_STORAGE_VERSION = 14;
@@ -122,8 +128,10 @@ interface RightPanelStoreState {
   ) => boolean;
   open: (
     ref: ScopedThreadRef,
-    kind: Exclude<RightPanelKind, "file" | "terminal" | "pull-request">,
+    kind: Exclude<RightPanelKind, "file" | "terminal" | "pull-request" | "work" | "work-task">,
   ) => void;
+  openWork: (ref: ScopedThreadRef, view: WorkSection) => void;
+  openWorkTask: (ref: ScopedThreadRef, taskId: string, title?: string) => void;
   openDevice: (ref: ScopedThreadRef, target: DeviceTabTarget, automatic?: boolean) => void;
   renameDevice: (ref: ScopedThreadRef, surfaceId: string, title: string) => void;
   openBrowser: (ref: ScopedThreadRef, tabId: string | null) => void;
@@ -181,7 +189,7 @@ interface RightPanelStoreState {
   toggleVisibility: (ref: ScopedThreadRef) => void;
   toggle: (
     ref: ScopedThreadRef,
-    kind: Exclude<RightPanelKind, "file" | "terminal" | "pull-request">,
+    kind: Exclude<RightPanelKind, "file" | "terminal" | "pull-request" | "work" | "work-task">,
   ) => void;
   setThreadPanelOpen: (
     ref: ScopedThreadRef,
@@ -204,7 +212,10 @@ const DEFAULT_THREAD_PANEL_VISIBILITY: ThreadPanelVisibility = {
 };
 
 const singletonSurface = (
-  kind: Exclude<RightPanelKind, "file" | "preview" | "terminal" | "pull-request">,
+  kind: Exclude<
+    RightPanelKind,
+    "file" | "preview" | "terminal" | "pull-request" | "work" | "work-task"
+  >,
 ): RightPanelSurface => {
   switch (kind) {
     case "diff":
@@ -252,6 +263,19 @@ const terminalSurface = (terminalId: string): RightPanelSurface => ({
   resourceId: terminalId,
   terminalIds: [terminalId],
   activeTerminalId: terminalId,
+});
+
+const workSurface = (view: WorkSection): RightPanelSurface => ({
+  id: `work:${view}`,
+  kind: "work",
+  view,
+});
+
+const workTaskSurface = (taskId: string, title?: string): RightPanelSurface => ({
+  id: `work-task:${taskId}`,
+  kind: "work-task",
+  taskId,
+  ...(title === undefined ? {} : { title }),
 });
 
 export type PullRequestSurface = Extract<RightPanelSurface, { kind: "pull-request" }>;
@@ -477,6 +501,21 @@ export function migratePersistedRightPanelState(persistedState: unknown): {
                           : 0;
                       return [{ ...surface, revealLine, revealRequestId }];
                     }
+                    if (surface.kind === "work") {
+                      return WORK_SECTIONS.includes(surface.view)
+                        ? [workSurface(surface.view)]
+                        : [];
+                    }
+                    if (surface.kind === "work-task") {
+                      return typeof surface.taskId === "string" && surface.taskId.length > 0
+                        ? [
+                            workTaskSurface(
+                              surface.taskId,
+                              typeof surface.title === "string" ? surface.title : undefined,
+                            ),
+                          ]
+                        : [];
+                    }
                     if (surface.kind === "pull-request") {
                       if (
                         typeof surface.projectId !== "string" ||
@@ -696,6 +735,27 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             return upsertSurface({ ...current, surfaces: withoutPlaceholder }, surface);
           }),
         ),
+      openWork: (ref, view) =>
+        set((state) =>
+          userAction(state, scopedThreadKey(ref), (current) =>
+            upsertSurface(current, workSurface(view)),
+          ),
+        ),
+      openWorkTask: (ref, taskId, title) =>
+        set((state) =>
+          userAction(state, scopedThreadKey(ref), (current) => {
+            const surface = workTaskSurface(taskId, title);
+            const next = upsertSurface(current, surface);
+            return title === undefined
+              ? next
+              : {
+                  ...next,
+                  surfaces: next.surfaces.map((entry) =>
+                    entry.id === surface.id ? surface : entry,
+                  ),
+                };
+          }),
+        ),
       openPullRequest: (ref, target) =>
         set((state) =>
           userAction(state, scopedThreadKey(ref), (current) => {
@@ -857,7 +917,6 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               const fallback = surfaces[Math.min(index, surfaces.length - 1)] ?? null;
               return {
                 ...current,
-                isOpen: surfaces.length > 0 && current.isOpen,
                 surfaces,
                 activeSurfaceId:
                   current.activeSurfaceId === surfaceId
@@ -896,11 +955,8 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             const index = current.surfaces.findIndex((surface) => surface.id === surfaceId);
             if (index < 0) return current;
             const surfaces = current.surfaces.filter((surface) => surface.id !== surfaceId);
-            const next = {
-              ...current,
-              isOpen: surfaces.length > 0 && current.isOpen,
-              surfaces,
-            };
+            // An emptied panel stays open as the launcher rail.
+            const next = { ...current, surfaces };
             if (current.activeSurfaceId !== surfaceId) {
               return next;
             }
@@ -945,7 +1001,7 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
           closeAction(state, scopedThreadKey(ref), (current) =>
             current.surfaces.length === 0
               ? current
-              : { ...current, isOpen: false, surfaces: [], activeSurfaceId: null },
+              : { ...current, surfaces: [], activeSurfaceId: null },
           ),
         ),
       moveSurface: (ref, surfaceId, toIndex) =>

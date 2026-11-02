@@ -13,6 +13,7 @@ import {
   type EnvironmentId,
 } from "@t3tools/contracts";
 import { Link, useNavigate } from "@tanstack/react-router";
+import { AgentAvatar } from "./AgentAvatar";
 import { useEffect, useRef, useState } from "react";
 
 import { requestConfirmDialog } from "../../confirmDialog";
@@ -115,7 +116,8 @@ export function AgentDetailPage({
           </Link>
         </WorkspaceBreadcrumbItem>
         <WorkspaceBreadcrumbSeparator />
-        <WorkspaceBreadcrumbItem current className="min-w-0">
+        <WorkspaceBreadcrumbItem current className="min-w-0 gap-2">
+          {detail ? <AgentAvatar agent={detail.summary} size="icon" /> : null}
           <h1 className="truncate">{detail?.summary.name ?? "Agent"}</h1>
         </WorkspaceBreadcrumbItem>
       </WorkspaceBreadcrumb>

@@ -1,10 +1,15 @@
-import { useNavigate } from "@tanstack/react-router";
+import { Link } from "@tanstack/react-router";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import type { ProjectWorkScope } from "@t3tools/client-runtime/project-work";
 import type { EnvironmentId, ProjectId, ProjectWorkTaskId } from "@t3tools/contracts";
 
 import { isElectron } from "../../env";
-import { WORK_SECTIONS, type WorkRouteSearch, type WorkSection } from "../../routes/-workSearch";
+import {
+  WORK_SECTION_LABELS,
+  WORK_SECTIONS,
+  type WorkRouteSearch,
+  type WorkSection,
+} from "../../routes/-workSearch";
 import { useAllEnvironmentProjectSnapshotsReady, useProject } from "../../state/entities";
 import { useEnvironment } from "../../state/environments";
 import { MiddleTruncate } from "../ui/middle-truncate";
@@ -24,18 +29,8 @@ import { WorkEmpty } from "./WorkLayout";
 import { WorkIntake } from "./WorkIntake";
 import { WorkKnowledge } from "./WorkKnowledge";
 import { WorkOverview } from "./WorkOverview";
-import { WorkPortfolio } from "./WorkPortfolio";
 import { WorkTasks } from "./WorkTasks";
 import { useWorkWriter } from "./useWorkWriter";
-
-const SECTION_LABELS: Record<WorkSection, string> = {
-  overview: "Overview",
-  tasks: "Tasks",
-  team: "Team",
-  knowledge: "Knowledge",
-  intake: "Intake",
-  portfolio: "All projects",
-};
 
 export function WorkPage({
   environmentId,
@@ -52,26 +47,22 @@ export function WorkPage({
   const projectsReady = useAllEnvironmentProjectSnapshotsReady();
   const environment = useEnvironment(environmentId);
   const writer = useWorkWriter(environmentId);
-  const navigate = useNavigate();
   const phase = environment?.connection.phase ?? "disconnected";
 
   const header = (
     <WorkspacePageHeader electron={isElectron}>
       <WorkspaceBreadcrumb ariaLabel="Work breadcrumb" className="min-w-0 flex-1">
         <WorkspaceBreadcrumbItem>
-          <button
-            type="button"
-            onClick={() => onSearchChange({ section: "portfolio" })}
+          <Link
+            to="/work"
             className="rounded-sm outline-none hover:underline focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
           >
             Work
-          </button>
+          </Link>
         </WorkspaceBreadcrumbItem>
         <WorkspaceBreadcrumbSeparator />
         <WorkspaceBreadcrumbItem current className="min-w-0">
-          <span className="truncate">
-            {search.section === "portfolio" ? "All projects" : (project?.title ?? "Project")}
-          </span>
+          <span className="truncate">{project?.title ?? "Project"}</span>
         </WorkspaceBreadcrumbItem>
       </WorkspaceBreadcrumb>
       {environment ? (
@@ -113,31 +104,27 @@ export function WorkPage({
         {header}
         <ScrollArea className="min-h-0 flex-1">
           <WorkspacePageContainer width="expanded" className="@container/work gap-6">
-            {section !== "portfolio" ? (
-              <div className="flex min-w-0 flex-col gap-1">
-                <h1 className="text-xl font-semibold tracking-tight">{project.title}</h1>
-                <div className="max-w-xl text-xs text-muted-foreground">
-                  <MiddleTruncate value={scope.checkoutPath} />
-                </div>
+            <div className="flex min-w-0 flex-col gap-1">
+              <h1 className="text-xl font-semibold tracking-tight">{project.title}</h1>
+              <div className="max-w-xl text-xs text-muted-foreground">
+                <MiddleTruncate value={scope.checkoutPath} />
               </div>
-            ) : null}
+            </div>
             <div className="sticky top-0 z-10 -mx-5 overflow-x-auto border-b border-border/60 bg-background px-5 py-2 sm:-mx-6 sm:px-6">
               <ToggleGroup
                 aria-label="Work sections"
-                value={section === "portfolio" ? [] : [section]}
+                value={[section]}
                 onValueChange={(next) => {
                   const value = next[0];
                   if (WORK_SECTIONS.some((section) => section === value))
                     onSearchChange({ section: value as WorkSection });
                 }}
               >
-                {(Object.keys(SECTION_LABELS) as WorkSection[])
-                  .filter((value) => value !== "portfolio")
-                  .map((value) => (
-                    <Toggle key={value} value={value}>
-                      {SECTION_LABELS[value]}
-                    </Toggle>
-                  ))}
+                {WORK_SECTIONS.map((value) => (
+                  <Toggle key={value} value={value}>
+                    {WORK_SECTION_LABELS[value]}
+                  </Toggle>
+                ))}
               </ToggleGroup>
             </div>
             {section === "overview" ? (
@@ -156,19 +143,6 @@ export function WorkPage({
               />
             ) : section === "team" ? (
               <WorkTeam scope={scope} writer={writer} onOpenTask={openTask} />
-            ) : section === "portfolio" ? (
-              <WorkPortfolio
-                onOpen={(target) =>
-                  void navigate({
-                    to: "/work/$environmentId/$projectId",
-                    params: { environmentId: target.environmentId, projectId: target.projectId },
-                    search:
-                      target.taskId === undefined
-                        ? { section: "overview" }
-                        : { section: "tasks", taskId: target.taskId },
-                  })
-                }
-              />
             ) : section === "knowledge" ? (
               <WorkKnowledge scope={scope} writer={writer} />
             ) : (

@@ -87,12 +87,12 @@ can still be started by you. Invoke those one per message: Claude directly runs
 only the last named skill and may try to start earlier ones through its Skill
 tool, which refuses skills reserved for manual invocation.
 
-## Task lists
+## Checklists
 
-To show Claude task lists in the web and desktop apps, add
+To show Claude's checklist in the web and desktop apps, add
 `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` under **Variables** in the Claude instance's
-**Environment** section in **Settings > Providers**. Each update shows as a Tasks
-row in the thread; open it to see every step.
+**Environment** section in **Settings > Providers**. Each update shows as a Checklist
+row in the thread, and the latest one in the thread details **Checklist** section.
 
 ## OpenRouter
 

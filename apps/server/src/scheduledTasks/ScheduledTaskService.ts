@@ -6,6 +6,7 @@ import { AssistantError, AssistantRepository } from "../assistants/AssistantRepo
 import { AssistantRoutineRepository } from "../assistants/AssistantRoutineRepository.ts";
 import { AssistantRoutineMutation } from "../assistants/AssistantRoutineMutation.ts";
 import { assertOrdinaryAssistantDestination } from "../assistants/AssistantGuards.ts";
+import { assistantThreadIsCurrent } from "../assistants/AssistantThreadAuthority.ts";
 import {
   canonicalProjectWorkPayload,
   CommandId,
@@ -442,14 +443,22 @@ export const layer = Layer.effect(
             Effect.mapError((cause) => taskError("Assistant is unavailable.", { taskId, cause })),
           );
         const binding = owner.detail.summary.binding;
+        const threadId = target.threadId == null ? null : ThreadId.make(target.threadId);
         if (
           target.projectId !== binding.backingProjectId ||
-          target.threadId !== binding.canonicalThreadId ||
-          (retained !== null &&
-            (retained.environmentId !== capability.value.scope.environmentId ||
-              retained.assistantId !== capability.value.scope.assistantId))
+          threadId === null ||
+          (retained === null
+            ? !(yield* assistantThreadIsCurrent({ threadId, ...binding }).pipe(
+                Effect.provideService(SqlClient.SqlClient, sql),
+                Effect.mapError((cause) =>
+                  taskError("Could not check the routine thread.", { taskId, cause }),
+                ),
+              ))
+            : threadId !== retained.threadId ||
+              retained.environmentId !== capability.value.scope.environmentId ||
+              retained.assistantId !== capability.value.scope.assistantId)
         )
-          return yield* taskError("Routine must remain bound to its canonical assistant.", {
+          return yield* taskError("Routine must remain bound to its assistant thread.", {
             taskId,
           });
         return;

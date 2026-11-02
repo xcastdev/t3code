@@ -1,29 +1,41 @@
+import type { ThreadStructure } from "@t3tools/client-runtime/state/models";
 import type {
-  EditorId,
   EnvironmentId,
+  OrchestrationV2PendingBackgroundTask,
   ProjectId,
-  ProjectScript,
-  ResolvedKeybindingsConfig,
+  ProviderInstanceId,
+  ServerProvider,
   ThreadId,
+  UsageLimitSourceSnapshots,
 } from "@t3tools/contracts";
 
 import type { DraftId } from "../../composerDraftStore";
-import { useT3ProjectFileScripts } from "../../hooks/useT3ProjectFileScripts";
-import { type EnvMode, type EnvironmentOption } from "../BranchToolbar.logic";
+import { type EnvMode } from "../BranchToolbar.logic";
 import { BranchToolbar } from "../BranchToolbar";
 import BaseGitActionsControl from "../GitActionsControl";
-import ProjectScriptsControl, {
-  type NewProjectScriptInput,
-  type ProjectScriptActionResult,
-} from "../ProjectScriptsControl";
-import { memo, type ComponentProps } from "react";
+import { GitBranchIcon } from "lucide-react";
+import { lazy, memo, Suspense, type ComponentProps } from "react";
+import {
+  ThreadDetailsAgentActivitySection,
+  ThreadDetailsAgentRoutinesSection,
+  ThreadDetailsAgentStatusSection,
+  type ThreadDetailsAgent,
+} from "./ThreadDetailsAgentSections";
 import { ThreadDetailsCard } from "./ThreadDetailsCard";
-import { OpenInPicker } from "./OpenInPicker";
-import { ThreadDetailsSection } from "./ThreadDetailsSection";
+import { ThreadDetailsSection, ThreadDetailsSummary } from "./ThreadDetailsSection";
+import {
+  ThreadDetailsBackgroundShellsSection,
+  ThreadDetailsContextSection,
+  ThreadDetailsTasksSection,
+  type ThreadDetailsContextProps,
+} from "./ThreadDetailsSections";
 import { ThreadAutomationsPanel } from "./ThreadAutomationsPanel";
 import { ThreadRelationshipsPanel } from "./ThreadRelationshipsControl";
 
 const GitActionsControl = memo(BaseGitActionsControl);
+// Both reuse settings and usage-page modules; keep them out of the chat bundle.
+const ThreadDetailsUsageSection = lazy(() => import("./ThreadDetailsUsageSection"));
+const ThreadDetailsMcpSection = lazy(() => import("./ThreadDetailsMcpSection"));
 
 export interface ThreadDetailsPanelProps extends Pick<
   ComponentProps<typeof ThreadDetailsCard>,
@@ -37,19 +49,9 @@ export interface ThreadDetailsPanelProps extends Pick<
   isServerThread: boolean;
   draftId?: DraftId;
   activeProjectName: string | undefined;
-  activeProjectScripts: ReadonlyArray<ProjectScript> | undefined;
-  preferredScriptId: string | null;
-  keybindings: ResolvedKeybindingsConfig;
-  availableEditors: ReadonlyArray<EditorId>;
-  showOpenInPicker: boolean;
-  openInShortcutEnabled: boolean;
   gitCwd: string | null;
   isGitRepo: boolean;
   envLocked: boolean;
-  availableEnvironments: readonly EnvironmentOption[];
-  autoEnvironmentLabel?: string | undefined;
-  onAutoEnvironment?: (() => void) | undefined;
-  onEnvironmentChange?: (environmentId: EnvironmentId) => void;
   onEnvModeChange: (mode: EnvMode) => void;
   envMode: EnvMode;
   activeThreadBranchOverride?: string | null;
@@ -59,20 +61,21 @@ export interface ThreadDetailsPanelProps extends Pick<
   onCheckoutPullRequestRequest?: (reference: string) => void;
   onComposerFocusRequest: () => void;
   onOpenChanges?: () => void;
-  onRunProjectScript: (script: ProjectScript) => void;
-  onAddProjectScript: (input: NewProjectScriptInput) => Promise<ProjectScriptActionResult>;
-  onUpdateProjectScript: (
-    scriptId: string,
-    input: NewProjectScriptInput,
-  ) => Promise<ProjectScriptActionResult>;
-  onDeleteProjectScript: (scriptId: string) => Promise<ProjectScriptActionResult>;
+  onOpenSourceControl?: (() => void) | undefined;
+  context: ThreadDetailsContextProps;
+  providers: readonly ServerProvider[];
+  usageLimitSources: UsageLimitSourceSnapshots;
+  providerInstanceId: ProviderInstanceId | null;
+  branch: string | null;
+  plans: ThreadStructure["plans"];
+  runs: ThreadStructure["runs"];
+  pendingBackgroundTasks: ReadonlyArray<OrchestrationV2PendingBackgroundTask>;
+  /** An agent's home chat gets a status and schedule view instead of the project's. */
+  agent?: ThreadDetailsAgent | null;
 }
 
 export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
-  const fileScripts = useT3ProjectFileScripts(
-    props.environmentId,
-    props.activeProjectScripts ? props.gitCwd : null,
-  );
+  const serverThread = props.isServerThread && !props.draftId;
   const activeThreadRef = { environmentId: props.environmentId, threadId: props.threadId };
   const branchToolbarProps = {
     showGitControls: props.isGitRepo,
@@ -106,93 +109,141 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
       anchor={props.anchor}
       handle={props.handle}
     >
-      {(density) => (
-        <>
-          <ThreadDetailsSection
-            headingId="thread-details-workspace-heading"
-            title="Workspace"
-            separated={false}
-            showHeading={false}
-          >
-            <div className="flex flex-col">
-              {density === "full" ? (
-                <BranchToolbar
-                  layout="panel"
-                  panelSection="workspace"
-                  availableEnvironments={props.availableEnvironments}
-                  {...(props.onEnvironmentChange
-                    ? { onEnvironmentChange: props.onEnvironmentChange }
-                    : {})}
-                  autoEnvironmentLabel={props.autoEnvironmentLabel}
-                  onAutoEnvironment={props.onAutoEnvironment}
-                  {...branchToolbarProps}
-                />
-              ) : null}
-
-              {density !== "essential" && props.showOpenInPicker ? (
-                <OpenInPicker
-                  keybindings={props.keybindings}
+      {(density) =>
+        props.agent ? (
+          <>
+            <ThreadDetailsAgentStatusSection agent={props.agent} />
+            {density !== "essential" && serverThread ? (
+              <ThreadDetailsTasksSection
+                environmentId={props.environmentId}
+                threadId={props.threadId}
+                plans={props.plans}
+                runs={props.runs}
+              />
+            ) : null}
+            {density !== "essential" && serverThread ? (
+              <ThreadDetailsBackgroundShellsSection
+                environmentId={props.environmentId}
+                threadId={props.threadId}
+                pendingBackgroundTasks={props.pendingBackgroundTasks}
+              />
+            ) : null}
+            {density !== "essential" ? (
+              <ThreadDetailsAgentActivitySection agent={props.agent} />
+            ) : null}
+            {density !== "essential" ? (
+              <ThreadDetailsAgentRoutinesSection agent={props.agent} />
+            ) : null}
+            {density === "full" ? (
+              <ThreadDetailsContextSection {...props.context} separated />
+            ) : null}
+            {density === "full" ? (
+              <Suspense fallback={null}>
+                <ThreadDetailsUsageSection
                   environmentId={props.environmentId}
-                  availableEditors={props.availableEditors}
-                  openInCwd={props.gitCwd}
-                  enableShortcut={props.openInShortcutEnabled}
-                  displayMode="panel"
+                  providers={props.providers}
+                  usageLimitSources={props.usageLimitSources}
+                  providerInstanceId={props.providerInstanceId}
                 />
-              ) : null}
+              </Suspense>
+            ) : null}
+          </>
+        ) : (
+          <>
+            <ThreadDetailsContextSection {...props.context} />
 
-              {props.activeProjectScripts ? (
-                <ProjectScriptsControl
+            {density !== "essential" ? (
+              <Suspense fallback={null}>
+                <ThreadDetailsUsageSection
                   environmentId={props.environmentId}
-                  displayMode="panel"
-                  scripts={props.activeProjectScripts}
-                  fileScripts={fileScripts}
-                  preferredScriptId={props.preferredScriptId}
-                  onRunScript={props.onRunProjectScript}
-                  onAddScript={props.onAddProjectScript}
-                  onUpdateScript={props.onUpdateProjectScript}
-                  onDeleteScript={props.onDeleteProjectScript}
+                  providers={props.providers}
+                  usageLimitSources={props.usageLimitSources}
+                  providerInstanceId={props.providerInstanceId}
                 />
-              ) : null}
-            </div>
-          </ThreadDetailsSection>
+              </Suspense>
+            ) : null}
 
-          {props.gitCwd ? (
-            <ThreadDetailsSection
-              headingId="thread-details-version-control-heading"
-              title="Version Control"
-              showHeading={false}
-              separated={density === "full"}
-            >
-              <div className="flex flex-col">
-                {props.isGitRepo ? (
-                  <BranchToolbar layout="panel" panelSection="branch" {...branchToolbarProps} />
-                ) : null}
-                {props.activeProjectName ? (
-                  <GitActionsControl
-                    displayMode="panel"
-                    compact={density !== "full"}
-                    gitCwd={props.gitCwd}
-                    activeThreadRef={activeThreadRef}
-                    {...(props.draftId ? { draftId: props.draftId } : {})}
-                    {...(props.onOpenChanges ? { onOpenChanges: props.onOpenChanges } : {})}
-                  />
-                ) : null}
-              </div>
-            </ThreadDetailsSection>
-          ) : null}
+            {props.gitCwd ? (
+              <ThreadDetailsSection
+                headingId="thread-details-version-control-heading"
+                title="Version Control"
+                collapsedSummary={
+                  props.branch ? (
+                    <ThreadDetailsSummary>
+                      <GitBranchIcon className="size-3 shrink-0" aria-hidden />
+                      <span className="truncate font-mono">{props.branch}</span>
+                    </ThreadDetailsSummary>
+                  ) : null
+                }
+              >
+                <div className="flex flex-col">
+                  {props.isGitRepo ? (
+                    <BranchToolbar
+                      layout="panel"
+                      panelSection="branch"
+                      {...branchToolbarProps}
+                      onOpenSourceControl={props.onOpenSourceControl}
+                    />
+                  ) : null}
+                  {props.activeProjectName ? (
+                    <GitActionsControl
+                      displayMode="panel"
+                      showActions={false}
+                      compact={density !== "full"}
+                      gitCwd={props.gitCwd}
+                      activeThreadRef={activeThreadRef}
+                      {...(props.draftId ? { draftId: props.draftId } : {})}
+                      {...(props.onOpenChanges ? { onOpenChanges: props.onOpenChanges } : {})}
+                    />
+                  ) : null}
+                </div>
+              </ThreadDetailsSection>
+            ) : null}
 
-          {density === "full" && !props.draftId ? (
-            <ThreadAutomationsPanel environmentId={props.environmentId} threadId={props.threadId} />
-          ) : null}
+            {density === "full" && !props.draftId ? (
+              <ThreadRelationshipsPanel
+                environmentId={props.environmentId}
+                threadId={props.threadId}
+              />
+            ) : null}
 
-          {density === "full" && !props.draftId ? (
-            <ThreadRelationshipsPanel
-              environmentId={props.environmentId}
-              threadId={props.threadId}
-            />
-          ) : null}
-        </>
-      )}
+            {density !== "essential" && serverThread ? (
+              <ThreadDetailsTasksSection
+                environmentId={props.environmentId}
+                threadId={props.threadId}
+                plans={props.plans}
+                runs={props.runs}
+              />
+            ) : null}
+
+            {density === "full" && serverThread ? (
+              <ThreadDetailsBackgroundShellsSection
+                environmentId={props.environmentId}
+                threadId={props.threadId}
+                pendingBackgroundTasks={props.pendingBackgroundTasks}
+              />
+            ) : null}
+
+            {density === "full" && serverThread ? (
+              <Suspense fallback={null}>
+                <ThreadDetailsMcpSection
+                  environmentId={props.environmentId}
+                  projectId={props.projectId}
+                  threadId={props.threadId}
+                  providerInstanceId={props.providerInstanceId}
+                />
+              </Suspense>
+            ) : null}
+
+            {density === "full" && !props.draftId ? (
+              <ThreadAutomationsPanel
+                environmentId={props.environmentId}
+                threadId={props.threadId}
+              />
+            ) : null}
+          </>
+        )
+      }
     </ThreadDetailsCard>
   );
 }

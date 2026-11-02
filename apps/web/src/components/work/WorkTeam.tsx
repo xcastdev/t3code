@@ -222,7 +222,16 @@ export function WorkTeam({
           {changed ? (
             <WorkReviewChanged
               onReview={() => {
-                setDraft(null);
+                if (recorded === null || recorded.kind === "unreadable" || blocked !== null) return;
+                const latest = recorded.kind === "configured" ? recorded.values : null;
+                setDraft({
+                  ...draft,
+                  selected: current,
+                  generation: recorded.generation,
+                  recorded: latest,
+                  values:
+                    draft.toggle && latest ? { ...latest, enabled: !latest.enabled } : draft.values,
+                });
               }}
             />
           ) : null}
@@ -377,7 +386,8 @@ function TeamForm({
                 {PROJECT_TEAM_PRESETS[profile.role].specialty}
               </p>
               <WorkAvatarEditor
-                role={profile.role}
+                identity={memberAvatarIdentity(profile.role, profile.name ?? profile.role)}
+                preset={PROJECT_TEAM_PRESETS[profile.role].avatar}
                 name={profile.name?.trim() || workStateLabel(profile.role)}
                 avatar={profile.avatar}
                 recorded={recorded?.profiles.find((p) => p.role === profile.role)?.avatar}

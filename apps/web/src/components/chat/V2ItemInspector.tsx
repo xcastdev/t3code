@@ -30,7 +30,20 @@ import { RenderErrorBoundary } from "../RenderErrorBoundary";
 import { CommandOutputPanel, useCommandOutputStreaming } from "./CommandOutputPanel";
 import { resolveExternalWebLinkHref } from "./externalLinkContextMenu";
 import type { ExpandedImagePreview } from "./ExpandedImagePreview";
-import { ShellCommandBlock } from "./ShellCommandBlock";
+import {
+  TerminalCommand,
+  ToolCode,
+  ToolDiff,
+  ToolDetailCard,
+  ToolDetailPane,
+  ToolPath,
+} from "./ToolCallDetail";
+import {
+  fileChangePatch,
+  isFileContentArg,
+  isFilePathArg,
+  toolArgsFilePath,
+} from "./ToolCallDetail.logic";
 import type { TurnItemSource } from "./timelineRowContext";
 
 interface V2ItemInspectorProps {
@@ -88,16 +101,25 @@ function StructuredValue({
   value,
   highlightJson = false,
   language,
+  bare = false,
 }: {
   readonly value: unknown;
   readonly highlightJson?: boolean;
   readonly language?: "typescript";
+  /** Inside a tool pane, which already scrolls and sets the type. */
+  readonly bare?: boolean;
 }) {
   const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
   const isJson = highlightJson && isJsonText(text);
   if (!text) return null;
   return (
-    <pre className={cn("max-h-80 overflow-auto text-muted-foreground", monoClassName)}>
+    <pre
+      className={
+        bare
+          ? "whitespace-pre-wrap break-words"
+          : cn("max-h-80 overflow-auto text-muted-foreground", monoClassName)
+      }
+    >
       {language || isJson ? (
         <RenderErrorBoundary fallback={text}>
           <Suspense fallback={text}>
@@ -118,7 +140,8 @@ function useFetchedTurnItem(
   skip = false,
 ) {
   const wireItem = projectedItem.item;
-  const fetches = !skip && turnItemNeedsDetailFetch(wireItem);
+  // The wire leaves out file change diffs; an opened edit fetches its diff to show it inline.
+  const fetches = !skip && (turnItemNeedsDetailFetch(wireItem) || wireItem.type === "file_change");
   const detail = useTurnItemDetail(
     fetches
       ? {
@@ -160,7 +183,7 @@ interface ToolOutputState {
   readonly onImageExpand?: ((preview: ExpandedImagePreview) => void) | undefined;
 }
 
-function ToolOutput(props: ToolOutputState) {
+function ToolOutput(props: ToolOutputState & { readonly codePath?: string | undefined }) {
   const images = props.images.map((resource) => (
     <ChatMarkdownAssetImage
       key={resource.index}
@@ -172,32 +195,58 @@ function ToolOutput(props: ToolOutputState) {
     />
   ));
   const text = props.output ? (
-    <div className="max-h-80 overflow-auto text-muted-foreground">{props.output}</div>
+    props.codePath ? (
+      <ToolCode text={props.output} path={props.codePath} />
+    ) : isJsonText(props.output) ? (
+      <StructuredValue value={props.output} highlightJson bare />
+    ) : (
+      <div className="whitespace-pre-wrap break-words">{props.output}</div>
+    )
   ) : props.pending ? (
-    <div className="text-muted-foreground italic">Loading output…</div>
+    <div className="font-sans text-muted-foreground italic">Loading output…</div>
   ) : props.error ? (
-    <div className="text-destructive">Couldn&apos;t load output: {props.error}</div>
-  ) : props.empty && images.length === 0 ? (
-    <div className="text-muted-foreground italic">No output.</div>
+    <div className="font-sans text-destructive">Couldn&apos;t load output: {props.error}</div>
+  ) : images.length === 0 ? (
+    <div className="font-sans text-muted-foreground italic">No output.</div>
   ) : null;
   return (
-    <>
+    <div className="space-y-1.5">
       {images}
       {text}
-    </>
+    </div>
   );
 }
 
-export function FetchedToolOutput(props: {
+/**
+ * A tool call whose input the row already knows, such as the files a read opened, with the
+ * output fetched from the environment. A read's output highlights for its file's type.
+ */
+export function FetchedToolDetail(props: {
   readonly projectedItem: OrchestrationV2ProjectedTurnItem;
   readonly environmentId: EnvironmentId;
+  readonly input: ReactNode;
+  readonly codePath?: string | undefined;
   readonly onImageExpand?: ((preview: ExpandedImagePreview) => void) | undefined;
   readonly source?: TurnItemSource | undefined;
 }) {
   const { output } = useFetchedTurnItem(props.projectedItem, props.environmentId, props.source);
   return (
-    <div className={cn("mt-1.5 space-y-1.5", monoClassName)}>
-      <ToolOutput {...output} onImageExpand={props.onImageExpand} />
+    <ToolDetailCard>
+      {props.input ? <ToolDetailPane label="Input">{props.input}</ToolDetailPane> : null}
+      <ToolDetailPane label="Output">
+        <ToolOutput {...output} codePath={props.codePath} onImageExpand={props.onImageExpand} />
+      </ToolDetailPane>
+    </ToolDetailCard>
+  );
+}
+
+/** Every path a read opened, in full. */
+export function ToolPaths({ paths }: { readonly paths: ReadonlyArray<string> }) {
+  return (
+    <div className="space-y-0.5">
+      {paths.map((path) => (
+        <ToolPath key={path} path={path} />
+      ))}
     </div>
   );
 }
@@ -213,29 +262,84 @@ function ToolCallBody(
   },
 ) {
   const call = toolCallLines({ command: props.command, args: props.args });
+  const filePath = call.args ? toolArgsFilePath(call.args) : null;
+  const terminal = call.command !== null;
   return (
-    <div className={cn("space-y-1.5", monoClassName)}>
-      {call.command ? <ShellCommandBlock command={call.command} /> : null}
+    <ToolDetailCard>
+      {call.command ? (
+        <ToolDetailPane label="Input" surface="terminal">
+          <TerminalCommand command={call.command} />
+        </ToolDetailPane>
+      ) : null}
       {call.args ? (
-        <div className="text-foreground/85">
-          {call.args.map(([key, value]) => (
-            <div key={key}>
-              <span className="text-muted-foreground">{key} </span>
-              {key === "code" && isJavaScriptReplTool(props.toolName) ? (
-                <StructuredValue value={value} language="typescript" />
-              ) : (
-                value
-              )}
-            </div>
-          ))}
+        <ToolDetailPane label="Input">
+          <dl className="space-y-1.5">
+            {call.args.map(([key, value]) => (
+              <div key={key}>
+                <dt className="text-muted-foreground">{key}</dt>
+                <dd className="min-w-0">
+                  {key === "code" && isJavaScriptReplTool(props.toolName) ? (
+                    <StructuredValue value={value} language="typescript" bare />
+                  ) : filePath && isFileContentArg(key) ? (
+                    <ToolCode text={value} path={filePath} />
+                  ) : isFilePathArg(key) ? (
+                    <ToolPath path={value} />
+                  ) : (
+                    <div className="whitespace-pre-wrap break-words">{value}</div>
+                  )}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </ToolDetailPane>
+      ) : null}
+      {call.argsText ? (
+        <ToolDetailPane label="Input">
+          <StructuredValue value={call.argsText} highlightJson bare />
+        </ToolDetailPane>
+      ) : null}
+      <ToolDetailPane
+        label="Output"
+        surface={terminal ? "terminal" : "code"}
+        scroll={props.outputSlot === undefined}
+        meta={
+          props.exitCode === undefined ? undefined : (
+            <span className={props.exitCode === 0 ? undefined : "text-destructive"}>
+              exit {props.exitCode}
+            </span>
+          )
+        }
+      >
+        {props.outputSlot ?? <ToolOutput {...props} />}
+      </ToolDetailPane>
+    </ToolDetailCard>
+  );
+}
+
+function FileChangeOutput({
+  item,
+  pending,
+  cacheKey,
+}: {
+  readonly item: Extract<OrchestrationV2ProjectedTurnItem["item"], { type: "file_change" }>;
+  readonly pending: boolean;
+  readonly cacheKey: string;
+}) {
+  const patch = fileChangePatch(item);
+  const message = patch === null ? item.diffStr?.trim() : undefined;
+  if (patch === null && !message && !pending) return null;
+  return (
+    <ToolDetailPane label="Output" scroll={patch === null}>
+      {patch ? (
+        <div className="max-h-96 overflow-auto font-sans">
+          <ToolDiff patch={patch} cacheKey={cacheKey} />
         </div>
-      ) : null}
-      {call.argsText ? <StructuredValue value={call.argsText} highlightJson /> : null}
-      {props.outputSlot ?? <ToolOutput {...props} />}
-      {props.exitCode !== undefined && props.exitCode !== 0 ? (
-        <div className="text-destructive">exit {props.exitCode}</div>
-      ) : null}
-    </div>
+      ) : message ? (
+        message
+      ) : (
+        <div className="font-sans text-muted-foreground italic">Loading diff…</div>
+      )}
+    </ToolDetailPane>
   );
 }
 
@@ -294,97 +398,125 @@ export const V2ItemInspector = memo(function V2ItemInspector(props: V2ItemInspec
       ) : null}
 
       {item.type === "file_change" ? (
-        <div className="space-y-2">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="font-mono text-muted-foreground">
-              {formatWorkspaceRelativePath(item.fileName, props.workspaceRoot)}
-            </span>
-            {item.additions !== undefined || item.deletions !== undefined ? (
-              <span>
-                <span className="text-diff-addition">+{formatDiffCount(item.additions ?? 0)}</span>{" "}
-                <span className="text-diff-deletion">-{formatDiffCount(item.deletions ?? 0)}</span>
-              </span>
-            ) : null}
-            {item.runId !== null && props.onOpenTurnDiff ? (
-              <Button
-                size="xs"
-                variant="outline"
-                onClick={() => props.onOpenTurnDiff?.(item.runId!, item.fileName)}
-              >
-                Open diff
-              </Button>
-            ) : null}
-          </div>
-          {item.status === "failed" && item.diffStr?.trim() ? (
-            <StructuredValue value={item.diffStr} />
-          ) : null}
-          {item.changes !== undefined && item.changes.length > 0 ? (
-            <ul className="space-y-1 font-mono text-muted-foreground">
-              {item.changes.map((change) => (
-                <li key={JSON.stringify([change.operation, change.oldPath, change.path])}>
-                  {change.operation} {change.oldPath ? `${change.oldPath} → ` : ""}
-                  {formatWorkspaceRelativePath(change.path, props.workspaceRoot)}
-                  {change.fileType || change.mimeType
-                    ? ` (${[change.fileType, change.mimeType].filter(Boolean).join(", ")})`
-                    : ""}
-                </li>
-              ))}
-            </ul>
-          ) : null}
-        </div>
-      ) : null}
-
-      {item.type === "file_search" && item.pattern?.trim() ? (
-        <div className={cn("text-foreground/85", monoClassName)}>{item.pattern}</div>
-      ) : null}
-
-      {item.type === "web_search" && item.patterns?.length ? (
-        <div className={cn("text-foreground/85", monoClassName)}>{item.patterns.join("\n")}</div>
-      ) : null}
-
-      {item.type === "file_search" && item.results?.length ? (
-        <ul className="space-y-1">
-          {item.results.map((result) => (
-            <li key={JSON.stringify(result)}>
-              <span className="font-mono text-foreground/80">
-                {formatWorkspaceRelativePath(result.fileName, props.workspaceRoot)}
-                {result.line === undefined ? "" : `:${result.line}`}
-                {result.column === undefined ? "" : `:${result.column}`}
-              </span>
-              {result.preview ? (
-                <p className="mt-0.5 whitespace-pre-wrap text-muted-foreground">{result.preview}</p>
-              ) : null}
-            </li>
-          ))}
-        </ul>
-      ) : null}
-
-      {item.type === "web_search" && item.results?.length ? (
-        <ul className="space-y-1.5">
-          {item.results.map((result) => {
-            const safeHref = resolveExternalWebLinkHref(result.url);
-            return (
-              <li key={JSON.stringify(result)}>
-                {safeHref ? (
-                  <a
-                    href={safeHref}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1 font-medium text-foreground hover:underline"
+        <ToolDetailCard>
+          <ToolDetailPane
+            label="Input"
+            meta={
+              <>
+                {item.additions !== undefined || item.deletions !== undefined ? (
+                  <span className="tabular-nums">
+                    <span className="text-diff-addition">
+                      +{formatDiffCount(item.additions ?? 0)}
+                    </span>{" "}
+                    <span className="text-diff-deletion">
+                      -{formatDiffCount(item.deletions ?? 0)}
+                    </span>
+                  </span>
+                ) : null}
+                {item.runId !== null && props.onOpenTurnDiff ? (
+                  <Button
+                    size="xs"
+                    variant="ghost"
+                    onClick={() => props.onOpenTurnDiff?.(item.runId!, item.fileName)}
                   >
-                    {result.title ?? result.url}
-                    <ExternalLinkIcon className="size-3" />
-                  </a>
-                ) : (
-                  <p className="font-medium text-foreground">
-                    {result.title ?? result.url ?? "Search result"}
-                  </p>
-                )}
-                {result.snippet ? <p className="text-muted-foreground">{result.snippet}</p> : null}
-              </li>
-            );
-          })}
-        </ul>
+                    Open diff
+                  </Button>
+                ) : null}
+              </>
+            }
+          >
+            <ToolPath path={item.fileName} />
+            {item.changes !== undefined && item.changes.length > 0 ? (
+              <ul className="mt-1.5 space-y-0.5 text-muted-foreground">
+                {item.changes.map((change) => (
+                  <li key={JSON.stringify([change.operation, change.oldPath, change.path])}>
+                    {change.operation} {change.oldPath ? `${change.oldPath} → ` : ""}
+                    {formatWorkspaceRelativePath(change.path, props.workspaceRoot)}
+                    {change.fileType || change.mimeType
+                      ? ` (${[change.fileType, change.mimeType].filter(Boolean).join(", ")})`
+                      : ""}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </ToolDetailPane>
+          <FileChangeOutput
+            item={item}
+            pending={outputState.pending}
+            cacheKey={`${props.projectedItem.sourceThreadId}:${props.projectedItem.sourceItemId}`}
+          />
+        </ToolDetailCard>
+      ) : null}
+
+      {item.type === "file_search" ? (
+        <ToolDetailCard>
+          {item.pattern?.trim() ? (
+            <ToolDetailPane label="Input">{item.pattern}</ToolDetailPane>
+          ) : null}
+          <ToolDetailPane label="Output">
+            {item.results?.length ? (
+              <ul className="space-y-1">
+                {item.results.map((result) => (
+                  <li key={JSON.stringify(result)}>
+                    <span className="text-foreground/85">
+                      {formatWorkspaceRelativePath(result.fileName, props.workspaceRoot)}
+                      {result.line === undefined ? "" : `:${result.line}`}
+                      {result.column === undefined ? "" : `:${result.column}`}
+                    </span>
+                    {result.preview ? (
+                      <p className="mt-0.5 whitespace-pre-wrap text-muted-foreground">
+                        {result.preview}
+                      </p>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <div className="font-sans text-muted-foreground italic">No matches.</div>
+            )}
+          </ToolDetailPane>
+        </ToolDetailCard>
+      ) : null}
+
+      {item.type === "web_search" ? (
+        <ToolDetailCard>
+          {item.patterns?.length ? (
+            <ToolDetailPane label="Input">{item.patterns.join("\n")}</ToolDetailPane>
+          ) : null}
+          <ToolDetailPane label="Output">
+            {item.results?.length ? (
+              <ul className="space-y-1.5 font-sans">
+                {item.results.map((result) => {
+                  const safeHref = resolveExternalWebLinkHref(result.url);
+                  return (
+                    <li key={JSON.stringify(result)}>
+                      {safeHref ? (
+                        <a
+                          href={safeHref}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 font-medium text-foreground hover:underline"
+                        >
+                          {result.title ?? result.url}
+                          <ExternalLinkIcon className="size-3" />
+                        </a>
+                      ) : (
+                        <p className="font-medium text-foreground">
+                          {result.title ?? result.url ?? "Search result"}
+                        </p>
+                      )}
+                      {result.snippet ? (
+                        <p className="text-muted-foreground">{result.snippet}</p>
+                      ) : null}
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : (
+              <div className="font-sans text-muted-foreground italic">No results.</div>
+            )}
+          </ToolDetailPane>
+        </ToolDetailCard>
       ) : null}
 
       {item.type === "dynamic_tool" ? (

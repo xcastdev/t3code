@@ -11,6 +11,8 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as SqlClient from "effect/sql/SqlClient";
+import { assistantConversationIsCurrent } from "./AssistantThreadAuthority.ts";
 import { AssistantError, type AssistantRecord } from "./AssistantRepository.ts";
 import { ResourceInstructionComposition } from "../orchestration-v2/ResourceInstructionComposition.ts";
 import { ManagedTextResourceCatalogService } from "../managedTextResources/ManagedTextResourceCatalogService.ts";
@@ -48,6 +50,7 @@ const make = Effect.gen(function* () {
   const epoch = yield* Effect.serviceOption(AssistantInstructionEpoch);
   const skills = yield* Effect.serviceOption(SkillCatalogService);
   const texts = yield* Effect.serviceOption(ManagedTextResourceCatalogService);
+  const sql = yield* SqlClient.SqlClient;
   return AssistantResources.of({
     prepare: Effect.fn("AssistantResources.prepare")(
       function* (record, threadId) {
@@ -55,8 +58,14 @@ const make = Effect.gen(function* () {
         const binding = record.detail.summary.binding;
         if (record.workspaceRoot === null)
           return yield* new AssistantError({ reason: "needs-repair" });
+        const conversation =
+          threadId === undefined ||
+          threadId === binding.canonicalThreadId ||
+          (yield* assistantConversationIsCurrent({ threadId, ...binding }).pipe(
+            Effect.provideService(SqlClient.SqlClient, sql),
+          ));
         const memory =
-          (threadId === undefined || threadId === binding.canonicalThreadId) && Option.isSome(epoch)
+          conversation && Option.isSome(epoch)
             ? yield* epoch.value.context(record)
             : { memoryEpoch: 0, text: "" };
         const skillKeys: string[] = [];

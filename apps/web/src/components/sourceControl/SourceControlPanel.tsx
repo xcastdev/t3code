@@ -10,11 +10,19 @@ import type {
   GitCommitStagedResult,
   GitHistoryResult,
   GitIndexStatusResult,
+  ScopedThreadRef,
 } from "@t3tools/contracts";
 import { FileDiff } from "@pierre/diffs/react";
-import { ExternalLinkIcon, GitBranchIcon, MinusIcon, PlusIcon, RefreshCwIcon } from "lucide-react";
+import {
+  ExternalLinkIcon,
+  GitBranchIcon,
+  MinusIcon,
+  PlusIcon,
+  RefreshCwIcon,
+  SparklesIcon,
+} from "lucide-react";
 import { type AsyncResult, type Atom, type AtomRegistry } from "effect/reactivity";
-import { useContext, useEffect, useState } from "react";
+import { type ReactNode, useContext, useEffect, useState } from "react";
 
 import { useOpenInPreferredEditor } from "~/editorPreferences";
 import { useRenderedAppearance } from "~/hooks/useTheme";
@@ -47,6 +55,7 @@ import { useAtomCommand } from "~/state/use-atom-command";
 import { formatRelativeTimeLabel } from "~/timestampFormat";
 
 import { DiffWorkerPoolProvider } from "../DiffWorkerPoolProvider";
+import GitActionsControl from "../GitActionsControl";
 import { DIFF_VIEW_UNSAFE_CSS } from "../diffs/StyledDiffCodeView";
 import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
@@ -58,6 +67,12 @@ const HISTORY_REQUEST_TIMEOUT_MS = 30_000;
 const GRAPH_LANE_WIDTH = 10;
 const GRAPH_ROW_HEIGHT = 28;
 const GRAPH_MAX_LANES = 8;
+// Lanes rotate the theme accent's hue; the floors keep a muted or very dark accent legible.
+const GRAPH_LANE_COLORS = Array.from(
+  { length: GRAPH_MAX_LANES },
+  (_, lane) => `oklch(from var(--primary) clamp(0.6, l, 0.78) max(c, 0.12) calc(h + ${lane * 45}))`,
+);
+const graphLaneColor = (lane: number) => GRAPH_LANE_COLORS[lane % GRAPH_MAX_LANES];
 
 function failureMessage(error: unknown, fallback: string): string {
   return error instanceof Error && error.message.trim().length > 0 ? error.message : fallback;
@@ -124,10 +139,14 @@ async function fetchHistoryPage(
 
 export interface SourceControlPanelProps {
   readonly environmentId: EnvironmentId;
+  /** Scopes the shared git actions menu (dialogs, toasts, branch sync) to the panel's thread. */
+  readonly threadRef: ScopedThreadRef;
   readonly workspaceRoot: string;
   readonly availableEditors: ReadonlyArray<EditorId>;
   /** Opens a workspace-relative path in the panel's file tabs. */
   readonly onOpenFile: (relativePath: string) => void;
+  /** The thread's branch picker, shown in place of the branch label for the workspace's own repository. */
+  readonly branchControl?: ReactNode;
 }
 
 export default function SourceControlPanel(props: SourceControlPanelProps) {
@@ -191,12 +210,10 @@ export default function SourceControlPanel(props: SourceControlPanelProps) {
             ))}
           </SelectPopup>
         </Select>
-      ) : rootPath !== null ? (
-        <span className="min-w-0 truncate text-sm font-medium">
-          {repositoryDisplayName(rootPath, outermostRoot)}
-        </span>
       ) : null}
-      {branch !== null ? (
+      {props.branchControl !== undefined && rootPath !== null && rootPath === outermostRoot ? (
+        props.branchControl
+      ) : branch !== null ? (
         <span className="flex min-w-0 items-center gap-1 truncate text-xs text-muted-foreground">
           <GitBranchIcon aria-hidden className="size-3 shrink-0" />
           <span className="truncate">{branch}</span>
@@ -280,6 +297,7 @@ export default function SourceControlPanel(props: SourceControlPanelProps) {
       <ChangesView
         key={sourceControlRepositoryKey({ environmentId, rootPath })}
         environmentId={environmentId}
+        threadRef={props.threadRef}
         rootPath={rootPath}
         workspaceRoot={workspaceRoot}
         status={status.data}
@@ -306,11 +324,6 @@ export default function SourceControlPanel(props: SourceControlPanelProps) {
   return (
     <div className="flex h-full min-w-0 flex-col bg-background">
       {header}
-      {discovery.data?.truncated ? (
-        <p className="border-b border-border/60 px-3 py-1.5 text-xs text-muted-foreground">
-          Showing the first repositories found. Open a nested folder as a project to reach the rest.
-        </p>
-      ) : null}
       {body}
     </div>
   );
@@ -334,6 +347,7 @@ type IndexFile = GitIndexStatusResult["staged"][number];
 
 function ChangesView(props: {
   readonly environmentId: EnvironmentId;
+  readonly threadRef: ScopedThreadRef;
   readonly rootPath: string;
   readonly workspaceRoot: string;
   readonly status: GitIndexStatusResult | null;
@@ -355,7 +369,11 @@ function ChangesView(props: {
   });
   const push = useGitStackedAction({ environmentId, cwd: rootPath });
   const [message, setMessage] = useState("");
-  const [pushAfterCommit, setPushAfterCommit] = useState(false);
+  const generateMessage = useAtomCommand(
+    sourceControlWorkspaceEnvironment.generateStagedCommitMessage,
+    { reportFailure: false },
+  );
+  const [generating, setGenerating] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastCommit, setLastCommit] = useState<GitCommitStagedResult | null>(null);
@@ -412,7 +430,6 @@ function ChangesView(props: {
         cwd: status.fingerprint.rootPath,
         expected: status.fingerprint,
         message: message.trim(),
-        ...(pushAfterCommit ? { push: true } : {}),
       },
     });
     setBusy(false);
@@ -423,6 +440,26 @@ function ChangesView(props: {
     }
     if (!isAtomCommandInterrupted(result)) {
       setError(failureMessage(squashAtomCommandFailure(result), "Couldn't commit staged changes."));
+    }
+  };
+
+  const generate = async () => {
+    if (busy || generating || status.staged.length === 0 || !allowed) return;
+    setGenerating(true);
+    setError(null);
+    const result = await generateMessage({
+      environmentId,
+      input: { cwd: status.fingerprint.rootPath },
+    });
+    setGenerating(false);
+    if (result._tag === "Success") {
+      setMessage(result.value.message);
+      return;
+    }
+    if (!isAtomCommandInterrupted(result)) {
+      setError(
+        failureMessage(squashAtomCommandFailure(result), "Couldn't generate a commit message."),
+      );
     }
   };
 
@@ -515,31 +552,46 @@ function ChangesView(props: {
           }}
         />
         <div className="flex items-center gap-2">
-          <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <input
-              type="checkbox"
-              checked={pushAfterCommit}
-              onChange={(event) => setPushAfterCommit(event.target.checked)}
-            />
-            Push after commit
-          </label>
-          <span className="ml-auto min-w-0 truncate text-xs text-muted-foreground">
-            {blocker !== null && blocker !== "no-message" ? COMMIT_BLOCKER_LABELS[blocker] : null}
-          </span>
           <Tooltip>
             <TooltipTrigger
               render={
-                <span className="inline-flex">
-                  <Button size="xs" disabled={blocker !== null} onClick={() => void commit()}>
-                    {pushAfterCommit ? "Commit staged & push" : "Commit staged"}
-                  </Button>
-                </span>
+                <Button
+                  size="xs"
+                  disabled={!allowed || busy || generating || status.staged.length === 0}
+                  onClick={() => void generate()}
+                />
               }
-            />
-            <TooltipPopup side="top">
-              Commits only what is staged. Repository hooks don't run for this commit.
-            </TooltipPopup>
+            >
+              <SparklesIcon />
+              {generating ? "Generating…" : "Generate"}
+            </TooltipTrigger>
+            <TooltipPopup side="top">Write a commit message for the staged changes</TooltipPopup>
           </Tooltip>
+          <span className="ml-auto min-w-0 truncate text-xs text-muted-foreground">
+            {blocker !== null && blocker !== "no-message" ? COMMIT_BLOCKER_LABELS[blocker] : null}
+          </span>
+          <GitActionsControl
+            gitCwd={rootPath}
+            activeThreadRef={props.threadRef}
+            toolbarVariant="default"
+            primaryControl={{
+              disabled: blocker !== null,
+              node: (
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <Button size="xs" disabled={blocker !== null} onClick={() => void commit()} />
+                    }
+                  >
+                    Commit
+                  </TooltipTrigger>
+                  <TooltipPopup side="top">
+                    Commits only what is staged. Repository hooks don't run for this commit.
+                  </TooltipPopup>
+                </Tooltip>
+              ),
+            }}
+          />
         </div>
       </div>
     </div>
@@ -818,7 +870,7 @@ function HistoryGraphCell(props: { readonly row: HistoryGraphRow; readonly lanes
   return (
     <svg
       aria-hidden
-      className="shrink-0 text-muted-foreground"
+      className="shrink-0"
       width={width}
       height={GRAPH_ROW_HEIGHT}
       viewBox={`0 0 ${width} ${GRAPH_ROW_HEIGHT}`}
@@ -828,6 +880,8 @@ function HistoryGraphCell(props: { readonly row: HistoryGraphRow; readonly lanes
         const toX = segment.to === null ? node : x(segment.to);
         const fromY = segment.from === null ? middle : 0;
         const toY = segment.to === null ? middle : GRAPH_ROW_HEIGHT;
+        // A line belongs to the lane it runs in: its top lane, or its bottom lane when it leaves the node.
+        const lane = segment.from ?? segment.to ?? props.row.lane;
         return (
           <line
             key={`${segment.from ?? "n"}-${segment.to ?? "n"}`}
@@ -835,12 +889,13 @@ function HistoryGraphCell(props: { readonly row: HistoryGraphRow; readonly lanes
             y1={fromY}
             x2={toX}
             y2={toY}
-            stroke="currentColor"
-            strokeWidth={1.25}
+            stroke={graphLaneColor(lane)}
+            strokeWidth={1.5}
+            strokeLinecap="round"
           />
         );
       })}
-      <circle cx={node} cy={middle} r={3} className="fill-foreground" />
+      <circle cx={node} cy={middle} r={3} fill={graphLaneColor(props.row.lane)} />
     </svg>
   );
 }

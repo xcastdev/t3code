@@ -5,7 +5,7 @@ import {
   sameAgentAvatar,
   switchAgentAvatarMode,
 } from "@t3tools/client-runtime/project-work";
-import { PROJECT_TEAM_PRESETS, type ProjectTeamAvatar } from "@t3tools/contracts";
+import type { ProjectIconColor, ProjectTeamAvatar } from "@t3tools/contracts";
 import { CheckIcon, PlayIcon, ShuffleIcon } from "lucide-react";
 import { useId, useState } from "react";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
@@ -15,18 +15,20 @@ import { Label } from "../ui/label";
 import { Toggle, ToggleGroup } from "../ui/toggle-group";
 import { WorkMemberAvatar } from "./WorkMemberAvatar";
 import { WorkMeta } from "./WorkLayout";
-import { memberAvatarIdentity } from "./workTeamView";
-import type { TeamRole } from "./workLogic";
 
 export function WorkAvatarEditor({
-  role,
+  identity: initials,
+  preset,
   name,
   avatar,
   recorded,
   others,
   onChange,
 }: {
-  role: TeamRole;
+  /** What the avatar shows without a face. */
+  identity: { monogram: string; color: ProjectIconColor };
+  /** The face offered when switching away from initials with nothing stashed. */
+  preset: ProjectTeamAvatar;
   name: string;
   avatar: ProjectTeamAvatar | null | undefined;
   recorded: ProjectTeamAvatar | null | undefined;
@@ -38,13 +40,12 @@ export function WorkAvatarEditor({
   const reduceMotion = useMediaQuery("(prefers-reduced-motion: reduce)");
   const motionId = useId();
   const descriptionId = useId();
-  const preset = PROJECT_TEAM_PRESETS[role].avatar;
   const unavailable = reduceMotion
     ? "Your system reduces motion."
     : !avatar?.motion
       ? "Motion is off for this avatar."
       : null;
-  const identity = { ...memberAvatarIdentity(role, name), avatar };
+  const identity = { ...initials, avatar };
   return (
     <section
       aria-label={`Avatar for ${name}`}
@@ -157,7 +158,7 @@ export function WorkAvatarEditor({
               </WorkMeta>
             </>
           ) : (
-            <WorkMeta>Initials use the agent's name and role color.</WorkMeta>
+            <WorkMeta>Initials use the agent's name and color.</WorkMeta>
           )}
           {!sameAgentAvatar(avatar, recorded) ? (
             <div>

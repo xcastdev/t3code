@@ -3,6 +3,19 @@ import { IsoDateTime, NonNegativeInt, ProjectId, TrimmedNonEmptyString } from ".
 import { ProjectWorkTaskId } from "./projectWorkCore.ts";
 
 const Text = TrimmedNonEmptyString.check(Schema.isMaxLength(4_000));
+export const ProjectIssueFailureReason = Schema.Literals([
+  "human-required",
+  "invalid-input",
+  "inactive-project",
+  "repository-mismatch",
+  "account-mismatch",
+  "stale-binding",
+  "detached",
+  "invalid-storage",
+  "storage",
+  "unavailable",
+]);
+
 export const ProjectIssueIdentity = Schema.Struct({
   host: Text,
   repositoryNodeId: Text,

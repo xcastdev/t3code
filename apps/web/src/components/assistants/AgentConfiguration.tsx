@@ -22,6 +22,8 @@ import {
   WorkSection,
 } from "../work/WorkLayout";
 import { agentBlockedReason, type AgentContext } from "./AgentDetailPage";
+import { WorkAvatarEditor } from "../work/WorkAvatarEditor";
+import { agentInitials, newAgentAvatar } from "./AgentAvatar";
 import { AgentResourceBindings } from "./AgentResourceBindings";
 import {
   INTERACTION_MODE_LABELS,
@@ -180,9 +182,25 @@ function ConfigurationFields({
   const set = <K extends keyof AssistantConfiguration>(key: K, value: AssistantConfiguration[K]) =>
     onChange({ ...configuration, [key]: value });
   const memory = configuration.memory;
+  const recorded = context.detail.configuration.configuration.avatar;
+  const [preset] = useState(() => recorded ?? newAgentAvatar());
   return (
     <>
       <WorkRow className="gap-4">
+        <fieldset disabled={disabled} className="min-w-0">
+          <WorkAvatarEditor
+            identity={agentInitials(configuration.name)}
+            preset={preset}
+            name={configuration.name.trim() || "Agent"}
+            avatar={configuration.avatar}
+            recorded={recorded}
+            others={[]}
+            onChange={(avatar) => {
+              const { avatar: _avatar, ...initials } = configuration;
+              onChange(avatar ? { ...configuration, avatar } : initials);
+            }}
+          />
+        </fieldset>
         <WorkField label="Name">
           {(id) => (
             <Input

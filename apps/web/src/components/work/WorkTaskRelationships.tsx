@@ -29,9 +29,7 @@ export function WorkTaskRelationships({
   const task = context.task;
   const linkAction = context.policy.actions["link-relationship"];
   const unlinkAction = context.policy.actions["unlink-relationship"];
-  const linkReason = linkAction.available
-    ? surface.blocked
-    : (linkAction.reason ?? "Links can't change in this state.");
+  const linkReason = linkAction.available ? surface.blocked : "Links can't change in this state.";
   const review = useWorkReview(surface.current);
   const [kind, setKind] = useState<Kind>("depends-on");
   const [target, setTarget] = useState<ProjectWorkTaskId | null>(null);
@@ -78,6 +76,7 @@ export function WorkTaskRelationships({
         projectId: scope.projectId,
         expectedRevision: selected.revision,
         relationshipId: relationship.relationshipId,
+        // oxlint-disable-next-line react/purity -- oxc#27309: this timestamp is read only by the unlink event handler.
         unlinkedAt: new Date().toISOString(),
       },
     );
@@ -168,7 +167,7 @@ export function WorkTaskRelationships({
         const confirming = unlinking?.relationshipId === relationship.relationshipId;
         const unlinkReason = unlinkAction.available
           ? surface.blocked
-          : (unlinkAction.reason ?? "Links can't change in this state.");
+          : "Links can't change in this state.";
         return (
           <WorkRow key={relationship.relationshipId} className="gap-1">
             <div className="flex items-center gap-2">

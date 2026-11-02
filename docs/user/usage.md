@@ -116,6 +116,11 @@ current model's limits without leaving the conversation. The result opens above 
 closes when you dismiss it or send your next message. It uses the same snapshot as **Usage → Limits**, so it does not run the agent or refresh
 anything. The command is offered only for providers that appear under **Usage → Limits**.
 
+The thread details panel's **Usage** section shows the current thread's limits in its header when
+collapsed. Harnesses such as Pi or OpenCode run on another provider's login, so they show no limits
+until you choose whose to show: open **Settings → Providers → Usage providers** and set the
+harness's usage limits to that provider.
+
 OpenCode Go reports its session, weekly, and monthly allowance when OpenCode runs locally in
 the environment. T3 cannot report limits for external OpenCode servers because their credentials
 belong to the remote server. Limits need an OpenCode Go API key, or an OpenCode Console connected

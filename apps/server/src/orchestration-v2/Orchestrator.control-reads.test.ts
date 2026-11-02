@@ -596,6 +596,180 @@ it.effect("implements a proposed plan that the command projection leaves out", (
   }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect("starts a chat under a thread of its project, and refuses one elsewhere", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const projectId = ProjectId.make("project:agent");
+    const create = (
+      threadId: string,
+      extra: { projectId?: ProjectId; parentThreadId?: ThreadId },
+    ) =>
+      orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(`create-${threadId}`),
+        threadId: ThreadId.make(threadId),
+        projectId: extra.projectId ?? projectId,
+        title: threadId,
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "user",
+        creationSource: "web",
+        ...(extra.parentThreadId === undefined ? {} : { parentThreadId: extra.parentThreadId }),
+      });
+    const home = ThreadId.make("thread:home");
+    yield* create(home, {});
+    yield* create("thread:topic", { parentThreadId: home });
+    const topic = yield* projections.getThread(ThreadId.make("thread:topic"));
+    assert.deepEqual(topic?.lineage, {
+      parentThreadId: home,
+      relationshipToParent: "chat",
+      rootThreadId: home,
+    });
+
+    const elsewhere = yield* create("thread:elsewhere", {
+      projectId: ProjectId.make("project:other"),
+      parentThreadId: home,
+    }).pipe(Effect.result);
+    assert.isTrue(Result.isFailure(elsewhere));
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("clears a task list by emptying it, and refuses one already replaced", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = ThreadId.make("thread:clear-tasks");
+    const now = yield* DateTime.now;
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create-clear-tasks"),
+      threadId,
+      projectId: ProjectId.make("project:clear-tasks"),
+      title: "Tasks",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    const seed = (name: string, status: "active" | "superseded") =>
+      projections.apply({
+        id: EventId.make(`plan:${name}`),
+        type: "plan.updated",
+        threadId,
+        occurredAt: now,
+        payload: {
+          id: PlanId.make(name),
+          threadId,
+          runId: null,
+          nodeId: NodeId.make(`node:${name}`),
+          kind: "todo_list",
+          status,
+          steps: [{ id: "step-1", text: "Write the fix", status: "running" }],
+        },
+      });
+    yield* seed("current", "active");
+    yield* seed("replaced", "superseded");
+
+    yield* orchestrator.dispatch({
+      type: "thread.todo-list.clear",
+      commandId: CommandId.make("clear-current"),
+      threadId,
+      planId: PlanId.make("current"),
+    });
+    const cleared = yield* projections.getPlan(threadId, PlanId.make("current"));
+    assert.equal(cleared?.status, "completed");
+    assert.deepEqual(cleared?.kind === "todo_list" ? cleared.steps : null, []);
+
+    const refused = yield* orchestrator
+      .dispatch({
+        type: "thread.todo-list.clear",
+        commandId: CommandId.make("clear-replaced"),
+        threadId,
+        planId: PlanId.make("replaced"),
+      })
+      .pipe(Effect.result);
+    assert.isTrue(Result.isFailure(refused));
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("sets T3's checklist on the newest started run, never a queued one", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = ThreadId.make("thread:set-checklist");
+    const now = yield* DateTime.now;
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create-set-checklist"),
+      threadId,
+      projectId: ProjectId.make("project:set-checklist"),
+      title: "Checklist",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    const set = (name: string) =>
+      orchestrator
+        .dispatch({
+          type: "thread.todo-list.set",
+          commandId: CommandId.make(`set-checklist:${name}`),
+          threadId,
+          planId: PlanId.make("checklist"),
+          steps: [{ id: "step-1", text: "Write the fix", status: "running" }],
+        })
+        .pipe(Effect.result);
+    assert.isTrue(Result.isFailure(yield* set("before-any-run")));
+
+    for (const [ordinal, status] of [
+      [1, "running"],
+      [2, "queued"],
+    ] as const) {
+      yield* projections.apply({
+        id: EventId.make(`set-checklist:run:${ordinal}`),
+        type: "run.created",
+        threadId,
+        occurredAt: now,
+        payload: {
+          id: RunId.make(`run:set-checklist:${ordinal}`),
+          threadId,
+          ordinal,
+          providerInstanceId: instanceId,
+          modelSelection,
+          providerThreadId: null,
+          userMessageId: MessageId.make(`message:set-checklist:${ordinal}`),
+          rootNodeId: NodeId.make(`node:set-checklist:${ordinal}`),
+          activeAttemptId: null,
+          status,
+          requestedAt: now,
+          startedAt: status === "queued" ? null : now,
+          completedAt: null,
+          checkpointId: null,
+          contextHandoffId: null,
+        },
+      });
+    }
+    assert.isTrue(Result.isSuccess(yield* set("during-run")));
+
+    const plan = yield* projections.getPlan(threadId, PlanId.make("checklist"));
+    assert.equal(plan?.runId, "run:set-checklist:1");
+    assert.equal(plan?.status, "active");
+    assert.deepEqual(plan?.kind === "todo_list" ? plan.steps.map((step) => step.text) : [], [
+      "Write the fix",
+    ]);
+  }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect("settles only the stopped run's background work, once", () =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;

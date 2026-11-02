@@ -617,7 +617,8 @@ describe("V2 session presentation", () => {
         {
           kind: "work",
           entry: {
-            label: stepStatus === "completed" ? "Tasks 1/1" : "Tasks 0/1 · Verify the change",
+            label:
+              stepStatus === "completed" ? "Checklist 1/1" : "Checklist 0/1 · Verify the change",
           },
         },
       ]);

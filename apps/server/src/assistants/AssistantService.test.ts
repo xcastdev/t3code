@@ -113,3 +113,33 @@ it.effect(
       assert.equal((yield* sql`SELECT * FROM t3_workflow_v2_assistant_admissions`).length, 0);
     }).pipe(Effect.provide(layer)),
 );
+
+it.effect("the roster shows the avatar the agent is configured with, until it is removed", () =>
+  Effect.gen(function* () {
+    const service = yield* Service.AssistantService;
+    const avatar = {
+      kind: "generated",
+      version: 1,
+      seed: 42,
+      tone: "sage",
+      expression: "curious",
+      motion: true,
+    } as const;
+    const created = yield* service.create({
+      ...input,
+      configuration: { ...configuration, avatar },
+    });
+    assert.deepStrictEqual(created.summary.avatar, avatar);
+    const { avatar: _avatar, ...initials } = configuration;
+    yield* service.updateConfiguration({
+      ...created.summary,
+      commandId: CommandId.make("initials"),
+      expectedRevision: created.summary.configurationRevision,
+      configuration: initials,
+    });
+    const [listed] = (yield* service.list({ environmentId, includeArchived: false, limit: 100 }))
+      .assistants;
+    assert.equal(listed?.assistantId, created.summary.assistantId);
+    assert.isUndefined(listed?.avatar);
+  }).pipe(Effect.provide(layer)),
+);

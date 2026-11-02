@@ -3604,6 +3604,8 @@ const layerCoreWsRpc = (
           gitWorkflow.mutateIndex(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
         [WS_METHODS.gitCommitStaged]: (input) =>
           gitWorkflow.commitStaged(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+        [WS_METHODS.gitGenerateStagedCommitMessage]: (input) =>
+          gitWorkflow.generateStagedCommitMessage(input),
         [WS_METHODS.gitHistory]: (input) => gitWorkflow.history(input),
         [WS_METHODS.gitHistoryDiff]: (input) => gitWorkflow.historyDiff(input),
         [WS_METHODS.gitRunStackedAction]: (input) =>

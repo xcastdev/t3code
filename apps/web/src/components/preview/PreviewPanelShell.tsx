@@ -10,9 +10,14 @@ import { RightPanelResizeHandle } from "./RightPanelResizeHandle";
 
 export type PreviewPanelMode = "inline" | "sheet" | "sidebar" | "embedded";
 
+/** Inline rail width, border included: 22px icons with 8px each side. */
+export const PREVIEW_PANEL_RAIL_WIDTH = 39;
+
 interface PreviewPanelShellProps {
   mode: PreviewPanelMode;
   maximized?: boolean;
+  /** Inline only: a fixed-width launcher rail instead of the resizable panel. */
+  rail?: boolean;
   inlineSize?: PreviewPanelInlineSize;
   open?: boolean;
   /** Use a distinct key per surface to keep remembered widths independent. */
@@ -45,9 +50,11 @@ function PreviewPanelShellFrame(
   const collapsible = isInline && props.open !== undefined;
   const open = props.open ?? true;
   const maximized = props.maximized ?? false;
+  const rail = isInline && !maximized && props.rail === true;
   const hostRef = useRef<HTMLDivElement | null>(null);
   const returnedFocus = useRef(false);
-  const { width, handlers, observeRow } = props.inlineSize;
+  const { handlers, observeRow } = props.inlineSize;
+  const width = rail ? PREVIEW_PANEL_RAIL_WIDTH : props.inlineSize.width;
   // Width animates only for an open or close. Any other width change disables
   // the transition in the same commit that changes the width, so the browser
   // never starts one; the next open or close re-enables it in its own commit,
@@ -116,7 +123,8 @@ function PreviewPanelShellFrame(
           ? maximized
             ? // Maximizing meets the sidebar border or window edge; omit the duplicate border.
               "flex-1"
-            : "shrink-0 border-l border-border"
+            : // The rail keeps the 1px border width so its icons stay centered; only the line goes.
+              cn("shrink-0 border-l", rail ? "border-transparent" : "border-border")
           : "w-full",
         collapsible &&
           "[[data-panel-animations=true]_&]:transition-[width] [[data-panel-animations=true]_&]:duration-(--panel-animation-duration) [[data-panel-animations=true]_&]:ease-out",
@@ -139,7 +147,7 @@ function PreviewPanelShellFrame(
       data-preview-panel-mode={props.mode}
       data-preview-panel-maximized={maximized ? "true" : "false"}
     >
-      {isInline && !maximized ? <RightPanelResizeHandle handlers={handlers} /> : null}
+      {isInline && !maximized && !rail ? <RightPanelResizeHandle handlers={handlers} /> : null}
       <div className={cn("h-full min-h-0 w-full", collapsible && "overflow-clip")}>
         <div
           className="flex h-full min-h-0 min-w-0 flex-col"

@@ -714,7 +714,7 @@ function itemSummary(
     case "proposed_plan":
       return "Proposed plan";
     case "todo_list":
-      return "Plan updated";
+      return "Checklist updated";
     case "user_message":
       return "User message";
     case "assistant_message":

@@ -22,7 +22,7 @@ import { AuthSessionRepository } from "../persistence/AuthSessions.ts";
 import { AssistantRepository, AssistantError } from "./AssistantRepository.ts";
 import { AssistantRoutines } from "./AssistantRoutines.ts";
 import { AssistantEventBus } from "./AssistantEventBus.ts";
-import { assistantThreadIsCurrent } from "./AssistantThreadAuthority.ts";
+import { assistantConversationIsCurrent } from "./AssistantThreadAuthority.ts";
 const isAssistantError = Schema.is(AssistantError);
 const unavailable = (cause: unknown) =>
   isAssistantError(cause) ? cause : new AssistantError({ reason: "unavailable", cause });
@@ -138,10 +138,9 @@ const make = Effect.gen(function* () {
     )
       return yield* new AssistantError({ reason: "forbidden" });
     if (
-      record.detail.summary.binding.canonicalThreadId !== caller.threadId ||
       record.detail.summary.lifecycle !== "active" ||
       record.detail.summary.provisioningState !== "ready" ||
-      !(yield* assistantThreadIsCurrent({
+      !(yield* assistantConversationIsCurrent({
         threadId: caller.threadId,
         ...record.detail.summary.binding,
       }).pipe(Effect.provideService(SqlClient.SqlClient, sql)))

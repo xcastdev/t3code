@@ -6,7 +6,7 @@ import {
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { deriveWorkTask, gateResponses, guidedControls } from "./workModel";
+import { deriveWorkTask, describeWorkFailure, gateResponses, guidedControls } from "./workModel";
 
 const at = "2026-10-01T00:00:00.000Z";
 const later = "2026-10-02T00:00:00.000Z";
@@ -220,3 +220,24 @@ function specification(revision: number) {
     protected: false,
   };
 }
+
+it("explains repository lookup failures without blaming an unrelated task edit", () => {
+  expect(
+    describeWorkFailure({
+      _tag: "ProjectWorkRpcError",
+      operation: "write",
+      reason: "rejected",
+      issueReason: "repository-mismatch",
+    }),
+  ).toBe(
+    "This checkout's GitHub repository could not be verified. Check its Git remote and try again.",
+  );
+});
+
+it("keeps legacy Work errors and unknown issue reasons on the generic fallback", () => {
+  const legacy = { _tag: "ProjectWorkRpcError", operation: "write", reason: "rejected" };
+  const expected =
+    "The server rejected this change. Someone may have changed the task; review it again.";
+  expect(describeWorkFailure(legacy)).toBe(expected);
+  expect(describeWorkFailure({ ...legacy, issueReason: "future-reason" })).toBe(expected);
+});

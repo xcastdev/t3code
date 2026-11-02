@@ -44,6 +44,7 @@ export class GitWorkflowService extends Context.Service<
     readonly indexStatus: GitIndexOperationsService["indexStatus"];
     readonly mutateIndex: GitIndexOperationsService["mutateIndex"];
     readonly commitStaged: GitIndexOperationsService["commitStaged"];
+    readonly generateStagedCommitMessage: GitManager.GitManager["Service"]["generateStagedCommitMessage"];
     readonly history: GitIndexOperationsService["history"];
     readonly historyDiff: GitIndexOperationsService["historyDiff"];
     readonly isRepository: (cwd: string) => Effect.Effect<boolean, GitManagerServiceError>;
@@ -475,6 +476,12 @@ export const make = Effect.gen(function* () {
         ),
       );
     }),
+    generateStagedCommitMessage: Effect.fn("GitWorkflowService.generateStagedCommitMessage")(
+      (input) =>
+        ensureGit("GitWorkflowService.generateStagedCommitMessage", input.cwd).pipe(
+          Effect.andThen(gitManager.generateStagedCommitMessage(input)),
+        ),
+    ),
     runStackedAction: Effect.fn("GitWorkflowService.runStackedAction")(function (input, options) {
       return ensureGit("GitWorkflowService.runStackedAction", input.cwd).pipe(
         Effect.flatMap((handle) =>

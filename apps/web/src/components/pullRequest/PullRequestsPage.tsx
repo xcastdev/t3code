@@ -1115,7 +1115,7 @@ export function PullRequestsPage() {
   );
   const openPanelControls = (
     <div
-      className="absolute top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] z-50 mr-px flex h-[var(--workspace-topbar-height)] items-center gap-1 [-webkit-app-region:no-drag]"
+      className="absolute top-[var(--workspace-controls-top)] right-[var(--workspace-rail-controls-right)] z-50 flex h-[var(--workspace-topbar-height)] items-center gap-2 [-webkit-app-region:no-drag]"
       data-workspace-titlebar-controls
     >
       {rightPanelState.isOpen ? (
@@ -1352,9 +1352,18 @@ export function PullRequestsPage() {
     useRightPanelStore.getState().activateSurface(rightPanelRef, surface.id);
     selectSurfaceInUrl(surface);
   };
+  // This panel has no launcher rail, so emptying it collapses it.
+  const closeEmptiedPanel = () => {
+    if (rightPanelRef === null) return;
+    const { byThreadKey, close } = useRightPanelStore.getState();
+    if (selectThreadRightPanelState(byThreadKey, rightPanelRef).surfaces.length === 0) {
+      close(rightPanelRef);
+    }
+  };
   const closeSurface = (surface: PullRequestSurface) => {
     if (rightPanelRef === null) return;
     useRightPanelStore.getState().closeSurface(rightPanelRef, surface.id);
+    closeEmptiedPanel();
     const next = selectActiveRightPanelSurface(
       useRightPanelStore.getState().byThreadKey,
       rightPanelRef,
@@ -1378,6 +1387,7 @@ export function PullRequestsPage() {
   const closeAllSurfaces = () => {
     if (rightPanelRef === null) return;
     useRightPanelStore.getState().closeAllSurfaces(rightPanelRef);
+    closeEmptiedPanel();
     selectSurfaceInUrl(null);
   };
 
@@ -1483,18 +1493,14 @@ export function PullRequestsPage() {
             onCopyFilePath={() => undefined}
             onAddBrowser={() => undefined}
             onAddBrowserInProfile={() => undefined}
-            onAddTerminal={() => undefined}
             onAddDiff={() => undefined}
             onAddFiles={() => undefined}
             onAddPullRequest={() => undefined}
-            onAddPullRequests={() => undefined}
             onAddDevice={() => undefined}
             browserAvailable={false}
-            terminalAvailable={false}
             diffAvailable={false}
             filesAvailable={false}
             pullRequestAvailable={false}
-            pullRequestsAvailable={false}
             deviceAvailable={false}
             pullRequestStatusSeeds={listedPullRequestTabStatuses}
           >

@@ -1,6 +1,7 @@
 import { assistantHomeTarget } from "@t3tools/client-runtime/state/assistants";
 import type { AssistantSummary, EnvironmentId } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
+import { AgentAvatar } from "./AgentAvatar";
 import { PlusIcon } from "lucide-react";
 import { useState } from "react";
 
@@ -207,6 +208,7 @@ function AgentRosterRow({
         }
       >
         <span className="flex min-w-0 max-w-full items-center gap-2">
+          <AgentAvatar agent={assistant} size="icon" />
           <span className="truncate text-sm font-medium">{assistant.name}</span>
           <AssistantToneBadge tone={status.tone}>{status.label}</AssistantToneBadge>
         </span>

@@ -46,6 +46,7 @@ import {
 } from "./ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 import { cn } from "~/lib/utils";
+import { COMPOSER_SURFACE_TOKENS_CLASS } from "./chat/ComposerSurface";
 import {
   THREAD_DETAILS_PANEL_CHEVRON_CLASS,
   THREAD_DETAILS_PANEL_ICON_CLASS,
@@ -57,6 +58,8 @@ import {
 export type { NewProjectScriptInput, ProjectScriptActionResult };
 
 const NO_FILE_SCRIPTS: ReadonlyArray<T3ProjectFileScript> = [];
+const TITLEBAR_SPLIT_PART_CLASS =
+  "flex h-full cursor-pointer items-center outline-none transition-colors hover:bg-accent hover:text-foreground data-popup-open:bg-accent data-popup-open:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring aria-disabled:cursor-not-allowed aria-disabled:opacity-64";
 
 interface ProjectScriptsControlProps {
   displayMode?: "toolbar" | "panel";
@@ -73,6 +76,8 @@ interface ProjectScriptsControlProps {
     input: NewProjectScriptInput,
   ) => Promise<ProjectScriptActionResult>;
   onDeleteScript: (scriptId: string) => Promise<ProjectScriptActionResult>;
+  /** Toolbar only: menu items appended below the scripts, such as editors to open the project in. */
+  menuFooter?: React.ReactNode;
 }
 
 export default function ProjectScriptsControl({
@@ -87,6 +92,7 @@ export default function ProjectScriptsControl({
   onAddScript,
   onUpdateScript,
   onDeleteScript,
+  menuFooter,
 }: ProjectScriptsControlProps) {
   const isPanel = displayMode === "panel";
   const ActionGroup = isPanel ? "div" : Group;
@@ -229,7 +235,7 @@ export default function ProjectScriptsControl({
       {importMenuItems}
       <MenuItem density={presentation === "menu" ? "touch" : "default"} onClick={openAddDialog}>
         <PlusIcon className="size-4" />
-        <MenuItemLabel>{isPanel ? "Add project script" : "Add action"}</MenuItemLabel>
+        <MenuItemLabel>{isPanel ? "Add project script" : "New script"}</MenuItemLabel>
       </MenuItem>
     </>
   );
@@ -274,6 +280,73 @@ export default function ProjectScriptsControl({
             </MenuItem>
           )}
         </>
+      ) : !isPanel ? (
+        // One composer-surfaced pill with two targets that hover like the composer's controls.
+        <div
+          role="group"
+          aria-label="Project scripts"
+          data-titlebar-split
+          className={cn(
+            COMPOSER_SURFACE_TOKENS_CLASS,
+            "flex h-8 shrink-0 items-center overflow-hidden rounded-lg border border-(--chat-composer-outline) bg-(--chat-composer-glass-surface) text-foreground/85 text-sm dark:inset-shadow-2xs dark:inset-shadow-(color:--chat-composer-highlight)",
+          )}
+        >
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <button
+                  type="button"
+                  className={cn(TITLEBAR_SPLIT_PART_CLASS, "gap-1.5 pr-2 pl-2.5")}
+                  aria-label={primaryScript ? `Run ${primaryScript.name}` : "New project script"}
+                  aria-disabled={(primaryScript !== undefined && !onRunScript) || undefined}
+                  onClick={() => (primaryScript ? onRunScript?.(primaryScript) : openAddDialog())}
+                />
+              }
+            >
+              {primaryScript ? (
+                <ScriptIcon icon={primaryScript.icon} className="size-4 shrink-0" />
+              ) : (
+                <PlusIcon className="size-4 shrink-0" />
+              )}
+              <span className="max-w-40 truncate font-medium">{primaryScript?.name ?? "New"}</span>
+            </TooltipTrigger>
+            <TooltipPopup side="bottom">
+              {!primaryScript
+                ? "Add a project script"
+                : onRunScript
+                  ? `Run ${primaryScript.name}`
+                  : "Pair this client again with permission to run terminal commands."}
+            </TooltipPopup>
+          </Tooltip>
+          <span aria-hidden className="h-3.5 w-px shrink-0 bg-(--chat-composer-outline)" />
+          <Menu
+            open={actionsMenuOpen.scripts}
+            onOpenChange={(open) =>
+              setActionsMenuOpen({ presentation, scripts: open, imports: false })
+            }
+          >
+            <MenuTrigger
+              render={
+                <button
+                  type="button"
+                  className={cn(TITLEBAR_SPLIT_PART_CLASS, "w-6 justify-center")}
+                  aria-label="Project scripts and editors"
+                />
+              }
+            >
+              <ChevronDownIcon className="size-3.5" />
+            </MenuTrigger>
+            <MenuPopup align="end">
+              {scriptItems}
+              {menuFooter ? (
+                <>
+                  <MenuSeparator />
+                  {menuFooter}
+                </>
+              ) : null}
+            </MenuPopup>
+          </Menu>
+        </div>
       ) : primaryScript ? (
         <ActionGroup
           role="group"

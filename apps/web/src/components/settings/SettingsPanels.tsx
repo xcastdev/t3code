@@ -17,6 +17,7 @@ import {
   MAX_SIDEBAR_AUTO_SETTLE_AFTER_DAYS,
   MIN_SIDEBAR_AUTO_SETTLE_AFTER_DAYS,
   type ResponseStreamingMode,
+  type TimelineLiveActivity,
   type QuitConfirmationMode,
   SidebarProjectSortOrder,
 } from "@t3tools/contracts/settings";
@@ -107,6 +108,19 @@ const RESPONSE_STREAMING_MODE_LABELS: Record<ResponseStreamingMode, string> = {
 const RESPONSE_STREAMING_MODE_DESCRIPTIONS: Record<ResponseStreamingMode, string> = {
   turn: "Text appears once the agent finishes its turn.",
   paragraph: "Each paragraph or code block appears as soon as it is complete.",
+};
+
+const TIMELINE_LIVE_ACTIVITY_LABELS: Record<TimelineLiveActivity, string> = {
+  latest: "Latest steps",
+  box: "Scrolling box",
+  all: "Every step",
+};
+
+const TIMELINE_LIVE_ACTIVITY_DESCRIPTIONS: Record<TimelineLiveActivity, string> = {
+  latest:
+    "Show the agent's last 7 steps as it works, with thoughts inline. Earlier steps fold into a row you can open.",
+  box: "Show the current batch of steps in a short box that scrolls, with earlier steps listed above it.",
+  all: "Show every step and thought as its own row while the agent works.",
 };
 
 const SIDEBAR_PROJECT_SORT_ORDER_LABELS: Record<SidebarProjectSortOrder, string> = {
@@ -481,6 +495,12 @@ export function useSettingsRestore(onRestored?: () => void) {
     ...(settings.followUpBehavior !== DEFAULT_UNIFIED_SETTINGS.followUpBehavior
       ? ["Follow-up behavior"]
       : []),
+    ...(settings.timelineLiveActivity !== DEFAULT_UNIFIED_SETTINGS.timelineLiveActivity
+      ? ["While a turn runs"]
+      : []),
+    ...(settings.timelineTurnEnd !== DEFAULT_UNIFIED_SETTINGS.timelineTurnEnd
+      ? ["When a turn ends"]
+      : []),
     ...(settings.contextWindowMeterEnabled !== DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled
       ? ["Context window indicator"]
       : []),
@@ -595,6 +615,8 @@ export function useSettingsRestore(onRestored?: () => void) {
       composerRichTextEnabled: DEFAULT_UNIFIED_SETTINGS.composerRichTextEnabled,
       sendShortcut: DEFAULT_UNIFIED_SETTINGS.sendShortcut,
       followUpBehavior: DEFAULT_UNIFIED_SETTINGS.followUpBehavior,
+      timelineLiveActivity: DEFAULT_UNIFIED_SETTINGS.timelineLiveActivity,
+      timelineTurnEnd: DEFAULT_UNIFIED_SETTINGS.timelineTurnEnd,
       contextWindowMeterEnabled: DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled,
       environmentIdentificationMode: DEFAULT_UNIFIED_SETTINGS.environmentIdentificationMode,
       glassOpacity: DEFAULT_UNIFIED_SETTINGS.glassOpacity,
@@ -1176,6 +1198,84 @@ export function ChatSettingsPanel() {
             }
           />
         </AdvancedSettings>
+      </SettingsSection>
+
+      <SettingsSection id="turn-activity" title="Turn activity">
+        <SettingsRow
+          {...searchableSetting("timeline-live-activity")}
+          description={TIMELINE_LIVE_ACTIVITY_DESCRIPTIONS[settings.timelineLiveActivity]}
+          resetAction={
+            settings.timelineLiveActivity !== DEFAULT_UNIFIED_SETTINGS.timelineLiveActivity ? (
+              <SettingResetButton
+                label="while a turn runs"
+                onClick={() =>
+                  updateSettings({
+                    timelineLiveActivity: DEFAULT_UNIFIED_SETTINGS.timelineLiveActivity,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Select
+              value={settings.timelineLiveActivity}
+              onValueChange={(value) => {
+                if (value === "latest" || value === "box" || value === "all") {
+                  updateSettings({ timelineLiveActivity: value });
+                }
+              }}
+            >
+              <SelectTrigger size="sm" className="w-auto min-w-0" aria-label="While a turn runs">
+                <SelectValue>
+                  {TIMELINE_LIVE_ACTIVITY_LABELS[settings.timelineLiveActivity]}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectPopup align="end" alignItemWithTrigger={false}>
+                <SelectItem value="latest">{TIMELINE_LIVE_ACTIVITY_LABELS.latest}</SelectItem>
+                <SelectItem value="box">{TIMELINE_LIVE_ACTIVITY_LABELS.box}</SelectItem>
+                <SelectItem value="all">{TIMELINE_LIVE_ACTIVITY_LABELS.all}</SelectItem>
+              </SelectPopup>
+            </Select>
+          }
+        />
+        <SettingsRow
+          {...searchableSetting("timeline-turn-end")}
+          description={
+            settings.timelineTurnEnd === "fold"
+              ? "A finished turn folds its steps under one line with the time, steps, changed files and anything that needs a look. Replies, pages and plans stay in view."
+              : "A finished turn keeps every step in the conversation, grouped into rows you can open."
+          }
+          resetAction={
+            settings.timelineTurnEnd !== DEFAULT_UNIFIED_SETTINGS.timelineTurnEnd ? (
+              <SettingResetButton
+                label="when a turn ends"
+                onClick={() =>
+                  updateSettings({ timelineTurnEnd: DEFAULT_UNIFIED_SETTINGS.timelineTurnEnd })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Select
+              value={settings.timelineTurnEnd}
+              onValueChange={(value) => {
+                if (value === "fold" || value === "keep") {
+                  updateSettings({ timelineTurnEnd: value });
+                }
+              }}
+            >
+              <SelectTrigger size="sm" className="w-auto min-w-0" aria-label="When a turn ends">
+                <SelectValue>
+                  {settings.timelineTurnEnd === "fold" ? "Fold into a report" : "Keep every step"}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectPopup align="end" alignItemWithTrigger={false}>
+                <SelectItem value="fold">Fold into a report</SelectItem>
+                <SelectItem value="keep">Keep every step</SelectItem>
+              </SelectPopup>
+            </Select>
+          }
+        />
       </SettingsSection>
 
       <SettingsSection id="follow-ups" title="Follow-ups">

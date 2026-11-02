@@ -499,6 +499,58 @@ describe("rightPanelStore", () => {
     expect(selectThreadRightPanelState(migrated.byThreadKey, refA).maximized).toBe(true);
   });
 
+  it("opens each Work view and each task once, keeping a task's latest title", async () => {
+    const store = useRightPanelStore.getState();
+    store.openWork(refA, "tasks");
+    store.openWork(refA, "team");
+    store.openWork(refA, "tasks");
+    store.openWorkTask(refA, "task-1");
+    store.openWorkTask(refA, "task-1", "Fix login");
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA),
+    ).toMatchObject({
+      activeSurfaceId: "work-task:task-1",
+      surfaces: [
+        { id: "work:tasks", view: "tasks" },
+        { id: "work:team", view: "team" },
+        { id: "work-task:task-1", taskId: "task-1", title: "Fix login" },
+      ],
+    });
+
+    store.closeSurface(refA, "work-task:task-1");
+    await reopenClosedView(useClosedViewStore.getState().entries[0]!, {
+      workspaceAvailable: true,
+      openPreview: () => {
+        throw new Error("A Work tab must not create a browser session");
+      },
+    });
+    await reloadRightPanelStore();
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces.map(
+        (surface) => surface.id,
+      ),
+    ).toEqual(["work:tasks", "work:team", "work-task:task-1"]);
+  });
+
+  it("drops Work tabs it can't show during migration", () => {
+    const migrated = migratePersistedRightPanelState({
+      byThreadKey: {
+        "env-1:thread-A": {
+          isOpen: true,
+          activeSurfaceId: "work:tasks",
+          surfaces: [
+            { id: "work:tasks", kind: "work", view: "tasks" },
+            { id: "work:portfolio", kind: "work", view: "portfolio" },
+            { id: "work-task:", kind: "work-task", taskId: "" },
+          ],
+        },
+      },
+    });
+    expect(migrated.byThreadKey["env-1:thread-A"]?.surfaces.map((surface) => surface.id)).toEqual([
+      "work:tasks",
+    ]);
+  });
+
   it("drops the legacy singleton terminal surface during migration", () => {
     expect(
       migratePersistedRightPanelState({
@@ -1120,12 +1172,32 @@ describe("rightPanelStore", () => {
     });
   });
 
-  it("closing the final terminal pane removes its surface and closes the panel", () => {
+  it("closing the final terminal pane removes its surface and leaves the empty panel open", () => {
     useRightPanelStore.getState().openTerminal(refA, "term-1");
     useRightPanelStore.getState().closeTerminal(refA, "terminal:term-1", "term-1");
 
     expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
-      isOpen: false,
+      isOpen: true,
+      activeSurfaceId: null,
+      surfaces: [],
+    });
+  });
+
+  it("closing the last tab or every tab leaves an open panel open and empty", () => {
+    const store = useRightPanelStore.getState();
+    store.openBrowser(refA, "tab-a");
+    store.closeSurface(refA, "browser:tab-a");
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      isOpen: true,
+      activeSurfaceId: null,
+      surfaces: [],
+    });
+
+    store.openBrowser(refA, "tab-a");
+    store.openFile(refA, "src/index.ts");
+    store.closeAllSurfaces(refA);
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      isOpen: true,
       activeSurfaceId: null,
       surfaces: [],
     });

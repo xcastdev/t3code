@@ -43,7 +43,11 @@ describe("RPC authorization scopes", () => {
     ]) {
       expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationReadScope);
     }
-    for (const method of [WS_METHODS.gitMutateIndex, WS_METHODS.gitCommitStaged]) {
+    for (const method of [
+      WS_METHODS.gitMutateIndex,
+      WS_METHODS.gitCommitStaged,
+      WS_METHODS.gitGenerateStagedCommitMessage,
+    ]) {
       expect(requiredScopeForRpcMethod(method)).toBe(AuthSourceControlWriteScope);
       expect(clientRpcRequiredScopes(method, undefined)).toEqual([AuthSourceControlWriteScope]);
     }

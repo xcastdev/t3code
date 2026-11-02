@@ -103,6 +103,7 @@ import {
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
 import { formatModelSlugName, resolveSelectableModel } from "@t3tools/shared/model";
+import type { ThreadStructure } from "@t3tools/client-runtime/state/shell";
 import { projectScriptCwd, resolveProjectScripts } from "@t3tools/shared/projectScripts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { resolveThreadReferenceCopyTarget } from "@t3tools/client-runtime/thread-reference";
@@ -152,6 +153,7 @@ import {
   selectThreadRightPanelState,
   useRightPanelStore,
 } from "../rightPanelStore";
+import type { WorkSection } from "../routes/-workSearch";
 import { isPreviewSupportedInRuntime, useThreadPreviewState } from "../previewStateStore";
 import { previewRuntimeTabId } from "../browser/previewRuntimeTabId";
 import {
@@ -263,6 +265,7 @@ import type { AssistantCitationRequest } from "./chat/AssistantCitationSource";
 import { useCitedHistory } from "./chat/citationProcedure";
 import type { MessagesTimelineHistoryControls } from "./chat/MessagesTimeline";
 import { ThreadTimeline } from "./chat/ThreadTimeline";
+import { checklistProgressByRun } from "./chat/ThreadDetailsSections.logic";
 import { ProviderSubagentBar } from "./chat/ProviderSubagentBar";
 import { latestRunWork as deriveLatestRunWork } from "./chat/runWorkSummary";
 import { useAssistantThreadOwnership } from "./assistants/useAssistantHome";
@@ -275,6 +278,9 @@ import {
 import { ChatHeader } from "./chat/ChatHeader";
 import { useRemoteOpenState } from "~/remoteOpen";
 import { shouldShowOpenInPicker } from "./chat/OpenInPicker.logic";
+import { OpenInPicker } from "./chat/OpenInPicker";
+import ProjectScriptsControl from "./ProjectScriptsControl";
+import { useT3ProjectFileScripts } from "../hooks/useT3ProjectFileScripts";
 import { useOpenFavoriteEditorShortcut } from "./chat/OpenInPickerShortcut";
 import {
   PanelLayoutControls,
@@ -352,6 +358,7 @@ import { observeResize } from "~/lib/observeResize";
 import { ThreadVisitWatermark } from "./chat/ThreadVisitWatermark";
 import { ChatTerminalDrawers } from "./chat/ChatTerminalDrawers";
 import { ChatRightPanel } from "./chat/ChatRightPanel";
+import { BranchToolbarBranchSelector } from "./BranchToolbarBranchSelector";
 import { useDraftEnvironmentRouting } from "./chat/useDraftEnvironmentRouting";
 import { branchMismatchBannerItem } from "./chat/ThreadActivityBanners";
 import { ThreadNow } from "./chat/ThreadNow";
@@ -373,6 +380,8 @@ import {
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_MODELS: ServerProvider["models"] = [];
 const EMPTY_USAGE_LIMIT_SOURCES: UsageLimitSourceSnapshots = [];
+const EMPTY_PLANS: ThreadStructure["plans"] = [];
+const EMPTY_RUNS: ThreadStructure["runs"] = [];
 import type { CodexArtifactTemplate } from "@t3tools/shared/codexArtifactTemplates";
 
 const EMPTY_FEEDBACK_SUBMISSIONS: ReadonlyArray<CodexFeedbackSubmission> = [];
@@ -1044,9 +1053,13 @@ export default function ChatView(props: ChatViewProps) {
     activePreviewMiniPlayer?.source ?? null,
     renderedRightPanelSurface,
   );
-  const canMaximizeRightPanel = rightPanelOpen;
+  // With no tabs the inline panel is a narrow launcher rail, too thin to hold the titlebar controls.
+  const rightPanelRail =
+    rightPanelOpen && !shouldUsePlanSidebarSheet && activeRightPanelSurface === null;
+  const canMaximizeRightPanel = rightPanelOpen && !rightPanelRail;
   const rightPanelMaximized = canMaximizeRightPanel && rightPanelState.maximized === true;
-  const inlineRightPanelOwnsTitleBar = rightPanelOpen && !shouldUsePlanSidebarSheet;
+  const inlineRightPanelOwnsTitleBar =
+    rightPanelOpen && !shouldUsePlanSidebarSheet && !rightPanelRail;
   const [threadPanelPopoverHandle] = useState(PopoverCreateHandle);
   const [chatCanvasStore] = useState(createChatCanvasStore);
 
@@ -1611,6 +1624,10 @@ export default function ChatView(props: ChatViewProps) {
     primaryEnvironmentId,
     remoteOpenMode: remoteOpenState.mode,
   });
+  const projectFileScripts = useT3ProjectFileScripts(
+    activeThread?.environmentId ?? environmentId,
+    activeProject ? gitCwd : null,
+  );
   useOpenFavoriteEditorShortcut({
     enabled: showOpenInPicker && !backgroundThread,
     environmentId: activeThread?.environmentId ?? environmentId,
@@ -1701,20 +1718,22 @@ export default function ChatView(props: ChatViewProps) {
           providerSubagentModels,
           reportedModelSelection,
         );
+  // Started threads keep the strip with plain machine and workspace labels; the setting keeps the pickers.
+  const composerContextStripReadOnly = !isDraftHeroState && !settings.persistComposerContextStrip;
   const mountComposerContextStrip = shouldShowComposerContextStrip({
     isDraftHeroState,
-    persistInActiveThreads: settings.persistComposerContextStrip,
+    persistInActiveThreads: true,
     hasActiveProject: activeProject !== null && !showProviderSubagentBar,
     isGitRepo,
-    showEnvironmentIndicator: showComposerEnvironmentIndicator,
+    showEnvironmentIndicator: showComposerEnvironmentIndicator || composerContextStripReadOnly,
     hostsRestingComposerControls: routeKind === "server",
   });
   const showComposerContextStrip = shouldShowComposerContextStrip({
     isDraftHeroState,
-    persistInActiveThreads: settings.persistComposerContextStrip,
+    persistInActiveThreads: true,
     hasActiveProject: activeProject !== null && !showProviderSubagentBar,
     isGitRepo,
-    showEnvironmentIndicator: showComposerEnvironmentIndicator,
+    showEnvironmentIndicator: showComposerEnvironmentIndicator || composerContextStripReadOnly,
     hostsRestingComposerControls: routeKind === "server" && restingComposerControlsVisible,
   });
   const mountComposerModelStrip =
@@ -1848,7 +1867,7 @@ export default function ChatView(props: ChatViewProps) {
   const {
     activatePanelTerminalStable,
     addTerminalContextToDraftStable,
-    addTerminalSurfaceStable,
+    addDrawerTerminalStable,
     closePanelTerminalStable,
     lastInvokedScriptByProjectId,
     runProjectScriptStable,
@@ -3098,12 +3117,39 @@ export default function ChatView(props: ChatViewProps) {
     return <NoActiveThreadState />;
   }
 
+  const sourceControlBranchControl =
+    isGitRepo && gitCwd ? (
+      <BranchToolbarBranchSelector
+        displayMode="header"
+        className="min-w-0"
+        forceNewWorktree={multipleModelSelections !== null}
+        environmentId={activeThread.environmentId}
+        threadId={activeThread.id}
+        {...(draftId ? { draftId } : {})}
+        envLocked={envLocked}
+        effectiveEnvModeOverride={multipleModelSelections !== null ? "worktree" : envMode}
+        {...(canOverrideServerThreadEnvMode
+          ? {
+              activeThreadBranchOverride: activeThreadBranch,
+              onActiveThreadBranchOverrideChange: setPendingServerThreadBranch,
+            }
+          : {})}
+        startFromOrigin={startFromOrigin}
+        onStartFromOriginChange={onStartFromOriginChange}
+        {...(canCheckoutPullRequestIntoThread
+          ? { onCheckoutPullRequestRequest: openPullRequestDialogStable }
+          : {})}
+        onComposerFocusRequest={scheduleComposerFocusStable}
+      />
+    ) : undefined;
   const rightPanelContent = activeThreadRef ? (
     <RightPanelSurfaceContent
+      sourceControlBranchControl={sourceControlBranchControl}
       surface={renderedRightPanelSurface}
       activeSurfaceId={activeRightPanelSurface?.id ?? null}
       threadRef={activeThreadRef}
       environmentId={activeThread.environmentId}
+      projectId={activeThread.projectId}
       visible={rightPanelOpen}
       composerDraftTarget={composerDraftTarget}
       keybindings={keybindings}
@@ -3118,7 +3164,7 @@ export default function ChatView(props: ChatViewProps) {
         onAddTerminalContext: addTerminalContextToDraftStable,
         onSplitTerminal: splitPanelTerminalStable,
         onSplitTerminalVertical: splitPanelTerminalVerticalStable,
-        onNewTerminal: addTerminalSurfaceStable,
+        onNewTerminal: addDrawerTerminalStable,
         onActiveTerminalChange: activatePanelTerminalStable,
         onCloseTerminal: closePanelTerminalStable,
         splitShortcutLabel: splitTerminalShortcutLabel ?? undefined,
@@ -3167,13 +3213,40 @@ export default function ChatView(props: ChatViewProps) {
     <PanelLayoutControls
       {...panelToggleControlProps}
       showThreadPanelControl={!inlineRightPanelOwnsTitleBar}
+      showTerminalControl={!inlineRightPanelOwnsTitleBar}
     />
   );
   const threadPanelHeaderControl = <ThreadPanelHeaderControl {...panelToggleControlProps} />;
+  const projectScriptsHeaderControl = activeProject ? (
+    <ProjectScriptsControl
+      environmentId={activeThread.environmentId}
+      scripts={activeProjectScripts}
+      fileScripts={projectFileScripts}
+      preferredScriptId={lastInvokedScriptByProjectId[activeProject.id] ?? null}
+      onRunScript={runProjectScriptStable}
+      onAddScript={saveProjectScriptStable}
+      onUpdateScript={updateProjectScriptStable}
+      onDeleteScript={deleteProjectScriptStable}
+      {...(showOpenInPicker
+        ? {
+            menuFooter: (
+              <OpenInPicker
+                presentation="section"
+                environmentId={activeThread.environmentId}
+                keybindings={keybindings}
+                availableEditors={availableEditors}
+                openInCwd={gitCwd}
+                enableShortcut={false}
+              />
+            ),
+          }
+        : {})}
+    />
+  ) : null;
   const panelLayoutControls = (
     <WorkspaceTitlebarControls
       showMaximizeControl={!shouldUsePlanSidebarSheet}
-      rightPanelOpen={rightPanelOpen}
+      rightPanelOpen={canMaximizeRightPanel}
       animationsActive={panelAnimationsActive}
       maximized={rightPanelMaximized}
       onToggleMaximized={toggleRightPanelMaximizedStable}
@@ -3225,7 +3298,7 @@ export default function ChatView(props: ChatViewProps) {
           {isElectron && rightPanelControlsAtRoot ? (
             <span
               aria-hidden
-              className="pointer-events-none fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] h-[var(--workspace-topbar-height)] w-28 [-webkit-app-region:no-drag]"
+              className="pointer-events-none fixed top-[var(--workspace-controls-top)] right-[var(--workspace-rail-controls-right)] h-[var(--workspace-topbar-height)] w-29 [-webkit-app-region:no-drag]"
             />
           ) : null}
           {!rightPanelControlsAtRoot && !rightPanelControlsInPanel ? panelLayoutControls : null}
@@ -3239,6 +3312,8 @@ export default function ChatView(props: ChatViewProps) {
             parentThreadLink={parentThreadLink}
             onOpenThread={onOpenRelatedThreadStable}
             rightPanelOpen={inlineRightPanelOwnsTitleBar}
+            rightPanelRail={rightPanelRail}
+            actions={projectScriptsHeaderControl}
             onNewThreadInProject={handleNewThreadInActiveProjectStable}
             {...(activeDraftLogicalProjectKey
               ? { onOpenProjectSettings: handleOpenDraftProjectSettingsStable }
@@ -3298,6 +3373,8 @@ export default function ChatView(props: ChatViewProps) {
                 {...(activeProject ? { onRunShellCommand: runShellCommandStable } : {})}
                 isWorking={isWorking}
                 runlessWorkActive={runlessWorkStartedAt !== null}
+                turnChecklists={checklistProgressByRun(serverProjection?.plans ?? EMPTY_PLANS)}
+                backgroundWorkRunning={pendingBackgroundTasks.length}
                 activeTurnInProgress={isWorking || !latestRunSettled}
                 isCompacting={isCompacting}
                 awaitingUser={
@@ -3586,7 +3663,9 @@ export default function ChatView(props: ChatViewProps) {
                               restingControlsHost={restingComposerControlsHost}
                               restingControlsHaveLeadingContext={
                                 mountComposerContextStrip &&
-                                (isGitRepo || showComposerEnvironmentIndicator)
+                                (isGitRepo ||
+                                  showComposerEnvironmentIndicator ||
+                                  composerContextStripReadOnly)
                               }
                               onRestingControlsVisibilityChange={setRestingComposerControlsVisible}
                               getTimelineScrollableNode={getTimelineScrollableNodeStable}
@@ -3715,6 +3794,7 @@ export default function ChatView(props: ChatViewProps) {
                                 availableEnvironments={logicalProjectEnvironments}
                                 composerControlsHostRef={setRestingComposerControlsHost}
                                 contextStripVisible={showComposerContextStrip}
+                                readOnly={composerContextStripReadOnly}
                               />
                             </div>
                           )}
@@ -3759,34 +3839,9 @@ export default function ChatView(props: ChatViewProps) {
               isServerThread={isServerThread}
               {...(draftId ? { draftId } : {})}
               activeProjectName={activeProject?.title}
-              activeProjectScripts={activeProject ? activeProjectScripts : undefined}
-              preferredScriptId={
-                activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
-              }
-              keybindings={keybindings}
-              availableEditors={availableEditors}
-              showOpenInPicker={showOpenInPicker}
-              openInShortcutEnabled={
-                !(
-                  rightPanelOpen &&
-                  renderedRightPanelSurface?.kind === "file" &&
-                  renderedRightPanelSurface.attachment === undefined
-                )
-              }
               gitCwd={gitCwd}
               isGitRepo={isGitRepo}
               envLocked={envLocked}
-              availableEnvironments={logicalProjectEnvironments}
-              autoEnvironmentLabel={autoEnvironmentLabel}
-              onAutoEnvironment={
-                draftId &&
-                !envLocked &&
-                canAutoBalanceEnvironments &&
-                loadBalancingSettings.loadBalancingEnabled
-                  ? onAutoEnvironmentStable
-                  : undefined
-              }
-              {...(canChangeEnvironment ? { onEnvironmentChange: onEnvironmentChangeStable } : {})}
               onEnvModeChange={onEnvModeChangeStable}
               envMode={envMode}
               {...(canOverrideServerThreadEnvMode
@@ -3804,10 +3859,24 @@ export default function ChatView(props: ChatViewProps) {
               {...(isServerThread && isGitRepo
                 ? { onOpenChanges: openChangesFromThreadPanelStable }
                 : {})}
-              onRunProjectScript={runProjectScriptStable}
-              onAddProjectScript={saveProjectScriptStable}
-              onUpdateProjectScript={updateProjectScriptStable}
-              onDeleteProjectScript={deleteProjectScriptStable}
+              onOpenSourceControl={
+                sourceControlSurfaceAvailable ? addSourceControlSurfaceStable : undefined
+              }
+              context={{
+                snapshot: activeContextWindow,
+                modelDisplayName: formatModelSlugName(activeThread.modelSelection.model) || null,
+                onCompact: activeContextWindow ? onComposerCompactContextStable : undefined,
+                compactDisabled,
+                compactDisabledReason,
+              }}
+              providers={providerStatuses}
+              usageLimitSources={serverConfig?.usageLimitSources ?? EMPTY_USAGE_LIMIT_SOURCES}
+              providerInstanceId={activeProviderInstanceId}
+              branch={activeThreadBranch}
+              plans={serverProjection?.plans ?? EMPTY_PLANS}
+              runs={serverProjection?.runs ?? EMPTY_RUNS}
+              pendingBackgroundTasks={pendingBackgroundTasks}
+              agent={agentHome}
             />
 
             <PullRequestThreadDialogHost
@@ -3847,7 +3916,7 @@ export default function ChatView(props: ChatViewProps) {
           maximized={rightPanelMaximized}
           layoutControls={
             rightPanelOpen ? (
-              <div className="mr-px flex items-center gap-1">
+              <div className="mr-px flex items-center gap-2">
                 <RightPanelMaximizeControl
                   maximized={rightPanelMaximized}
                   onToggle={toggleRightPanelMaximizedStable}
@@ -3877,21 +3946,23 @@ export default function ChatView(props: ChatViewProps) {
           onCopyFilePath={copyRightPanelFilePathStable}
           onAddBrowser={() => createBrowserSurface()}
           onAddBrowserInProfile={createBrowserSurfaceStable}
-          onAddTerminal={addTerminalSurfaceStable}
           onAddDiff={addDiffSurfaceStable}
           onAddFiles={addFilesSurfaceStable}
           onAddPullRequest={addPullRequestSurfaceStable}
-          onAddPullRequests={addPullRequestsSurfaceStable}
           onAddDevice={addDeviceSurfaceStable}
           {...(sourceControlSurfaceAvailable
             ? { onAddSourceControl: addSourceControlSurfaceStable }
             : {})}
+          {...(activeProject !== null && activeThreadRef !== null
+            ? {
+                onAddWork: (view: WorkSection) =>
+                  useRightPanelStore.getState().openWork(activeThreadRef, view),
+              }
+            : {})}
           browserAvailable={canOperatePreview && browserAvailable}
-          terminalAvailable={activeProject !== null && canOperateTerminal}
           diffAvailable={isServerThread && isGitRepo}
           filesAvailable={activeProject !== null}
           pullRequestAvailable={pullRequestSurfaceAvailable}
-          pullRequestsAvailable={pullRequestsSurfaceAvailable}
           deviceAvailable={activeThreadRef !== null}
         >
           {rightPanelContent}

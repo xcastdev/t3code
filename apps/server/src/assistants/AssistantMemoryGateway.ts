@@ -55,7 +55,7 @@ const make = Effect.gen(function* () {
     input: { assistantId: AssistantId },
     caller: { threadId: ThreadId; providerSessionId: string },
   ) {
-    const record = yield* repository.findByThread(caller.threadId);
+    const record = yield* repository.findByConversation(caller.threadId);
     if (
       record === null ||
       record.detail.summary.assistantId !== input.assistantId ||
@@ -161,11 +161,16 @@ const make = Effect.gen(function* () {
           })).source,
         } satisfies AssistantMemoryWriteResult;
       case "reteach": {
-        const evidence = yield* sources.forRun(
-          record.detail.summary.binding.canonicalThreadId,
-          input.runId,
-        );
-        if (evidence === null || evidence.messageId !== input.messageId)
+        const run = (yield* sql<{
+          thread_id: ThreadId;
+        }>`SELECT thread_id FROM orchestration_v2_projection_runs WHERE run_id=${input.runId}`)[0];
+        const evidence =
+          run === undefined ? null : yield* sources.forRun(run.thread_id, input.runId);
+        if (
+          evidence === null ||
+          evidence.messageId !== input.messageId ||
+          evidence.assistantId !== input.assistantId
+        )
           return yield* new ProjectMemoryError({ reason: "forbidden" });
         return {
           operation: "reteach",
