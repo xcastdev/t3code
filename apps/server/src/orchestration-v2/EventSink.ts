@@ -1062,6 +1062,7 @@ const layerBase: Layer.Layer<
             ...(proposedWorktreePath === undefined ? {} : { proposedWorktreePath }),
             runId: run.id,
             ...(run.activeAttemptId === null ? {} : { runAttemptId: run.activeAttemptId }),
+            modelSelection: run.modelSelection,
             queued: run.status === "queued" || run.status === "preparing",
             ...(originThreadId === undefined ? {} : { originThreadId }),
           },

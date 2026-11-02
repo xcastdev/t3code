@@ -28,6 +28,7 @@ import {
   McpDefinitionId,
   NodeId,
   ProviderDriverKind,
+  ProviderInstanceId,
   ProviderThreadId,
   ProviderSessionId,
   ProviderTurnId,
@@ -86,6 +87,7 @@ import * as Threads from "../orchestration-v2/ThreadManagementService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as Folders from "../project/ManagedProjectFolders.ts";
 import { configuration, environmentId } from "./AssistantTestHelpers.ts";
+import { AssistantLifecycleMutation } from "./AssistantGuards.ts";
 
 const isAdmissionError = Schema.is(Admission.RunAdmissionError);
 const decodeAdmission = Schema.decodeUnknownEffect(
@@ -396,31 +398,19 @@ it.live(
           ],
         ],
         [
-          "raw-home-model",
-          "thread.model.set",
+          "raw-home-provider",
+          "provider.switch",
           [
             {
-              id: EventId.make("model-change"),
-              type: "thread.model-selection-updated",
+              id: EventId.make("provider-change"),
+              type: "thread.provider-switched",
               threadId: home.id,
               occurredAt: now,
               payload: {
                 ...home,
-                modelSelection: { ...home.modelSelection, model: "unconfigured-model" },
+                providerInstanceId: ProviderInstanceId.make("claude"),
+                modelSelection: { instanceId: ProviderInstanceId.make("claude"), model: "opus" },
               },
-            },
-          ],
-        ],
-        [
-          "raw-home-runtime",
-          "thread.runtime-mode.set",
-          [
-            {
-              id: EventId.make("runtime-change"),
-              type: "thread.runtime-mode-updated",
-              threadId: home.id,
-              occurredAt: now,
-              payload: { ...home, runtimeMode: "full-access" },
             },
           ],
         ],
@@ -619,7 +609,10 @@ it.live(
             type: "thread.model-selection-updated",
             threadId: chat.id,
             occurredAt: now,
-            payload: { ...chat, modelSelection: { ...chat.modelSelection, model: "other" } },
+            payload: {
+              ...chat,
+              modelSelection: { instanceId: ProviderInstanceId.make("claude"), model: "opus" },
+            },
           },
           "thread.model.set",
         ),
@@ -1748,4 +1741,161 @@ it.live(
         rowsBefore,
       );
     }).pipe(Effect.provide(NativeResources.layer.pipe(Layer.provideMerge(testLayer)))),
+);
+
+it.live(
+  "Home and its chats run with their own model, effort and modes, and admission captures them",
+  () =>
+    Effect.gen(function* () {
+      const { home } = yield* setup();
+      const now = yield* DateTime.now;
+      const modelSelection = {
+        instanceId: configuration.modelSelection.instanceId,
+        model: "gpt-6-luna",
+        options: [{ id: "reasoningEffort", value: "high" }],
+      };
+      const overridden: OrchestrationV2AppThread = {
+        ...home,
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "plan",
+      };
+      for (const [name, type, payload] of [
+        ["home-own-model", "thread.model-selection-updated", { ...home, modelSelection }],
+        [
+          "home-own-runtime",
+          "thread.runtime-mode-updated",
+          { ...home, modelSelection, runtimeMode: "full-access" },
+        ],
+        ["home-own-interaction", "thread.interaction-mode-updated", overridden],
+      ] as const)
+        assert.equal(
+          (yield* commit(
+            name,
+            home.id,
+            [{ id: EventId.make(name), type, threadId: home.id, occurredAt: now, payload }],
+            type,
+          )).receipt.status,
+          "accepted",
+          name,
+        );
+      const { run, result } = yield* createRun(overridden, "override-turn");
+      assert.equal(result.receipt.status, "accepted");
+      const admitted = yield* (yield* Admission.RunAdmission).check({
+        threadId: home.id,
+        runId: run.id,
+        now: DateTime.formatIso(now),
+        operation: "start",
+      });
+      if (admitted._tag !== "admitted") return yield* Effect.die("Override was not admitted");
+      assert.equal(admitted.owner.configuration.model, "gpt-6-luna");
+      assert.deepStrictEqual(admitted.owner.configuration.options, modelSelection.options);
+      const sql = yield* SqlClient.SqlClient;
+      const captured = yield* decodeAdmission(
+        (yield* sql<{
+          configuration_json: string;
+        }>`SELECT configuration_json FROM t3_workflow_v2_assistant_admissions WHERE thread_id=${home.id} AND run_id=${run.id}`)[0]!
+          .configuration_json,
+      );
+      assert.deepStrictEqual(captured.configuration.configuration.modelSelection, modelSelection);
+      assert.equal(captured.configuration.configuration.runtimeMode, "full-access");
+      assert.equal(captured.configuration.configuration.interactionMode, "plan");
+      assert.equal(captured.configuration.configuration.prompt, configuration.prompt);
+
+      const elsewhere = { instanceId: ProviderInstanceId.make("claude"), model: "opus" };
+      const { result: refused } = yield* createRun(
+        { ...overridden, providerInstanceId: elsewhere.instanceId, modelSelection: elsewhere },
+        "other-provider-turn",
+        "preparing",
+        2,
+      );
+      assert.equal(refused.receipt.status, "rejected");
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.live("Home keeps the agent's name and stays open while its chats stay ordinary", () =>
+  Effect.gen(function* () {
+    const { home, binding } = yield* setup();
+    const threads = yield* Threads.ThreadManagementService;
+    for (const [index, command] of (
+      [
+        { type: "thread.metadata.update", title: "Renamed" },
+        { type: "thread.metadata.update", regenerateTitle: true },
+        { type: "thread.settle" },
+        { type: "thread.archive" },
+      ] as const
+    ).entries()) {
+      const result = yield* threads
+        .dispatch({
+          ...command,
+          commandId: CommandId.make(`home:refused:${index}`),
+          threadId: home.id,
+        })
+        .pipe(Effect.result);
+      assert.equal(
+        result._tag === "Failure" ? result.failure._tag : "accepted",
+        "OrchestratorAssistantHomeFixedError",
+        JSON.stringify(command),
+      );
+    }
+    yield* threads.dispatch({
+      type: "message.dispatch",
+      commandId: CommandId.make("home:first-message"),
+      threadId: home.id,
+      messageId: MessageId.make("home:first-message"),
+      text: "Plan the week",
+      attachments: [],
+      titleSeed: "Plan the week",
+      dispatchMode: { type: "defer_start" },
+      createdBy: "user",
+      creationSource: "web",
+    });
+    let shell = yield* threads.getThreadShell(home.id);
+    assert.equal(shell!.title, home.title);
+    assert.isNotOk(shell!.titleRegeneration);
+    assert.equal(shell!.settledAt, null);
+    assert.equal(shell!.archivedAt, null);
+
+    yield* threads
+      .dispatch({
+        type: "thread.metadata.update",
+        commandId: CommandId.make("home:agent-rename"),
+        threadId: home.id,
+        title: "Scholar",
+      })
+      .pipe(Effect.provideService(AssistantLifecycleMutation, binding.assistantId));
+    shell = yield* threads.getThreadShell(home.id);
+    assert.equal(shell!.title, "Scholar");
+
+    const chatId = ThreadId.make("home:chat");
+    yield* threads.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("home:chat:create"),
+      threadId: chatId,
+      projectId: binding.backingProjectId,
+      parentThreadId: home.id,
+      title: "Chat",
+      modelSelection: configuration.modelSelection,
+      runtimeMode: configuration.runtimeMode,
+      interactionMode: configuration.interactionMode,
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* threads.dispatch({
+      type: "thread.metadata.update",
+      commandId: CommandId.make("home:chat:rename"),
+      threadId: chatId,
+      title: "Renamed chat",
+    });
+    yield* threads.dispatch({
+      type: "thread.settle",
+      commandId: CommandId.make("home:chat:settle"),
+      threadId: chatId,
+    });
+    const chat = yield* threads.getThreadShell(chatId);
+    assert.equal(chat!.title, "Renamed chat");
+    assert.notEqual(chat!.settledAt, null);
+  }).pipe(Effect.provide(continuationLayer)),
 );

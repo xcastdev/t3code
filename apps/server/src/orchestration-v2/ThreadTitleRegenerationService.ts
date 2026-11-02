@@ -122,8 +122,13 @@ const make = Effect.gen(function* () {
         return { type: "stale" as const };
       }
 
-      const project = yield* projects.get(projection.thread.projectId);
-      if (Option.isNone(project)) {
+      const project = yield* projects.getShell(projection.thread.projectId);
+      // An agent's Home keeps the agent's name.
+      if (
+        Option.isNone(project) ||
+        (project.value.assistantId !== undefined &&
+          projection.thread.lineage.parentThreadId === null)
+      ) {
         return { type: "complete" as const };
       }
 

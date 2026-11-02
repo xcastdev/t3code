@@ -1,7 +1,14 @@
 import type { ProjectId, ThreadId } from "@t3tools/contracts";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/sql/SqlClient";
 import { AssistantError } from "./AssistantRepository.ts";
+
+// Only the checked lifecycle service supplies this scope; no wire input carries it.
+export class AssistantLifecycleMutation extends Context.Reference<string>(
+  "t3/assistants/AssistantLifecycleMutation",
+  { defaultValue: () => "" },
+) {}
 
 // These checks also protect reservations whose canonical thread has not been created yet.
 export const assertOrdinaryAssistantDestination = Effect.fn(

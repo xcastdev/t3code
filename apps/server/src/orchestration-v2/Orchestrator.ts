@@ -1,4 +1,5 @@
 import { archivedForkSource } from "./ThreadHistoryArchiveCommitGuard.ts";
+import { AssistantLifecycleMutation } from "../assistants/AssistantGuards.ts";
 import { projectTerminalNoticeItem } from "../terminal/ProjectTerminalNotice.ts";
 import type {
   GuestShareId,
@@ -276,6 +277,15 @@ export class OrchestratorSubagentThreadReadOnlyError extends Schema.TaggedError<
   }
 }
 
+export class OrchestratorAssistantHomeFixedError extends Schema.TaggedError<OrchestratorAssistantHomeFixedError>()(
+  "OrchestratorAssistantHomeFixedError",
+  { commandId: CommandId, threadId: ThreadId },
+) {
+  override get message(): string {
+    return "An agent's Home keeps the agent's name and stays open: it cannot be renamed, settled or archived. Start a chat for separate work.";
+  }
+}
+
 export class OrchestratorThreadAboveModeLimitError extends Schema.TaggedError<OrchestratorThreadAboveModeLimitError>()(
   "OrchestratorThreadAboveModeLimitError",
   {
@@ -360,6 +370,7 @@ export const OrchestratorV2Error = Schema.Union([
   OrchestratorCommandPreviouslyRejectedError,
   OrchestratorCommandIdConflictError,
   OrchestratorSubagentThreadReadOnlyError,
+  OrchestratorAssistantHomeFixedError,
   OrchestratorThreadAboveModeLimitError,
   OrchestratorRuntimeModeAboveCeilingError,
 ]);
@@ -1107,6 +1118,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     },
   );
 
+  // An agent's Home is the root thread of its backing project; chats and delegated work have parents.
+  const assistantHomeOwner = Effect.fn("Orchestrator.assistantHomeOwner")(function* (
+    command: OrchestrationV2ServerCommand,
+    thread: Pick<OrchestrationV2AppThread, "projectId" | "lineage">,
+  ) {
+    if (thread.lineage.parentThreadId !== null) return undefined;
+    const project = yield* projects.getShell(thread.projectId).pipe(mapDispatchError(command));
+    return Option.isSome(project) ? project.value.assistantId : undefined;
+  });
   const mapDispatchError =
     (command: OrchestrationV2ServerCommand) =>
     <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, OrchestratorDispatchError, R> =>
@@ -3136,6 +3156,28 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         commandType: command.type,
         cause: `Thread ${command.threadId} is deleted.`,
       });
+    }
+    if (
+      command.type === "thread.archive" ||
+      command.type === "thread.settle" ||
+      (command.type === "thread.metadata.update" &&
+        (command.regenerateTitle === true ||
+          (command.title !== undefined && command.title !== thread.title)))
+    ) {
+      const assistantId = yield* assistantHomeOwner(command, thread);
+      if (
+        assistantId !== undefined &&
+        !(
+          command.type === "thread.metadata.update" &&
+          command.regenerateTitle !== true &&
+          (yield* AssistantLifecycleMutation) === assistantId
+        )
+      ) {
+        return yield* new OrchestratorAssistantHomeFixedError({
+          commandId: command.commandId,
+          threadId: command.threadId,
+        });
+      }
     }
     if (
       command.type === "thread.pull-request.watch" &&
@@ -5709,7 +5751,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         (yield* projectionStore
           .getMessageCount(command.threadId)
           .pipe(mapDispatchError(command))) === 0) ||
-        (command.createdBy === "user" && onlyMaintenanceHistory))
+        (command.createdBy === "user" && onlyMaintenanceHistory)) &&
+      (yield* assistantHomeOwner(command, projection.thread)) === undefined
     ) {
       const now = yield* DateTime.now;
       const thread: OrchestrationV2AppThread = {

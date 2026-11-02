@@ -13,7 +13,6 @@ import {
   ThreadId,
   type OrchestrationV2DomainEvent,
 } from "@t3tools/contracts";
-import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -33,13 +32,11 @@ import {
   assistantConversationIsCurrent,
   assistantThreadIsCurrent,
 } from "./AssistantThreadAuthority.ts";
+import { AssistantLifecycleMutation } from "./AssistantGuards.ts";
 
-// Only the checked lifecycle service supplies this scope; no wire input carries it.
-export class AssistantLifecycleMutation extends Context.Reference<string>(
-  "t3/assistants/AssistantLifecycleMutation",
-  { defaultValue: () => "" },
-) {}
 const denied = (reason: string): Admission.AdmissionResult => ({ _tag: "denied", reason });
+const providerLocked =
+  "Agent threads stay on the agent's provider. Change the provider in the agent's configuration.";
 const wrap = <A, E, R>(operation: string, effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.mapError((cause) => new Admission.RunAdmissionError({ operation, cause })));
 const StoredSnapshot = Schema.Struct({
@@ -352,7 +349,6 @@ const make = Effect.gen(function* () {
     events: ReadonlyArray<OrchestrationV2DomainEvent>;
   }) {
     yield* previous.guardEvents?.(input) ?? Effect.void;
-    const changed = new Set<string>();
     for (const event of input.events) {
       const creation = input.events.find(
         (value) => value.type === "thread.created" && value.threadId === event.threadId,
@@ -458,19 +454,15 @@ const make = Effect.gen(function* () {
         event.type === "thread.provider-switched"
       ) {
         if (!(yield* conversation(record, event.threadId))) return yield* fail();
-        if (changed.has(event.threadId)) continue;
-        changed.add(event.threadId);
-        const configured = record.detail.configuration.configuration;
+        // Home and chats keep their own model and modes, on the provider the agent's resources target.
         if (
-          ((event.type === "thread.model-selection-updated" ||
-            event.type === "thread.provider-switched") &&
-            !modelSelectionsEqual(event.payload.modelSelection, configured.modelSelection)) ||
-          (event.type === "thread.runtime-mode-updated" &&
-            event.payload.runtimeMode !== configured.runtimeMode) ||
-          (event.type === "thread.interaction-mode-updated" &&
-            event.payload.interactionMode !== configured.interactionMode)
+          event.payload.modelSelection.instanceId !==
+          record.detail.configuration.configuration.modelSelection.instanceId
         )
-          return yield* fail();
+          return yield* new Admission.RunAdmissionError({
+            operation: input.commandType,
+            cause: providerLocked,
+          });
       }
     }
   });
@@ -573,15 +565,20 @@ const make = Effect.gen(function* () {
           if (shell !== null && !(yield* threadCurrent(record, input.threadId)))
             return denied("Assistant child target changed.");
           const configuration = record.detail.configuration.configuration;
+          // A thread's own model and modes are its per-thread overrides of the agent defaults.
+          const effective = {
+            ...configuration,
+            modelSelection:
+              input.modelSelection ?? shell?.modelSelection ?? configuration.modelSelection,
+            runtimeMode: shell?.runtimeMode ?? configuration.runtimeMode,
+            interactionMode: shell?.interactionMode ?? configuration.interactionMode,
+          };
           if (
-            shell !== null &&
             input.operation !== "steer" &&
             input.operation !== "runtime-answer" &&
-            (!modelSelectionsEqual(shell.modelSelection, configuration.modelSelection) ||
-              shell.runtimeMode !== configuration.runtimeMode ||
-              shell.interactionMode !== configuration.interactionMode)
+            effective.modelSelection.instanceId !== configuration.modelSelection.instanceId
           )
-            return denied("Assistant thread configuration is pending synchronization.");
+            return denied(providerLocked);
           const prior = (yield* sql<{
             configuration_json: string;
             configuration_revision: number;
@@ -619,13 +616,17 @@ const make = Effect.gen(function* () {
           )
             return denied("Assistant resources changed during admission.");
           const captured = {
-            configuration: record.detail.configuration,
+            configuration: { ...record.detail.configuration, configuration: effective },
             snapshot: input.preparedResources.snapshot,
             configurationHash: assistantConfigurationHash(record),
             runAttemptId: input.runAttemptId ?? null,
           };
           yield* sql`INSERT INTO t3_workflow_v2_assistant_admissions(thread_id,run_id,assistant_id,configuration_revision,configuration_json,created_at) VALUES(${input.threadId},${input.runId},${record.detail.summary.assistantId},${record.detail.configuration.revision},${yield* encode(captured)},${input.now})`;
-          return admitted(record, input, captured.snapshot);
+          return admitted(
+            { ...record, detail: { ...record.detail, configuration: captured.configuration } },
+            input,
+            captured.snapshot,
+          );
         }),
       ),
     ),

@@ -11,8 +11,11 @@ import {
   CommandId,
   type ThreadId,
   type AuthSessionId,
+  type AssistantConfiguration,
+  type AssistantDetail,
   type AssistantLifecycleInput,
 } from "@t3tools/contracts";
+import { modelSelectionsEqual } from "@t3tools/shared/model";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -21,7 +24,7 @@ import * as Option from "effect/Option";
 import { AssistantError, AssistantRepository } from "./AssistantRepository.ts";
 import { AssistantService } from "./AssistantService.ts";
 import { AssistantProvisioning } from "./AssistantProvisioning.ts";
-import { AssistantLifecycleMutation } from "./AssistantAdmission.ts";
+import { AssistantLifecycleMutation } from "./AssistantGuards.ts";
 import { ThreadManagementService } from "../orchestration-v2/ThreadManagementService.ts";
 import { AuthSessionRepository } from "../persistence/AuthSessions.ts";
 import { ServerEnvironment } from "../environment/ServerEnvironment.ts";
@@ -57,35 +60,71 @@ const make = Effect.gen(function* () {
       isAssistantError(cause) ? cause : new AssistantError({ reason: "unavailable", cause }),
     ),
   );
+  // Home's stored title is the agent's name; only this lifecycle scope may rename it.
+  const syncHomeTitle = Effect.fn("AssistantRuntime.syncHomeTitle")(function* (
+    detail: AssistantDetail,
+    commandId: CommandId,
+  ) {
+    const binding = detail.summary.binding;
+    const name = detail.configuration.configuration.name;
+    const home = yield* threads.getThreadShell(binding.canonicalThreadId);
+    if (home === null || home.deletedAt !== null || home.title === name) return;
+    yield* threads
+      .dispatch({
+        type: "thread.metadata.update",
+        commandId: CommandId.make(`${commandId}:home-title`),
+        threadId: home.id,
+        title: name,
+      })
+      .pipe(Effect.provideService(AssistantLifecycleMutation, binding.assistantId));
+  });
+  // Threads still on the previous default follow the new one; a thread's own choice stays.
+  // Overrides stay on the agent's provider, so a provider change moves every thread.
   const synchronize = Effect.fn("AssistantRuntime.synchronize")(
-    function* (detail: import("@t3tools/contracts").AssistantDetail, commandId: CommandId) {
+    function* (previous: AssistantConfiguration, detail: AssistantDetail, commandId: CommandId) {
       if (detail.summary.provisioningState !== "ready") return;
       const binding = detail.summary.binding;
       const configuration = detail.configuration.configuration;
+      yield* syncHomeTitle(detail, commandId);
       const chats = yield* sql<{
         thread_id: ThreadId;
       }>`SELECT thread_id FROM orchestration_v2_projection_threads WHERE project_id=${binding.backingProjectId} AND thread_id!=${binding.canonicalThreadId} AND deleted_at IS NULL AND archived_at IS NULL AND json_extract(payload_json,'$.lineage.relationshipToParent')='chat'`;
       for (const threadId of [binding.canonicalThreadId, ...chats.map((row) => row.thread_id)]) {
+        const shell = yield* threads.getThreadShell(threadId);
+        if (shell === null) continue;
         const prefix =
           threadId === binding.canonicalThreadId ? commandId : `${commandId}:${threadId}`;
-        yield* threads.dispatch({
-          type: "thread.model-selection.set",
-          commandId: CommandId.make(`${prefix}:model`),
-          threadId,
-          modelSelection: configuration.modelSelection,
-        });
-        yield* threads.dispatch({
-          type: "thread.runtime-mode.set",
-          commandId: CommandId.make(`${prefix}:runtime`),
-          threadId,
-          runtimeMode: configuration.runtimeMode,
-        });
-        yield* threads.dispatch({
-          type: "thread.interaction-mode.set",
-          commandId: CommandId.make(`${prefix}:interaction`),
-          threadId,
-          interactionMode: configuration.interactionMode,
-        });
+        if (
+          !modelSelectionsEqual(shell.modelSelection, configuration.modelSelection) &&
+          (modelSelectionsEqual(shell.modelSelection, previous.modelSelection) ||
+            shell.modelSelection.instanceId !== configuration.modelSelection.instanceId)
+        )
+          yield* threads.dispatch({
+            type: "thread.model-selection.set",
+            commandId: CommandId.make(`${prefix}:model`),
+            threadId,
+            modelSelection: configuration.modelSelection,
+          });
+        if (
+          shell.runtimeMode !== configuration.runtimeMode &&
+          shell.runtimeMode === previous.runtimeMode
+        )
+          yield* threads.dispatch({
+            type: "thread.runtime-mode.set",
+            commandId: CommandId.make(`${prefix}:runtime`),
+            threadId,
+            runtimeMode: configuration.runtimeMode,
+          });
+        if (
+          shell.interactionMode !== configuration.interactionMode &&
+          shell.interactionMode === previous.interactionMode
+        )
+          yield* threads.dispatch({
+            type: "thread.interaction-mode.set",
+            commandId: CommandId.make(`${prefix}:interaction`),
+            threadId,
+            interactionMode: configuration.interactionMode,
+          });
       }
     },
     Effect.mapError((cause) =>
@@ -96,11 +135,15 @@ const make = Effect.gen(function* () {
     input: import("@t3tools/contracts").AssistantUpdateConfigurationInput,
     sessionId: AuthSessionId,
   ) {
-    const detail = yield* sql.withTransaction(
-      authorize(sessionId, true).pipe(Effect.andThen(service.updateConfiguration(input))),
+    const { previous, detail } = yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* authorize(sessionId, true);
+        const previous = (yield* repository.get(input)).detail.configuration.configuration;
+        return { previous, detail: yield* service.updateConfiguration(input) };
+      }),
     );
     if (Option.isSome(eventBus)) yield* eventBus.value.publish(input);
-    yield* synchronize(detail, input.commandId);
+    yield* synchronize(previous, detail, input.commandId);
     return detail;
   });
   const lifecycle = Effect.fn("AssistantRuntime.lifecycle")(
@@ -172,6 +215,16 @@ const make = Effect.gen(function* () {
       });
       for (const record of page)
         yield* provisioning.reconcile(record).pipe(
+          Effect.andThen((current) =>
+            current.detail.summary.provisioningState === "ready"
+              ? syncHomeTitle(
+                  current.detail,
+                  CommandId.make(
+                    `assistant-recover:${current.detail.summary.assistantId}:${current.detail.configuration.revision}`,
+                  ),
+                )
+              : Effect.void,
+          ),
           Effect.catch((cause) =>
             Effect.logWarning("Assistant binding reconciliation remains unavailable.", {
               assistantId: record.detail.summary.assistantId,

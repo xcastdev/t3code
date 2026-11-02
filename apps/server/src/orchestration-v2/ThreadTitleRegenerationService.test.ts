@@ -1,5 +1,6 @@
 import { assert, describe, it, vi } from "@effect/vitest";
 import {
+  AssistantId,
   CommandId,
   ChatAttachmentId,
   type ChatAttachment,
@@ -49,6 +50,7 @@ const adapter = {
 function makeHarness(
   options: {
     readonly generateTitle?: TextGeneration.TextGeneration["Service"]["generateThreadTitle"];
+    readonly assistantId?: AssistantId;
   } = {},
 ) {
   const layerDatabase = SqlitePersistence.layerMemory;
@@ -69,13 +71,15 @@ function makeHarness(
     options.generateTitle ?? (() => Effect.succeed({ title: "Generated title" })),
   );
   const layerProjectedProjects = Layer.mock(ProjectStore.ProjectStoreV2)({
-    get: (requestedProjectId) =>
+    getShell: (requestedProjectId) =>
       Effect.succeed(
         requestedProjectId === projectId
           ? Option.some({
-              projectId,
+              id: projectId,
+              ...(options.assistantId === undefined ? {} : { assistantId: options.assistantId }),
               title: "Project",
               workspaceRoot: "/repo",
+              repositoryIdentity: null,
               defaultModelSelection: modelSelection,
               defaultThreadEnvMode: null,
               autoPull: false,
@@ -86,7 +90,6 @@ function makeHarness(
               archivedAt: null,
               createdAt: "2026-06-20T00:00:00.000Z",
               updatedAt: "2026-06-20T00:00:00.000Z",
-              deletedAt: null,
             })
           : Option.none(),
       ),
@@ -413,6 +416,33 @@ describe("ThreadTitleRegenerationService", () => {
         assert.include(call?.message, "USER:\nInvestigate the flaky login test");
         const projection = yield* threads.getThreadProjection(threadId);
         assert.equal(projection.thread.title, "Fresh title");
+        assert.isNotOk(projection.thread.titleRegeneration);
+      }).pipe(Effect.provide(harness.layer));
+    }),
+  );
+
+  it.effect("keeps an agent Home's name instead of generating a title", () =>
+    Effect.gen(function* () {
+      const harness = makeHarness({ assistantId: AssistantId.make("assistant:title") });
+      yield* Effect.gen(function* () {
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        const titleRegeneration = yield* ThreadTitleRegeneration.ThreadTitleRegenerationService;
+        const threadId = yield* createThread({
+          command: "command:title:home:create",
+          thread: "thread:title:home",
+        });
+        yield* dispatchUserMessage({
+          command: "command:title:home:message",
+          threadId,
+          text: "Investigate the flaky login test",
+        });
+        const requestId = yield* armRegeneration({ command: "command:title:home:1", threadId });
+
+        yield* titleRegeneration.execute({ threadId, requestId, kind: { type: "regenerate" } });
+
+        assert.equal(harness.generateThreadTitle.mock.calls.length, 0);
+        const projection = yield* threads.getThreadProjection(threadId);
+        assert.equal(projection.thread.title, "Seed title");
         assert.isNotOk(projection.thread.titleRegeneration);
       }).pipe(Effect.provide(harness.layer));
     }),

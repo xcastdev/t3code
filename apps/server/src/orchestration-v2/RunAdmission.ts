@@ -1,4 +1,4 @@
-import type { ProviderOptionSelections } from "@t3tools/contracts";
+import type { ModelSelection, ProviderOptionSelections } from "@t3tools/contracts";
 import type {
   NodeId,
   OrchestrationV2DomainEvent,
@@ -102,6 +102,8 @@ export interface CommitInput {
   readonly projectId?: ProjectId;
   readonly runId?: RunId;
   readonly runAttemptId?: RunAttemptId;
+  /** The run's own selection; it may differ from the owner's default. */
+  readonly modelSelection?: ModelSelection;
   readonly queued?: boolean;
   readonly preparedBindingId?: string;
 }

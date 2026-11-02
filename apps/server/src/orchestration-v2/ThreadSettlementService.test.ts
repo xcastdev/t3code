@@ -1,4 +1,4 @@
-import { SourceControlProviderKind } from "@t3tools/contracts";
+import { AssistantId, SourceControlProviderKind } from "@t3tools/contracts";
 import { assert, describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import {
@@ -850,31 +850,54 @@ describe("ThreadSettlementServiceV2 worker", () => {
     ),
   );
 
-  it.effect("settles only the project opted in while environment settlement is disabled", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        yield* TestClock.setTime(Date.parse(NOW));
-        const thread = makeThread("project-opt-in", {
-          latestRunCompletedAt: DateTime.makeUnsafe("2026-08-25T00:00:00.000Z"),
-        });
-        const other = makeThread("environment-off", { projectId: ProjectId.make("other-project") });
-        const fixture = yield* makeHarness({
-          snapshot: makeSnapshot([thread, other]),
-          settings: {
-            ...DEFAULT_SERVER_SETTINGS,
-            sidebarAutoSettleAfterDays: null,
-            sidebarAutoSettleOnMerge: false,
-            projectSettingsOverrides: { [PROJECT_ID]: { sidebarAutoSettleAfterDays: 2 } },
-          },
-        });
-        yield* Effect.gen(function* () {
-          const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
-          yield* startHarness(service, fixture.activation, fixture.snapshotReads);
-          const commands = yield* Ref.get(fixture.commands);
-          expect(commands.map((command) => command.threadId)).toEqual([thread.id]);
-        }).pipe(Effect.provide(fixture.layer));
-      }),
-    ),
+  it.effect(
+    "settles only opted-in projects, and never an agent Home, while environment settlement is disabled",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(Date.parse(NOW));
+          const thread = makeThread("project-opt-in", {
+            latestRunCompletedAt: DateTime.makeUnsafe("2026-08-25T00:00:00.000Z"),
+          });
+          const other = makeThread("environment-off", {
+            projectId: ProjectId.make("other-project"),
+          });
+          const agentProject = ProjectId.make("agent-project");
+          const home = makeThread("agent-home", { projectId: agentProject });
+          const chat = makeThread("agent-chat", {
+            projectId: agentProject,
+            lineage: {
+              rootThreadId: home.id,
+              parentThreadId: home.id,
+              relationshipToParent: "chat",
+            },
+          });
+          const fixture = yield* makeHarness({
+            snapshot: makeSnapshot(
+              [thread, other, home, chat],
+              [
+                makeProject(),
+                { ...makeProject(agentProject), assistantId: AssistantId.make("agent") },
+              ],
+            ),
+            settings: {
+              ...DEFAULT_SERVER_SETTINGS,
+              sidebarAutoSettleAfterDays: null,
+              sidebarAutoSettleOnMerge: false,
+              projectSettingsOverrides: {
+                [PROJECT_ID]: { sidebarAutoSettleAfterDays: 2 },
+                [agentProject]: { sidebarAutoSettleAfterDays: 2 },
+              },
+            },
+          });
+          yield* Effect.gen(function* () {
+            const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+            yield* startHarness(service, fixture.activation, fixture.snapshotReads);
+            const commands = yield* Ref.get(fixture.commands);
+            expect(commands.map((command) => command.threadId)).toEqual([thread.id, chat.id]);
+          }).pipe(Effect.provide(fixture.layer));
+        }),
+      ),
   );
 
   it.effect("stops settling the rest of a sweep once auto-settlement is turned off", () =>
