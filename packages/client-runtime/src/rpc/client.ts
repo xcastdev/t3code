@@ -55,7 +55,6 @@ export type EnvironmentSubscriptionRpcTag =
   | typeof WS_METHODS.projectTerminalMetadata
   | typeof WS_METHODS.skillsCatalogSubscribe
   | typeof WS_METHODS.managedTextResourcesCatalogSubscribe
-  | typeof WS_METHODS.codexAuthCallbackSubscribe
   | typeof WS_METHODS.providerAuthSubscribe
   | typeof WS_METHODS.providerInstallSubscribe
   | typeof ORCHESTRATION_V2_WS_METHODS.subscribeShell
@@ -69,7 +68,6 @@ export type EnvironmentSubscriptionRpcTag =
   | typeof WS_METHODS.projectWorkSubscribe
   | typeof WS_METHODS.serverGetStorageCleanupReport
   | typeof WS_METHODS.serverGetDatabaseStorage
-  | typeof WS_METHODS.subscribeTerminalEvents
   | typeof WS_METHODS.subscribeTerminalMetadata
   | typeof WS_METHODS.subscribePreviewEvents
   | typeof WS_METHODS.subscribeDiscoveredLocalServers

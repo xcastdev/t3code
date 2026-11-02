@@ -141,6 +141,13 @@ const WEEKDAY_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const
 export function routineScheduleLabel(schedule: ScheduledTaskUpsertSchedule | null): string {
   if (schedule === null) return "No schedule";
   if (schedule.type === "webhook") return "When its webhook is called";
+  if (schedule.type === "once") {
+    // @effect-diagnostics-next-line globalDate:off
+    const runAt = new Date(schedule.runAt);
+    return Number.isNaN(runAt.getTime())
+      ? "Once"
+      : `Once, ${runAt.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}`;
+  }
   if (schedule.type === "interval") {
     const minutes = Math.round(schedule.everyMs / 60_000);
     if (minutes % 1440 === 0)

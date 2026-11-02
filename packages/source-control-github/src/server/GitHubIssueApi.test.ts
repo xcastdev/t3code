@@ -11,6 +11,8 @@ import {
 } from "effect/http";
 import * as TestSourceControlHost from "@t3tools/source-control-testing/TestSourceControlHost";
 import * as SourceControlRateLimit from "@t3tools/source-control-core/server/SourceControlRateLimit";
+import * as GitHubAppAccess from "./GitHubAppAccess.ts";
+import * as GitHubAppSignIn from "./GitHubAppSignIn.ts";
 import * as GitHubCredentials from "./GitHubCredentials.ts";
 import * as GitHubRest from "./GitHubRest.ts";
 import * as GitHubQuota from "./GitHubQuota.ts";
@@ -90,6 +92,15 @@ function harness(
                 fingerprint: `${host}:fingerprint`,
               })
             : Effect.fail(new GitHubCredentials.GitHubNotSignedInError({ host })),
+        saved: () => Effect.succeedNone,
+        fingerprint: (host, token) => Effect.succeed(`${host}:${token}`),
+        invalidate: () => Effect.void,
+      }),
+    ),
+    Layer.provideMerge(
+      Layer.mock(GitHubAppSignIn.GitHubAppSignIn)({
+        enabled: false,
+        token: () => Effect.succeedNone,
         invalidate: () => Effect.void,
       }),
     ),
@@ -98,6 +109,7 @@ function harness(
   );
   const layer = GitHubIssueApi.layer.pipe(
     Layer.provideMerge(GitHubPullRequestApi.layer),
+    Layer.provideMerge(GitHubAppAccess.layer),
     Layer.provide(transport),
     Layer.provide(TestSourceControlHost.layer()),
     Layer.provide(NodeServices.layer),

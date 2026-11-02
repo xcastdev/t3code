@@ -64,6 +64,14 @@ import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore
 import * as ProjectEnrichment from "../project/ProjectEnrichmentService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import { AssistantMemoryGateway } from "../assistants/AssistantMemoryGateway.ts";
+import * as SecretResolver from "@t3tools/secret-provider-core/server/SecretResolver";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
+import * as NativeChildWorkQuery from "../orchestration-v2/NativeChildWorkQuery.ts";
+import * as PeerLinkRequests from "../peer/PeerLinkRequests.ts";
+import * as PeerLinks from "../peer/PeerLinks.ts";
+import * as ScratchThreadPromotion from "../project/ScratchThreadPromotion.ts";
+import * as SourceControlSignIn from "../sourceControl/SourceControlSignIn.ts";
+import * as TriageService from "../triage/TriageService.ts";
 
 // Unrelated native and external operations fail on use; no live layer is installed.
 export const layerControlledFixtureBoundaries = Layer.mergeAll(
@@ -101,7 +109,7 @@ export const layerControlledFixtureBoundaries = Layer.mergeAll(
   Layer.mock(ModelManifest.ModelManifest)({}),
   Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({}),
   Layer.mock(OtlpEndpointCheck.OtlpEndpointCheck)({}),
-  Layer.mock(PortScanner.PortDiscovery)({}),
+  PortScanner.layerTest,
   Layer.mock(PreviewManager.PreviewManager)({}),
   Layer.mock(ProcessDiagnostics.ProcessDiagnostics)({}),
   Layer.mock(ProcessResourceMonitor.ProcessResourceMonitor)({}),
@@ -134,4 +142,12 @@ export const layerControlledFixtureBoundaries = Layer.mergeAll(
   Layer.mock(VcsStatusBroadcaster.VcsStatusBroadcaster)({}),
   Layer.mock(WorkspaceEntries.WorkspaceEntries)({}),
   Layer.mock(WorktreeSetupTracker.WorktreeSetupTracker)({}),
+  ManagedPolicy.layerTest(),
+  Layer.mock(NativeChildWorkQuery.NativeChildWorkQuery)({}),
+  Layer.mock(PeerLinks.PeerLinks)({}),
+  Layer.mock(PeerLinkRequests.PeerLinkRequests)({}),
+  Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
+  Layer.mock(SecretResolver.SecretResolver)({}),
+  Layer.mock(SourceControlSignIn.SourceControlSignIn)({}),
+  Layer.mock(TriageService.TriageService)({}),
 );

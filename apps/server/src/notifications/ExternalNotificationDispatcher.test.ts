@@ -11,6 +11,7 @@ import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Sqlite from "../persistence/Sqlite.ts";
 import * as Settings from "../serverSettings.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import { mapSettingsSecrets, SECRET_REDACTED } from "../settingsSecrets.ts";
 import { externalNotificationMigration } from "../persistence/ExternalNotificationMigration.ts";
 import * as Adapter from "./HomeAssistantWebhookAdapter.ts";
@@ -225,6 +226,7 @@ it.effect(
     }).pipe(
       Effect.provide(
         Settings.layer.pipe(
+          Layer.provide(ManagedPolicy.layerTest()),
           Layer.provideMerge(ServerSecretStore.layer),
           Layer.provideMerge(Sqlite.layerMemory),
           Layer.provideMerge(

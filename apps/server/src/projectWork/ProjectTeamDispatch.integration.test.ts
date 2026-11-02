@@ -42,6 +42,7 @@ import * as Launch from "../orchestration-v2/ThreadLaunchService.ts";
 import * as Threads from "../orchestration-v2/ThreadManagementService.ts";
 import * as Receipts from "../orchestration-v2/CommandReceiptStore.ts";
 import * as Projects from "../orchestration-v2/ProjectStore.ts";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as Admission from "../orchestration-v2/RunAdmission.ts";
 import * as WorkAdmission from "./ProjectWorkRunAdmission.ts";
 import * as Repository from "./ProjectWorkRepository.ts";
@@ -983,6 +984,9 @@ it.effect(
     const runnerServices = Layer.mergeAll(
       NodeCrypto.layer,
       Layer.mock(ProjectService.ProjectService)({}),
+      Layer.mock(ProjectionStore.ProjectionStoreV2)({
+        getThreadShell: () => Effect.succeed(null),
+      }),
       Layer.mock(ServerSettings.ServerSettingsService)({
         getSettings: Effect.fail(
           new ServerSettingsError({ settingsPath: "<test>", operation: "read-file" }),

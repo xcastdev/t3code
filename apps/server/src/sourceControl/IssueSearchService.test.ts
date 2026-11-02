@@ -50,6 +50,8 @@ function harness(
                 faviconPath: null,
                 projectIcon: null,
                 scripts: [],
+                pinnedAt: null,
+                archivedAt: null,
                 createdAt: "2026-10-01T00:00:00Z",
                 updatedAt: "2026-10-01T00:00:00Z",
                 deletedAt: null,

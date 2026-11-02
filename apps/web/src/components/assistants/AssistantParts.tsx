@@ -3,11 +3,7 @@ import type { EnvironmentId, ModelSelection, ProviderInstanceId } from "@t3tools
 
 import { useEnvironmentSettings } from "../../hooks/useSettings";
 import { getCustomModelOptionsByInstance } from "../../modelSelection";
-import {
-  applyProviderInstanceSettings,
-  deriveProviderInstanceEntries,
-  sortProviderInstanceEntries,
-} from "../../providerInstances";
+import { providerInstanceEntriesFor } from "../../providerInstances";
 import { EMPTY_SERVER_PROVIDERS, serverEnvironment } from "../../state/server";
 import { ProviderModelPicker } from "../chat/ProviderModelPicker";
 import { SETTINGS_PICKER_TRIGGER_CLASSNAME } from "../settings/settingsLayout";
@@ -44,9 +40,7 @@ function useAssistantModelChoices(environmentId: EnvironmentId, selection: Model
   const settings = useEnvironmentSettings(environmentId);
   const providers =
     useAtomValue(serverEnvironment.providersValueAtom(environmentId)) ?? EMPTY_SERVER_PROVIDERS;
-  const instanceEntries = sortProviderInstanceEntries(
-    applyProviderInstanceSettings(deriveProviderInstanceEntries(providers), settings, null),
-  );
+  const instanceEntries = providerInstanceEntriesFor(providers, settings, null);
   const fallback = instanceEntries.find((entry) => entry.enabled) ?? instanceEntries[0];
   const activeInstanceId =
     selection?.instanceId ?? fallback?.instanceId ?? ("" as ProviderInstanceId);

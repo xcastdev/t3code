@@ -53,6 +53,7 @@ export interface RuntimeSubagent {
   readonly role: string | null;
   readonly model: string | null;
   readonly effort: string | null;
+  readonly speed?: string | undefined;
   readonly status: RuntimeSubagentStatus;
   readonly activationCount: number;
   readonly usage: SubagentUsage | null;
@@ -159,8 +160,8 @@ function workflowMembersToRuntime(
       kind: "workflow_agent" as const,
       title: agent.label,
       model: agent.model ?? null,
-      // Workflow members have no persisted options; the coordinator's effort is not evidence.
-      effort: null,
+      effort: agent.effort ?? null,
+      ...(agent.speed === undefined ? {} : { speed: agent.speed }),
       status,
       activationCount: agent.attempt ?? 1,
       usage: workflowUsage(agent),

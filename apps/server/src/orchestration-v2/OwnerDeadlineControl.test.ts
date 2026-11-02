@@ -84,9 +84,7 @@ it.effect(
         row(root),
         row(child),
       ]);
-      const normal = Option.getOrThrow(
-        yield* outbox.claimNext({ workerId: "normal", leaseDurationMs: 1000 }),
-      );
+      const normal = Option.getOrThrow(yield* outbox.claimNext({ workerId: "normal" }));
       assert.equal(normal.id, "normal");
       yield* outbox.retry({
         effectId: "normal",
@@ -103,14 +101,11 @@ it.effect(
         child.expiresAt,
       );
       yield* TestClock.adjust("5 seconds");
-      assert.isTrue(
-        Option.isNone(yield* outbox.claimNext({ workerId: "normal", leaseDurationMs: 1000 })),
-      );
+      assert.isTrue(Option.isNone(yield* outbox.claimNext({ workerId: "normal" })));
       assert.equal(
         Option.getOrThrow(
           yield* outbox.claimNext({
             workerId: "control",
-            leaseDurationMs: 1000,
             consumer: "owner-deadline",
           }),
         ).id,
@@ -121,7 +116,6 @@ it.effect(
         Option.getOrThrow(
           yield* outbox.claimNext({
             workerId: "control",
-            leaseDurationMs: 1000,
             consumer: "owner-deadline",
           }),
         ).id,
@@ -184,7 +178,6 @@ it.effect(
       yield* TestClock.adjust("10 seconds");
       yield* outbox.claimNext({
         workerId: "crashed",
-        leaseDurationMs: 1000,
         consumer: "owner-deadline",
       });
       // Simulate recovery on a machine whose clock precedes the retained true expiry.

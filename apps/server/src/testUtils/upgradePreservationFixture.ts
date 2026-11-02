@@ -31,6 +31,7 @@ import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as AuthSessions from "../persistence/AuthSessions.ts";
 import * as ProviderRuntime from "../persistence/ProviderSessionRuntime.ts";
@@ -75,6 +76,7 @@ export const preservationScheduleLayer = ScheduledTasks.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       NodeCrypto.layer,
+      ManagedPolicy.layerTest(),
       Layer.succeed(
         Scheduler.Scheduler,
         Scheduler.Scheduler.of({
@@ -110,9 +112,12 @@ export function preservationSettingsLayer(root: string) {
   const config = ServerConfig.layerTest(root, root);
   return ServerSettings.layer.pipe(
     Layer.provide(
-      Layer.mock(ServerSecretStore.ServerSecretStore)({
-        get: () => Effect.succeedNone,
-      }),
+      Layer.mergeAll(
+        Layer.mock(ServerSecretStore.ServerSecretStore)({
+          get: () => Effect.succeedNone,
+        }),
+        ManagedPolicy.layerTest(),
+      ),
     ),
     Layer.provide(config),
   );
@@ -135,33 +140,51 @@ export const seedUpgradePreservation = Effect.fn("upgradeFixture.seedPreservatio
   workspaceRoot: string,
 ) {
   const sink = yield* EventSink.EventSinkV2;
-  yield* sink.commitProjectCommand({
+  const sql = yield* SqlClient.SqlClient;
+  // The project command is committed like EventSink.commitProjectCommand does, except that its
+  // projection row is written in the migration-66 shape: today's ProjectStore writes newer columns.
+  const projectCommand: Receipts.ProjectCommandReceiptV2 = {
     commandId: CommandId.make("preservation-project-create"),
     projectId: preservationIds.project,
     commandType: "project.create",
     acceptedAt: at,
-    event: {
-      eventId: EventId.make("preservation-project-created"),
-      aggregateKind: "project",
-      aggregateId: preservationIds.project,
-      occurredAt: iso,
-      commandId: null,
-      causationEventId: null,
-      correlationId: null,
-      metadata: {},
-      type: "project.created",
-      payload: {
-        projectId: preservationIds.project,
-        title: "Saved workspace",
-        workspaceRoot,
-        defaultModelSelection: modelSelection,
-        defaultThreadEnvMode: null,
-        scripts: [],
-        createdAt: iso,
-        updatedAt: iso,
-      },
-    },
-  });
+    resultSequence: 0,
+    status: "accepted",
+    error: null,
+  };
+  yield* sql.withTransaction(
+    Effect.gen(function* () {
+      const receipts = yield* Receipts.CommandReceiptStoreV2;
+      yield* receipts.insertIfAbsent(projectCommand);
+      const event = yield* (yield* EventStore.EventStoreV2).appendProjectEvent({
+        eventId: EventId.make("preservation-project-created"),
+        aggregateKind: "project",
+        aggregateId: preservationIds.project,
+        occurredAt: iso,
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        type: "project.created",
+        payload: {
+          projectId: preservationIds.project,
+          title: "Saved workspace",
+          workspaceRoot,
+          defaultModelSelection: modelSelection,
+          defaultThreadEnvMode: null,
+          scripts: [],
+          createdAt: iso,
+          updatedAt: iso,
+        },
+      });
+      yield* sql`INSERT INTO projection_projects
+        (project_id, title, workspace_root, default_model_selection_json, default_thread_env_mode,
+          auto_pull, favicon_path, project_icon_json, scripts_json, created_at, updated_at, deleted_at)
+        VALUES (${preservationIds.project}, 'Saved workspace', ${workspaceRoot},
+          ${encodeFixtureJson(modelSelection)}, NULL, 0, NULL, NULL, '[]', ${iso}, ${iso}, NULL)`;
+      yield* receipts.upsert({ ...projectCommand, resultSequence: event.sequence });
+    }),
+  );
   const thread = {
     createdBy: "user" as const,
     creationSource: "web" as const,
@@ -391,7 +414,7 @@ export const seedUpgradePreservation = Effect.fn("upgradeFixture.seedPreservatio
     ],
   });
   const outbox = yield* Outbox.EffectOutboxV2;
-  yield* outbox.claimNext({ workerId: "previous-fixture-worker", leaseDurationMs: 60_000 });
+  yield* outbox.claimNext({ workerId: "previous-fixture-worker" });
   yield* sink.commitCommand({
     commandId: CommandId.make("preservation-fork-create"),
     threadId: preservationIds.fork,

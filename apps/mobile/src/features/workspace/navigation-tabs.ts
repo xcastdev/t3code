@@ -1,6 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/reactivity";
-import { useMemo } from "react";
 import { Platform } from "react-native";
 import {
   NAVIGATION_TAB_LABELS,
@@ -31,7 +30,7 @@ export function useNavigationTabOrder() {
   const saved = AsyncResult.isSuccess(preferences)
     ? preferences.value.navigationTabOrder
     : undefined;
-  return useMemo(() => resolveWorkspaceTabOrder(saved), [saved]);
+  return resolveWorkspaceTabOrder(saved);
 }
 
 export function useHiddenNavigationTabs() {
@@ -39,14 +38,11 @@ export function useHiddenNavigationTabs() {
   const saved = AsyncResult.isSuccess(preferences)
     ? preferences.value.hiddenNavigationTabs
     : undefined;
-  return useMemo(
-    () => (navigationCustomizationAvailable() ? resolveHiddenNavigationTabs(saved) : []),
-    [saved],
-  );
+  return navigationCustomizationAvailable() ? resolveHiddenNavigationTabs(saved) : [];
 }
 
 export function useEnabledNavigationTabs() {
   const order = useNavigationTabOrder();
   const hidden = useHiddenNavigationTabs();
-  return useMemo(() => enabledNavigationTabs(order, hidden), [order, hidden]);
+  return enabledNavigationTabs(order, hidden);
 }

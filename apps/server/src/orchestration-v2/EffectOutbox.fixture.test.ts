@@ -46,9 +46,7 @@ it.effect(
       const before = yield* sql`SELECT * FROM orchestration_v2_effect_outbox ORDER BY effect_id`;
       assert.isTrue(Option.isNone(yield* outbox.nextClaimableAt));
       assert.isTrue(Option.isNone(yield* outbox.nextClaimableAtFor("owner-deadline")));
-      assert.isTrue(
-        Option.isNone(yield* outbox.claimNext({ workerId: "fixture", leaseDurationMs: 1000 })),
-      );
+      assert.isTrue(Option.isNone(yield* outbox.claimNext({ workerId: "fixture" })));
       yield* outbox.enqueue([
         {
           id: "fresh-fixture",
@@ -67,16 +65,13 @@ it.effect(
       ]);
       assert.isTrue(Option.isSome(yield* outbox.nextClaimableAtFor("owner-deadline")));
       assert.isTrue(Option.isSome(yield* outbox.nextClaimableAt));
-      const claimed = Option.getOrThrow(
-        yield* outbox.claimNext({ workerId: "fixture", leaseDurationMs: 1000 }),
-      );
+      const claimed = Option.getOrThrow(yield* outbox.claimNext({ workerId: "fixture" }));
       assert.equal(claimed.id, "fresh-fixture");
       assert.isTrue(yield* outbox.succeed({ effectId: claimed.id, workerId: "fixture" }));
       assert.isTrue(Option.isNone(yield* outbox.nextClaimableAt));
       const claimedControl = Option.getOrThrow(
         yield* outbox.claimNext({
           workerId: "fixture-control",
-          leaseDurationMs: 1000,
           consumer: "owner-deadline",
         }),
       );

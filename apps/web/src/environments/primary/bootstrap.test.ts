@@ -1,37 +1,9 @@
-import { EnvironmentId, type ExecutionEnvironmentDescriptor } from "@t3tools/contracts";
-import * as Effect from "effect/Effect";
+import { ConnectionBlockedError } from "@t3tools/client-runtime/connection";
+import { EnvironmentId } from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import {
-  readPrimaryEnvironmentTarget,
-  resolvePrimaryEnvironmentHttpUrl,
-  resolveInitialPrimaryEnvironmentDescriptor,
-  resetPrimaryEnvironmentDescriptorForTests,
-} from ".";
-import { installEnvironmentHttpTest } from "../../../test/environmentHttpTest";
-
-const BASE_ENVIRONMENT = {
-  environmentId: EnvironmentId.make("environment-local"),
-  label: "Local environment",
-  platform: {
-    os: "darwin",
-    arch: "arm64",
-  },
-  serverVersion: "0.0.0-test",
-  capabilities: {
-    repositoryIdentity: true,
-  },
-} satisfies ExecutionEnvironmentDescriptor;
-
-let disposeHttpTest: (() => Promise<void>) | undefined;
-
-async function installDescriptorApi() {
-  const testApi = await installEnvironmentHttpTest({
-    descriptor: () => Effect.succeed(BASE_ENVIRONMENT),
-  });
-  disposeHttpTest = testApi.dispose;
-  return testApi;
-}
+import { readPrimaryEnvironmentTarget, resolvePrimaryEnvironmentHttpUrl } from ".";
+import { attachedPrimaryIdentityError } from "../../connection/platform";
 
 function installTestBrowser(url: string) {
   vi.stubGlobal("window", {
@@ -49,33 +21,17 @@ describe("environmentBootstrap", () => {
     installTestBrowser("http://localhost/");
   });
 
-  afterEach(async () => {
-    await disposeHttpTest?.();
-    disposeHttpTest = undefined;
-    resetPrimaryEnvironmentDescriptorForTests();
+  afterEach(() => {
     vi.unstubAllEnvs();
     vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 
-  it("reuses an in-flight descriptor bootstrap request", async () => {
-    const testApi = await installDescriptorApi();
-
-    await Promise.all([
-      resolveInitialPrimaryEnvironmentDescriptor(),
-      resolveInitialPrimaryEnvironmentDescriptor(),
-    ]);
-
-    expect(testApi.calls.descriptor).toBe(1);
-  });
-
-  it("uses https descriptor urls when the primary environment uses wss", async () => {
+  it("uses https descriptor urls when the primary environment uses wss", () => {
     vi.stubEnv("VITE_HTTP_URL", "https://remote.example.com");
     vi.stubEnv("VITE_WS_URL", "wss://remote.example.com");
-    await installDescriptorApi();
 
-    await expect(resolveInitialPrimaryEnvironmentDescriptor()).resolves.toEqual(BASE_ENVIRONMENT);
     expect(resolvePrimaryEnvironmentHttpUrl("/.well-known/t3/environment")).toBe(
       "https://remote.example.com/.well-known/t3/environment",
     );
@@ -99,7 +55,7 @@ describe("environmentBootstrap", () => {
     });
   });
 
-  it("uses the vite proxy for desktop-managed loopback descriptor requests during local dev", async () => {
+  it("uses the vite proxy for desktop-managed loopback descriptor requests during local dev", () => {
     vi.stubEnv("VITE_DEV_SERVER_URL", "http://127.0.0.1:5733");
     vi.stubGlobal("window", {
       location: new URL("http://127.0.0.1:5733/"),
@@ -107,6 +63,7 @@ describe("environmentBootstrap", () => {
         replaceState: vi.fn(),
       },
       desktopBridge: {
+        getLocalEnvironmentEnabled: () => true,
         getLocalEnvironmentBootstraps: () => [
           {
             id: "primary",
@@ -118,9 +75,7 @@ describe("environmentBootstrap", () => {
         ],
       },
     });
-    await installDescriptorApi();
 
-    await expect(resolveInitialPrimaryEnvironmentDescriptor()).resolves.toEqual(BASE_ENVIRONMENT);
     expect(resolvePrimaryEnvironmentHttpUrl("/.well-known/t3/environment")).toBe(
       "http://127.0.0.1:5733/.well-known/t3/environment",
     );
@@ -131,6 +86,7 @@ describe("environmentBootstrap", () => {
       location: new URL("http://127.0.0.1:5733/"),
       history: { replaceState: vi.fn() },
       desktopBridge: {
+        getLocalEnvironmentEnabled: () => true,
         getLocalEnvironmentBootstraps: () => [
           {
             id: "primary",
@@ -147,25 +103,33 @@ describe("environmentBootstrap", () => {
     });
   }
 
-  it("sends attached loopback requests straight to the attached server, not the dev proxy", async () => {
+  it("sends attached loopback requests straight to the attached server, not the dev proxy", () => {
     vi.stubEnv("VITE_DEV_SERVER_URL", "http://127.0.0.1:5733");
     installAttachedDesktop({ environmentId: "environment-local" });
-    await installDescriptorApi();
 
     expect(resolvePrimaryEnvironmentHttpUrl("/.well-known/t3/environment")).toBe(
       "http://127.0.0.1:4773/.well-known/t3/environment",
     );
-    await expect(resolveInitialPrimaryEnvironmentDescriptor()).resolves.toEqual(BASE_ENVIRONMENT);
+    expect(
+      attachedPrimaryIdentityError(
+        readPrimaryEnvironmentTarget()!,
+        EnvironmentId.make("environment-local"),
+      ),
+    ).toBeNull();
   });
 
-  it("refuses a different server answering at the attached address without retrying", async () => {
+  it("refuses a different server answering at the attached address", () => {
     installAttachedDesktop({ environmentId: "environment-expected" });
-    const testApi = await installDescriptorApi();
 
-    await expect(resolveInitialPrimaryEnvironmentDescriptor()).rejects.toThrow(
+    const error = attachedPrimaryIdentityError(
+      readPrimaryEnvironmentTarget()!,
+      EnvironmentId.make("environment-local"),
+    );
+    expect(error).toBeInstanceOf(ConnectionBlockedError);
+    expect(error?.reason).toBe("configuration");
+    expect(error?.message).toContain(
       "A different T3 Code server is answering at the attached address",
     );
-    expect(testApi.calls.descriptor).toBe(1);
   });
 
   it("fails closed when an attached bootstrap has no identity", () => {

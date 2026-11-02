@@ -80,6 +80,7 @@ import * as WorkRuntime from "../projectWork/ProjectWorkRuntime.ts";
 import * as WorkGateway from "../projectWork/ProjectWorkGateway.ts";
 import * as ScheduledTasks from "../scheduledTasks/ScheduledTaskService.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as Launch from "../orchestration-v2/ThreadLaunchService.ts";
 import * as Threads from "../orchestration-v2/ThreadManagementService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
@@ -745,6 +746,7 @@ const serviceGuardLayer = Layer.mergeAll(
     Layer.provide(
       Layer.mergeAll(
         Scheduler.layer,
+        ManagedPolicy.layerTest(),
         Layer.mock(Launch.ThreadLaunchService)({}),
         Layer.mock(Threads.ThreadManagementService)({}),
         Layer.mock(SecretRequests.SecretRequests)({}),

@@ -111,7 +111,8 @@ it.layer(
   it.effect("captured generation drains without killing a replacement or another session", () =>
     Effect.gen(function* () {
       const { manager, processes, input, capture } = yield* fixture();
-      yield* manager.restart(input);
+      yield* manager.close(input);
+      yield* manager.open(input);
       yield* manager.open({ ...input, terminalId: "other" });
       const original = processes[0]!;
       yield* Deferred.await(original.signalled);
@@ -149,7 +150,8 @@ it.layer(
       const { manager, processes, input, capture } = yield* fixture();
       yield* manager.writeCaptured({ ...input, capture, data: "original command" });
       expect(processes[0]!.writes).toEqual(["original command"]);
-      yield* manager.restart(input);
+      yield* manager.close(input);
+      yield* manager.open(input);
       const rejected = yield* manager
         .writeCaptured({ ...input, capture, data: "stale command" })
         .pipe(Effect.result);

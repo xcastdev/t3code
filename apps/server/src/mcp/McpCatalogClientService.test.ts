@@ -257,7 +257,6 @@ function fixture(
     revoke: unused,
     revokeAllExcept: unused,
     setLastConnectedAt: unused,
-    setClientConnection: unused,
   });
   const dependencies = Layer.mergeAll(
     Layer.succeed(Catalog.McpCatalogService, catalog),

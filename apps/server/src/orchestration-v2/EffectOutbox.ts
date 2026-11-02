@@ -186,7 +186,6 @@ export interface OrchestrationEffectV2 {
   readonly attemptCount: number;
   readonly availableAt: string;
   readonly leaseOwner: string | null;
-  readonly leaseExpiresAt: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly completedAt: string | null;
@@ -254,7 +253,6 @@ export interface EffectOutboxV2Shape {
   >;
   readonly claimNext: (input: {
     readonly workerId: string;
-    readonly leaseDurationMs: number;
     readonly excludeRestartContinuations?: boolean;
     readonly consumer?: EffectConsumer;
   }) => Effect.Effect<Option.Option<OrchestrationEffectV2>, EffectOutboxError>;
@@ -291,7 +289,6 @@ type EffectRow = {
   readonly attempt_count: number;
   readonly available_at: string;
   readonly lease_owner: string | null;
-  readonly lease_expires_at: string | null;
   readonly created_at: string;
   readonly updated_at: string;
   readonly completed_at: string | null;
@@ -314,7 +311,6 @@ const rowToEffect = (row: EffectRow) =>
       attemptCount: row.attempt_count,
       availableAt: row.available_at,
       leaseOwner: row.lease_owner,
-      leaseExpiresAt: row.lease_expires_at,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       completedAt: row.completed_at,
@@ -504,7 +500,6 @@ export const layerWithOptions = ({
             SET
               status = 'cancelled',
               lease_owner = NULL,
-              lease_expires_at = NULL,
               completed_at = ${now},
               updated_at = ${now},
               last_error = ${reason}
@@ -525,7 +520,7 @@ export const layerWithOptions = ({
             const now = DateTime.formatIso(yield* DateTime.now);
             const rows = yield* sql<{ readonly effect_id: string }>`
             UPDATE orchestration_v2_effect_outbox
-            SET status = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
+            SET status = 'cancelled', lease_owner = NULL,
                 completed_at = ${now}, updated_at = ${now}, last_error = ${reason}
             WHERE effect_id IN ${sql.in(effectIds)} AND status IN ('pending', 'running')
             RETURNING effect_id
@@ -568,7 +563,6 @@ export const layerWithOptions = ({
           SET
             status = 'cancelled',
             lease_owner = NULL,
-            lease_expires_at = NULL,
             completed_at = ${now},
             updated_at = ${now},
             last_error = 'Cancelled because the server process ended before the effect completed.'
@@ -581,7 +575,6 @@ export const layerWithOptions = ({
           SET
             status = 'pending',
             lease_owner = NULL,
-            lease_expires_at = NULL,
             available_at = ${now},
             updated_at = ${now},
             last_error = 'Requeued after the previous server process ended.'
@@ -598,27 +591,15 @@ export const layerWithOptions = ({
         ),
         // The worker polls for the next effect even when there is no work to claim.
         claimNext: Effect.fnUntraced(
-          function* ({
-            workerId,
-            leaseDurationMs,
-            excludeRestartContinuations = false,
-            consumer = "normal",
-          }) {
-            const now = yield* DateTime.now;
-            const nowIso = DateTime.formatIso(now);
-            const leaseExpiresAt = DateTime.formatIso(
-              DateTime.add(now, { milliseconds: Math.max(1, leaseDurationMs) }),
-            );
-            // Empty safety claims are expected while the daemon is idle. Tracing
-            // this query records the full SQL text on every poll and can dominate
-            // the local trace without adding actionable information.
+          function* ({ workerId, excludeRestartContinuations = false, consumer = "normal" }) {
+            const nowIso = DateTime.formatIso(yield* DateTime.now);
+            // Idle claims return empty; tracing their full SQL on every poll overwhelms useful traces.
             const claimStatement = sql<EffectRow>`
             UPDATE orchestration_v2_effect_outbox
             SET
               status = 'running',
               attempt_count = attempt_count + 1,
               lease_owner = ${workerId},
-              lease_expires_at = ${leaseExpiresAt},
               updated_at = ${nowIso},
               last_error = NULL
             WHERE effect_id = (
@@ -673,7 +654,6 @@ export const layerWithOptions = ({
             SET
               status = 'succeeded',
               lease_owner = NULL,
-              lease_expires_at = NULL,
               completed_at = ${now},
               updated_at = ${now},
               last_error = NULL
@@ -709,7 +689,6 @@ export const layerWithOptions = ({
               status = 'pending',
               available_at = ${availableAt},
               lease_owner = NULL,
-              lease_expires_at = NULL,
               updated_at = ${nowIso},
               last_error = ${error}
             WHERE effect_id = ${effectId}
@@ -738,7 +717,6 @@ export const layerWithOptions = ({
             SET
               status = 'failed',
               lease_owner = NULL,
-              lease_expires_at = NULL,
               completed_at = ${now},
               updated_at = ${now},
               last_error = ${error}

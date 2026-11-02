@@ -40,10 +40,12 @@ export function ThreadDetailsSection({
       {...props}
       aria-labelledby={showHeading ? headingId : undefined}
       aria-label={showHeading ? undefined : title}
+      // A row can still render nothing (a fresh draft quiets Git actions), so an empty section
+      // collapses, and a divider only follows a section that has content.
       className={cn(
-        "px-2 pt-2",
+        "px-2 pt-2 has-[>div:last-child:empty]:hidden",
         collapsed ? "pb-1" : "pb-2.5",
-        separated && "border-t border-border/65",
+        separated && "border-border/65 [section:not(:has(>div:last-child:empty))~&]:border-t",
       )}
     >
       <div

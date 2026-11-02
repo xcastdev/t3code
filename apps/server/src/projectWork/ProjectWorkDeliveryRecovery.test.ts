@@ -226,6 +226,8 @@ it.effect(
           }),
           Layer.succeed(Engine.OrchestratorV2, {
             listActiveSubagentThreadIds: unused,
+            countThreads: unused,
+            listActiveShellIndex: unused,
             listOlderSettledThreads: unused,
             findGuestShareThreadId: unused,
             stopExactRun: unused,

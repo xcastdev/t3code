@@ -1,20 +1,15 @@
 import { assert, it, vi } from "@effect/vitest";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { ProjectId, type TerminalEvent } from "@t3tools/contracts";
-import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
 import * as Projects from "./ProjectService.ts";
 import * as Setup from "./ProjectSetupScriptRunner.ts";
-
-const shell = Layer.mergeAll(
-  Layer.succeed(HostProcess.Platform, "linux"),
-  Layer.succeed(HostProcess.Environment, { SHELL: "/bin/zsh" }),
-);
 
 const makeEvents = Effect.fn("test.projectSetupDrain.events")(function* () {
   const closed = yield* Deferred.make<void>();
@@ -48,11 +43,14 @@ it.effect("captures the exact terminal after an interrupted open before writing 
     const write = vi.fn(() => Effect.void);
     const writeCaptured = vi.fn(() => Effect.void);
     const services = Layer.mergeAll(
-      shell,
       Layer.mock(Projects.ProjectService)({}),
+      Layer.mock(ProjectionStore.ProjectionStoreV2)({
+        getThreadShell: () => Effect.succeed(null),
+      }),
       ServerSettings.layerTest(),
       NodeCrypto.layer,
       Layer.mock(TerminalManager.TerminalManager)({
+        getShell: () => Effect.succeed("/bin/zsh"),
         openCaptured: () =>
           Deferred.succeed(entered, undefined).pipe(
             Effect.andThen(Deferred.await(opened)),
@@ -139,11 +137,14 @@ it.effect("withholds a delayed setup write from a replacement and retains unknow
         ).pipe(Effect.ensuring(Deferred.succeed(attempted, undefined))),
     );
     const services = Layer.mergeAll(
-      shell,
       Layer.mock(Projects.ProjectService)({}),
+      Layer.mock(ProjectionStore.ProjectionStoreV2)({
+        getThreadShell: () => Effect.succeed(null),
+      }),
       ServerSettings.layerTest(),
       NodeCrypto.layer,
       Layer.mock(TerminalManager.TerminalManager)({
+        getShell: () => Effect.succeed("/bin/zsh"),
         openCaptured: () =>
           Effect.succeed({
             capture: handle,
@@ -240,11 +241,14 @@ it.effect("a terminal restart ends the original setup observer before replacemen
     };
     const onOutputLine = vi.fn(() => Effect.void);
     const services = Layer.mergeAll(
-      shell,
       Layer.mock(Projects.ProjectService)({}),
+      Layer.mock(ProjectionStore.ProjectionStoreV2)({
+        getThreadShell: () => Effect.succeed(null),
+      }),
       ServerSettings.layerTest(),
       NodeCrypto.layer,
       Layer.mock(TerminalManager.TerminalManager)({
+        getShell: () => Effect.succeed("/bin/zsh"),
         openCaptured: () => Effect.succeed({ capture: handle, snapshot }),
         subscribe: events.subscribe,
         writeCaptured: () => Effect.void,

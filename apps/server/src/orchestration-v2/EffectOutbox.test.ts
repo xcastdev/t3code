@@ -50,19 +50,12 @@ it.effect(
           request: { type: "terminal.cleanup" },
         },
       ]);
-      assert.equal(
-        (yield* Effect.result(outbox.claimNext({ workerId: "stock", leaseDurationMs: 1000 })))._tag,
-        "Failure",
-      );
-      const ordinary = Option.getOrThrow(
-        yield* outbox.claimNext({ workerId: "stock", leaseDurationMs: 1000 }),
-      );
+      assert.equal((yield* Effect.result(outbox.claimNext({ workerId: "stock" })))._tag, "Failure");
+      const ordinary = Option.getOrThrow(yield* outbox.claimNext({ workerId: "stock" }));
       assert.equal(ordinary.id, "ordinary");
       yield* outbox.succeed({ effectId: ordinary.id, workerId: "stock" });
       assert.deepEqual(yield* outbox.reconcileAfterProcessLoss, { requeued: 0, cancelled: 0 });
-      assert.isTrue(
-        Option.isNone(yield* outbox.claimNext({ workerId: "stock", leaseDurationMs: 1000 })),
-      );
+      assert.isTrue(Option.isNone(yield* outbox.claimNext({ workerId: "stock" })));
       const states =
         yield* sql`SELECT effect_id,status FROM orchestration_v2_effect_outbox WHERE command_id='control' ORDER BY effect_id`;
       assert.deepEqual(states, [
@@ -76,7 +69,6 @@ it.effect(
       const reclaimed = Option.getOrThrow(
         yield* outbox.claimNext({
           workerId: "feature",
-          leaseDurationMs: 1000,
           consumer: "owner-deadline",
         }),
       );
@@ -88,8 +80,6 @@ it.effect(
         "1970-01-01T00:00:00.000Z",
       );
       yield* TestClock.adjust("10 seconds");
-      assert.isTrue(
-        Option.isNone(yield* outbox.claimNext({ workerId: "normal", leaseDurationMs: 1000 })),
-      );
+      assert.isTrue(Option.isNone(yield* outbox.claimNext({ workerId: "normal" })));
     }).pipe(Effect.provide(layers)),
 );

@@ -67,7 +67,7 @@ describe("CreateAgentDialog", () => {
     await expect.element(create).toBeDisabled();
 
     await userEvent.click(picker);
-    await userEvent.click(page.getByText("Fixture model"));
+    await userEvent.click(page.getByRole("option", { name: /Fixture model/ }));
 
     await expect.element(page.getByRole("button", { name: /Fixture model/ })).toBeVisible();
     await expect.element(create).toBeEnabled();
@@ -83,7 +83,7 @@ describe("CreateAgentDialog", () => {
     await userEvent.type(screen.getByLabelText("Personality"), "Dry and brief.");
     await userEvent.click(page.getByRole("button", { name: "Curious", exact: true }));
     await userEvent.click(page.getByRole("button", { name: "Choose a model" }));
-    await userEvent.click(page.getByText("Fixture model"));
+    await userEvent.click(page.getByRole("option", { name: /Fixture model/ }));
     await userEvent.keyboard("{Escape}");
     await userEvent.click(page.getByRole("button", { name: "Create agent" }));
     expect(writer.run.mock.lastCall?.[2].configuration).toMatchObject({

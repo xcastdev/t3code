@@ -222,7 +222,7 @@ it.effect(
           networkStatus: yield* SubscriptionRef.make<NetworkStatus>("online"),
           start: Effect.void,
           register: () => Effect.die("unused register"),
-          registerPlatform: () => Effect.void,
+          assertKnownAddress: () => Effect.void,
           reconcilePlatform: () => Effect.void,
           remove: () => Effect.void,
           removeRoute: () => Effect.void,

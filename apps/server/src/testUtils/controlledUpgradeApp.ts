@@ -44,6 +44,8 @@ import * as HttpApi from "effect/http-api/HttpApi";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 import * as HttpServer from "effect/http/HttpServer";
 import * as ServerConfig from "../config.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
+import * as NetService from "@t3tools/shared/Net";
 import * as ServerHttp from "../http.ts";
 import { layerFixtureFilesystem } from "./upgradeFixtureFilesystem.ts";
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
@@ -169,6 +171,7 @@ export function controlledUpgradeApplicationLayer(
   ).pipe(Layer.provide(base));
   // Auth gets its own new database: copied pairing grants and sessions never authenticate here.
   const auth = EnvironmentAuth.layer.pipe(
+    Layer.provide(ManagedPolicy.layerTest()),
     Layer.provide(Layer.fresh(SqlitePersistence.layerMemory)),
     Layer.provide(layerControlledFreshSecrets),
     Layer.provide(environment),
@@ -213,7 +216,8 @@ export function controlledUpgradeApplicationLayer(
       streamChanges: Stream.concat(Stream.make([]), Stream.never),
     }),
     Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({}),
-    Layer.mock(ServerBrowser.ServerBrowser)({}),
+    // Each WS connection registers a profile reporter; the fixture has no browser to report to.
+    Layer.mock(ServerBrowser.ServerBrowser)({ profileReporter: Effect.succeed(() => Effect.void) }),
     Layer.succeed(
       HttpClient.HttpClient,
       HttpClient.make(() =>
@@ -307,7 +311,9 @@ export function controlledUpgradeApplicationLayer(
   ).pipe(
     ServerHttp.withUntracedRequests,
     Layer.provideMerge(consuming),
-    Layer.provideMerge(layerApplicationHttpServer.pipe(Layer.provide(config))),
+    Layer.provideMerge(
+      layerApplicationHttpServer.pipe(Layer.provide(Layer.merge(config, NetService.layer))),
+    ),
     Layer.provideMerge(NodeServices.layer),
   );
   return Layer.effectDiscard(

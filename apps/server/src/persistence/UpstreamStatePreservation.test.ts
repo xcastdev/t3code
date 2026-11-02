@@ -40,13 +40,29 @@ it.effect(
         const sourceRoot = NodePath.join(root, "source");
         const workspace = NodePath.join(root, "workspace");
         const disposableRoot = NodePath.join(root, "snapshot");
-        for (const path of [sourceRoot, workspace, disposableRoot]) NodeFS.mkdirSync(path);
+        const beforeRoot = NodePath.join(root, "before");
+        for (const path of [sourceRoot, workspace, disposableRoot, beforeRoot])
+          NodeFS.mkdirSync(path);
         const dbPath = NodePath.join(sourceRoot, "statev2.sqlite");
         const sourceDatabase = NodeSqliteClient.layer({ filename: dbPath });
         yield* runMigrations({ toMigrationInclusive: 66 }).pipe(Effect.provide(sourceDatabase));
         const sourceServices = preservationSeedLayer.pipe(Layer.provideMerge(sourceDatabase));
         yield* seedUpgradePreservation(workspace).pipe(Effect.provide(sourceServices));
-        const before = yield* readUpgradePreservation().pipe(Effect.provide(sourceServices));
+        const sourceInventory = inventoryUpgradeDatabase(dbPath);
+        const sourceBytes = NodeFS.readFileSync(dbPath);
+        // Today's readers need the latest schema, so `before` reads a migrated scratch copy.
+        const beforeCopy = yield* Effect.promise(() =>
+          prepareUpgradeSnapshot({
+            configured: { dbPath },
+            disposableRoot: beforeRoot,
+            activeDatabasePaths: [dbPath],
+          }),
+        );
+        const beforeDatabase = NodeSqliteClient.layer({ filename: beforeCopy.runtimePath });
+        yield* runMigrations().pipe(Effect.provide(beforeDatabase));
+        const before = yield* readUpgradePreservation().pipe(
+          Effect.provide(preservationSeedLayer.pipe(Layer.provideMerge(beforeDatabase))),
+        );
         assert.deepEqual(
           before.conversation.messages.map((message) => message.text),
           ["Keep the saved request", "Keep the saved answer"],
@@ -91,8 +107,6 @@ it.effect(
           .map((stored) => stored.event)
           .reduce(ProjectionStore.applyToProjection, ProjectionStore.emptyProjection(created));
         assert.deepEqual(replayed, before.conversation);
-        const sourceInventory = inventoryUpgradeDatabase(dbPath);
-        const sourceBytes = NodeFS.readFileSync(dbPath);
         const snapshot = yield* Effect.promise(() =>
           prepareUpgradeSnapshot({
             configured: { dbPath },

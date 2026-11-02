@@ -32,8 +32,7 @@ export function withTerminalOutputWindow(
             message._tag === "Request" &&
             (message.tag === WS_METHODS.terminalAttach ||
               message.tag === WS_METHODS.terminalObserve ||
-              message.tag === WS_METHODS.projectTerminalAttach ||
-              message.tag === WS_METHODS.subscribeTerminalEvents)
+              message.tag === WS_METHODS.projectTerminalAttach)
           ) {
             const key = `${clientId}:${message.id}`;
             if (!windows.has(key)) windows.set(key, []);

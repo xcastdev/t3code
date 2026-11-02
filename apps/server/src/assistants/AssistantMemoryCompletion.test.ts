@@ -47,7 +47,7 @@ it.effect(
           ?.n,
         0,
       );
-      yield* sql`CREATE TABLE projection_projects(project_id TEXT PRIMARY KEY,title TEXT NOT NULL,workspace_root TEXT NOT NULL,default_model_selection_json TEXT,default_thread_env_mode TEXT,auto_pull INTEGER NOT NULL DEFAULT 0,favicon_path TEXT,project_icon_json TEXT,scripts_json TEXT NOT NULL DEFAULT '[]',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,deleted_at TEXT)`;
+      yield* sql`CREATE TABLE projection_projects(project_id TEXT PRIMARY KEY,title TEXT NOT NULL,workspace_root TEXT NOT NULL,default_model_selection_json TEXT,default_thread_env_mode TEXT,auto_pull INTEGER NOT NULL DEFAULT 0,favicon_path TEXT,project_icon_json TEXT,scripts_json TEXT NOT NULL DEFAULT '[]',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,deleted_at TEXT,pinned_at TEXT,archived_at TEXT)`;
       const project = { kind: "project" as const, projectId: ProjectId.make("empty-project") };
       yield* sql`INSERT INTO projection_projects(project_id,title,workspace_root,created_at,updated_at) VALUES(${project.projectId},'Empty project','/tmp/empty-project',${evidence.settledAt},${evidence.settledAt})`;
       const projectMetadata = yield* memory.recipientMetadata({

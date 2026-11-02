@@ -331,7 +331,7 @@ it.effect(
       }
       const outbox = yield* Outbox.EffectOutboxV2;
       assert.equal((yield* Effect.result(outbox.get("synthetic-future")))._tag, "Failure");
-      const claim = { workerId: "stock-worker", leaseDurationMs: 60_000 };
+      const claim = { workerId: "stock-worker" };
       assert.equal((yield* Effect.result(outbox.claimNext(claim)))._tag, "Failure");
       // Release the authored fixture's already-running ordinary effect before claiming its sibling.
       assert.isTrue(

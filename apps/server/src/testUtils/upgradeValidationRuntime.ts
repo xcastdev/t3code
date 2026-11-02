@@ -206,6 +206,9 @@ function makeUpgradeValidationRuntime(
         refreshInstance: Effect.fn("ProviderRegistry.ProviderRegistry.refreshInstance")(() =>
           Effect.succeed([]),
         ),
+        reloadSecretsAndRefresh: Effect.fn(
+          "ProviderRegistry.ProviderRegistry.reloadSecretsAndRefresh",
+        )(() => Effect.succeed([])),
         refreshAfterUpdate: Effect.fn("ProviderRegistry.ProviderRegistry.refreshAfterUpdate")(() =>
           Effect.succeed([]),
         ),

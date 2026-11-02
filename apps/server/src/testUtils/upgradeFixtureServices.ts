@@ -23,6 +23,7 @@ import * as ProviderRuntimeRecoveryService from "../orchestration-v2/ProviderRun
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProviderContinuationService from "../orchestration-v2/ProviderContinuationService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
@@ -73,6 +74,12 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
           detach: Effect.fn("ProviderSessionManager.ProviderSessionManagerV2.detach")(() =>
             refuse("provider.detach"),
           ),
+          releaseUnlessBusy: Effect.fn(
+            "ProviderSessionManager.ProviderSessionManagerV2.releaseUnlessBusy",
+          )(() => refuse("provider.releaseUnlessBusy")),
+          otherWorkingThreads: Effect.fn(
+            "ProviderSessionManager.ProviderSessionManagerV2.otherWorkingThreads",
+          )(() => Effect.succeed([])),
         }),
       );
       const registry = Layer.succeed(
@@ -121,6 +128,7 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
         Layer.provide(
           Layer.mergeAll(
             schedulerLayer,
+            ManagedPolicy.layerTest(),
             Layer.mock(ThreadLaunchService.ThreadLaunchService)({
               launch: () => refuse("thread.launch"),
             }),

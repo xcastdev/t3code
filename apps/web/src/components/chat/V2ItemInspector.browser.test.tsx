@@ -68,7 +68,6 @@ describe("V2ItemInspector", () => {
       <V2ItemInspector
         projectedItem={projected}
         environmentId={EnvironmentId.make("environment")}
-        onOpenThread={() => {}}
       />,
     );
     await expect.element(screen.getByText("Output")).toBeVisible();

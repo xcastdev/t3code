@@ -95,17 +95,9 @@ export const make = Effect.gen(function* () {
   const sqlClient = yield* Effect.serviceOption(SqlClient.SqlClient);
 
   const resolveCheckpoints = Effect.fn("CheckpointStore.resolveCheckpoints")(function* (
-    operation: string,
     cwd: string,
   ) {
     const handle = yield* vcsRegistry.resolve({ cwd });
-    if (!handle.driver.checkpoints) {
-      return yield* new VcsUnsupportedOperationError({
-        operation,
-        kind: handle.kind,
-        detail: `${handle.kind} driver does not implement checkpoint operations.`,
-      });
-    }
     return handle.driver.checkpoints satisfies VcsCheckpointOps;
   });
 
@@ -117,45 +109,42 @@ export const make = Effect.gen(function* () {
   const captureCheckpoint: CheckpointStore["Service"]["captureCheckpoint"] = Effect.fn(
     "captureCheckpoint",
   )(function* (input) {
-    const checkpoints = yield* resolveCheckpoints("CheckpointStore.captureCheckpoint", input.cwd);
+    const checkpoints = yield* resolveCheckpoints(input.cwd);
     return yield* checkpoints.captureCheckpoint(input);
   });
 
   const hasCheckpointRef: CheckpointStore["Service"]["hasCheckpointRef"] = Effect.fn(
     "hasCheckpointRef",
   )(function* (input) {
-    const checkpoints = yield* resolveCheckpoints("CheckpointStore.hasCheckpointRef", input.cwd);
+    const checkpoints = yield* resolveCheckpoints(input.cwd);
     return yield* checkpoints.hasCheckpointRef(input);
   });
 
   const restoreCheckpoint: CheckpointStore["Service"]["restoreCheckpoint"] = Effect.fn(
     "restoreCheckpoint",
   )(function* (input) {
-    const checkpoints = yield* resolveCheckpoints("CheckpointStore.restoreCheckpoint", input.cwd);
+    const checkpoints = yield* resolveCheckpoints(input.cwd);
     return yield* checkpoints.restoreCheckpoint(input);
   });
 
   const diffCheckpoints: CheckpointStore["Service"]["diffCheckpoints"] = Effect.fn(
     "diffCheckpoints",
   )(function* (input) {
-    const checkpoints = yield* resolveCheckpoints("CheckpointStore.diffCheckpoints", input.cwd);
+    const checkpoints = yield* resolveCheckpoints(input.cwd);
     return yield* checkpoints.diffCheckpoints(input);
   });
 
   const listAuthoredPaths: CheckpointStore["Service"]["listAuthoredPaths"] = Effect.fn(
     "listAuthoredPaths",
   )(function* (input) {
-    const checkpoints = yield* resolveCheckpoints("CheckpointStore.listAuthoredPaths", input.cwd);
+    const checkpoints = yield* resolveCheckpoints(input.cwd);
     return yield* checkpoints.listAuthoredPaths(input);
   });
 
   const deleteCheckpointRefs: CheckpointStore["Service"]["deleteCheckpointRefs"] = Effect.fn(
     "deleteCheckpointRefs",
   )(function* (input) {
-    const checkpoints = yield* resolveCheckpoints(
-      "CheckpointStore.deleteCheckpointRefs",
-      input.cwd,
-    );
+    const checkpoints = yield* resolveCheckpoints(input.cwd);
     if (Option.isNone(sqlClient)) return yield* checkpoints.deleteCheckpointRefs(input);
     const sql = sqlClient.value;
     // Hold the writer transaction through deletion so preparation cannot insert a claim after the check.
@@ -189,7 +178,7 @@ export const make = Effect.gen(function* () {
   return CheckpointStore.of({
     isGitRepository,
     matchesCheckpoint: Effect.fn("CheckpointStore.matchesCheckpoint")(function* (input) {
-      const checkpoints = yield* resolveCheckpoints("CheckpointStore.matchesCheckpoint", input.cwd);
+      const checkpoints = yield* resolveCheckpoints(input.cwd);
       if (!checkpoints.matchesCheckpoint)
         return yield* new VcsUnsupportedOperationError({
           operation: "CheckpointStore.matchesCheckpoint",
@@ -199,10 +188,7 @@ export const make = Effect.gen(function* () {
       return yield* checkpoints.matchesCheckpoint(input);
     }),
     retainCheckpointRef: Effect.fn("CheckpointStore.retainCheckpointRef")(function* (input) {
-      const checkpoints = yield* resolveCheckpoints(
-        "CheckpointStore.retainCheckpointRef",
-        input.cwd,
-      );
+      const checkpoints = yield* resolveCheckpoints(input.cwd);
       if (!checkpoints.retainCheckpointRef)
         return yield* new VcsUnsupportedOperationError({
           operation: "CheckpointStore.retainCheckpointRef",

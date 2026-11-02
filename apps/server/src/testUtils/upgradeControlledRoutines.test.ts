@@ -39,6 +39,7 @@ import { AssistantRuntime } from "../assistants/AssistantRuntime.ts";
 import { AssistantRoutineGateway } from "../assistants/AssistantRoutineGateway.ts";
 import { AssistantRoutines } from "../assistants/AssistantRoutines.ts";
 import * as ScheduledTasks from "../scheduledTasks/ScheduledTaskService.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import {
   AuthSessionId,
@@ -90,6 +91,7 @@ it.live("runs and recovers real assistant routines without mutating copied sched
       Layer.mock(TerminalManager.TerminalManager)({}),
       Layer.mock(OwnerDeadline.OwnerDeadlineControl)({}),
       Layer.mock(Cleanup.ResourceCleanupService)({}),
+      ManagedPolicy.layerTest(),
       Layer.succeed(Environment.ServerEnvironment, {
         getEnvironmentId: Effect.succeed(EnvironmentId.make("fixture")),
         getDescriptor: Effect.die("unused"),

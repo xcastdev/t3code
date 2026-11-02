@@ -30,6 +30,7 @@ function installDesktop(input: {
   vi.stubGlobal("window", {
     location: new URL("http://127.0.0.1:5733/"),
     desktopBridge: {
+      getLocalEnvironmentEnabled: () => true,
       getLocalEnvironmentBootstraps: () => (bootstrap === null ? [] : [bootstrap]),
       getLocalEnvironmentBearerToken,
       getPrimaryBackendState: async () => input.backendState ?? { mode: "managed" },

@@ -33,7 +33,7 @@ import {
 } from "../projectWork/memory/ProjectMemoryService.test-utils.ts";
 import * as Projects from "./ProjectStore.ts";
 import * as Projection from "./ProjectionStore.ts";
-import { buildActiveShellSnapshot, loadShellSnapshotParts } from "./ShellStream.ts";
+import { loadSubscriberShellSnapshot } from "./ShellStream.ts";
 import { THREAD_HISTORY_PAGE_POLICY } from "./threadHistoryPaging.ts";
 
 // Exceed the assistant roster's 100-record page while preserving every ordinary shell row.
@@ -252,14 +252,18 @@ const populateAndRead = Effect.fn("ShellDomainPayloadTest.populateAndRead")(func
     });
   }
 
-  const snapshot = buildActiveShellSnapshot(
-    yield* loadShellSnapshotParts({
-      sql,
-      readThreads: projection.readShellSnapshot({ location: "active" }),
-      listProjects: projects.listShells(),
-      latestSequence: events.latestApplicationSequence,
-    }),
-  );
+  const { snapshot } = yield* loadSubscriberShellSnapshot({
+    sql,
+    listShellIndex: projection.listActiveShellIndex(),
+    readThreads: (threadIds) =>
+      projection.readShellSnapshot({
+        location: "active",
+        ...(threadIds === undefined ? {} : { threadIds }),
+      }),
+    listProjects: projects.listShells(),
+    latestSequence: events.latestApplicationSequence,
+    options: { omitIdleSubagents: false, omitOlderSettled: false },
+  });
   assert.equal(snapshot.projects.length, OWNER_COUNT + 1);
   assert.equal(snapshot.threads.length, OWNER_COUNT + 1);
   assert.equal(

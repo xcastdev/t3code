@@ -243,6 +243,9 @@ export const layerControlledProviders = Layer.unwrap(
           refreshInstance: Effect.fn("ProviderRegistry.ProviderRegistry.refreshInstance")(() =>
             Effect.succeed(visible),
           ),
+          reloadSecretsAndRefresh: Effect.fn(
+            "ProviderRegistry.ProviderRegistry.reloadSecretsAndRefresh",
+          )(() => Effect.succeed(visible)),
           refreshAfterUpdate: Effect.fn("ProviderRegistry.ProviderRegistry.refreshAfterUpdate")(
             () => Effect.succeed(visible),
           ),

@@ -58,6 +58,7 @@ import * as WorkEvents from "../projectWork/ProjectWorkEventBus.ts";
 import * as AuthSessions from "../persistence/AuthSessions.ts";
 import * as ScheduledTasks from "../scheduledTasks/ScheduledTaskService.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as Launch from "../orchestration-v2/ThreadLaunchService.ts";
 import * as Threads from "../orchestration-v2/ThreadManagementService.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
@@ -287,7 +288,7 @@ const unused = Layer.mergeAll(
   Layer.mock(Folders.ManagedProjectFolders)({ namedProjectsRoot: "/unused" }),
   Layer.mock(SecretRequests.SecretRequests)({}),
 );
-const schedulerPorts = Layer.mergeAll(unused, Scheduler.layer).pipe(
+const schedulerPorts = Layer.mergeAll(unused, Scheduler.layer, ManagedPolicy.layerTest()).pipe(
   Layer.provideMerge(NodeCrypto.layer),
 );
 const scheduled = ScheduledTasks.layer.pipe(Layer.provideMerge(schedulerPorts));
