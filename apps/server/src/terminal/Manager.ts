@@ -136,7 +136,7 @@ const MAX_TERMINAL_LABEL_LENGTH = 128;
 const decodeClaudeSettings = Schema.decodeUnknownOption(ClaudeSettings);
 const decodeCodexSettings = Schema.decodeUnknownOption(CodexSettings);
 
-class TerminalSubprocessCheckError extends Schema.TaggedError<TerminalSubprocessCheckError>()(
+export class TerminalSubprocessCheckError extends Schema.TaggedError<TerminalSubprocessCheckError>()(
   "TerminalSubprocessCheckError",
   {
     cause: Schema.optional(Schema.Defect()),
@@ -1666,9 +1666,14 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
             snapshotSucceeded: true,
             queryElapsedMs: 0,
           })),
+          // Without the resource monitor, a working ps still polls at its own pace; only a
+          // failed table backs off.
           Effect.catch(() =>
             fallbackProcessTableSnapshot(fallbackTimeout).pipe(
-              Effect.map((fallback) => ({ ...fallback, snapshotSucceeded: false })),
+              Effect.map((fallback) => ({
+                ...fallback,
+                snapshotSucceeded: Result.isSuccess(fallback.snapshot),
+              })),
             ),
           ),
         )

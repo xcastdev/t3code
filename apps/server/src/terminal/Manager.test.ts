@@ -228,7 +228,7 @@ interface CreateManagerOptions {
   }>;
   processTable?: Effect.Effect<
     ReadonlyArray<{ readonly pid: number; readonly ppid: number; readonly name: string }>,
-    never
+    TerminalManager.TerminalSubprocessCheckError
   >;
   subprocessPollIntervalMs?: number;
   processKillGraceMs?: number;
@@ -876,6 +876,48 @@ it.layer(
         ).toBe(true);
         yield* manager.close({ threadId: "thread-1" });
       }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("keeps its poll interval while the resource monitor is down and ps answers", () =>
+    Effect.gen(function* () {
+      let running = false;
+      const { manager, getEvents, ptyAdapter } = yield* createManager(5, {
+        subprocessPollIntervalMs: 1_000,
+        processKillGraceMs: 0,
+        processTable: Effect.fail(
+          new TerminalManager.TerminalSubprocessCheckError({
+            cause: "sidecar is not running",
+            command: "resource-monitor",
+          }),
+        ),
+      }).pipe(
+        Effect.provideService(ProcessRunner.ProcessRunner, {
+          run: () =>
+            Effect.sync(() => ({
+              stdout: running ? "  100  9000 node\n" : "",
+              stderr: "",
+              code: ChildProcessSpawner.ExitCode(0),
+              timedOut: false,
+              stdoutTruncated: false,
+              stderrTruncated: false,
+              stdoutInvalidUtf8: false,
+              stderrInvalidUtf8: false,
+            })),
+        }),
+        Effect.provide(layerWithHostPlatform("linux")),
+      );
+
+      yield* manager.open(openInput());
+      yield* TestClock.adjust("40 seconds");
+      running = true;
+      ptyAdapter.processes[0]!.emitData("node server.js\r\n");
+      yield* TestClock.adjust("2 seconds");
+
+      expect(
+        (yield* getEvents).some((event) => event.type === "activity" && event.hasRunningSubprocess),
+      ).toBe(true);
+      yield* manager.close({ threadId: "thread-1" });
+    }).pipe(Effect.provide(TestClock.layer())),
   );
 
   it.effect("idles at least as long as a slow process-table query took before the next", () =>
