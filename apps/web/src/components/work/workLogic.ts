@@ -451,16 +451,19 @@ export function syncModelPolicies(values: TeamConfigurationValues): TeamConfigur
       providerInstanceId,
     });
   }
+  const routeKey = (policy: TeamModelPolicy) =>
+    `${teamProviderOf(values, policy)}\u0000${policy.model}`;
+  // Existing policies keep their place, so the limit rows being edited never reorder.
+  const kept = values.modelPolicies.filter((policy) => routes.has(routeKey(policy)));
+  const keptKeys = new Set(kept.map(routeKey));
   return {
     ...values,
-    modelPolicies: [...routes.values()].map(
-      (route) =>
-        values.modelPolicies.find(
-          (policy) =>
-            policy.model === route.model &&
-            teamProviderOf(values, policy) === route.providerInstanceId,
-        ) ?? { ...route, ...DEFAULT_MODEL_POLICY },
-    ),
+    modelPolicies: [
+      ...kept,
+      ...[...routes.entries()]
+        .filter(([key]) => !keptKeys.has(key))
+        .map(([, route]) => ({ ...route, ...DEFAULT_MODEL_POLICY })),
+    ],
   };
 }
 

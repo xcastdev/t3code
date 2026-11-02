@@ -19,6 +19,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   buildProtectedRevision,
   buildTeamConfigurationIntent,
+  DEFAULT_MODEL_POLICY,
   combineWorkPages,
   decisionChanged,
   decisionSnapshot,
@@ -527,6 +528,30 @@ describe("buildTeamConfigurationIntent", () => {
     ).toEqual({
       reason: "Sage's provider isn't available on this environment. Choose another.",
     });
+  });
+
+  it("keeps the policies' order while editing, so limit rows never swap under the cursor", () => {
+    const claude = "claude" as never;
+    const recorded = {
+      ...values,
+      profiles: values.profiles.map((profile) =>
+        profile.role === "coordinator" ? { ...profile, providerInstanceId: claude } : profile,
+      ),
+      // Recorded order: Codex first, though the first member runs on Claude.
+      modelPolicies: [
+        { ...DEFAULT_MODEL_POLICY, model: "m1", providerInstanceId: "codex" as never },
+        { ...DEFAULT_MODEL_POLICY, model: "m1", providerInstanceId: claude, modelCalls: 5 },
+      ],
+    };
+    expect(
+      syncModelPolicies(recorded).modelPolicies.map((policy) => [
+        policy.providerInstanceId,
+        policy.modelCalls,
+      ]),
+    ).toEqual([
+      ["codex", DEFAULT_MODEL_POLICY.modelCalls],
+      ["claude", 5],
+    ]);
   });
 
   it("refuses a model the provider no longer offers", () => {
