@@ -115,7 +115,8 @@ it("starts a status filter on its first page after paging the unfiltered list", 
   await expect.element(screen.getByText("Task 0", { exact: true })).toBeVisible();
   await userEvent.click(screen.getByRole("button", { name: "Next", exact: true }));
   await expect.element(screen.getByText("Task 64", { exact: true })).toBeVisible();
-  await userEvent.click(screen.getByRole("button", { name: "Blocked 1", exact: true }));
+  await userEvent.click(screen.getByRole("button", { name: "Filter tasks", exact: true }));
+  await userEvent.click(screen.getByRole("menuitemradio", { name: "Blocked 1", exact: true }));
   await expect.element(screen.getByText("Task 68", { exact: true })).toBeVisible();
   await expect.element(screen.getByText("Task 64", { exact: true })).not.toBeInTheDocument();
   await expect
