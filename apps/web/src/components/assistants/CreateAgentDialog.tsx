@@ -23,7 +23,6 @@ import {
 } from "../ui/dialog";
 import { Input } from "../ui/input";
 import { Textarea } from "../ui/textarea";
-import { Toggle, ToggleGroup } from "../ui/toggle-group";
 import {
   assistantConfigurationError,
   defaultAssistantConfiguration,
@@ -68,7 +67,6 @@ export function CreateAgentDialog({
   const [runtimeMode, setRuntimeMode] = useState<AssistantConfiguration["runtimeMode"]>(
     () => DEFAULT_RUNTIME_MODE,
   );
-  const [instruction, setInstruction] = useState<InstructionKey>("personality");
   // One command ID per dialog, so a retried submit is the same creation.
   const [commandId] = useState(() => CommandId.make(newAssistantCommandId()));
   const configuration =
@@ -118,8 +116,7 @@ export function CreateAgentDialog({
         <DialogHeader>
           <DialogTitle>New agent</DialogTitle>
           <DialogDescription>
-            The agent gets its own chat and private memory on this environment. Creating it doesn't
-            start a run.
+            The agent gets its own chat and private memory on this environment.
           </DialogDescription>
         </DialogHeader>
         <DialogPanel>
@@ -132,7 +129,7 @@ export function CreateAgentDialog({
               others={[]}
               onChange={setAvatar}
             />
-            <div className="grid min-w-0 gap-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start">
+            <div className="grid min-w-0 gap-4 sm:grid-cols-[minmax(0,18rem)_auto] sm:items-start sm:justify-start">
               <WorkField label="Name">
                 {(id) => (
                   <Input
@@ -160,39 +157,23 @@ export function CreateAgentDialog({
                 )}
               </WorkField>
             </div>
-            <section aria-label="Instructions" className="flex min-w-0 flex-col gap-2">
-              <div className="flex min-w-0 items-center justify-between gap-3">
-                <span className="text-sm font-medium">Instructions</span>
-                <ToggleGroup
-                  aria-label="Instruction"
-                  size="sm"
-                  value={[instruction]}
-                  onValueChange={(next) => {
-                    const key = INSTRUCTION_KEYS.find((candidate) => candidate === next[0]);
-                    if (key) setInstruction(key);
-                  }}
-                >
-                  {INSTRUCTION_KEYS.map((key) => (
-                    <Toggle key={key} value={key}>
-                      {INSTRUCTIONS[key].label}
-                      {text[key].trim() ? (
-                        <span aria-hidden className="size-1.5 rounded-full bg-primary" />
-                      ) : null}
-                    </Toggle>
-                  ))}
-                </ToggleGroup>
-              </div>
-              <Textarea
-                aria-label={INSTRUCTIONS[instruction].label}
-                rows={4}
-                placeholder={INSTRUCTIONS[instruction].placeholder}
-                value={text[instruction]}
-                onChange={(event) => setText({ ...text, [instruction]: event.target.value })}
-              />
-              <p className="text-xs text-muted-foreground">
-                All optional. Tools, skills and memory can be set after creating it.
-              </p>
-            </section>
+            {INSTRUCTION_KEYS.map((key) => (
+              <WorkField key={key} label={INSTRUCTIONS[key].label}>
+                {(id) => (
+                  <Textarea
+                    id={id}
+                    rows={3}
+                    placeholder={INSTRUCTIONS[key].placeholder}
+                    value={text[key]}
+                    onChange={(event) => setText({ ...text, [key]: event.target.value })}
+                  />
+                )}
+              </WorkField>
+            ))}
+            <p className="text-xs text-muted-foreground">
+              Personality, rules and prompt are optional. Tools, skills and memory can be set after
+              creating it.
+            </p>
             <WorkFormStatus message={writer.failureFor("create") ?? blocked} />
           </fieldset>
         </DialogPanel>

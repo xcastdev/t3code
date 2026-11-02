@@ -79,7 +79,6 @@ describe("CreateAgentDialog", () => {
     await userEvent.type(screen.getByLabelText("Name"), "Helper");
     await userEvent.click(page.getByRole("button", { name: "Curious", exact: true }));
     await userEvent.type(screen.getByLabelText("Personality"), "Dry and brief.");
-    await userEvent.click(page.getByRole("button", { name: "Rules", exact: true }));
     await userEvent.type(screen.getByLabelText("Rules"), "Never push.");
     await userEvent.click(page.getByRole("button", { name: "Choose a model" }));
     await userEvent.click(page.getByRole("option", { name: /Fixture model/ }));
