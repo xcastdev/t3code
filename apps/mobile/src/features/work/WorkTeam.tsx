@@ -4,7 +4,11 @@ import {
   type ProjectWorkScope,
   type ProjectWorkSelection,
 } from "@t3tools/client-runtime/project-work";
-import { CommandId, type ProjectTeamRecordRead } from "@t3tools/contracts";
+import {
+  CommandId,
+  type ProjectTeamRecordRead,
+  type ProviderOptionDescriptor,
+} from "@t3tools/contracts";
 import { useState } from "react";
 import { View } from "react-native";
 
@@ -24,7 +28,12 @@ import {
   MEMORY_ACCESS,
   recordedTeamConfiguration,
   syncModelPolicies,
+  teamEffortControl,
+  teamEffortValue,
+  teamProviderOf,
   type TeamConfigurationValues,
+  type TeamProfile,
+  withTeamEffort,
 } from "./workLogic";
 import { WorkAvatarEditor } from "./WorkAvatarEditor";
 import { WorkAgentAvatar } from "./WorkAgentAvatar";
@@ -99,7 +108,12 @@ export function WorkTeamSection({
     (!projectWorkSelectionIsCurrent(draft.selected, current) ||
       draft.generation !== recorded?.generation);
   const providers = (serverConfig?.providers ?? []).filter((provider) => provider.enabled);
-  const provider = providers.find((entry) => entry.instanceId === draft?.values.providerInstanceId);
+  const availableModels = new Map(
+    providers.map((entry) => [
+      entry.instanceId as string,
+      new Set(entry.models.map((model) => model.slug)),
+    ]),
+  );
   const build = (commandId: CommandId) =>
     draft === null
       ? null
@@ -110,14 +124,28 @@ export function WorkTeamSection({
           projectId: scope.projectId,
           expectedRevision: draft.selected.revision,
           expectedConfigurationGeneration: draft.generation,
-          availableModels: provider ? new Set(provider.models.map((model) => model.slug)) : null,
+          availableModels,
         });
   const built = build(VALIDATION_COMMAND_ID);
   const buildReason = built !== null && "reason" in built ? built.reason : null;
 
   const open = (toggle: boolean) => {
     if (recorded === null || revision === null) return;
-    const values = recorded.kind === "configured" ? recorded.values : emptyTeamConfiguration();
+    const empty = emptyTeamConfiguration();
+    // A new team starts every member on the first enabled provider; each can change it.
+    const first = providers[0];
+    const values =
+      recorded.kind === "configured"
+        ? recorded.values
+        : first === undefined
+          ? empty
+          : {
+              ...empty,
+              profiles: empty.profiles.map((profile) => ({
+                ...profile,
+                providerInstanceId: first.instanceId,
+              })),
+            };
     setDraft({
       values: toggle ? { ...values, enabled: !values.enabled } : values,
       selected: current,
@@ -137,6 +165,27 @@ export function WorkTeamSection({
   const providerName = (id: string) => {
     const entry = providers.find((item) => item.instanceId === id);
     return entry ? (entry.displayName ?? entry.instanceId) : `${id} (unavailable)`;
+  };
+  /** Provider, model and effort, e.g. "Claude · opus-4 · High". */
+  const routeLabel = (
+    providerInstanceId: string,
+    profile: Pick<TeamProfile, "model" | "options">,
+  ) => {
+    const effort = teamEffortControl(
+      providers
+        .find((item) => item.instanceId === providerInstanceId)
+        ?.models.find((model) => model.slug === profile.model)?.capabilities?.optionDescriptors,
+    );
+    const value = teamEffortValue(profile.options, effort?.descriptor.id);
+    return [
+      providerName(providerInstanceId),
+      profile.model,
+      value === null
+        ? null
+        : (effort?.choices.find((choice) => choice.id === value)?.label ?? value),
+    ]
+      .filter(Boolean)
+      .join(" · ");
   };
 
   return (
@@ -159,8 +208,14 @@ export function WorkTeamSection({
             <>
               <WorkText>
                 {recorded.values.enabled ? "Enabled" : "Disabled"} ·{" "}
-                {providerName(recorded.values.providerInstanceId)} · generation{" "}
-                {recorded.generation}
+                {[
+                  ...new Set(
+                    recorded.values.profiles.map((profile) =>
+                      providerName(teamProviderOf(recorded.values, profile)),
+                    ),
+                  ),
+                ].join(" · ")}{" "}
+                · generation {recorded.generation}
               </WorkText>
               {recorded.values.profiles.map((profile) => (
                 <View key={profile.role} className="flex-row items-center gap-3">
@@ -172,7 +227,8 @@ export function WorkTeamSection({
                   <View className="min-w-0 flex-1">
                     <WorkText>{profile.name ?? workStateLabel(profile.role)}</WorkText>
                     <WorkText muted>
-                      {workStateLabel(profile.role)} · {profile.model} ·{" "}
+                      {workStateLabel(profile.role)} ·{" "}
+                      {routeLabel(teamProviderOf(recorded.values, profile), profile)} ·{" "}
                       {MEMORY_LABELS[profile.memoryAccess]} memory
                     </WorkText>
                   </View>
@@ -219,7 +275,11 @@ export function WorkTeamSection({
               providers={providers.map((entry) => ({
                 id: entry.instanceId,
                 label: entry.displayName ?? entry.instanceId,
-                models: entry.models.map((model) => ({ slug: model.slug, name: model.name })),
+                models: entry.models.map((model) => ({
+                  slug: model.slug,
+                  name: model.name,
+                  descriptors: model.capabilities?.optionDescriptors,
+                })),
               }))}
               onChange={update}
             />
@@ -245,8 +305,15 @@ export function WorkTeamSection({
 interface ProviderChoice {
   readonly id: string;
   readonly label: string;
-  readonly models: ReadonlyArray<{ readonly slug: string; readonly name: string }>;
+  readonly models: ReadonlyArray<{
+    readonly slug: string;
+    readonly name: string;
+    readonly descriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined;
+  }>;
 }
+
+// Options belong to one model, so they are dropped whenever a member's route changes.
+const withoutOptions = ({ options: _options, ...profile }: TeamProfile): TeamProfile => profile;
 
 function TeamForm(props: {
   values: TeamConfigurationValues;
@@ -255,8 +322,12 @@ function TeamForm(props: {
   onChange: (values: TeamConfigurationValues) => void;
 }) {
   const { values, recorded, onChange } = props;
-  const provider = props.providers.find((entry) => entry.id === values.providerInstanceId);
-  const [choosingModel, setChoosingModel] = useState<string | null>(null);
+  const [choosing, setChoosing] = useState<{
+    readonly role: string;
+    readonly field: "provider" | "model" | "effort";
+  } | null>(null);
+  const toggle = (role: string, field: "provider" | "model" | "effort") =>
+    setChoosing(choosing?.role === role && choosing.field === field ? null : { role, field });
   return (
     <>
       <ListSection title="Team setup">
@@ -266,28 +337,13 @@ function TeamForm(props: {
           onValueChange={(enabled) => onChange({ ...values, enabled })}
         />
       </ListSection>
-      <ListSection
-        title="Provider"
-        {...(props.providers.length === 0
-          ? { footer: "No providers are enabled on this environment." }
-          : {})}
-      >
-        {props.providers.map((entry) => (
-          <ListChoiceRow
-            key={entry.id}
-            label={entry.label}
-            selected={entry.id === values.providerInstanceId}
-            onPress={() =>
-              onChange({
-                ...values,
-                providerInstanceId: entry.id as TeamConfigurationValues["providerInstanceId"],
-                // Models belong to one provider; switching asks for each role's model again.
-                profiles: values.profiles.map((profile) => ({ ...profile, model: "" })),
-              })
-            }
-          />
-        ))}
-      </ListSection>
+      {props.providers.length === 0 ? (
+        <ListSection title="Providers">
+          <WorkBlock>
+            <WorkText muted>No providers are enabled on this environment.</WorkText>
+          </WorkBlock>
+        </ListSection>
+      ) : null}
       {values.profiles.map((profile, index) => {
         const set = (patch: Partial<typeof profile>) =>
           onChange({
@@ -296,28 +352,97 @@ function TeamForm(props: {
               at === index ? { ...entry, ...patch } : entry,
             ),
           });
-        const modelName =
-          provider?.models.find((model) => model.slug === profile.model)?.name ?? profile.model;
+        const update = (next: (entry: TeamProfile) => TeamProfile) =>
+          onChange({
+            ...values,
+            profiles: values.profiles.map((entry, at) => (at === index ? next(entry) : entry)),
+          });
+        const providerId = teamProviderOf(values, profile);
+        const provider = props.providers.find((entry) => entry.id === providerId);
+        const model = provider?.models.find((entry) => entry.slug === profile.model);
+        const effort = teamEffortControl(model?.descriptors);
+        const effortValue = effort ? teamEffortValue(profile.options, effort.descriptor.id) : null;
+        const isOpen = (field: "provider" | "model" | "effort") =>
+          choosing?.role === profile.role && choosing.field === field;
         return (
           <ListSection key={profile.role} title={workStateLabel(profile.role)}>
             <ListActionRow
-              label={`Model: ${modelName || "choose"}`}
-              disabled={provider === undefined}
-              onPress={() => setChoosingModel(choosingModel === profile.role ? null : profile.role)}
+              label={`Provider: ${provider?.label ?? (providerId || "choose")}`}
+              onPress={() => toggle(profile.role, "provider")}
             />
-            {choosingModel === profile.role
-              ? (provider?.models ?? []).map((model) => (
+            {isOpen("provider")
+              ? props.providers.map((entry) => (
                   <ListChoiceRow
-                    key={model.slug}
-                    label={model.name}
-                    selected={model.slug === profile.model}
+                    key={entry.id}
+                    label={entry.label}
+                    selected={entry.id === providerId}
                     onPress={() => {
-                      set({ model: model.slug });
-                      setChoosingModel(null);
+                      if (entry.id !== providerId)
+                        // Models belong to one provider; switching asks for this member's model again.
+                        update((current) => ({
+                          ...withoutOptions(current),
+                          providerInstanceId: entry.id as NonNullable<
+                            TeamProfile["providerInstanceId"]
+                          >,
+                          model: "",
+                        }));
+                      setChoosing(null);
                     }}
                   />
                 ))
               : null}
+            <ListActionRow
+              label={`Model: ${model?.name ?? (profile.model || "choose")}`}
+              disabled={provider === undefined}
+              onPress={() => toggle(profile.role, "model")}
+            />
+            {isOpen("model")
+              ? (provider?.models ?? []).map((entry) => (
+                  <ListChoiceRow
+                    key={entry.slug}
+                    label={entry.name}
+                    selected={entry.slug === profile.model}
+                    onPress={() => {
+                      if (entry.slug !== profile.model)
+                        update((current) => ({ ...withoutOptions(current), model: entry.slug }));
+                      setChoosing(null);
+                    }}
+                  />
+                ))
+              : null}
+            {effort ? (
+              <>
+                <ListActionRow
+                  label={`${effort.descriptor.label}: ${
+                    effort.choices.find((choice) => choice.id === effortValue)?.label ??
+                    "Model default"
+                  }`}
+                  onPress={() => toggle(profile.role, "effort")}
+                />
+                {isOpen("effort")
+                  ? [{ id: null, label: "Model default" }, ...effort.choices].map((choice) => (
+                      <ListChoiceRow
+                        key={choice.id ?? "default"}
+                        label={choice.label}
+                        selected={choice.id === effortValue}
+                        onPress={() => {
+                          update((current) => {
+                            const options = withTeamEffort(
+                              current.options,
+                              effort.descriptor.id,
+                              choice.id,
+                            );
+                            return options === undefined
+                              ? withoutOptions(current)
+                              : { ...withoutOptions(current), options };
+                          });
+                          setChoosing(null);
+                        }}
+                      />
+                    ))
+                  : null}
+              </>
+            ) : null}
             <WorkAvatarEditor
               role={profile.role}
               name={profile.name?.trim() || workStateLabel(profile.role)}
@@ -363,7 +488,7 @@ function TeamForm(props: {
         );
       })}
       {values.modelPolicies.length > 0 ? (
-        <ListSection title="Limits per model">
+        <ListSection title="Limits per provider and model">
           {values.modelPolicies.map((policy, index) => {
             const set = (patch: Partial<typeof policy>) =>
               onChange({
@@ -373,8 +498,12 @@ function TeamForm(props: {
                 ),
               });
             return (
-              <WorkBlock key={policy.model}>
-                <WorkText>{policy.model}</WorkText>
+              <WorkBlock key={`${teamProviderOf(values, policy)}:${policy.model}`}>
+                <WorkText>
+                  {props.providers.find((entry) => entry.id === teamProviderOf(values, policy))
+                    ?.label ?? teamProviderOf(values, policy)}{" "}
+                  · {policy.model}
+                </WorkText>
                 <View className="flex-row gap-2">
                   <View className="flex-1">
                     <WorkInput

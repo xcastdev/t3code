@@ -231,7 +231,8 @@ const ROLE_FOR_DELIVERABLE: Record<string, WorkRoleRecord["role"]> = {
 
 export interface WorkStartPlan {
   readonly gate: WorkGate;
-  readonly providerInstanceId: string;
+  /** The task's recorded team provider; members recorded with their own provider use that. */
+  readonly providerInstanceId: string | null;
   readonly role: WorkRoleRecord["role"] | null;
   /** Assignment and investigation grants only run under the role they were created for. */
   readonly exactRole: boolean;
@@ -265,13 +266,10 @@ export function startAvailability(input: {
   if (gate.status !== "approved") return { reason: "Approve the assignment before starting it." };
   if (recordsOfKind(input.records, "run-binding").some((b) => bindingPhase(b.status).live))
     return { reason: "A worker is already running this task." };
-  const providerInstanceId = membership.rootConstraints?.providerInstanceId;
-  if (providerInstanceId === undefined)
-    return { reason: "The team provider isn't recorded for this task. Configure the team first." };
   return {
     plan: {
       gate,
-      providerInstanceId,
+      providerInstanceId: membership.rootConstraints?.providerInstanceId ?? null,
       role: ROLE_FOR_DELIVERABLE[membership.deliverableKind] ?? null,
       exactRole:
         gate.gate === "assignment" ||
@@ -297,10 +295,16 @@ export interface WorkStartCandidate {
 }
 
 /** Every active member, with the ones that can't run this grant marked and listed last. */
+/** The provider a member runs on: its own, else the one recorded for the task's team. */
+export const memberProviderInstanceId = (
+  role: Pick<WorkRoleRecord, "providerInstanceId">,
+  plan: Pick<WorkStartPlan, "providerInstanceId">,
+): string | null => role.providerInstanceId ?? plan.providerInstanceId;
+
 export function startCandidates(
   members: ReadonlyArray<WorkMemberRecord>,
   roles: ReadonlyArray<WorkRoleRecord>,
-  plan: Pick<WorkStartPlan, "role" | "exactRole" | "successorId">,
+  plan: Pick<WorkStartPlan, "role" | "exactRole" | "successorId" | "providerInstanceId">,
 ): WorkStartCandidate[] {
   return members
     .filter((member) => member.status === "active")
@@ -312,7 +316,9 @@ export function startCandidates(
           ? "Another member was requested to take over this task."
           : plan.exactRole && plan.role !== null && revision.role !== plan.role
             ? `This assignment needs a ${plan.role}.`
-            : null;
+            : memberProviderInstanceId(revision, plan) === null
+              ? "This member has no provider. Edit the team to choose one."
+              : null;
       return [{ member, role: revision, preferred: revision.role === plan.role, ineligible }];
     })
     .sort(
@@ -524,7 +530,11 @@ export function makeDispatchIntent(
     expectedMemberRevision: input.member.revision,
     authorizationGateId: input.plan.gate.recordId,
     expectedGateRevision: input.plan.gate.revision,
-    modelSelection: { instanceId: input.plan.providerInstanceId, model: input.role.model },
+    modelSelection: {
+      instanceId: memberProviderInstanceId(input.role, input.plan) ?? "",
+      model: input.role.model,
+      ...(input.role.options === undefined ? {} : { options: input.role.options }),
+    },
     workspace: input.workspace,
   };
 }

@@ -44,6 +44,7 @@ import {
   FRESHNESS_LABEL,
   gateFreshness,
   makeDispatchIntent,
+  memberProviderInstanceId,
   makeMemoryRetractIntent,
   makeMemorySharesIntent,
   makeMessageAttentionIntent,
@@ -273,8 +274,11 @@ function StartWorker({ surface }: { surface: Surface }) {
           <WorkInput label="Base branch" value={baseRef} onChange={setBaseRef} maxLength={256} />
         ) : null}
         <WorkText muted>
-          Runs one worker on {plan.providerInstanceId} for this assignment, within the team's
-          limits.
+          Runs one worker on{" "}
+          {chosen
+            ? (memberProviderInstanceId(chosen.role, plan) ?? "no provider")
+            : "the member's provider"}{" "}
+          for this assignment, within the team's limits.
         </WorkText>
         {problem !== null ? <WorkText muted>{problem}</WorkText> : null}
         <WorkFormActions

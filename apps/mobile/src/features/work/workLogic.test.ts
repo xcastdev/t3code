@@ -59,7 +59,10 @@ describe("disabling a team whose provider or model disappeared", () => {
   };
 
   it("sends the recorded configuration unchanged when disabling", () => {
-    for (const availableModels of [null, new Set(["m2"])]) {
+    for (const availableModels of [
+      new Map<string, ReadonlySet<string>>(),
+      new Map([["codex", new Set(["m2"])]]),
+    ]) {
       const built = buildTeamConfigurationIntent({
         ...base,
         values: { ...recorded, enabled: false },
@@ -77,7 +80,10 @@ describe("disabling a team whose provider or model disappeared", () => {
   it("still checks the live catalog for edits and enabling", () => {
     const edited = { ...recorded, enabled: false, projectPriority: 1 };
     for (const values of [edited, recorded])
-      for (const availableModels of [null, new Set(["m2"])])
+      for (const availableModels of [
+        new Map<string, ReadonlySet<string>>(),
+        new Map([["codex", new Set(["m2"])]]),
+      ])
         expect(buildTeamConfigurationIntent({ ...base, values, availableModels })).toHaveProperty(
           "reason",
         );

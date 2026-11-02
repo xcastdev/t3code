@@ -265,8 +265,18 @@ describe("recordedTeamConfiguration", () => {
     expect(recorded.generation).toBe(3);
     expect(recorded.values.enabled).toBe(false);
     expect(recorded.values.profiles.map((profile) => profile.role)).toEqual([...TEAM_ROLES]);
+    // Roles recorded before members chose a provider read back on the team's provider.
+    expect(new Set(recorded.values.profiles.map((profile) => profile.providerInstanceId))).toEqual(
+      new Set(["codex"]),
+    );
     expect(recorded.values.modelPolicies).toEqual([
-      { model: "model-a", tokenLimit: 1000, durationLimitMs: 60_000, modelCalls: 3 },
+      {
+        model: "model-a",
+        providerInstanceId: "codex",
+        tokenLimit: 1000,
+        durationLimitMs: 60_000,
+        modelCalls: 3,
+      },
     ]);
   });
 
@@ -296,7 +306,7 @@ describe("recordedTeamConfiguration", () => {
       projectId: ProjectId.make("project-1"),
       expectedRevision: 10,
       expectedConfigurationGeneration: 3,
-      availableModels: new Set(["model-a"]),
+      availableModels: new Map([["codex", new Set(["model-a"])]]),
     });
     expect("intent" in built && built.intent.profiles[0]).toHaveProperty("name", "Atlas");
   });
@@ -338,7 +348,7 @@ describe("recordedTeamConfiguration", () => {
       projectId: ProjectId.make("project-1"),
       expectedRevision: 10,
       expectedConfigurationGeneration: 3,
-      availableModels: new Set(["model-a"]),
+      availableModels: new Map([["codex", new Set(["model-a"])]]),
     });
     expect("intent" in built && built.intent.profiles[0]).toHaveProperty("avatar", null);
   });
@@ -371,7 +381,7 @@ describe("buildTeamConfigurationIntent", () => {
       ...base,
       values,
       recorded: null,
-      availableModels: new Set(["m1"]),
+      availableModels: new Map([["codex", new Set(["m1"])]]),
     });
     expect("intent" in built && built.intent).toMatchObject({
       type: "project-team.configure",
@@ -390,7 +400,7 @@ describe("buildTeamConfigurationIntent", () => {
       ...base,
       values: draft,
       recorded: null,
-      availableModels: new Set(["m1"]),
+      availableModels: new Map([["codex", new Set(["m1"])]]),
     });
     expect("intent" in built && built.intent.profiles.map((p) => p.name)).toEqual([
       "My lead",
@@ -420,9 +430,52 @@ describe("buildTeamConfigurationIntent", () => {
       ...base,
       values: duplicate,
       recorded: null,
-      availableModels: new Set(["m1"]),
+      availableModels: new Map([["codex", new Set(["m1"])]]),
     });
     expect(built).toHaveProperty("reason");
+  });
+
+  it("keeps one policy per provider and model, and checks each member's own catalog", () => {
+    const mixed = syncModelPolicies({
+      ...values,
+      profiles: values.profiles.map((profile) =>
+        profile.role === "planner" || profile.role === "reviewer"
+          ? {
+              ...profile,
+              providerInstanceId: "claude" as never,
+              options: [{ id: "effort", value: "high" }],
+            }
+          : profile,
+      ),
+    });
+    expect(mixed.modelPolicies.map((policy) => [policy.providerInstanceId, policy.model])).toEqual([
+      ["codex", "m1"],
+      ["claude", "m1"],
+    ]);
+    const catalogs = new Map([
+      ["codex", new Set(["m1"])],
+      ["claude", new Set(["m1"])],
+    ]);
+    const built = buildTeamConfigurationIntent({
+      ...base,
+      values: mixed,
+      recorded: null,
+      availableModels: catalogs,
+    });
+    expect("intent" in built && built.intent.profiles[2]).toMatchObject({
+      providerInstanceId: "claude",
+      options: [{ id: "effort", value: "high" }],
+    });
+    expect(
+      buildTeamConfigurationIntent({
+        ...base,
+        values: mixed,
+        recorded: null,
+        availableModels: new Map([["codex", new Set(["m1"])]]),
+      }),
+    ).toEqual({
+      reason: "Sage's provider isn't available on this environment. Choose another.",
+    });
   });
 
   it("refuses a model the provider no longer offers", () => {
@@ -431,7 +484,7 @@ describe("buildTeamConfigurationIntent", () => {
         ...base,
         values,
         recorded: null,
-        availableModels: new Set(["m2"]),
+        availableModels: new Map([["codex", new Set(["m2"])]]),
       }),
     ).toHaveProperty("reason");
   });
@@ -445,8 +498,8 @@ describe("buildTeamConfigurationIntent", () => {
     const disable = { ...recorded, enabled: false };
 
     it.each([
-      ["provider is gone", null],
-      ["model is gone", new Set(["m2"])],
+      ["provider is gone", new Map<string, ReadonlySet<string>>()],
+      ["model is gone", new Map([["codex", new Set(["m2"])]])],
     ])("still disables the exact recorded team when its %s", (_, availableModels) => {
       const built = buildTeamConfigurationIntent({
         ...base,
@@ -472,7 +525,10 @@ describe("buildTeamConfigurationIntent", () => {
         { ...disable, profiles: disable.profiles.map((p) => ({ ...p, instructions: "x" })) },
       ],
     ])("checks the live catalog when %s", (_, from, next) => {
-      for (const availableModels of [null, new Set(["m2"])])
+      for (const availableModels of [
+        new Map<string, ReadonlySet<string>>(),
+        new Map([["codex", new Set(["m2"])]]),
+      ])
         expect(
           buildTeamConfigurationIntent({ ...base, values: next, recorded: from, availableModels }),
         ).toHaveProperty("reason");

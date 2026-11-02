@@ -303,6 +303,60 @@ const member = (id: string, roleId: string) =>
     roleRevisionId: roleId,
   });
 
+it("runs each member on its own provider and effort, over the task's team provider", () => {
+  const available = startAvailability({ membership, terminal: false, records: [gate("approved")] });
+  if (!("plan" in available)) throw new Error("expected a start plan");
+  const effort = [{ id: "effort", value: "high" }];
+  const own = record<WorkRoleRecord>({
+    ...role("planner-role", "planner"),
+    providerInstanceId: "claude",
+    options: effort,
+  });
+  const intent = makeDispatchIntent(
+    {
+      commandId: CommandId.make("dispatch-own"),
+      projectId,
+      taskId,
+      expectedRevision: 7,
+      expectedTaskRevision: 3,
+    },
+    {
+      plan: available.plan,
+      member: member("planner", "planner-role"),
+      role: own,
+      workspace: { type: "root" },
+    },
+  );
+  expect(intent.modelSelection).toEqual({ instanceId: "claude", model: "m", options: effort });
+});
+
+it("starts a mixed team's task without a recorded team provider, but not a member without one", () => {
+  const mixed = startAvailability({
+    membership: {
+      ...membership,
+      rootConstraints: (({ providerInstanceId: _team, ...rest }) => rest)(
+        membership.rootConstraints!,
+      ),
+    },
+    terminal: false,
+    records: [gate("approved")],
+  });
+  if (!("plan" in mixed)) throw new Error("expected a start plan");
+  expect(mixed.plan.providerInstanceId).toBeNull();
+  const [withProvider, withoutProvider] = startCandidates(
+    [member("coder", "impl"), member("legacy", "legacy-impl")],
+    [
+      record<WorkRoleRecord>({ ...role("impl", "implementer"), providerInstanceId: "codex" }),
+      role("legacy-impl", "implementer"),
+    ],
+    mixed.plan,
+  );
+  expect(withProvider?.ineligible).toBeNull();
+  expect(withoutProvider?.ineligible).toBe(
+    "This member has no provider. Edit the team to choose one.",
+  );
+});
+
 it("only offers members and workspaces the server can start for this grant", () => {
   const roles = [role("impl", "implementer"), role("rev", "reviewer")];
   const members = [member("reviewer", "rev"), member("coder", "impl")];
@@ -310,6 +364,7 @@ it("only offers members and workspaces the server can start for this grant", () 
     role: "implementer",
     exactRole: true,
     successorId: null,
+    providerInstanceId: "codex",
   });
   expect(exact.map((entry) => [entry.member.recordId, entry.ineligible === null])).toEqual([
     ["coder", true],
@@ -326,6 +381,7 @@ it("only offers members and workspaces the server can start for this grant", () 
     role: "implementer",
     exactRole: false,
     successorId: "reviewer",
+    providerInstanceId: "codex",
   });
   expect(successor.find((entry) => entry.member.recordId === "coder")?.ineligible).toMatch(
     /requested/,

@@ -18,7 +18,13 @@ import {
   type ProjectWorkRelationshipRead,
   type ProjectWorkTaskContext,
   type ProjectWorkTaskId,
+  type ProviderOptionDescriptor,
+  type ProviderOptionSelection,
 } from "@t3tools/contracts";
+import {
+  isReasoningSelect,
+  selectableProviderOptionChoices,
+} from "@t3tools/client-runtime/model-traits";
 import {
   projectWorkSelectionIsCurrent,
   type ProjectWorkSelection,
@@ -239,9 +245,9 @@ export function recordedTeamConfiguration(
   const status = first.status;
   if (status !== "configured" && status !== "disabled")
     return unreadable("The team status is from a newer server.");
+  // Policies may name different providers now that members choose their own.
   const sameShape = (policy: Limits) =>
     policy.status === first.status &&
-    policy.providerInstanceId === first.providerInstanceId &&
     JSON.stringify([...(policy.profileRecordIds ?? [])].sort()) === JSON.stringify([...ids].sort());
   if (ids.length !== 6 || new Set(ids).size !== 6 || !policies.every(sameShape))
     return unreadable("The recorded limits disagree about the current profiles.");
@@ -269,6 +275,12 @@ export function recordedTeamConfiguration(
       skills: role.skills,
       tools: role.tools,
       model: role.model,
+      // Roles from before members chose a provider ran on their model's team policy.
+      providerInstanceId:
+        role.providerInstanceId ??
+        policies.find((policy) => policy.model === role.model)?.providerInstanceId ??
+        first.providerInstanceId!,
+      ...(role.options === undefined ? {} : { options: role.options }),
       memoryAccess: role.memoryAccess as (typeof MEMORY_ACCESS)[number],
       delegationDepth: role.delegationDepth,
     });
@@ -279,12 +291,15 @@ export function recordedTeamConfiguration(
     projectPriority: first.projectPriority ?? 0,
     taskPriorities: first.taskPriorities ?? [],
     profiles: TEAM_ROLES.map((role) => profiles.find((profile) => profile.role === role)!),
-    modelPolicies: policies.map(({ model, tokenLimit, durationLimitMs, modelCalls }) => ({
-      model,
-      tokenLimit,
-      durationLimitMs,
-      modelCalls,
-    })),
+    modelPolicies: policies.map(
+      ({ model, providerInstanceId, tokenLimit, durationLimitMs, modelCalls }) => ({
+        model,
+        providerInstanceId: providerInstanceId ?? first.providerInstanceId!,
+        tokenLimit,
+        durationLimitMs,
+        modelCalls,
+      }),
+    ),
     environmentModelCalls: first.environmentModelCalls,
     projectWritableWorkers: first.projectWritableWorkers,
     delegationDepth: first.delegationDepth,
@@ -326,17 +341,67 @@ export function fillPresetNames(values: TeamConfigurationValues): TeamConfigurat
   };
 }
 
-/** One policy per selected model, keeping limits already entered for that model. */
+type EffortDescriptor = Extract<ProviderOptionDescriptor, { type: "select" }>;
+
+/** The reasoning effort control a model offers, with the choices a picker may show. */
+export function teamEffortControl(
+  descriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined,
+): { readonly descriptor: EffortDescriptor; readonly choices: EffortDescriptor["options"] } | null {
+  const descriptor = descriptors?.find(isReasoningSelect);
+  return descriptor === undefined
+    ? null
+    : { descriptor, choices: selectableProviderOptionChoices(descriptor) };
+}
+
+/** A member's chosen effort, or null when it runs at the model's default. */
+export function teamEffortValue(
+  options: ReadonlyArray<ProviderOptionSelection> | undefined,
+  descriptorId?: string,
+): string | null {
+  const selection = options?.find((option) =>
+    descriptorId === undefined ? typeof option.value === "string" : option.id === descriptorId,
+  );
+  return typeof selection?.value === "string" ? selection.value : null;
+}
+
+/** Sets or clears one effort selection, keeping a member's other options. */
+export function withTeamEffort(
+  options: ReadonlyArray<ProviderOptionSelection> | undefined,
+  descriptorId: string,
+  value: string | null,
+): ReadonlyArray<ProviderOptionSelection> | undefined {
+  const rest = (options ?? []).filter((option) => option.id !== descriptorId);
+  const next = value === null ? rest : [...rest, { id: descriptorId, value }];
+  return next.length === 0 ? undefined : next;
+}
+
+/** The provider a profile or policy runs on: its own, else the team default. */
+export const teamProviderOf = (
+  values: Pick<TeamConfigurationValues, "providerInstanceId">,
+  entry: { readonly providerInstanceId?: TeamConfigurationValues["providerInstanceId"] },
+): TeamConfigurationValues["providerInstanceId"] =>
+  entry.providerInstanceId ?? values.providerInstanceId;
+
+/** One policy per selected provider and model, keeping limits already entered for that pair. */
 export function syncModelPolicies(values: TeamConfigurationValues): TeamConfigurationValues {
-  const models = [...new Set(values.profiles.map((profile) => profile.model).filter(Boolean))];
+  const routes = new Map<string, Pick<TeamModelPolicy, "model" | "providerInstanceId">>();
+  for (const profile of values.profiles) {
+    const providerInstanceId = teamProviderOf(values, profile);
+    if (!profile.model || !providerInstanceId) continue;
+    routes.set(`${providerInstanceId}\u0000${profile.model}`, {
+      model: profile.model,
+      providerInstanceId,
+    });
+  }
   return {
     ...values,
-    modelPolicies: models.map(
-      (model) =>
-        values.modelPolicies.find((policy) => policy.model === model) ?? {
-          model,
-          ...DEFAULT_MODEL_POLICY,
-        },
+    modelPolicies: [...routes.values()].map(
+      (route) =>
+        values.modelPolicies.find(
+          (policy) =>
+            policy.model === route.model &&
+            teamProviderOf(values, policy) === route.providerInstanceId,
+        ) ?? { ...route, ...DEFAULT_MODEL_POLICY },
     ),
   };
 }
@@ -365,9 +430,18 @@ export function buildTeamConfigurationIntent(input: {
   readonly projectId: ProjectId;
   readonly expectedRevision: number;
   readonly expectedConfigurationGeneration: number;
-  readonly availableModels: ReadonlySet<string> | null;
+  /** Models each enabled provider offers on this environment, by provider instance. */
+  readonly availableModels: ReadonlyMap<string, ReadonlySet<string>>;
 }): { readonly intent: ConfigurationIntent } | { readonly reason: string } {
-  const { values, availableModels } = input;
+  const { availableModels } = input;
+  // New teams have no team default yet; the first member's provider becomes it.
+  const values: TeamConfigurationValues = {
+    ...input.values,
+    providerInstanceId:
+      input.values.providerInstanceId ||
+      (input.values.profiles.find((profile) => profile.providerInstanceId)?.providerInstanceId ??
+        input.values.providerInstanceId),
+  };
   const profiles = values.profiles.map((profile) => ({
     ...profile,
     name: profile.name?.trim() || profile.role,
@@ -376,16 +450,22 @@ export function buildTeamConfigurationIntent(input: {
   const names = profiles.map((profile) => profile.name.toLocaleLowerCase());
   if (new Set(names).size !== names.length)
     return { reason: "Give each team member a different name." };
-  if (!values.providerInstanceId) return { reason: "Choose a provider." };
+  if (values.profiles.some((profile) => !teamProviderOf(values, profile)))
+    return { reason: "Choose a provider for every member." };
   if (values.profiles.some((profile) => !profile.model))
-    return { reason: "Choose a model for every role." };
-  if (!isRecordedTeamDisable(values, input.recorded)) {
-    if (availableModels === null)
-      return { reason: "This provider isn't available on this environment. Choose another." };
-    if (values.profiles.some((profile) => !availableModels.has(profile.model)))
-      return {
-        reason: "A selected model isn't offered by this provider. Choose an available one.",
-      };
+    return { reason: "Choose a model for every member." };
+  if (!isRecordedTeamDisable(input.values, input.recorded)) {
+    for (const profile of values.profiles) {
+      const offered = availableModels.get(teamProviderOf(values, profile));
+      if (offered === undefined)
+        return {
+          reason: `${profile.name?.trim() || profile.role}'s provider isn't available on this environment. Choose another.`,
+        };
+      if (!offered.has(profile.model))
+        return {
+          reason: `${profile.name?.trim() || profile.role}'s model isn't offered by its provider. Choose an available one.`,
+        };
+    }
   }
   const decoded = decodeConfiguration({
     ...values,

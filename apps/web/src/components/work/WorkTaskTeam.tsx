@@ -28,6 +28,7 @@ import {
   bindingPhase,
   makeAssignmentStartIntent,
   makeDispatchIntent,
+  memberProviderInstanceId,
   makeExecutionStartIntent,
   makeInvestigationStartIntent,
   makeMessageAttentionIntent,
@@ -233,7 +234,10 @@ function StartWorker({ surface }: { surface: WorkTaskSurface }) {
                   value={entry.member.recordId}
                   disabled={entry.ineligible !== null}
                 >
-                  {entry.member.name} · {entry.role.role} · {entry.role.model}
+                  {entry.member.name} · {entry.role.role} ·{" "}
+                  {[memberProviderInstanceId(entry.role, plan), entry.role.model]
+                    .filter(Boolean)
+                    .join(" · ")}
                   {entry.ineligible !== null ? ` · ${entry.ineligible}` : ""}
                 </SelectItem>
               ))}
@@ -269,8 +273,11 @@ function StartWorker({ surface }: { surface: WorkTaskSurface }) {
         </WorkField>
       ) : null}
       <WorkMeta>
-        Runs {chosen ? chosen.role.model : "the member's model"} on {plan.providerInstanceId} for
-        this one assignment, within the team's limits.
+        Runs {chosen ? chosen.role.model : "the member's model"} on{" "}
+        {chosen
+          ? (memberProviderInstanceId(chosen.role, plan) ?? "no provider")
+          : "the member's provider"}{" "}
+        for this one assignment, within the team's limits.
       </WorkMeta>
       {problem !== null ? <WorkMeta className="text-warning-foreground">{problem}</WorkMeta> : null}
       <div className="flex flex-wrap gap-2">
