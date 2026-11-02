@@ -7,39 +7,49 @@ import {
 import {
   ProjectWorkDecisionId,
   ProjectWorkKnowledgeId,
+  ProjectWorkTaskId,
+  type ProjectWorkActorRead,
   type ProjectWorkDecisionRead,
   type ProjectWorkKnowledgeRead,
 } from "@t3tools/contracts";
-import { PlusIcon } from "lucide-react";
-import { useState } from "react";
+import {
+  BookPlusIcon,
+  BotIcon,
+  CirclePlayIcon,
+  GitBranchIcon,
+  HistoryIcon,
+  ListTodoIcon,
+  MessageSquareIcon,
+  PencilIcon,
+  PenLineIcon,
+  ScaleIcon,
+  TerminalSquareIcon,
+  type LucideIcon,
+} from "lucide-react";
+import { type ReactNode, useState } from "react";
 
 import { isElectron } from "../../env";
 import { cn, randomUUID } from "../../lib/utils";
+import { RelativeTime } from "../RelativeTime";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Textarea } from "../ui/textarea";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import {
   makeProjectWorkDecisionCommand,
   makeProjectWorkKnowledgePromoteCommand,
 } from "./workMutations";
 import { WorkReviewChanged } from "./WorkNotice";
-import {
-  WorkEmpty,
-  WorkField,
-  WorkFormStatus,
-  WorkMeta,
-  WorkRow,
-  WorkSection,
-  WorkTime,
-} from "./WorkLayout";
+import { WorkField, WorkFormStatus, WorkMeta, WorkRow } from "./WorkLayout";
 import { WorkNotice, WorkPager, WorkRecordsNotice } from "./WorkNotice";
 import { workWriteBlockedReason } from "./useWorkRead";
 import { useWorkPage, useWorkRecords, workRecordsBlockedReason } from "./useWorkRecords";
 import { knowledgeLineage } from "./workLogic";
 import type { WorkWriter } from "./useWorkWriter";
 import { workStateLabel } from "./workModel";
-import { WorkStatus } from "./WorkStatus";
+import { WorkStatusGlyph } from "./WorkStatus";
+import { WorkTaskLink } from "./WorkTaskRefs";
 import { newCommandId, useWorkReview } from "./workTaskSurface";
 
 const WORK_LIST_PAGE = 32;
@@ -50,13 +60,109 @@ const projectSelection = (scope: ProjectWorkScope, revision: number): ProjectWor
   taskRevision: 0,
 });
 
+const SOURCE_PRESENTATION: Record<string, { readonly label: string; readonly icon: LucideIcon }> = {
+  manual: { label: "Added by hand", icon: PenLineIcon },
+  task: { label: "From a task", icon: ListTodoIcon },
+  thread: { label: "From a thread", icon: MessageSquareIcon },
+  session: { label: "From a session", icon: TerminalSquareIcon },
+  worktree: { label: "From a worktree", icon: GitBranchIcon },
+  attempt: { label: "From an attempt", icon: CirclePlayIcon },
+};
+
+const actorLabel = (actor: ProjectWorkActorRead | undefined) =>
+  actor?.displayName ??
+  (actor === undefined
+    ? null
+    : actor.kind === "human"
+      ? "A person"
+      : actor.kind === "agent"
+        ? "An agent"
+        : workStateLabel(actor.kind));
+
 /** Reviewed project knowledge and decisions; both stay as written until a human replaces them. */
-export function WorkKnowledge({ scope, writer }: { scope: ProjectWorkScope; writer: WorkWriter }) {
+export function WorkKnowledge({
+  scope,
+  writer,
+  onOpenTask,
+}: {
+  scope: ProjectWorkScope;
+  writer: WorkWriter;
+  onOpenTask?: (taskId: ProjectWorkTaskId) => void;
+}) {
   return (
-    <div className="grid min-w-0 items-start gap-6 @5xl/work:grid-cols-2">
-      <KnowledgeList scope={scope} writer={writer} />
+    // Capped and split once wide, so a sparse page never stretches across the screen.
+    <div className="mx-auto grid w-full max-w-6xl min-w-0 items-start gap-6 @4xl/work:grid-cols-[minmax(0,1fr)_20rem]">
+      <KnowledgeList scope={scope} writer={writer} onOpenTask={onOpenTask} />
       <DecisionList scope={scope} writer={writer} />
     </div>
+  );
+}
+
+function ListHeader(props: {
+  readonly title: string;
+  readonly count: number | null;
+  readonly description: string;
+  readonly action: ReactNode;
+}) {
+  return (
+    <div className="flex min-w-0 items-start gap-2 px-1">
+      <div className="min-w-0 flex-1">
+        <h2 className="m-0 text-sm font-medium text-foreground">
+          {props.title}
+          {props.count === null ? null : (
+            <span className="ms-1.5 text-xs font-normal tabular-nums text-muted-foreground">
+              {props.count}
+            </span>
+          )}
+        </h2>
+        <WorkMeta>{props.description}</WorkMeta>
+      </div>
+      {props.action}
+    </div>
+  );
+}
+
+function IconAction(props: {
+  readonly label: string;
+  readonly blocked: string | null;
+  readonly variant?: "default" | "ghost";
+  readonly onClick: () => void;
+  readonly children: ReactNode;
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            size="icon-xs"
+            variant={props.variant ?? "default"}
+            aria-label={props.label}
+            disabled={props.blocked !== null}
+            onClick={props.onClick}
+          />
+        }
+      >
+        {props.children}
+      </TooltipTrigger>
+      <TooltipPopup>{props.blocked ?? props.label}</TooltipPopup>
+    </Tooltip>
+  );
+}
+
+function Byline(props: { readonly actor: ProjectWorkActorRead | undefined; readonly at: string }) {
+  const author = actorLabel(props.actor);
+  return (
+    <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+      {author ? (
+        <>
+          <span className="truncate">{author}</span>
+          <span aria-hidden="true">·</span>
+        </>
+      ) : null}
+      <span className="shrink-0 tabular-nums">
+        <RelativeTime timestamp={props.at} />
+      </span>
+    </span>
   );
 }
 
@@ -117,7 +223,15 @@ function TitleBodyForm(props: {
   );
 }
 
-function KnowledgeList({ scope, writer }: { scope: ProjectWorkScope; writer: WorkWriter }) {
+function KnowledgeList({
+  scope,
+  writer,
+  onOpenTask,
+}: {
+  scope: ProjectWorkScope;
+  writer: WorkWriter;
+  onOpenTask: ((taskId: ProjectWorkTaskId) => void) | undefined;
+}) {
   const pager = useWorkPage(
     scope.environmentId,
     { projectId: scope.projectId, operation: "knowledge" },
@@ -192,109 +306,208 @@ function KnowledgeList({ scope, writer }: { scope: ProjectWorkScope; writer: Wor
   };
 
   return (
-    <WorkSection
-      title="Knowledge"
-      description="Facts and conventions people have confirmed for this project. Revising keeps the earlier version as history."
-      actions={
-        editing === null ? (
-          <Button
-            size="xs"
-            disabled={blocked !== null}
-            title={blocked ?? undefined}
-            onClick={() => open("new")}
-          >
-            <PlusIcon /> Add knowledge
-          </Button>
-        ) : null
-      }
-    >
+    <section aria-label="Knowledge" className="flex min-w-0 flex-col gap-2">
+      <ListHeader
+        title="Knowledge"
+        count={view.page === null ? null : items.length}
+        description="Facts and conventions people confirmed for this project. Revising keeps the earlier version."
+        action={
+          editing === null ? (
+            <IconAction label="Add knowledge" blocked={blocked} onClick={() => open("new")}>
+              <BookPlusIcon />
+            </IconAction>
+          ) : null
+        }
+      />
       {view.status !== "ready" ? (
-        <WorkRow>
-          <WorkNotice view={view} subject="knowledge" />
-        </WorkRow>
+        <div className="rounded-xl border border-border/60 bg-card/40">
+          <WorkRow>
+            <WorkNotice view={view} subject="knowledge" />
+          </WorkRow>
+        </div>
       ) : null}
       {history.complete && history.status === "ready" ? null : (
-        <WorkRow>
-          <WorkRecordsNotice set={history} subject="knowledge history" />
-        </WorkRow>
+        <div className="rounded-xl border border-border/60 bg-card/40">
+          <WorkRow>
+            <WorkRecordsNotice set={history} subject="knowledge history" />
+          </WorkRow>
+        </div>
       )}
       {editing !== null ? (
-        <TitleBodyForm
-          key={editing === "new" ? "new" : editing.knowledgeId}
-          titleLabel="Title"
-          bodyLabel="What should be remembered"
-          {...(editing === "new" ? {} : { initialTitle: editing.title, initialBody: editing.body })}
-          submitLabel={editing === "new" ? "Save knowledge" : "Save revision"}
-          pending={writer.pendingKey === key}
-          blocked={editingReason}
-          changed={review.changed}
-          onReview={review.rebase}
-          failure={writer.failureFor(key)}
-          onSubmit={(title, body) => void save(title, body)}
-          onCancel={() => {
-            setEditing(null);
-            review.close();
-          }}
-        />
+        <div className="rounded-xl border border-border/60 bg-card/40">
+          <TitleBodyForm
+            key={editing === "new" ? "new" : editing.knowledgeId}
+            titleLabel="Title"
+            bodyLabel="What should be remembered"
+            {...(editing === "new"
+              ? {}
+              : { initialTitle: editing.title, initialBody: editing.body })}
+            submitLabel={editing === "new" ? "Save knowledge" : "Save revision"}
+            pending={writer.pendingKey === key}
+            blocked={editingReason}
+            changed={review.changed}
+            onReview={review.rebase}
+            failure={writer.failureFor(key)}
+            onSubmit={(title, body) => void save(title, body)}
+            onCancel={() => {
+              setEditing(null);
+              review.close();
+            }}
+          />
+        </div>
       ) : null}
       {view.page !== null && items.length === 0 && editing === null ? (
-        <WorkEmpty
-          title={pager.offset === 0 ? "No knowledge yet" : "No more knowledge"}
-          {...(pager.offset === 0
-            ? { detail: "Record what agents and people should keep in mind here." }
-            : {})}
-        />
-      ) : null}
-      {items.map((entry) => {
-        const replacement = lineage.supersededBy.get(entry.knowledgeId);
-        const predecessor =
-          entry.supersedesKnowledgeId === undefined
-            ? null
-            : (lineage.byId.get(entry.supersedesKnowledgeId) ?? null);
-        const reason = reviseReason(entry);
-        return (
-          <WorkRow key={entry.knowledgeId}>
-            <div className="flex flex-wrap items-center gap-2">
-              <p
-                className={cn(
-                  "min-w-0 flex-1 text-sm font-medium break-words",
-                  replacement && "text-muted-foreground",
-                )}
-              >
-                {entry.title}
-              </p>
-              {history.complete ? (
-                <Badge size="sm" variant={replacement ? "outline" : "success"}>
-                  {replacement ? "Replaced" : "Current"}
-                </Badge>
-              ) : null}
-              {replacement ? null : (
-                <Button
-                  size="xs"
-                  variant="ghost"
-                  disabled={reason !== null || editing !== null}
-                  title={reason ?? undefined}
-                  onClick={() => open(entry)}
-                >
-                  Revise
-                </Button>
-              )}
-            </div>
-            {entry.body ? (
-              <p className="text-sm whitespace-pre-wrap break-words">{entry.body}</p>
-            ) : null}
+        <div className="rounded-xl border border-border/60 bg-card/40">
+          <WorkRow>
             <WorkMeta>
-              {workStateLabel(entry.sourceKind)} · <WorkTime value={entry.updatedAt} />
-              {replacement ? ` · replaced by “${replacement.title}”` : ""}
-              {entry.supersedesKnowledgeId !== undefined
-                ? ` · replaces ${predecessor ? `“${predecessor.title}”` : "an earlier entry"}`
-                : ""}
+              {pager.offset === 0
+                ? "No knowledge yet. Add what agents and people should keep in mind."
+                : "No more knowledge."}
             </WorkMeta>
           </WorkRow>
-        );
-      })}
+        </div>
+      ) : null}
+      {items.length > 0 ? (
+        <div className="grid min-w-0 gap-3 @2xl/work:grid-cols-2 @4xl/work:grid-cols-1 @6xl/work:grid-cols-2">
+          {items.map((entry) => {
+            const replacement = lineage.supersededBy.get(entry.knowledgeId);
+            const predecessor =
+              entry.supersedesKnowledgeId === undefined
+                ? null
+                : (lineage.byId.get(entry.supersedesKnowledgeId) ?? null);
+            return (
+              <KnowledgeCard
+                key={entry.knowledgeId}
+                scope={scope}
+                entry={entry}
+                status={history.complete ? (replacement ? "replaced" : "current") : null}
+                replacementTitle={replacement?.title ?? null}
+                predecessorTitle={
+                  entry.supersedesKnowledgeId === undefined
+                    ? null
+                    : (predecessor?.title ?? "an earlier entry")
+                }
+                reviseBlocked={
+                  editing !== null ? "Finish the open edit first." : reviseReason(entry)
+                }
+                onRevise={replacement ? null : () => open(entry)}
+                onOpenTask={onOpenTask}
+              />
+            );
+          })}
+        </div>
+      ) : null}
       <WorkPager pager={pager} noun="Entries" />
-    </WorkSection>
+    </section>
+  );
+}
+
+function KnowledgeCard(props: {
+  readonly scope: ProjectWorkScope;
+  readonly entry: ProjectWorkKnowledgeRead;
+  readonly status: "current" | "replaced" | null;
+  readonly replacementTitle: string | null;
+  readonly predecessorTitle: string | null;
+  readonly reviseBlocked: string | null;
+  readonly onRevise: (() => void) | null;
+  readonly onOpenTask: ((taskId: ProjectWorkTaskId) => void) | undefined;
+}) {
+  const { entry } = props;
+  const [expanded, setExpanded] = useState(false);
+  const source = SOURCE_PRESENTATION[entry.sourceKind] ?? {
+    label: `From ${workStateLabel(entry.sourceKind).toLowerCase()}`,
+    icon: BotIcon,
+  };
+  const SourceIcon = source.icon;
+  const replaced = props.status === "replaced";
+  // Long entries clamp to an excerpt; the full text is one click away.
+  const long = entry.body.length > 280 || entry.body.split("\n").length > 4;
+  return (
+    <article
+      className={cn(
+        "flex min-w-0 flex-col gap-2.5 rounded-xl border border-border/60 bg-card/40 p-4",
+        replaced && "bg-muted/10",
+      )}
+    >
+      <div className="flex min-w-0 items-start gap-2.5">
+        <span
+          aria-hidden="true"
+          className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground"
+        >
+          <SourceIcon className="size-3.5" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <h3
+            className={cn(
+              "m-0 text-sm leading-5 font-semibold break-words",
+              replaced && "text-muted-foreground",
+            )}
+          >
+            {entry.title}
+          </h3>
+          <WorkMeta>{source.label}</WorkMeta>
+        </div>
+        {props.status === null ? null : (
+          <Badge size="sm" variant={replaced ? "outline" : "success"}>
+            {replaced ? "Replaced" : "Current"}
+          </Badge>
+        )}
+        {props.onRevise === null ? null : (
+          <IconAction
+            label="Revise"
+            variant="ghost"
+            blocked={props.reviseBlocked}
+            onClick={props.onRevise}
+          >
+            <PencilIcon />
+          </IconAction>
+        )}
+      </div>
+      {entry.body ? (
+        <div className="flex min-w-0 flex-col items-start gap-1">
+          <p
+            className={cn(
+              "m-0 text-sm leading-relaxed whitespace-pre-wrap break-words text-foreground/85",
+              long && !expanded && "line-clamp-4",
+            )}
+          >
+            {entry.body}
+          </p>
+          {long ? (
+            <Button size="xs" variant="ghost" onClick={() => setExpanded((open) => !open)}>
+              {expanded ? "Show less" : "Show more"}
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
+      {props.replacementTitle !== null || props.predecessorTitle !== null ? (
+        <div className="flex flex-col gap-1">
+          {props.replacementTitle !== null ? (
+            <WorkMeta className="flex items-center gap-1.5">
+              <HistoryIcon aria-hidden="true" className="size-3 shrink-0" />
+              <span className="min-w-0 break-words">Replaced by “{props.replacementTitle}”</span>
+            </WorkMeta>
+          ) : null}
+          {props.predecessorTitle !== null ? (
+            <WorkMeta className="flex items-center gap-1.5">
+              <HistoryIcon aria-hidden="true" className="size-3 shrink-0" />
+              <span className="min-w-0 break-words">Replaces “{props.predecessorTitle}”</span>
+            </WorkMeta>
+          ) : null}
+        </div>
+      ) : null}
+      {entry.sourceKind === "task" && props.onOpenTask ? (
+        <WorkTaskLink
+          scope={props.scope}
+          taskId={ProjectWorkTaskId.make(entry.sourceId)}
+          prefix="From"
+          onOpen={props.onOpenTask}
+        />
+      ) : null}
+      <div className="mt-auto border-t border-border/50 pt-2.5">
+        <Byline actor={entry.attribution?.actor} at={entry.updatedAt} />
+      </div>
+    </article>
   );
 }
 
@@ -364,143 +577,177 @@ function DecisionList({ scope, writer }: { scope: ProjectWorkScope; writer: Work
   const formKey = `${key}:${target?.decision?.decisionId ?? "new"}`;
 
   return (
-    <WorkSection
-      title="Decisions"
-      description="Proposed choices stay proposed until a person accepts or rejects them."
-      actions={
-        target === null ? (
-          <Button
-            size="xs"
-            disabled={blocked !== null}
-            title={blocked ?? undefined}
-            onClick={() => open("propose", null)}
-          >
-            <PlusIcon /> Propose decision
-          </Button>
-        ) : null
-      }
-    >
-      {view.status !== "ready" ? (
-        <WorkRow>
-          <WorkNotice view={view} subject="decisions" />
-        </WorkRow>
-      ) : null}
-      {target !== null && target.mode !== "reject" ? (
-        <TitleBodyForm
-          key={`${target.mode}:${target.decision?.decisionId ?? "new"}`}
-          titleLabel={target.mode === "supersede" ? "Replacement decision" : "Decision"}
-          bodyLabel="Context and consequences"
-          {...(target.decision
-            ? { initialTitle: target.decision.title, initialBody: target.decision.body }
-            : {})}
-          submitLabel={target.mode === "supersede" ? "Propose replacement" : "Propose decision"}
-          pending={writer.pendingKey === formKey}
-          blocked={blocked}
-          changed={review.changed}
-          onReview={review.rebase}
-          failure={writer.failureFor(formKey)}
-          onSubmit={(title, body) => {
-            if (review.selected)
-              void send(target.mode, target.decision, review.selected, { title, body });
-          }}
-          onCancel={() => {
-            setTarget(null);
-            review.close();
-          }}
-        />
-      ) : null}
-      {view.page !== null && decisions.length === 0 && target === null ? (
-        <WorkEmpty title={pager.offset === 0 ? "No decisions recorded" : "No more decisions"} />
-      ) : null}
-      {decisions.map((decision) => {
-        const rowKey = `${key}:${decision.decisionId}`;
-        const rejecting =
-          target?.mode === "reject" && target.decision?.decisionId === decision.decisionId;
-        return (
-          <WorkRow key={decision.decisionId}>
-            <div className="flex flex-wrap items-center gap-2">
-              <p className="min-w-0 flex-1 text-sm font-medium break-words">{decision.title}</p>
-              <WorkStatus state={decision.state} />
-            </div>
-            {decision.body ? (
-              <p className="text-sm whitespace-pre-wrap break-words">{decision.body}</p>
-            ) : null}
-            {decision.rejectionReason ? (
-              <WorkMeta>Rejected: {decision.rejectionReason}</WorkMeta>
-            ) : null}
+    <section aria-label="Decisions" className="flex min-w-0 flex-col gap-2">
+      <ListHeader
+        title="Decisions"
+        count={view.page === null ? null : decisions.length}
+        description="Proposed choices stay proposed until a person accepts or rejects them."
+        action={
+          target === null ? (
+            <IconAction
+              label="Propose decision"
+              blocked={blocked}
+              onClick={() => open("propose", null)}
+            >
+              <ScaleIcon />
+            </IconAction>
+          ) : null
+        }
+      />
+      <div className="flex min-w-0 flex-col overflow-hidden rounded-xl border border-border/60 bg-card/40">
+        {view.status !== "ready" ? (
+          <WorkRow>
+            <WorkNotice view={view} subject="decisions" />
+          </WorkRow>
+        ) : null}
+        {target !== null && target.mode !== "reject" ? (
+          <TitleBodyForm
+            key={`${target.mode}:${target.decision?.decisionId ?? "new"}`}
+            titleLabel={target.mode === "supersede" ? "Replacement decision" : "Decision"}
+            bodyLabel="Context and consequences"
+            {...(target.decision
+              ? { initialTitle: target.decision.title, initialBody: target.decision.body }
+              : {})}
+            submitLabel={target.mode === "supersede" ? "Propose replacement" : "Propose decision"}
+            pending={writer.pendingKey === formKey}
+            blocked={blocked}
+            changed={review.changed}
+            onReview={review.rebase}
+            failure={writer.failureFor(formKey)}
+            onSubmit={(title, body) => {
+              if (review.selected)
+                void send(target.mode, target.decision, review.selected, { title, body });
+            }}
+            onCancel={() => {
+              setTarget(null);
+              review.close();
+            }}
+          />
+        ) : null}
+        {view.page !== null && decisions.length === 0 && target === null ? (
+          <WorkRow>
             <WorkMeta>
-              <WorkTime value={decision.updatedAt} />
+              {pager.offset === 0 ? "No decisions recorded yet." : "No more decisions."}
             </WorkMeta>
-            {rejecting ? (
-              <div className="flex flex-col gap-2 rounded-lg border border-border/60 bg-muted/30 p-3">
-                {review.changed ? <WorkReviewChanged onReview={review.rebase} /> : null}
-                <WorkField label="Why reject it?">
-                  {(id) => (
-                    <Textarea
-                      id={id}
-                      size="sm"
-                      maxLength={4000}
-                      value={reason}
-                      onChange={(event) => setReason(event.target.value)}
-                    />
-                  )}
-                </WorkField>
-                <div className="flex flex-wrap gap-2">
-                  <Button
-                    size="xs"
-                    variant="outline"
-                    disabled={reason.trim() === "" || review.changed || writer.pendingKey !== null}
-                    onClick={() => {
-                      if (review.selected)
-                        void send("reject", decision, review.selected, { reason: reason.trim() });
-                    }}
+          </WorkRow>
+        ) : null}
+        {decisions.map((decision) => {
+          const rowKey = `${key}:${decision.decisionId}`;
+          const rejecting =
+            target?.mode === "reject" && target.decision?.decisionId === decision.decisionId;
+          return (
+            <div
+              key={decision.decisionId}
+              className="flex min-w-0 flex-col gap-2 border-border/50 px-4 py-3 not-first:border-t"
+            >
+              <div className="flex min-w-0 items-start gap-2.5">
+                <span className="pt-0.5">
+                  <WorkStatusGlyph state={decision.state} />
+                </span>
+                <div className="flex min-w-0 flex-1 flex-col gap-1">
+                  <p
+                    className={cn(
+                      "m-0 text-sm leading-5 font-medium break-words",
+                      (decision.state === "rejected" || decision.state === "superseded") &&
+                        "text-muted-foreground",
+                    )}
                   >
-                    Confirm rejection
-                  </Button>
-                  <Button size="xs" variant="ghost" onClick={() => setTarget(null)}>
-                    Cancel
-                  </Button>
+                    {decision.title}
+                  </p>
+                  <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+                    <span className="shrink-0">{workStateLabel(decision.state)}</span>
+                    <span aria-hidden="true">·</span>
+                    <Byline actor={decision.attribution?.actor} at={decision.updatedAt} />
+                  </span>
                 </div>
               </div>
-            ) : target === null ? (
-              <div className="flex flex-wrap gap-2">
-                {decision.state === "proposed" ? (
-                  <>
-                    <Button
-                      size="xs"
-                      variant="outline"
-                      disabled={blocked !== null || writer.pendingKey !== null || current === null}
-                      onClick={() => current && void send("accept", decision, current)}
-                    >
-                      Accept
-                    </Button>
-                    <Button
-                      size="xs"
-                      variant="ghost"
-                      disabled={blocked !== null}
-                      onClick={() => open("reject", decision)}
-                    >
-                      Reject…
-                    </Button>
-                  </>
+              <div className="flex min-w-0 flex-col gap-2 ps-6.5">
+                {decision.body ? (
+                  <p className="m-0 line-clamp-3 text-xs leading-relaxed whitespace-pre-wrap break-words text-foreground/80">
+                    {decision.body}
+                  </p>
                 ) : null}
-                {decision.state === "accepted" ? (
-                  <Button
-                    size="xs"
-                    variant="ghost"
-                    disabled={blocked !== null}
-                    onClick={() => open("supersede", decision)}
-                  >
-                    Supersede…
-                  </Button>
+                {decision.rejectionReason ? (
+                  <WorkMeta className="break-words">Rejected: {decision.rejectionReason}</WorkMeta>
                 ) : null}
+                {rejecting ? (
+                  <div className="flex flex-col gap-2 rounded-lg border border-border/60 bg-muted/30 p-3">
+                    {review.changed ? <WorkReviewChanged onReview={review.rebase} /> : null}
+                    <WorkField label="Why reject it?">
+                      {(id) => (
+                        <Textarea
+                          id={id}
+                          size="sm"
+                          maxLength={4000}
+                          value={reason}
+                          onChange={(event) => setReason(event.target.value)}
+                        />
+                      )}
+                    </WorkField>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        size="xs"
+                        variant="outline"
+                        disabled={
+                          reason.trim() === "" || review.changed || writer.pendingKey !== null
+                        }
+                        onClick={() => {
+                          if (review.selected)
+                            void send("reject", decision, review.selected, {
+                              reason: reason.trim(),
+                            });
+                        }}
+                      >
+                        Confirm rejection
+                      </Button>
+                      <Button size="xs" variant="ghost" onClick={() => setTarget(null)}>
+                        Cancel
+                      </Button>
+                    </div>
+                  </div>
+                ) : target === null &&
+                  (decision.state === "proposed" || decision.state === "accepted") ? (
+                  <div className="flex flex-wrap gap-2">
+                    {decision.state === "proposed" ? (
+                      <>
+                        <Button
+                          size="xs"
+                          variant="outline"
+                          disabled={
+                            blocked !== null || writer.pendingKey !== null || current === null
+                          }
+                          onClick={() => current && void send("accept", decision, current)}
+                        >
+                          Accept
+                        </Button>
+                        <Button
+                          size="xs"
+                          variant="ghost"
+                          disabled={blocked !== null}
+                          onClick={() => open("reject", decision)}
+                        >
+                          Reject…
+                        </Button>
+                      </>
+                    ) : (
+                      <Button
+                        size="xs"
+                        variant="ghost"
+                        disabled={blocked !== null}
+                        onClick={() => open("supersede", decision)}
+                      >
+                        Supersede…
+                      </Button>
+                    )}
+                  </div>
+                ) : null}
+                <WorkFormStatus message={writer.failureFor(rowKey)} />
               </div>
-            ) : null}
-            <WorkFormStatus message={writer.failureFor(rowKey)} />
-          </WorkRow>
-        );
-      })}
+            </div>
+          );
+        })}
+      </div>
       <WorkPager pager={pager} noun="Decisions" />
-    </WorkSection>
+    </section>
   );
 }

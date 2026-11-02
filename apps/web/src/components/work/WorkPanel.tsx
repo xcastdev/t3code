@@ -65,7 +65,7 @@ export function WorkPanel({
         ) : surface.view === "team" ? (
           <WorkTeam scope={scope} writer={writer} onOpenTask={openTask} />
         ) : surface.view === "knowledge" ? (
-          <WorkKnowledge scope={scope} writer={writer} />
+          <WorkKnowledge scope={scope} writer={writer} onOpenTask={openTask} />
         ) : (
           <WorkIntake scope={scope} writer={writer} />
         )}

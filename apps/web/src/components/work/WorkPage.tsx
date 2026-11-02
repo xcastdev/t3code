@@ -144,7 +144,7 @@ export function WorkPage({
             ) : section === "team" ? (
               <WorkTeam scope={scope} writer={writer} onOpenTask={openTask} />
             ) : section === "knowledge" ? (
-              <WorkKnowledge scope={scope} writer={writer} />
+              <WorkKnowledge scope={scope} writer={writer} onOpenTask={openTask} />
             ) : (
               <WorkIntake scope={scope} writer={writer} />
             )}
