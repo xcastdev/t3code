@@ -1,6 +1,4 @@
 import type { RunWorkSummary } from "./runWorkSummary";
-import { ComposerControl } from "./ComposerControl";
-import { BotIcon } from "lucide-react";
 import { useComposerTypingGuard } from "./useComposerTypingGuard";
 import { insertAttachmentReferencesForDraft } from "./composerAttachmentReferences";
 import { DESKTOP_PASTE_AS_TEXT_EVENT } from "../../lib/desktopPasteAsText";
@@ -513,17 +511,6 @@ export interface ChatComposerProps {
   handleInteractionModeChange: (mode: ProviderInteractionMode) => void;
 
   focusComposer: () => void;
-  /**
-   * Set in an agent's home chat. Its model and modes belong to the agent's
-   * revisioned configuration, so the stock selectors give way to a link there
-   * and sends carry the thread's settings instead of local draft choices.
-   */
-  agentConfiguration?: {
-    readonly name: string;
-    readonly onOpen: () => void;
-    readonly modelSelection: ModelSelection;
-    readonly interactionMode: ProviderInteractionMode;
-  } | null;
   scheduleComposerFocus: () => void;
   setThreadError: (threadId: ThreadId | null, error: string | null) => void;
   onExpandImage: (preview: ExpandedImagePreview) => void;
@@ -625,7 +612,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     handleRuntimeModeChange,
     handleInteractionModeChange,
     focusComposer,
-    agentConfiguration,
     scheduleComposerFocus,
     setThreadError,
     onExpandImage,
@@ -923,9 +909,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     threadModelSelection: activeThreadModelSelection,
     projectModelSelection: activeProjectDefaultModelSelection,
     promptInjectionState: getComposerPromptInjectionState(prompt),
-    ignoreDraftModel: agentConfiguration != null,
     candidateInstanceIds: [
-      agentConfiguration ? null : (composerDraft.activeProvider ?? null),
+      composerDraft.activeProvider ?? null,
       activeThread?.runtime?.providerInstanceId,
       activeThreadModelSelection?.instanceId,
       activeProjectDefaultModelSelection?.instanceId,
@@ -1000,12 +985,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     planModeEnabled: settings.planModeEnabled,
     provider: selectedProviderStatus,
     interactionMode: requestedInteractionMode,
-    agentInteractionMode: agentConfiguration?.interactionMode ?? null,
   });
-  // An agent's home sends its thread's exact selection; the server rejects any other.
-  const selectedModelSelection: ModelSelection =
-    agentConfiguration?.modelSelection ??
-    createModelSelection(selectedInstanceId, selectedModel, selectedModelOptionsForDispatch);
+  const selectedModelSelection: ModelSelection = createModelSelection(
+    selectedInstanceId,
+    selectedModel,
+    selectedModelOptionsForDispatch,
+  );
   const selectedModelForPicker = selectedModel;
   const modelOptionsByInstance = new Map<ProviderInstanceId, ReadonlyArray<AppModelOption>>();
   for (const entry of providerInstanceEntries) {
@@ -2603,17 +2588,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     : composerControlsCollapsed
       ? 0
       : expandedControlsIconOnlyBlockCount;
-  const composerControls = agentConfiguration ? (
-    <ComposerControl
-      type="button"
-      onClick={agentConfiguration.onOpen}
-      data-chat-agent-configuration="true"
-      className="shrink-0"
-    >
-      <BotIcon className="size-4" />
-      {`Configure ${agentConfiguration.name}`}
-    </ComposerControl>
-  ) : (
+  const composerControls = (
     <ComposerControlsBar
       environmentId={environmentId}
       routeKind={routeKind}

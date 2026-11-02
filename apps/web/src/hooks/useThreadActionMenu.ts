@@ -9,10 +9,13 @@ import {
 } from "@t3tools/client-runtime/state/runtime";
 import { canSnooze, effectiveSnoozed } from "@t3tools/client-runtime/state/thread-settled";
 import {
+  type AssistantId,
   AuthOrchestrationOperateScope,
+  type EnvironmentId,
   type ScopedThreadRef,
   type ThreadId,
 } from "@t3tools/contracts";
+import { isAssistantHomeThread } from "@t3tools/client-runtime/state/assistants";
 import { useRouter } from "@tanstack/react-router";
 
 import { pickSnoozePreset, resolveSnoozePresets } from "../components/Sidebar.snooze";
@@ -31,6 +34,7 @@ import { readEnvironmentScope } from "../state/session";
 import {
   readEnvironmentServerConfigLoaded,
   readEnvironmentSupportsAutoSettleOptOut,
+  readProject,
   readThreadShell,
   useProjects,
 } from "../state/entities";
@@ -43,10 +47,25 @@ import {
 } from "@t3tools/client-runtime/state/project-grouping";
 import { buildPhysicalToLogicalProjectKeyMap } from "../sidebarProjectGrouping";
 import { threadRuntimeCanArchive } from "@t3tools/client-runtime/state/models";
+import { useCreateAgentChat } from "../components/assistants/useCreateAgentChat";
 import { useCopyToClipboard } from "./useCopyToClipboard";
 import { useNewThreadHandler } from "./useHandleNewThread";
 import { useClientSettings } from "./useSettings";
 import { canTurnThreadIntoProject, useThreadActions } from "./useThreadActions";
+
+interface AgentMenuOwner {
+  readonly environmentId: EnvironmentId;
+  readonly assistantId: AssistantId;
+  readonly canonicalThreadId: ThreadId;
+  readonly name: string;
+}
+
+const AGENT_MENU_SECTIONS = {
+  "agent-configure": "configuration",
+  "agent-overview": "overview",
+  "agent-memory": "memory",
+  "agent-routines": "routines",
+} as const;
 
 function failureToast(title: string, error: unknown) {
   toastManager.add(
@@ -64,9 +83,12 @@ export function useThreadActionMenu(input: {
   readonly onStartRename: () => void;
   readonly onFind?: ((threadRef: ScopedThreadRef) => void) | undefined;
   readonly canShareWithGuest: boolean;
+  /** The agent that owns this thread; its options lead the menu. */
+  readonly agent?: AgentMenuOwner | null | undefined;
 }) {
-  const { threadRef, projectCwd, onStartRename, onFind, canShareWithGuest } = input;
+  const { threadRef, projectCwd, onStartRename, onFind, canShareWithGuest, agent } = input;
   const router = useRouter();
+  const createAgentChat = useCreateAgentChat(() => {});
   const projects = useProjects();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const projectGroupingSettings = useClientSettings(selectProjectGroupingSettings);
@@ -132,6 +154,10 @@ export function useThreadActionMenu(input: {
         titleRegeneration: configLoaded,
       };
       const isRegeneratingTitle = thread.titleRegeneration != null;
+      const isAgentHome = isAssistantHomeThread(
+        thread,
+        readProject(scopeProjectRef(threadRef.environmentId, thread.projectId)),
+      );
       const snoozePresets = resolveSnoozePresets(now, timestampFormat, threadRef.environmentId);
       const items = buildThreadActionMenuItems({
         canOperate: readEnvironmentScope(threadRef.environmentId, AuthOrchestrationOperateScope),
@@ -149,6 +175,8 @@ export function useThreadActionMenu(input: {
         snoozePresets,
         canShareWithGuest,
         canTurnIntoProject: canTurnThreadIntoProject(threadRef),
+        agent: agent ?? null,
+        isAgentHome,
       });
       const clicked = await settlePromise(() => api.contextMenu.show(items, position));
       if (clicked._tag === "Failure" || clicked.value === null) return;
@@ -190,6 +218,20 @@ export function useThreadActionMenu(input: {
         }
       };
       switch (action) {
+        case "agent-configure":
+        case "agent-overview":
+        case "agent-memory":
+        case "agent-routines":
+          if (!agent) return;
+          void router.navigate({
+            to: "/agents/$environmentId/$assistantId",
+            params: { environmentId: agent.environmentId, assistantId: agent.assistantId },
+            search: { section: AGENT_MENU_SECTIONS[action] },
+          });
+          return;
+        case "agent-new-chat":
+          if (agent) await createAgentChat(agent);
+          return;
         case "find":
           onFind?.(threadRef);
           return;

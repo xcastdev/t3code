@@ -21,7 +21,6 @@ import type { useTimelineFollow } from "./useTimelineFollow";
 import type { useUsageLimitsPanel } from "./useUsageLimitsPanel";
 
 interface ComposerResumeInput {
-  readonly confirmComposerSettings: () => boolean;
   readonly environmentId: EnvironmentId;
   readonly routeThreadKey: string;
   readonly currentRouteThreadKeyRef: { readonly current: string | null };
@@ -98,7 +97,6 @@ export function useComposerResume(input: ComposerResumeInput) {
     ) {
       return;
     }
-    if (resumableRunId !== null && !input.confirmComposerSettings()) return;
     const threadId = activeThread.id;
     sendInFlightRef.current = true;
     setResumingThreadKeys((current) => new Set(current).add(routeThreadKey));

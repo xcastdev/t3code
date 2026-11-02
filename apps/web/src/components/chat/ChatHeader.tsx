@@ -11,7 +11,6 @@ import {
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import { BotIcon, ChevronDownIcon } from "lucide-react";
-import { Link } from "@tanstack/react-router";
 import {
   memo,
   useEffect,
@@ -27,6 +26,8 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
 import { useThreadActionMenu } from "~/hooks/useThreadActionMenu";
 import { readLocalApi } from "~/localApi";
+import { isAssistantHomeThread } from "@t3tools/client-runtime/state/assistants";
+import { readThreadShell } from "../../state/entities";
 import { threadEnvironment } from "../../state/threads";
 import { canShareWithGuestAtom } from "./guestShareAvailability";
 import { useAtomValue } from "@effect/atom-react";
@@ -171,10 +172,16 @@ export const ChatHeader = memo(function ChatHeader({
     isRenamingTitle,
   ]);
   const renameCommittedRef = useRef(false);
+  // Home keeps the agent's name, so the header reads "<Agent> / Home" and offers no rename.
+  const isAgentHome = assistantHome?.kind === "canonical";
+  const displayTitle = isAgentHome ? "Home" : activeThreadTitle;
   const startRename = () => {
+    const shell = readThreadShell(activeThreadRef);
     if (
       !isServerThread ||
-      !readEnvironmentScope(activeThreadEnvironmentId, AuthOrchestrationOperateScope)
+      !readEnvironmentScope(activeThreadEnvironmentId, AuthOrchestrationOperateScope) ||
+      isAgentHome ||
+      (shell !== null && isAssistantHomeThread(shell, activeProject))
     )
       return;
     renameCommittedRef.current = false;
@@ -216,6 +223,7 @@ export const ChatHeader = memo(function ChatHeader({
     onStartRename: startRename,
     onFind: onFindInThread,
     canShareWithGuest,
+    agent: assistantHome,
   });
   const titleButtonRef = useRef<HTMLButtonElement | null>(null);
   const titleMenuTimerRef = useRef<number | null>(null);
@@ -234,11 +242,13 @@ export const ChatHeader = memo(function ChatHeader({
     // oxlint-disable-next-line react/exhaustive-effect-dependencies -- A pending title menu belongs to the thread that was clicked, so switching threads drops it.
     [activeThreadEnvironmentId, activeThreadId],
   );
-  const openTitleMenuNow = () => {
+  const openMenuBelow = (target: HTMLElement) => {
     cancelPendingTitleMenu();
-    const rect = titleButtonRef.current?.getBoundingClientRect();
-    if (!rect) return;
+    const rect = target.getBoundingClientRect();
     openMenu({ x: rect.left, y: rect.bottom + 4 });
+  };
+  const openTitleMenuNow = () => {
+    if (titleButtonRef.current) openMenuBelow(titleButtonRef.current);
   };
   const openMenuFromTitle = (event: ReactMouseEvent<HTMLButtonElement>) => {
     if (isTrailingDoubleClick(event.detail)) return;
@@ -307,27 +317,20 @@ export const ChatHeader = memo(function ChatHeader({
       >
         {assistantHome ? (
           <>
-            {/* An agent's home chat belongs to the agent, not to its backing workspace. */}
+            {/* An agent's threads belong to the agent, not to its backing workspace. */}
             <WorkspaceBreadcrumbItem className="shrink">
-              <Link
-                to="/agents/$environmentId/$assistantId"
-                params={{
-                  environmentId: assistantHome.environmentId,
-                  assistantId: assistantHome.assistantId,
-                }}
-                search={{ section: "overview" }}
-                aria-label={
-                  assistantHome.kind === "canonical"
-                    ? `Open agent ${assistantHome.name}`
-                    : `Part of agent ${assistantHome.name}'s work. Open the agent`
-                }
-                className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+              <button
+                type="button"
+                aria-haspopup="menu"
+                aria-label={`Options for agent ${assistantHome.name}`}
+                onClick={(event) => openMenuBelow(event.currentTarget)}
+                className="inline-flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 rounded-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
               >
                 <BotIcon className="size-3.5 shrink-0" />
                 <WorkspaceBreadcrumbText className="max-w-40">
                   {assistantHome.name}
                 </WorkspaceBreadcrumbText>
-              </Link>
+              </button>
             </WorkspaceBreadcrumbItem>
             <WorkspaceBreadcrumbSeparator>
               <WorkspaceBreadcrumbText>/</WorkspaceBreadcrumbText>
@@ -423,17 +426,19 @@ export const ChatHeader = memo(function ChatHeader({
                   <button
                     ref={titleButtonRef}
                     type="button"
-                    aria-label={`Thread actions for ${activeThreadTitle}`}
+                    aria-label={`Thread actions for ${displayTitle}`}
                     aria-haspopup="menu"
                     onClick={openMenuFromTitle}
-                    onDoubleClick={canOperateThread ? handleTitleDoubleClick : undefined}
+                    onDoubleClick={
+                      canOperateThread && !isAgentHome ? handleTitleDoubleClick : undefined
+                    }
                     onBlur={cancelPendingTitleMenu}
                     className="group/thread-title inline-flex min-w-0 max-w-full cursor-pointer items-center gap-1 rounded-sm text-left focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                   />
                 }
               >
-                <h2 className="min-w-0" dir={textDirection(activeThreadTitle)}>
-                  <WorkspaceBreadcrumbText>{activeThreadTitle}</WorkspaceBreadcrumbText>
+                <h2 className="min-w-0" dir={textDirection(displayTitle)}>
+                  <WorkspaceBreadcrumbText>{displayTitle}</WorkspaceBreadcrumbText>
                 </h2>
                 <ChevronDownIcon
                   aria-hidden
@@ -441,7 +446,7 @@ export const ChatHeader = memo(function ChatHeader({
                   className="size-3.5 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover/thread-title:opacity-100 group-focus-visible/thread-title:opacity-100"
                 />
               </TooltipTrigger>
-              <TooltipPopup side="top">{activeThreadTitle}</TooltipPopup>
+              <TooltipPopup side="top">{displayTitle}</TooltipPopup>
             </Tooltip>
           ) : (
             <Tooltip>

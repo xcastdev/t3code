@@ -5,10 +5,21 @@ open its **Home**, the long-lived conversation that always returns to the same o
 beside it to show or hide its chats without leaving the current one. Start a
 separate chat for a topic you want to keep apart, with **New chat** under the assistant, in the
 sidebar header, or with **New chat with agent…** in the command palette; outside an assistant's
-conversation, it asks which assistant. A chat starts with a clean conversation but works as the same assistant, with its
-project, settings and memory. Use the filter in the sidebar header to show only some assistants, or
-only one environment's. Use **Stop** in a conversation to stop its active work.
-From the assistant's Home, open its agent page to change its setup.
+conversation, it asks which assistant. A chat starts with a clean conversation and the assistant's
+default model and modes, but works as the same assistant, with its project and memory. Use the
+filter in the sidebar header to show only some assistants, or only one environment's. Use **Stop**
+in a conversation to stop its active work.
+
+Home always carries the assistant's name and stays open: it cannot be renamed, settled or archived.
+Chats can. Select the assistant's name in the conversation header for **Configure**, its overview,
+**Memory**, **Routines** and **New chat**.
+
+The composer's model, effort, speed, permissions and plan mode change only the conversation you are
+in, on the assistant's provider. To change the defaults, use **Configure**; conversations still on
+the old defaults follow, and ones you changed keep their choice.
+
+Pin Home to keep the assistant at the top of the Agents list, or pin a chat to keep it at the top of
+the assistant's chats.
 
 Create one with **New agent** in the Agents sidebar header: give it a face or initials and a name,
 then choose its model in the same picker as the composer, with its effort, speed and permissions.

@@ -34,7 +34,6 @@ export function useComposerProviderModel(
     readonly threadRef: ScopedThreadRef | DraftId;
     readonly threadModelSelection: ModelSelection | null | undefined;
     readonly projectModelSelection: ModelSelection | null | undefined;
-    readonly ignoreDraftModel: boolean;
     readonly promptInjectionState: ReturnType<typeof getComposerPromptInjectionState>;
   },
 ) {
@@ -50,8 +49,7 @@ export function useComposerProviderModel(
     lockedProvider,
     lockedInstanceId,
   } = input;
-  const storedDraftModelState = useComposerDraftModelState(threadRef);
-  const draftModelState = input.ignoreDraftModel ? null : storedDraftModelState;
+  const draftModelState = useComposerDraftModelState(threadRef);
   const providerInstanceEntries: ReadonlyArray<ProviderInstanceEntry> = providerInstanceEntriesFor(
     providerStatuses,
     settings,

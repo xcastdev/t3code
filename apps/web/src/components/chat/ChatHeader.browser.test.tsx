@@ -1,8 +1,21 @@
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { AssistantId, EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { expect, it, vi } from "vite-plus/test";
 import { userEvent } from "vite-plus/test/browser";
 
-const persisted = vi.hoisted(() => ({ title: "" }));
+const persisted = vi.hoisted(() => ({
+  title: "",
+  owner: null as null | {
+    kind: "canonical" | "child";
+    environmentId: EnvironmentId;
+    assistantId: AssistantId;
+    canonicalThreadId: ThreadId;
+    name: string;
+  },
+}));
+vi.mock(import("../assistants/useAssistantHome"), async (importOriginal) => ({
+  ...(await importOriginal()),
+  useAssistantThreadOwner: () => persisted.owner,
+}));
 vi.mock(import("../../state/session"), async (importOriginal) => ({
   ...(await importOriginal()),
   useEnvironmentScope: () => true,
@@ -47,6 +60,7 @@ it.each(["blur", "Enter"] as const)(
   "preserves a concurrent title update when an untouched rename ends with %s",
   async (finish) => {
     persisted.title = "New thread";
+    persisted.owner = null;
     await using screen = await render(header(persisted.title));
     await screen.getByRole("button", { name: "Thread actions for New thread" }).dblClick();
     const input = screen.getByRole("textbox", { name: "Thread title" });
@@ -72,3 +86,23 @@ it.each(["blur", "Enter"] as const)(
     expect(persisted.title).toBe("My edited title");
   },
 );
+
+it("titles an agent's Home as Home under the agent and offers no rename there", async () => {
+  persisted.title = "Scholar";
+  persisted.owner = {
+    kind: "canonical",
+    environmentId: EnvironmentId.make("environment"),
+    assistantId: AssistantId.make("scholar"),
+    canonicalThreadId: ThreadId.make("thread"),
+    name: "Scholar",
+  };
+  await using screen = await render(header(persisted.title));
+  await expect
+    .element(screen.getByRole("button", { name: "Options for agent Scholar" }))
+    .toBeVisible();
+  await screen.getByRole("button", { name: "Thread actions for Home" }).dblClick();
+  await expect
+    .element(screen.getByRole("textbox", { name: "Thread title" }))
+    .not.toBeInTheDocument();
+  expect(persisted.title).toBe("Scholar");
+});

@@ -203,6 +203,17 @@ export function assistantSelectionIsCurrent(
   );
 }
 
+/**
+ * An agent's Home is the root thread of its backing project; its chats and delegated work have
+ * parents. Home keeps the agent's name and stays open, so it is never renamed, settled or archived.
+ */
+export function isAssistantHomeThread(
+  thread: { readonly lineage: { readonly parentThreadId: string | null } },
+  project: { readonly assistantId?: string | undefined } | null | undefined,
+): boolean {
+  return project?.assistantId !== undefined && thread.lineage.parentThreadId === null;
+}
+
 export function assistantHomeTarget(binding: AssistantHomeBinding) {
   return {
     environmentId: binding.environmentId,

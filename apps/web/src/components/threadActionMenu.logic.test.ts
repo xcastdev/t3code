@@ -74,4 +74,32 @@ describe("buildThreadActionMenuItems", () => {
     expect(items.find((item) => item.id === "archive")?.disabled).toBe(true);
     expect(items.find((item) => item.id === "turn-into-project")?.disabled).toBe(true);
   });
+
+  it("leads with the agent's options and keeps Home's name and place", () => {
+    const agent = { name: "Scholar" };
+    const ids = (state: Partial<ThreadActionMenuState>) =>
+      buildThreadActionMenuItems({ ...baseState, agent, ...state }).map((item) => item.id);
+    const home = ids({ isAgentHome: true });
+    expect(home.slice(0, 5)).toEqual([
+      "agent-configure",
+      "agent-overview",
+      "agent-memory",
+      "agent-routines",
+      "agent-new-chat",
+    ]);
+    expect(home).toContain("pin");
+    for (const hidden of [
+      "rename",
+      "regenerate-title",
+      "settle",
+      "auto-settle",
+      "archive",
+      "delete",
+    ] as const)
+      expect(home).not.toContain(hidden);
+    expect(ids({ isAgentHome: true, isSettled: true })).toContain("unsettle");
+    expect(ids({})).toEqual(
+      expect.arrayContaining(["agent-configure", "rename", "settle", "archive"]),
+    );
+  });
 });

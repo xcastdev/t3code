@@ -916,7 +916,12 @@ function OpenCommandPaletteDialog(props: {
         title: agent.name,
         ...(environments.length > 1 ? { description: environmentLabel } : {}),
         icon: <AgentAvatar agent={agent} size="icon" />,
-        run: () => createAgentChat(agent),
+        run: () =>
+          createAgentChat({
+            environmentId: agent.environmentId,
+            assistantId: agent.assistantId,
+            canonicalThreadId: agent.binding.canonicalThreadId,
+          }),
       };
     });
 

@@ -26,10 +26,6 @@ import {
   makeModelDisabledReason,
 } from "../ChatView.logic";
 interface ComposerSelectionInput {
-  readonly agentConfigured: boolean;
-  readonly onAgentConfigured: () => void;
-  readonly ownerSettingsPending: boolean;
-  readonly onOwnerSettingsPending: () => void;
   readonly environmentId: EnvironmentId;
   readonly composerDraftTarget: ComposerThreadTarget;
   readonly draftThread: DraftSessionState | null;
@@ -95,8 +91,6 @@ export function useComposerSelection(input: ComposerSelectionInput) {
   const setDraftThreadContext = useComposerDraftStore((store) => store.setDraftThreadContext);
 
   const handleRuntimeModeChange = (mode: RuntimeMode) => {
-    if (input.agentConfigured) return input.onAgentConfigured();
-    if (input.ownerSettingsPending) return input.onOwnerSettingsPending();
     if (mode === runtimeMode) return;
     setComposerDraftRuntimeMode(composerDraftTarget, mode);
     if (isLocalDraftThread) {
@@ -107,8 +101,6 @@ export function useComposerSelection(input: ComposerSelectionInput) {
   const handleRuntimeModeChangeStable = useStableCallback(handleRuntimeModeChange);
 
   const handleInteractionModeChange = (mode: ProviderInteractionMode) => {
-    if (input.agentConfigured) return input.onAgentConfigured();
-    if (input.ownerSettingsPending) return input.onOwnerSettingsPending();
     if (mode === "plan" && !interactionModeEnabled) return;
     if (mode === interactionMode) return;
     setComposerDraftInteractionMode(composerDraftTarget, mode);
@@ -152,8 +144,6 @@ export function useComposerSelection(input: ComposerSelectionInput) {
     model: string,
     options?: { focusComposer?: boolean },
   ) => {
-    if (input.agentConfigured) return input.onAgentConfigured();
-    if (input.ownerSettingsPending) return input.onOwnerSettingsPending();
     if (!activeThread) return;
     const entry = providerStatuses.find((snapshot) => snapshot.instanceId === instanceId);
     const resolvedDriverKind = entry?.driver ?? null;

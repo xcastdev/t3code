@@ -4,7 +4,6 @@ import { DEFAULT_UNIFIED_SETTINGS } from "@t3tools/contracts/settings";
 import { expect, it, onTestFinished, vi } from "vite-plus/test";
 import { DraftId, useComposerDraftStore } from "../../composerDraftStore";
 import { makeThreadFixture } from "../../test-fixtures";
-import { resolveComposerSettingsSource } from "../ChatView.logic";
 import { useComposerSelection } from "./useComposerSelection";
 
 // Exercise the event handlers and real draft store without mounting a client.
@@ -28,10 +27,7 @@ vi.mock(import("../../composerDraftStore"), async (original) => {
 });
 vi.mock("../ui/toast", () => ({ toastManager: { add: vi.fn() } }));
 
-function setup(
-  owner: "unknown" | "offline" | "ordinary" | "child" | "canonical" | null,
-  ownerSettingsPending = owner === "unknown" || owner === "offline",
-) {
+function setup(thread: "server" | "local-draft") {
   const previousState = useComposerDraftStore.getState();
   onTestFinished(() => {
     useComposerDraftStore.setState(previousState, true);
@@ -45,7 +41,7 @@ function setup(
   });
   const activeThread = makeThreadFixture();
   const composerDraftTarget = scopeThreadRef(activeThread.environmentId, activeThread.id);
-  if (owner === null) {
+  if (thread === "local-draft") {
     useComposerDraftStore
       .getState()
       .setProjectDraftThreadId(
@@ -68,20 +64,7 @@ function setup(
     slashCommands: [],
     skills: [],
   };
-  const onOwnerSettingsPending = vi.fn();
-  const onAgentConfigured = vi.fn();
-  const confirmComposerSettings = () =>
-    resolveComposerSettingsSource({
-      owner,
-      draft: { modelSelection: null, runtimeMode: null, interactionMode: null },
-      thread: owner === null ? null : activeThread,
-    }) !== "wait";
   const input = {
-    agentConfigured: owner === "canonical",
-    onAgentConfigured,
-    ownerSettingsPending,
-    onOwnerSettingsPending,
-    confirmComposerSettings,
     environmentId: activeThread.environmentId,
     composerDraftTarget,
     draftThread: null,
@@ -96,7 +79,7 @@ function setup(
     runtimeMode: activeThread.runtimeMode,
     interactionMode: activeThread.interactionMode,
     interactionModeEnabled: true,
-    isLocalDraftThread: owner === null,
+    isLocalDraftThread: thread === "local-draft",
     canOverrideServerThreadEnvMode: false,
     setPendingServerThreadEnvModeEntry: vi.fn(),
     setPendingServerThreadStartFromOriginByThreadId: vi.fn(),
@@ -123,24 +106,10 @@ function changeSettings(context: ReturnType<typeof setup>, edit: (typeof edits)[
   }
 }
 
-it.each(["unknown", "offline"] as const)(
-  "blocks all settings edits for a clean draft while ownership is %s",
-  (owner) => {
-    const context = setup(owner);
-    expect(context.confirmComposerSettings()).toBe(true);
-    const before = useComposerDraftStore.getState();
-    for (const edit of edits) changeSettings(context, edit);
-    expect(useComposerDraftStore.getState()).toBe(before);
-    expect(context.onOwnerSettingsPending).toHaveBeenCalledTimes(4);
-    expect(context.onAgentConfigured).not.toHaveBeenCalled();
-    expect(context.scheduleComposerFocus).not.toHaveBeenCalled();
-  },
-);
-
-it.each(["ordinary", "child", null] as const)(
-  "allows draft and sticky settings edits for ownership %s",
-  (owner) => {
-    const context = setup(owner);
+it.each(["server", "local-draft"] as const)(
+  "records draft and sticky settings edits for a %s thread",
+  (thread) => {
+    const context = setup(thread);
     for (const edit of edits) changeSettings(context, edit);
     const state = useComposerDraftStore.getState();
     expect(state.getComposerDraft(context.composerDraftTarget)).toMatchObject({
@@ -154,22 +123,11 @@ it.each(["ordinary", "child", null] as const)(
       instanceId: context.instanceId,
       model: "gpt-5.5",
     });
-    if (owner === null) {
+    if (thread === "local-draft") {
       expect(state.getDraftThread(context.composerDraftTarget)).toMatchObject({
         runtimeMode: "approval-required",
         interactionMode: "plan",
       });
     }
-    expect(context.onOwnerSettingsPending).not.toHaveBeenCalled();
-    expect(context.onAgentConfigured).not.toHaveBeenCalled();
   },
 );
-
-it("directs canonical settings edits to agent configuration before the pending-owner guard", () => {
-  const context = setup("canonical", true);
-  const before = useComposerDraftStore.getState();
-  for (const edit of edits) changeSettings(context, edit);
-  expect(useComposerDraftStore.getState()).toBe(before);
-  expect(context.onAgentConfigured).toHaveBeenCalledTimes(4);
-  expect(context.onOwnerSettingsPending).not.toHaveBeenCalled();
-});

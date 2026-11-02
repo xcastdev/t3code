@@ -36,6 +36,7 @@ import {
   isThreadWorking,
 } from "@t3tools/client-runtime/state/thread-inbox";
 import { sortSettledThreads } from "@t3tools/client-runtime/state/thread-sort";
+import { isAssistantHomeThread } from "@t3tools/client-runtime/state/assistants";
 import {
   nextShownOrder,
   threadSearchMatchKey,
@@ -1541,6 +1542,12 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
 
   const startThreadRename = (threadRef: ScopedThreadRef, title: string) => {
     if (!readEnvironmentScope(threadRef.environmentId, AuthOrchestrationOperateScope)) return;
+    const thread = threadByKeyRef.current.get(scopedThreadKey(threadRef));
+    if (
+      thread &&
+      isAssistantHomeThread(thread, projectByKey.get(`${thread.environmentId}:${thread.projectId}`))
+    )
+      return;
     setRenamingThreadRef(threadRef);
     setRenamingTitle(title);
   };
@@ -2297,7 +2304,15 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
         const thread = threadByKeyRef.current.get(threadKey);
         return thread ? [thread] : [];
       });
-      const settlingThreads = selectedThreads.filter(
+      // An agent's Home keeps its name and stays open.
+      const changeableThreads = selectedThreads.filter(
+        (thread) =>
+          !isAssistantHomeThread(
+            thread,
+            projectByKey.get(`${thread.environmentId}:${thread.projectId}`),
+          ),
+      );
+      const settlingThreads = changeableThreads.filter(
         (thread) => thread.settledOverride !== "settled",
       );
       const canSnoozeSelection = selectedThreads.every(
@@ -2305,7 +2320,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
           serverConfigs.has(thread.environmentId) &&
           canSnooze(thread, { now: selectionNow.toISOString() }),
       );
-      const titleRegenerationThreads = selectedThreads.filter((thread) =>
+      const titleRegenerationThreads = changeableThreads.filter((thread) =>
         serverConfigs.has(thread.environmentId),
       );
       const regeneratableTitleThreads = titleRegenerationThreads.filter(
@@ -2656,6 +2671,10 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                 canShareWithGuestAtom(threadRef.environmentId),
               ),
               canTurnIntoProject: canTurnThreadIntoProject(threadRef),
+              isAgentHome: isAssistantHomeThread(
+                thread,
+                projectByKey.get(`${thread.environmentId}:${thread.projectId}`),
+              ),
               supports: {
                 settlement: configLoaded,
                 autoSettleOptOut: supportsAutoSettleOptOut,

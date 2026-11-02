@@ -1,5 +1,6 @@
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 import type { AssistantSummary, EnvironmentId } from "@t3tools/contracts";
+import { sortPinnedThreadsByOrderKey } from "@t3tools/client-runtime/state/thread-sort";
 import * as Schema from "effect/Schema";
 
 export const AgentSidebarFilter = Schema.Struct({
@@ -43,10 +44,19 @@ export function toggleAgentFilterValue(
   };
 }
 
-/** An agent's chats: fresh conversations branched from its home, newest first. */
+/** An agent's chats: fresh conversations branched from its home, pinned first, then newest. */
 type ChatShell = Pick<
   EnvironmentThreadShell,
-  "environmentId" | "projectId" | "lineage" | "archivedAt" | "deletedAt" | "updatedAt"
+  | "id"
+  | "environmentId"
+  | "projectId"
+  | "lineage"
+  | "archivedAt"
+  | "deletedAt"
+  | "createdAt"
+  | "updatedAt"
+  | "pinnedAt"
+  | "pinOrderKey"
 >;
 
 export function agentChats<T extends ChatShell>(
@@ -54,17 +64,56 @@ export function agentChats<T extends ChatShell>(
   agent: Pick<AssistantSummary, "environmentId" | "binding">,
 ): ReadonlyArray<T> {
   const { backingProjectId, canonicalThreadId } = agent.binding;
-  return threads
-    .filter(
+  const chats = threads.filter(
+    (thread) =>
+      thread.environmentId === agent.environmentId &&
+      thread.projectId === backingProjectId &&
+      thread.lineage.relationshipToParent === "chat" &&
+      thread.lineage.rootThreadId === canonicalThreadId &&
+      thread.archivedAt === null &&
+      thread.deletedAt === null,
+  );
+  return [
+    ...sortPinnedThreadsByOrderKey(chats.filter((chat) => chat.pinnedAt != null)),
+    ...chats
+      .filter((chat) => chat.pinnedAt == null)
+      .toSorted((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
+  ];
+}
+
+/** An agent's Home shell, which carries the agent's pin. */
+export function agentHomeThread<T extends Pick<EnvironmentThreadShell, "id" | "environmentId">>(
+  threads: ReadonlyArray<T>,
+  agent: Pick<AssistantSummary, "environmentId" | "binding">,
+): T | null {
+  return (
+    threads.find(
       (thread) =>
         thread.environmentId === agent.environmentId &&
-        thread.projectId === backingProjectId &&
-        thread.lineage.relationshipToParent === "chat" &&
-        thread.lineage.rootThreadId === canonicalThreadId &&
-        thread.archivedAt === null &&
-        thread.deletedAt === null,
-    )
-    .toSorted((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+        thread.id === agent.binding.canonicalThreadId,
+    ) ?? null
+  );
+}
+
+/** Agents with a pinned Home lead in pin order; the rest keep their roster order. */
+export function agentsPinnedFirst<
+  A extends Pick<AssistantSummary, "environmentId" | "binding">,
+  T extends Pick<
+    EnvironmentThreadShell,
+    "id" | "environmentId" | "createdAt" | "pinnedAt" | "pinOrderKey"
+  >,
+>(agents: ReadonlyArray<A>, threads: ReadonlyArray<T>): ReadonlyArray<A> {
+  const homes = new Map(agents.map((agent) => [agent, agentHomeThread(threads, agent)]));
+  const pinnedHomes = sortPinnedThreadsByOrderKey(
+    agents.flatMap((agent) => {
+      const home = homes.get(agent);
+      return home?.pinnedAt != null ? [{ ...home, agent }] : [];
+    }),
+  );
+  return [
+    ...pinnedHomes.map((home) => home.agent),
+    ...agents.filter((agent) => homes.get(agent)?.pinnedAt == null),
+  ];
 }
 
 /** The agent a thread belongs to: its home, or any chat in the agent's project. */

@@ -2,6 +2,11 @@ import type { ContextMenuItem } from "@t3tools/contracts";
 import type { SnoozePreset } from "@t3tools/client-runtime/state/thread-settled";
 
 export type ThreadActionMenuId =
+  | "agent-configure"
+  | "agent-overview"
+  | "agent-memory"
+  | "agent-routines"
+  | "agent-new-chat"
   | "find"
   | "new-thread-on-branch"
   | "filter-by-project"
@@ -97,11 +102,19 @@ export interface ThreadActionMenuState {
   readonly canShareWithGuest?: boolean;
   /** A No project thread with its own folder, on a server that can promote it. */
   readonly canTurnIntoProject?: boolean;
+  /** The agent that owns this thread; its options lead the menu. */
+  readonly agent?: { readonly name: string } | null;
+  /** An agent's Home keeps the agent's name and stays open. */
+  readonly isAgentHome?: boolean;
 }
 
 /** Local navigation, read markers, and copying remain available to read-only clients. */
 export function threadActionRequiresOperate(action: ThreadActionMenuId): boolean {
   return ![
+    "agent-configure",
+    "agent-overview",
+    "agent-memory",
+    "agent-routines",
     "find",
     "new-thread-on-branch",
     "project-settings",
@@ -120,9 +133,30 @@ export function threadActionRequiresOperate(action: ThreadActionMenuId): boolean
 export function buildThreadActionMenuItems(
   state: ThreadActionMenuState,
 ): ReadonlyArray<ContextMenuItem<ThreadActionMenuId>> {
+  const home = state.isAgentHome === true;
   const items: ReadonlyArray<ContextMenuItem<ThreadActionMenuId>> = [
+    ...(state.agent
+      ? [
+          {
+            id: "agent-configure" as const,
+            label: `Configure ${state.agent.name}`,
+            icon: "settings",
+          },
+          { id: "agent-overview" as const, label: "Agent overview", icon: "bot" },
+          { id: "agent-memory" as const, label: "Memory", icon: "text-search" },
+          { id: "agent-routines" as const, label: "Routines", icon: "clock" },
+          { id: "agent-new-chat" as const, label: "New chat", icon: "message-square-plus" },
+        ]
+      : []),
     ...(state.canFind
-      ? [{ id: "find" as const, label: "Find in thread", icon: "text-search" }]
+      ? [
+          {
+            id: "find" as const,
+            label: "Find in thread",
+            icon: "text-search",
+            separatorBefore: Boolean(state.agent),
+          },
+        ]
       : []),
     ...(state.branch
       ? [
@@ -140,7 +174,7 @@ export function buildThreadActionMenuItems(
             : { id: "pin" as const, label: "Pin thread", icon: "pin" },
         ]
       : []),
-    ...(state.supports.settlement
+    ...(state.supports.settlement && (!home || state.isSettled)
       ? [
           state.isSettled
             ? { id: "unsettle" as const, label: "Un-settle thread", icon: "circle-check" }
@@ -170,8 +204,10 @@ export function buildThreadActionMenuItems(
               },
         ]
       : []),
-    { id: "rename", label: "Rename thread", icon: "pencil", separatorBefore: true },
-    ...(state.supports.titleRegeneration
+    ...(home
+      ? []
+      : [{ id: "rename" as const, label: "Rename thread", icon: "pencil", separatorBefore: true }]),
+    ...(state.supports.titleRegeneration && !home
       ? [
           {
             id: "regenerate-title" as const,
@@ -181,7 +217,7 @@ export function buildThreadActionMenuItems(
           },
         ]
       : []),
-    { id: "mark-unread", label: "Mark unread", icon: "mail-open" },
+    { id: "mark-unread", label: "Mark unread", icon: "mail-open", separatorBefore: home },
     ...(state.canShareWithGuest
       ? [{ id: "share-guest" as const, label: "Share with guest", icon: "user-plus" }]
       : []),
@@ -206,7 +242,7 @@ export function buildThreadActionMenuItems(
           },
         ]
       : []),
-    ...(state.supports.autoSettleOptOut
+    ...(state.supports.autoSettleOptOut && !home
       ? [
           {
             id: "auto-settle" as const,
@@ -244,19 +280,18 @@ export function buildThreadActionMenuItems(
     { id: "project-settings", label: "Project settings", icon: "settings" },
     { id: "thread-resources", label: "Skills, commands and MCP", icon: "settings" },
     { id: "history", label: "History", icon: "clock" },
-    {
-      id: "archive",
-      label: "Archive thread",
-      icon: "archive",
-      disabled: state.isRunning,
-      separatorBefore: true,
-    },
-    {
-      id: "delete",
-      label: "Delete",
-      destructive: true,
-      icon: "trash",
-    },
+    ...(home
+      ? []
+      : [
+          {
+            id: "archive" as const,
+            label: "Archive thread",
+            icon: "archive",
+            disabled: state.isRunning,
+            separatorBefore: true,
+          },
+          { id: "delete" as const, label: "Delete", destructive: true, icon: "trash" },
+        ]),
   ];
   return state.canOperate
     ? items

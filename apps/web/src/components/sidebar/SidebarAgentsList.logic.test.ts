@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   agentChats,
   agentOwningThread,
+  agentsPinnedFirst,
   agentPassesFilter,
   NO_AGENT_FILTER,
   toggleAgentFilterValue,
@@ -30,6 +31,8 @@ const thread = (
     projectId?: ProjectId;
     archivedAt?: string | null;
     updatedAt?: string;
+    pinnedAt?: string | null;
+    pinOrderKey?: string | null;
   } = {},
 ) => ({
   id: ThreadId.make(id),
@@ -42,7 +45,10 @@ const thread = (
   },
   archivedAt: overrides.archivedAt ?? null,
   deletedAt: null,
+  createdAt: "2026-09-01T00:00:00Z",
   updatedAt: overrides.updatedAt ?? "2026-10-01T00:00:00Z",
+  pinnedAt: overrides.pinnedAt ?? null,
+  pinOrderKey: overrides.pinOrderKey ?? null,
 });
 
 describe("agentChats", () => {
@@ -59,6 +65,47 @@ describe("agentChats", () => {
       agent,
     );
     expect(chats.map((chat) => chat.id)).toEqual(["newer", "older"]);
+  });
+
+  it("puts pinned chats first in pin order, then the rest newest first", () => {
+    const pinnedAt = "2026-10-05T00:00:00Z";
+    const chats = agentChats(
+      [
+        thread("recent", { updatedAt: "2026-10-09T00:00:00Z" }),
+        thread("pinned-second", { pinnedAt, pinOrderKey: "b" }),
+        thread("stale", { updatedAt: "2026-09-02T00:00:00Z" }),
+        thread("pinned-first", { pinnedAt, pinOrderKey: "a" }),
+      ],
+      agent,
+    );
+    expect(chats.map((chat) => chat.id)).toEqual([
+      "pinned-first",
+      "pinned-second",
+      "recent",
+      "stale",
+    ]);
+  });
+});
+
+describe("agentsPinnedFirst", () => {
+  const agentWithHome = (name: string) => ({
+    ...agent,
+    assistantId: AssistantId.make(name),
+    binding: { ...agent.binding, canonicalThreadId: ThreadId.make(`${name}-home`) },
+  });
+  const homeOf = (name: string, pinOrderKey: string | null) => ({
+    ...thread(`${name}-home`),
+    pinnedAt: pinOrderKey === null ? null : "2026-10-05T00:00:00Z",
+    pinOrderKey,
+  });
+
+  it("leads with agents whose Home is pinned and keeps the roster order for the rest", () => {
+    const [alpha, beta, gamma, delta] = ["alpha", "beta", "gamma", "delta"].map(agentWithHome);
+    const ordered = agentsPinnedFirst(
+      [alpha!, beta!, gamma!, delta!],
+      [homeOf("alpha", null), homeOf("beta", "b"), homeOf("gamma", null), homeOf("delta", "a")],
+    );
+    expect(ordered.map((entry) => entry.assistantId)).toEqual(["delta", "beta", "alpha", "gamma"]);
   });
 });
 

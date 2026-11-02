@@ -21,9 +21,9 @@ export function isProjectPinShortcut(
 }
 
 /**
- * Pin toggle for a project row in a menu or list. A pinned project always shows its pin;
- * an unpinned one shows it only on the highlighted row. Keyboard users get a shortcut
- * from the list that hosts it, so the button stays out of the tab order.
+ * Pin toggle for a row in a menu or list. A pinned row always shows its pin; an unpinned one
+ * shows it only on the highlighted row, or the hovered `data-pin-row` in a sidebar. Keyboard
+ * users get a shortcut from the list that hosts it, so the button stays out of the tab order.
  */
 export function ProjectPinButton(props: {
   readonly name: string;
@@ -36,7 +36,8 @@ export function ProjectPinButton(props: {
     <span
       className={cn(
         "group/pin ml-auto flex",
-        !props.pinned && "opacity-0 in-data-highlighted:opacity-100 pointer-coarse:opacity-100",
+        !props.pinned &&
+          "opacity-0 in-data-highlighted:opacity-100 in-[[data-pin-row]:hover]:opacity-100 pointer-coarse:opacity-100",
       )}
     >
       <Button

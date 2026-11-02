@@ -22,7 +22,16 @@ import {
 } from "lucide-react";
 import { type RefObject, useRef, useState } from "react";
 
+import { scopeThreadRef } from "@t3tools/client-runtime/environment";
+import {
+  isAtomCommandInterrupted,
+  squashAtomCommandFailure,
+} from "@t3tools/client-runtime/state/runtime";
 import { openCommandPalette } from "~/commandPaletteBus";
+import { useThreadActions } from "~/hooks/useThreadActions";
+import { primaryServerKeybindingsAtom } from "~/state/server";
+import { useAtomValue } from "@effect/atom-react";
+import { shortcutLabelForCommand } from "~/keybindings";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { cn } from "~/lib/utils";
 import { useQuietThreadShells } from "~/state/entities";
@@ -39,6 +48,8 @@ import {
 } from "../assistants/useAssistants";
 import { useCreateAgentChat } from "../assistants/useCreateAgentChat";
 import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
+import { ProjectPinButton } from "../ProjectPinButton";
+import { toastManager } from "../ui/toast";
 import { ThreadHoverCard, ThreadHoverCardPopup } from "../ThreadHoverCard";
 import { Tooltip, TooltipTrigger } from "../ui/tooltip";
 import {
@@ -63,7 +74,9 @@ import {
   type AgentSidebarFilter,
   agentChatTitle,
   agentChats,
+  agentsPinnedFirst,
   agentFilterIsActive,
+  agentHomeThread,
   agentKey,
   agentPassesFilter,
   environmentsWithAgents,
@@ -97,29 +110,35 @@ export function SidebarAgentsList(props: {
     );
   const shown = environmentsWithAgents(environments, props.filter);
   const machines = useEnvironmentMachines();
-  // One list across environments; an environment without agents, or whose roster fails, adds nothing.
+  // One list across environments, pinned agents first; an environment without agents, or whose
+  // roster fails, adds nothing.
   return (
     <SidebarGroup className="flex-1" role="presentation">
       <div className="flex flex-col gap-px">
-        {shown.map((environment) => (
-          <EnvironmentAgents
-            key={environment.environmentId}
-            environment={environment}
-            machine={machines.get(environment.environmentId) ?? "server"}
-            threads={threads}
-            query={props.query}
-            filter={props.filter}
-            collapsed={collapsed}
-            onToggleCollapsed={toggleCollapsed}
-            onNavigate={props.onNavigate}
-          />
-        ))}
+        {[true, false].flatMap((pinned) =>
+          shown.map((environment) => (
+            <EnvironmentAgents
+              key={`${pinned ? "pinned" : "rest"}:${environment.environmentId}`}
+              pinned={pinned}
+              environment={environment}
+              machine={machines.get(environment.environmentId) ?? "server"}
+              threads={threads}
+              query={props.query}
+              filter={props.filter}
+              collapsed={collapsed}
+              onToggleCollapsed={toggleCollapsed}
+              onNavigate={props.onNavigate}
+            />
+          )),
+        )}
       </div>
     </SidebarGroup>
   );
 }
 
 function EnvironmentAgents(props: {
+  /** Renders only the agents whose Home is pinned, or only the rest. */
+  readonly pinned: boolean;
   readonly environment: EnvironmentPresentation;
   readonly machine: EnvironmentMachineKind;
   readonly threads: ReadonlyArray<EnvironmentThreadShell>;
@@ -142,11 +161,17 @@ function EnvironmentAgents(props: {
     );
     return matching.length > 0 ? [{ agent, chats: matching }] : [];
   });
-  return agents.map(({ agent, chats }) => (
+  const order = agentsPinnedFirst(
+    agents.map(({ agent }) => agent),
+    props.threads,
+  ).filter((agent) => (agentHomeThread(props.threads, agent)?.pinnedAt != null) === props.pinned);
+  const byAgent = new Map(agents.map((entry) => [entry.agent, entry]));
+  return order.map((agent) => (
     <SidebarAgent
       key={agent.assistantId}
       agent={agent}
-      chats={chats}
+      home={agentHomeThread(props.threads, agent)}
+      chats={byAgent.get(agent)!.chats}
       lastActivityAt={agentLastActivityAt(props.threads, agent)}
       environment={{ label: props.environment.label, machine: props.machine }}
       connected={connection.connected}
@@ -177,6 +202,8 @@ function agentLastActivityAt(
 
 function SidebarAgent(props: {
   readonly agent: AssistantSummary;
+  /** Home carries the agent's pin. */
+  readonly home: EnvironmentThreadShell | null;
   readonly chats: ReadonlyArray<EnvironmentThreadShell>;
   readonly environment: { readonly label: string; readonly machine: EnvironmentMachineKind };
   readonly lastActivityAt: string;
@@ -188,6 +215,23 @@ function SidebarAgent(props: {
   const navigate = useNavigate();
   const pathname = useLocation({ select: (location) => location.pathname });
   const createChat = useCreateAgentChat(props.onNavigate);
+  const { pinThread, confirmAndUnpinThread } = useThreadActions();
+  const keybindings = useAtomValue(primaryServerKeybindingsAtom);
+  const pinShortcutLabel = shortcutLabelForCommand(keybindings, "thread.pin");
+  const togglePin = (thread: EnvironmentThreadShell) => {
+    const ref = scopeThreadRef(thread.environmentId, thread.id);
+    const pinned = thread.pinnedAt != null;
+    void (pinned ? confirmAndUnpinThread(ref) : pinThread(ref)).then((result) => {
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        toastManager.add({
+          type: "error",
+          title: pinned ? "Failed to unpin" : "Failed to pin",
+          description: error instanceof Error ? error.message : "An error occurred.",
+        });
+      }
+    });
+  };
   const [showAll, setShowAll] = useState(false);
   const { agent } = props;
   const home = assistantHomeTarget(agent.binding);
@@ -211,7 +255,7 @@ function SidebarAgent(props: {
   const hiddenChats = props.chats.length - chats.length;
   return (
     <div>
-      <div className="relative">
+      <div className="relative" data-pin-row>
         <Tooltip>
           <TooltipTrigger
             render={
@@ -278,7 +322,7 @@ function SidebarAgent(props: {
                     </span>
                   </span>
                 </span>
-                {ready ? <span aria-hidden className="size-5 shrink-0" /> : null}
+                {ready ? <span aria-hidden className="h-5 w-11 shrink-0" /> : null}
               </SidebarMenuButton>
             }
           />
@@ -306,39 +350,60 @@ function SidebarAgent(props: {
           </ThreadHoverCardPopup>
         </Tooltip>
         {ready ? (
-          <button
-            type="button"
-            aria-expanded={props.expanded}
-            aria-label={props.expanded ? `Collapse ${agent.name}` : `Expand ${agent.name}`}
-            className="absolute end-(--sidebar-row-content-inset) top-1/2 grid size-5 -translate-y-1/2 cursor-pointer place-items-center rounded-md text-sidebar-muted-foreground outline-hidden ring-ring hover:bg-sidebar-row-hover hover:text-sidebar-foreground focus-visible:ring-2 focus-visible:ring-inset"
-            onClick={props.onToggle}
-          >
-            <ChevronRightIcon
-              aria-hidden
-              className={cn("size-3.5 transition-transform", props.expanded && "rotate-90")}
-            />
-          </button>
+          <div className="absolute end-(--sidebar-row-content-inset) top-1/2 flex -translate-y-1/2 items-center gap-0.5">
+            {props.home ? (
+              <ProjectPinButton
+                name={agent.name}
+                pinned={props.home.pinnedAt != null}
+                shortcutLabel={pinShortcutLabel}
+                onToggle={() => togglePin(props.home!)}
+              />
+            ) : null}
+            <button
+              type="button"
+              aria-expanded={props.expanded}
+              aria-label={props.expanded ? `Collapse ${agent.name}` : `Expand ${agent.name}`}
+              className="grid size-5 cursor-pointer place-items-center rounded-md text-sidebar-muted-foreground outline-hidden ring-ring hover:bg-sidebar-row-hover hover:text-sidebar-foreground focus-visible:ring-2 focus-visible:ring-inset"
+              onClick={props.onToggle}
+            >
+              <ChevronRightIcon
+                aria-hidden
+                className={cn("size-3.5 transition-transform", props.expanded && "rotate-90")}
+              />
+            </button>
+          </div>
         ) : null}
       </div>
       {props.expanded && ready ? (
         <SidebarMenuSub>
           {chats.map((chat) => (
             <SidebarMenuSubItem key={chat.id}>
-              <SidebarMenuSubButton
-                render={<button type="button" />}
-                isActive={pathname === `/${chat.environmentId}/${chat.id}`}
-                onClick={() => openThread(chat.id)}
-              >
-                <MessageSquareIcon />
-                <span className="min-w-0 flex-1 truncate text-left">
-                  {agentChatTitle(chat.title)}
-                </span>
-                {threadRuntimeIsActive(chat.runtime) ? (
-                  <Spinner size="xs" tone="muted" aria-label="Working" />
-                ) : chat.hasPendingApprovals || chat.hasPendingUserInput ? (
-                  <span className="shrink-0 text-2xs text-warning">Needs you</span>
-                ) : null}
-              </SidebarMenuSubButton>
+              <div className="relative" data-pin-row>
+                <SidebarMenuSubButton
+                  render={<button type="button" />}
+                  isActive={pathname === `/${chat.environmentId}/${chat.id}`}
+                  onClick={() => openThread(chat.id)}
+                >
+                  <MessageSquareIcon />
+                  <span className="min-w-0 flex-1 truncate text-left">
+                    {agentChatTitle(chat.title)}
+                  </span>
+                  {threadRuntimeIsActive(chat.runtime) ? (
+                    <Spinner size="xs" tone="muted" aria-label="Working" />
+                  ) : chat.hasPendingApprovals || chat.hasPendingUserInput ? (
+                    <span className="shrink-0 text-2xs text-warning">Needs you</span>
+                  ) : null}
+                  <span aria-hidden className="size-5 shrink-0" />
+                </SidebarMenuSubButton>
+                <div className="absolute end-1 top-1/2 flex -translate-y-1/2">
+                  <ProjectPinButton
+                    name={agentChatTitle(chat.title)}
+                    pinned={chat.pinnedAt != null}
+                    shortcutLabel={pinShortcutLabel}
+                    onToggle={() => togglePin(chat)}
+                  />
+                </div>
+              </div>
             </SidebarMenuSubItem>
           ))}
           {hiddenChats > 0 || showAll ? (
@@ -358,7 +423,13 @@ function SidebarAgent(props: {
               render={<button type="button" />}
               size="sm"
               className="text-muted-foreground"
-              onClick={() => void createChat(agent)}
+              onClick={() =>
+                void createChat({
+                  environmentId: agent.environmentId,
+                  assistantId: agent.assistantId,
+                  canonicalThreadId: agent.binding.canonicalThreadId,
+                })
+              }
             >
               <PlusIcon />
               <span>New chat</span>

@@ -49,6 +49,7 @@ vi.mock("../state/session", () => ({
 vi.mock("../state/entities", () => ({
   readEnvironmentServerConfigLoaded: () => true,
   readEnvironmentSupportsAutoSettleOptOut: () => true,
+  readProject: () => null,
   readThreadShell: () => ({
     id: "thread",
     environmentId: "secondary",
@@ -106,6 +107,9 @@ vi.mock("../components/Sidebar.snooze", () => ({
 }));
 vi.mock("./useCopyToClipboard", () => ({
   useCopyToClipboard: () => ({ copyToClipboard: () => recordEffect("copy") }),
+}));
+vi.mock("../components/assistants/useCreateAgentChat", () => ({
+  useCreateAgentChat: () => async () => recordEffect("agent-new-chat"),
 }));
 vi.mock("./useHandleNewThread", () => ({
   useNewThreadHandler: () => async () => recordEffect("draft"),

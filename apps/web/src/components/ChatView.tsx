@@ -276,7 +276,7 @@ import { checklistProgressByRun } from "./chat/ThreadDetailsSections.logic";
 import { NativeChildWorkDialog } from "./chat/NativeChildWorkDialog";
 import { ProviderSubagentBar } from "./chat/ProviderSubagentBar";
 import { latestRunWork as deriveLatestRunWork } from "./chat/runWorkSummary";
-import { useAssistantThreadOwnership } from "./assistants/useAssistantHome";
+import { useAssistantThreadOwner } from "./assistants/useAssistantHome";
 import { getTriggerDisplayModelName } from "./chat/providerIconUtils";
 import { resolveScrollToEndClearance } from "./composerFooterLayout";
 import { ChatHeader } from "./chat/ChatHeader";
@@ -344,7 +344,6 @@ import {
   resolveFileAttachmentUrl,
   resolveComposerInteractionMode,
   resolveComposerProviderSelection,
-  resolveComposerSettingsSource,
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
   startNewThreadForProject,
@@ -806,54 +805,10 @@ export default function ChatView(props: ChatViewProps) {
     : undefined;
   const isServerThread = serverThread !== null;
   const activeThread = isServerThread ? serverThread : localDraftThread;
-  // An agent's home chat runs on the agent's revisioned configuration; its children stay ordinary.
-  const assistantOwnership = useAssistantThreadOwnership(
+  const assistantOwner = useAssistantThreadOwner(
     isServerThread ? { environmentId, threadId } : null,
   );
-  const assistantOwner = assistantOwnership.owner;
   const agentHome = assistantOwner?.kind === "canonical" ? assistantOwner : null;
-  const composerSettingsSource = resolveComposerSettingsSource({
-    owner: assistantOwnership.kind,
-    draft: {
-      modelSelection: composerSelectedModelSelection,
-      runtimeMode: composerRuntimeMode,
-      interactionMode: composerInteractionMode,
-    },
-    thread: serverThread,
-  });
-  const agentSettings = composerSettingsSource === "thread" ? serverThread : null;
-  const openAgentConfiguration = () => {
-    if (agentHome === null) return;
-    void navigate({
-      to: "/agents/$environmentId/$assistantId",
-      params: { environmentId: agentHome.environmentId, assistantId: agentHome.assistantId },
-      search: { section: "configuration" },
-    });
-  };
-  const openAgentConfigurationStable = useStableCallback(openAgentConfiguration);
-  const reportAgentConfigured = () => {
-    toastManager.add({
-      type: "info",
-      title: "This chat uses its agent's configuration",
-      description: `Change the model and modes from Configure ${agentHome?.name ?? "agent"}.`,
-    });
-  };
-  // Until the owner is known, a local override could fight an agent's configuration.
-  const reportOwnerSettingsPending = () => {
-    toastManager.add({
-      type: "info",
-      title: "Checking this chat's settings",
-      description:
-        assistantOwnership.kind === "offline"
-          ? "Reconnect so T3 Code can confirm whether an agent owns this chat's model and mode, then try again. Your message is kept."
-          : "T3 Code is still confirming whether an agent owns this chat's model and mode. Try again in a moment. Your message is kept.",
-    });
-  };
-  const confirmComposerSettings = () => {
-    if (composerSettingsSource !== "wait") return true;
-    reportOwnerSettingsPending();
-    return false;
-  };
 
   const serverLatestRun =
     serverProjection === null ? null : deriveLatestThreadRun(serverProjection);
@@ -996,7 +951,6 @@ export default function ChatView(props: ChatViewProps) {
   const defaultRuntimeMode = resolveProjectSettings(settings, activeThread?.projectId ?? null)
     .settings.defaultRuntimeMode;
   const runtimeMode =
-    agentSettings?.runtimeMode ??
     composerRuntimeMode ??
     (isServerThread ? activeThread?.runtimeMode : undefined) ??
     defaultRuntimeMode;
@@ -1284,6 +1238,13 @@ export default function ChatView(props: ChatViewProps) {
     (providerEnvironmentId === undefined
       ? undefined
       : providersByEnvironment.get(providerEnvironmentId)) ?? EMPTY_PROVIDERS;
+  // Agent threads stay on the agent's provider instance, where its skills and tools are delivered.
+  const composerProviderStatuses =
+    isServerThread && activeThread && activeProject?.assistantId !== undefined
+      ? providerStatuses.filter(
+          (status) => status.instanceId === activeThread.modelSelection.instanceId,
+        )
+      : providerStatuses;
   const selectedProviderByThreadId = composerActiveProvider ?? null;
   const threadProvider =
     activeThread?.modelSelection.instanceId ??
@@ -1371,7 +1332,6 @@ export default function ChatView(props: ChatViewProps) {
     provider: activeProviderStatus,
     interactionMode:
       composerInteractionMode ?? activeThread?.interactionMode ?? DEFAULT_INTERACTION_MODE,
-    agentInteractionMode: agentSettings?.interactionMode ?? null,
   });
   const conversationProviderStatus =
     providerStatuses.find((status) => status.instanceId === activeRuntime?.providerInstanceId) ??
@@ -1438,7 +1398,6 @@ export default function ChatView(props: ChatViewProps) {
   const showPlanFollowUpPrompt = shouldShowPlanFollowUpPrompt({
     pendingUserInputCount: pendingUserInputs.length,
     interactionMode,
-    agentOwnsInteractionMode: agentSettings !== null,
     latestTurnSettled: latestRunSettled,
     hasActionableProposedPlan: hasActionableProposedPlan(activeProposedPlan),
     hasComposerAttachments: composerHasAttachments,
@@ -2488,7 +2447,6 @@ export default function ChatView(props: ChatViewProps) {
     threadStatusLine,
     shortcuts: threadLifecycleShortcuts,
   } = useThreadLifecycle({
-    confirmComposerSettings,
     environmentId,
     routeThreadKey,
     currentRouteThreadKeyRef,
@@ -2528,8 +2486,7 @@ export default function ChatView(props: ChatViewProps) {
       item.type === "user_message" &&
       (item.text.trim().toLowerCase() !== "/compact" || item.attachments.length > 0),
   );
-  const pendingHandoffSelection =
-    agentSettings?.modelSelection ?? composerSelectedModelSelection ?? activeThread?.modelSelection;
+  const pendingHandoffSelection = composerSelectedModelSelection ?? activeThread?.modelSelection;
   const pendingHandoffSelectionUsable = providerInstanceEntries.some(
     (entry) =>
       entry.instanceId === pendingHandoffSelection?.instanceId &&
@@ -2916,11 +2873,6 @@ export default function ChatView(props: ChatViewProps) {
     openProviderSetupStable,
     toggleInteractionModeStable,
   } = useComposerSelection({
-    agentConfigured: agentHome !== null,
-    onAgentConfigured: reportAgentConfigured,
-    ownerSettingsPending:
-      assistantOwnership.kind === "unknown" || assistantOwnership.kind === "offline",
-    onOwnerSettingsPending: reportOwnerSettingsPending,
     environmentId,
     composerDraftTarget,
     draftThread,
@@ -2942,7 +2894,6 @@ export default function ChatView(props: ChatViewProps) {
     scheduleComposerFocus,
   });
   const { onResume, isResuming } = useComposerResume({
-    confirmComposerSettings,
     environmentId,
     routeThreadKey,
     currentRouteThreadKeyRef,
@@ -2978,7 +2929,6 @@ export default function ChatView(props: ChatViewProps) {
     defaultRuntimeMode,
   });
   const { onSend } = useComposerSend({
-    confirmComposerSettings,
     environmentId,
     routeThreadKey,
     currentRouteThreadKeyRef,
@@ -3823,7 +3773,7 @@ export default function ChatView(props: ChatViewProps) {
                               defaultRuntimeMode={defaultRuntimeMode}
                               interactionMode={interactionMode}
                               lockedProvider={modelPickerLockedProvider}
-                              providerStatuses={providerStatuses as ServerProvider[]}
+                              providerStatuses={composerProviderStatuses as ServerProvider[]}
                               providerCatalogKnown={serverConfig !== null}
                               activeProjectDefaultModelSelection={
                                 activeProjectDefaultModelSelection
@@ -3884,16 +3834,6 @@ export default function ChatView(props: ChatViewProps) {
                               handleInteractionModeChange={handleInteractionModeChangeStable}
                               focusComposer={focusComposerStable}
                               latestRunWork={latestRunWork}
-                              agentConfiguration={
-                                agentHome === null || agentSettings === null
-                                  ? null
-                                  : {
-                                      name: agentHome.name,
-                                      onOpen: openAgentConfigurationStable,
-                                      modelSelection: agentSettings.modelSelection,
-                                      interactionMode: agentSettings.interactionMode,
-                                    }
-                              }
                               scheduleComposerFocus={scheduleComposerFocusStable}
                               setThreadError={setThreadError}
                               onExpandImage={onExpandTimelineImageStable}
