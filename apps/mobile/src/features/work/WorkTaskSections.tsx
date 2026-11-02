@@ -21,6 +21,8 @@ import { ListChoiceRow } from "../../components/ui/ListChoiceRow";
 import { ListSection } from "../../components/ui/ListSection";
 import { Notice } from "../../components/ui/Notice";
 import { uuidv4 } from "../../lib/uuid";
+import { useWorkProviderCatalog } from "./useWorkProviderCatalog";
+import { workRouteLabel } from "./workLogic";
 import { WorkBlock, WorkFormActions, WorkInput, WorkReadNotice, WorkText } from "./WorkParts";
 import type { Surface } from "./WorkTaskScreen";
 import { newCommandId, useWorkRead, useWorkReview } from "./useWork";
@@ -132,6 +134,7 @@ export function executionState(surface: Surface) {
 // ── Workers, questions, messages ───────────────────────────────────────────
 
 export function TaskWorkers({ surface }: { surface: Surface }) {
+  const catalog = useWorkProviderCatalog(surface.scope.environmentId);
   if (!surface.model.guided) return null;
   const bindings = recordsOfKind(surface.records, "run-binding").sort(newestFirst).slice(0, 8);
   return (
@@ -144,7 +147,12 @@ export function TaskWorkers({ surface }: { surface: Surface }) {
         bindings.map((binding) => (
           <WorkBlock key={binding.recordId}>
             <WorkText>
-              {bindingPhase(binding.status).label} · {binding.model}
+              {bindingPhase(binding.status).label} ·{" "}
+              {workRouteLabel(catalog, {
+                providerInstanceId: binding.providerInstanceId,
+                model: binding.model,
+                options: binding.configuration?.options,
+              })}
             </WorkText>
             <WorkText muted>
               {binding.workspaceState === "pending"
@@ -169,6 +177,7 @@ export function TaskWorkers({ surface }: { surface: Surface }) {
 
 function StartWorker({ surface }: { surface: Surface }) {
   const { scope, writer, model } = surface;
+  const catalog = useWorkProviderCatalog(scope.environmentId);
   const availability = startAvailability({
     membership: model.membership,
     records: surface.records,
@@ -253,7 +262,14 @@ function StartWorker({ surface }: { surface: Surface }) {
         <ListChoiceRow
           key={entry.member.recordId}
           label={entry.member.name}
-          description={entry.ineligible ?? `${entry.role.role} · ${entry.role.model}`}
+          description={
+            entry.ineligible ??
+            `${entry.role.role} · ${workRouteLabel(catalog, {
+              providerInstanceId: memberProviderInstanceId(entry.role, plan),
+              model: entry.role.model,
+              options: entry.role.options,
+            })}`
+          }
           selected={entry.member.recordId === memberId}
           disabled={entry.ineligible !== null}
           onPress={() => setMemberId(entry.member.recordId)}
@@ -274,10 +290,14 @@ function StartWorker({ surface }: { surface: Surface }) {
           <WorkInput label="Base branch" value={baseRef} onChange={setBaseRef} maxLength={256} />
         ) : null}
         <WorkText muted>
-          Runs one worker on{" "}
+          Runs{" "}
           {chosen
-            ? (memberProviderInstanceId(chosen.role, plan) ?? "no provider")
-            : "the member's provider"}{" "}
+            ? workRouteLabel(catalog, {
+                providerInstanceId: memberProviderInstanceId(chosen.role, plan),
+                model: chosen.role.model,
+                options: chosen.role.options,
+              })
+            : "the member's provider and model"}{" "}
           for this assignment, within the team's limits.
         </WorkText>
         {problem !== null ? <WorkText muted>{problem}</WorkText> : null}

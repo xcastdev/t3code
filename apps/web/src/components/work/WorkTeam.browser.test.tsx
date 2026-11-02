@@ -10,6 +10,8 @@ const mocks = vi.hoisted(() => ({ roster: vi.fn(), providers: vi.fn() }));
 vi.mock("./useWorkTeamRoster", () => ({ useWorkTeamRoster: mocks.roster }));
 vi.mock("./WorkTeamRoster", () => ({ WorkTeamMembers: () => null }));
 vi.mock("../../state/environments", () => ({ useEnvironmentProviders: mocks.providers }));
+// The composer's model picker has its own tests; this one covers names and avatars.
+vi.mock("../chat/ModelSelectionPicker", () => ({ ModelSelectionPicker: () => null }));
 
 function setup() {
   document.documentElement.classList.add("dark");

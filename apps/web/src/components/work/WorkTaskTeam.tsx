@@ -49,6 +49,8 @@ import {
   type WorkQuestionRecord,
 } from "./workPresentation";
 import { guidedFields, teamFields, useWorkReview, type WorkTaskSurface } from "./workTaskSurface";
+import { useWorkProviderCatalog } from "./useWorkProviderCatalog";
+import { workRouteLabel } from "./workLogic";
 
 /**
  * Workers, questions and messages for one task. Starting a worker is its own
@@ -61,6 +63,7 @@ export function WorkTaskTeam({ surface }: { surface: WorkTaskSurface }) {
 
 function GuidedTaskTeam({ surface }: { surface: WorkTaskSurface }) {
   const { roster } = useWorkTeamRoster(surface.scope);
+  const catalog = useWorkProviderCatalog(surface.scope.environmentId);
   const bindings = recordsOfKind(surface.records, "run-binding").toSorted((a, b) =>
     b.updatedAt.localeCompare(a.updatedAt),
   );
@@ -80,7 +83,11 @@ function GuidedTaskTeam({ surface }: { surface: WorkTaskSurface }) {
               <span className="text-sm font-medium">{member?.name ?? "Team member"}</span>
               <WorkStatus state={binding.status} label={phase.label} tone={phase.tone} />
               <span className="min-w-0 truncate text-xs text-muted-foreground">
-                {binding.model}
+                {workRouteLabel(catalog, {
+                  providerInstanceId: binding.providerInstanceId,
+                  model: binding.model,
+                  options: binding.configuration?.options,
+                })}
               </span>
               <WorkRevision className="text-muted-foreground">r{binding.revision}</WorkRevision>
               <span className="min-w-0 flex-1" />
@@ -121,6 +128,7 @@ function teamRecordsOf(values: ReadonlyArray<unknown>) {
 
 function StartWorker({ surface }: { surface: WorkTaskSurface }) {
   const { scope, writer, model } = surface;
+  const catalog = useWorkProviderCatalog(scope.environmentId);
   const availability = startAvailability({
     membership: model.membership,
     records: surface.records,
@@ -235,9 +243,11 @@ function StartWorker({ surface }: { surface: WorkTaskSurface }) {
                   disabled={entry.ineligible !== null}
                 >
                   {entry.member.name} · {entry.role.role} ·{" "}
-                  {[memberProviderInstanceId(entry.role, plan), entry.role.model]
-                    .filter(Boolean)
-                    .join(" · ")}
+                  {workRouteLabel(catalog, {
+                    providerInstanceId: memberProviderInstanceId(entry.role, plan),
+                    model: entry.role.model,
+                    options: entry.role.options,
+                  })}
                   {entry.ineligible !== null ? ` · ${entry.ineligible}` : ""}
                 </SelectItem>
               ))}
@@ -273,10 +283,14 @@ function StartWorker({ surface }: { surface: WorkTaskSurface }) {
         </WorkField>
       ) : null}
       <WorkMeta>
-        Runs {chosen ? chosen.role.model : "the member's model"} on{" "}
+        Runs{" "}
         {chosen
-          ? (memberProviderInstanceId(chosen.role, plan) ?? "no provider")
-          : "the member's provider"}{" "}
+          ? workRouteLabel(catalog, {
+              providerInstanceId: memberProviderInstanceId(chosen.role, plan),
+              model: chosen.role.model,
+              options: chosen.role.options,
+            })
+          : "the member's provider and model"}{" "}
         for this one assignment, within the team's limits.
       </WorkMeta>
       {problem !== null ? <WorkMeta className="text-warning-foreground">{problem}</WorkMeta> : null}

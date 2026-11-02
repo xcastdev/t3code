@@ -31,11 +31,13 @@ import {
   teamEffortControl,
   teamEffortValue,
   teamProviderOf,
+  workRouteLabel,
   type TeamConfigurationValues,
   type TeamProfile,
   withTeamEffort,
 } from "./workLogic";
 import { WorkAvatarEditor } from "./WorkAvatarEditor";
+import { useWorkProviderCatalog } from "./useWorkProviderCatalog";
 import { WorkAgentAvatar } from "./WorkAgentAvatar";
 import { workStateLabel } from "./workModel";
 
@@ -108,6 +110,7 @@ export function WorkTeamSection({
     (!projectWorkSelectionIsCurrent(draft.selected, current) ||
       draft.generation !== recorded?.generation);
   const providers = (serverConfig?.providers ?? []).filter((provider) => provider.enabled);
+  const catalog = useWorkProviderCatalog(scope.environmentId);
   const availableModels = new Map(
     providers.map((entry) => [
       entry.instanceId as string,
@@ -166,27 +169,11 @@ export function WorkTeamSection({
     const entry = providers.find((item) => item.instanceId === id);
     return entry ? (entry.displayName ?? entry.instanceId) : `${id} (unavailable)`;
   };
-  /** Provider, model and effort, e.g. "Claude · opus-4 · High". */
+  /** Provider, model and effort, e.g. "Claude · Claude Opus 5.5 · High". */
   const routeLabel = (
     providerInstanceId: string,
     profile: Pick<TeamProfile, "model" | "options">,
-  ) => {
-    const effort = teamEffortControl(
-      providers
-        .find((item) => item.instanceId === providerInstanceId)
-        ?.models.find((model) => model.slug === profile.model)?.capabilities?.optionDescriptors,
-    );
-    const value = teamEffortValue(profile.options, effort?.descriptor.id);
-    return [
-      providerName(providerInstanceId),
-      profile.model,
-      value === null
-        ? null
-        : (effort?.choices.find((choice) => choice.id === value)?.label ?? value),
-    ]
-      .filter(Boolean)
-      .join(" · ");
-  };
+  ) => workRouteLabel(catalog, { providerInstanceId, ...profile });
 
   return (
     <>
@@ -502,7 +489,10 @@ function TeamForm(props: {
                 <WorkText>
                   {props.providers.find((entry) => entry.id === teamProviderOf(values, policy))
                     ?.label ?? teamProviderOf(values, policy)}{" "}
-                  · {policy.model}
+                  ·{" "}
+                  {props.providers
+                    .find((entry) => entry.id === teamProviderOf(values, policy))
+                    ?.models.find((entry) => entry.slug === policy.model)?.name ?? policy.model}
                 </WorkText>
                 <View className="flex-row gap-2">
                   <View className="flex-1">

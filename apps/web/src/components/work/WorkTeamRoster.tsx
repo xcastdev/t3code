@@ -9,10 +9,9 @@ import { WorkRecordsNotice, WorkNotice } from "./WorkNotice";
 import { WorkTaskLink } from "./WorkTaskRefs";
 import { useWorkTeamRoster } from "./useWorkTeamRoster";
 import { recordedTeamConfiguration } from "./workLogic";
-import { teamEffortControl, teamEffortValue } from "./workLogic";
+import { useWorkProviderCatalog } from "./useWorkProviderCatalog";
+import { workRouteLabel } from "./workLogic";
 import { workStateLabel } from "./workModel";
-import { deriveProviderInstanceEntries } from "../../providerInstances";
-import { useEnvironmentProviders } from "../../state/environments";
 
 const MEMORY_LABELS = { none: "No memory", project: "Project", shared: "Shared" } as const;
 const countLabel = (count: number, noun: string) => `${count} ${noun}${count === 1 ? "" : "s"}`;
@@ -27,35 +26,21 @@ export function WorkTeamMembers({
   onOpenTask: (id: ProjectWorkTaskId) => void;
 }) {
   const { roster, members, roles, view, records } = useWorkTeamRoster(scope);
-  const providers = deriveProviderInstanceEntries(
-    useEnvironmentProviders().get(scope.environmentId) ?? [],
-  );
-  /** Provider, model and effort, e.g. "Claude · opus-4 · High". */
-  const routeLabel = (profile: NonNullable<(typeof roster)[number]["profile"]>) => {
-    // Roles from before members chose a provider ran on their model's team policy.
-    const providerInstanceId =
-      profile.providerInstanceId ??
-      records
-        .flatMap((record) => (record.kind === "limits" && "model" in record ? [record] : []))
-        .filter((record) => record.model === profile.model)
-        // A disabled team keeps its policies disabled; the newest still names its provider.
-        .sort((a, b) => b.generation - a.generation)[0]?.providerInstanceId;
-    const provider = providers.find((entry) => entry.instanceId === providerInstanceId);
-    const effort = teamEffortControl(
-      provider?.models.find((model) => model.slug === profile.model)?.capabilities
-        ?.optionDescriptors,
-    );
-    const value = teamEffortValue(profile.options, effort?.descriptor.id);
-    return [
-      provider?.displayName ?? providerInstanceId,
-      profile.model,
-      value === null
-        ? null
-        : (effort?.choices.find((choice) => choice.id === value)?.label ?? value),
-    ]
-      .filter(Boolean)
-      .join(" · ");
-  };
+  const catalog = useWorkProviderCatalog(scope.environmentId);
+  /** Provider, model and effort, e.g. "Claude · Claude Opus 5.5 · High". */
+  const routeLabel = (profile: NonNullable<(typeof roster)[number]["profile"]>) =>
+    workRouteLabel(catalog, {
+      // Roles from before members chose a provider ran on their model's team policy.
+      providerInstanceId:
+        profile.providerInstanceId ??
+        records
+          .flatMap((record) => (record.kind === "limits" && "model" in record ? [record] : []))
+          .filter((record) => record.model === profile.model)
+          // A disabled team keeps its policies disabled; the newest still names its provider.
+          .sort((a, b) => b.generation - a.generation)[0]?.providerInstanceId,
+      model: profile.model,
+      options: profile.options,
+    });
   return (
     <div className="flex min-w-0 flex-col gap-3">
       <WorkRecordsNotice set={members} subject="team members" />

@@ -31,7 +31,7 @@ import {
   assistantConfigurationError,
   assistantDraftState,
 } from "@t3tools/client-runtime/assistant-presentation";
-import { AssistantModelPicker } from "./AssistantParts";
+import { ModelSelectionPicker } from "../chat/ModelSelectionPicker";
 import { newAssistantCommandId } from "./useAssistants";
 
 interface EditSession {
@@ -216,7 +216,7 @@ function ConfigurationFields({
         >
           {() => (
             <div>
-              <AssistantModelPicker
+              <ModelSelectionPicker
                 environmentId={context.environmentId}
                 selection={configuration.modelSelection}
                 disabled={disabled || !context.connected}

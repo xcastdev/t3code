@@ -5,14 +5,15 @@ import {
 } from "@t3tools/client-runtime/project-work";
 import {
   CommandId,
+  type EnvironmentId,
   PROJECT_TEAM_PRESETS,
   type ProjectWorkTaskId,
-  type ProviderOptionDescriptor,
 } from "@t3tools/contracts";
 import { useId, useState } from "react";
 
 import { deriveProviderInstanceEntries } from "../../providerInstances";
 import { useEnvironmentProviders } from "../../state/environments";
+import { ModelSelectionPicker } from "../chat/ModelSelectionPicker";
 import { WorkTeamMembers } from "./WorkTeamRoster";
 import { useWorkTeamRoster } from "./useWorkTeamRoster";
 import { WorkAvatarEditor } from "./WorkAvatarEditor";
@@ -50,12 +51,8 @@ import {
   MEMORY_ACCESS,
   recordedTeamConfiguration,
   syncModelPolicies,
-  teamEffortControl,
-  teamEffortValue,
   teamProviderOf,
   type TeamConfigurationValues,
-  type TeamProfile,
-  withTeamEffort,
 } from "./workLogic";
 import { workStateLabel } from "./workModel";
 import { newCommandId } from "./workTaskSurface";
@@ -294,16 +291,13 @@ export function WorkTeam({
             </p>
           ) : (
             <TeamForm
+              environmentId={scope.environmentId}
               values={draft.values}
               recorded={draft.recorded}
               providers={providers.map((entry) => ({
                 id: entry.instanceId,
                 label: entry.displayName,
-                models: entry.models.map((model) => ({
-                  slug: model.slug,
-                  name: model.name,
-                  descriptors: model.capabilities?.optionDescriptors,
-                })),
+                models: entry.models.map((model) => ({ slug: model.slug, name: model.name })),
               }))}
               onChange={update}
             />
@@ -339,145 +333,28 @@ export function WorkTeam({
 interface ProviderChoice {
   readonly id: string;
   readonly label: string;
-  readonly models: ReadonlyArray<{
-    readonly slug: string;
-    readonly name: string;
-    readonly descriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined;
-  }>;
-}
-
-const DEFAULT_EFFORT = "__default";
-
-/** A member's provider, model and reasoning effort; changing a provider asks for its model again. */
-function MemberRouteFields(props: {
-  readonly providers: ReadonlyArray<ProviderChoice>;
-  readonly providerItems: Record<string, string>;
-  readonly providerInstanceId: string;
-  readonly model: string;
-  readonly options: TeamProfile["options"];
-  readonly onChange: (update: (profile: TeamProfile) => TeamProfile) => void;
-}) {
-  // Options belong to one model, so they are dropped whenever the route changes.
-  const withoutOptions = ({ options: _options, ...profile }: TeamProfile): TeamProfile => profile;
-  const provider = props.providers.find((entry) => entry.id === props.providerInstanceId);
-  const model = provider?.models.find((entry) => entry.slug === props.model);
-  const effort = teamEffortControl(model?.descriptors);
-  const chosenEffort = effort ? teamEffortValue(props.options, effort.descriptor.id) : null;
-  const modelItems = Object.fromEntries(
-    (provider?.models ?? []).map((entry) => [entry.slug, entry.name]),
-  );
-  const effortItems = effort
-    ? {
-        [DEFAULT_EFFORT]: "Model default",
-        ...Object.fromEntries(effort.choices.map((choice) => [choice.id, choice.label])),
-      }
-    : {};
-  return (
-    <div className="grid gap-2 sm:col-span-2 sm:grid-cols-3">
-      <WorkField label="Provider">
-        {(id) => (
-          <Select
-            value={props.providerInstanceId || null}
-            items={props.providerItems}
-            onValueChange={(value) => {
-              if (typeof value !== "string" || value === props.providerInstanceId) return;
-              props.onChange((profile) => ({
-                ...withoutOptions(profile),
-                providerInstanceId: value as NonNullable<TeamProfile["providerInstanceId"]>,
-                model: "",
-              }));
-            }}
-          >
-            <SelectTrigger id={id}>
-              <SelectValue placeholder="Choose a provider" />
-            </SelectTrigger>
-            <SelectPopup>
-              {props.providers.map((entry) => (
-                <SelectItem key={entry.id} value={entry.id}>
-                  {entry.label}
-                </SelectItem>
-              ))}
-            </SelectPopup>
-          </Select>
-        )}
-      </WorkField>
-      <WorkField label="Model">
-        {(id) => (
-          <Select
-            value={props.model || null}
-            items={modelItems}
-            onValueChange={(value) =>
-              typeof value === "string" &&
-              value !== props.model &&
-              // Effort levels belong to one model; a new model starts at its default.
-              props.onChange((profile) => ({ ...withoutOptions(profile), model: value }))
-            }
-          >
-            <SelectTrigger id={id} disabled={provider === undefined}>
-              <SelectValue placeholder="Choose a model" />
-            </SelectTrigger>
-            <SelectPopup>
-              {(provider?.models ?? []).map((entry) => (
-                <SelectItem key={entry.slug} value={entry.slug}>
-                  {entry.name}
-                </SelectItem>
-              ))}
-            </SelectPopup>
-          </Select>
-        )}
-      </WorkField>
-      <WorkField label={effort?.descriptor.label ?? "Effort"}>
-        {(id) => (
-          <Select
-            value={effort ? (chosenEffort ?? DEFAULT_EFFORT) : null}
-            items={effortItems}
-            onValueChange={(value) => {
-              if (effort === null || typeof value !== "string") return;
-              props.onChange((profile) => {
-                const options = withTeamEffort(
-                  profile.options,
-                  effort.descriptor.id,
-                  value === DEFAULT_EFFORT ? null : value,
-                );
-                return options === undefined
-                  ? withoutOptions(profile)
-                  : { ...withoutOptions(profile), options };
-              });
-            }}
-          >
-            <SelectTrigger id={id} disabled={effort === null}>
-              <SelectValue placeholder={model ? "Not adjustable" : "Choose a model first"} />
-            </SelectTrigger>
-            <SelectPopup>
-              {effort ? <SelectItem value={DEFAULT_EFFORT}>Model default</SelectItem> : null}
-              {(effort?.choices ?? []).map((choice) => (
-                <SelectItem key={choice.id} value={choice.id}>
-                  {choice.label}
-                </SelectItem>
-              ))}
-            </SelectPopup>
-          </Select>
-        )}
-      </WorkField>
-    </div>
-  );
+  readonly models: ReadonlyArray<{ readonly slug: string; readonly name: string }>;
 }
 
 function TeamForm({
+  environmentId,
   values,
   recorded,
   providers,
   onChange,
 }: {
+  readonly environmentId: EnvironmentId;
   readonly values: TeamConfigurationValues;
   readonly recorded: TeamConfigurationValues | null;
   readonly providers: ReadonlyArray<ProviderChoice>;
   readonly onChange: (values: TeamConfigurationValues) => void;
 }) {
   const enabledId = useId();
-  const providerItems = Object.fromEntries(providers.map((entry) => [entry.id, entry.label]));
   const providerName = (id: string) =>
     providers.find((entry) => entry.id === id)?.label ?? `${id} (unavailable)`;
+  const modelName = (id: string, model: string) =>
+    providers.find((entry) => entry.id === id)?.models.find((entry) => entry.slug === model)
+      ?.name ?? model;
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center gap-2">
@@ -579,21 +456,48 @@ function TeamForm({
                   </Button>
                 ) : null}
               </div>
-              <MemberRouteFields
-                providers={providers}
-                providerItems={providerItems}
-                providerInstanceId={teamProviderOf(values, profile)}
-                model={profile.model}
-                options={profile.options}
-                onChange={(update) =>
-                  onChange({
-                    ...values,
-                    profiles: values.profiles.map((entry, at) =>
-                      at === index ? update(entry) : entry,
-                    ),
-                  })
-                }
-              />
+              <div className="sm:col-span-2">
+                <WorkField label="Model">
+                  {() => (
+                    <div>
+                      <ModelSelectionPicker
+                        environmentId={environmentId}
+                        selection={
+                          profile.providerInstanceId && profile.model
+                            ? {
+                                instanceId: profile.providerInstanceId,
+                                model: profile.model,
+                                ...(profile.options === undefined
+                                  ? {}
+                                  : { options: profile.options }),
+                              }
+                            : null
+                        }
+                        disabled={false}
+                        onChange={(selection) =>
+                          onChange({
+                            ...values,
+                            profiles: values.profiles.map((entry, at) => {
+                              if (at !== index) return entry;
+                              const { options: _options, ...rest } = entry;
+                              // The picker owns the route: its options replace the member's.
+                              return {
+                                ...rest,
+                                providerInstanceId: selection.instanceId,
+                                model: selection.model,
+                                ...(selection.options === undefined ||
+                                selection.options.length === 0
+                                  ? {}
+                                  : { options: selection.options }),
+                              };
+                            }),
+                          })
+                        }
+                      />
+                    </div>
+                  )}
+                </WorkField>
+              </div>
               <WorkField label="Memory">
                 {(id) => (
                   <Select
@@ -657,7 +561,7 @@ function TeamForm({
                 className="grid gap-2 sm:grid-cols-3"
               >
                 <WorkNumber
-                  label={`${providerName(teamProviderOf(values, policy))} · ${policy.model}: tokens`}
+                  label={`${providerName(teamProviderOf(values, policy))} · ${modelName(teamProviderOf(values, policy), policy.model)}: tokens`}
                   value={policy.tokenLimit}
                   min={1}
                   onChange={(value) => set({ tokenLimit: value })}

@@ -19,6 +19,8 @@ import { ListRow } from "../../components/ui/ListRow";
 import { ListSection } from "../../components/ui/ListSection";
 import { useProjects } from "../../state/entities";
 import { useEnvironments } from "../../state/environments";
+import { useWorkProviderCatalog } from "./useWorkProviderCatalog";
+import { workRouteLabel } from "./workLogic";
 import { WorkBlock, WorkPager, WorkReadNotice, WorkText } from "./WorkParts";
 import { newCommandId, useWorkRead, workWriteBlockedReason, type WorkWriter } from "./useWork";
 import { useWorkPage } from "./useWorkRecords";
@@ -43,6 +45,7 @@ export function WorkSupervisionSection({
   readonly scope: ProjectWorkScope;
   readonly onOpenTask: (taskId: ProjectWorkTaskId) => void;
 }) {
+  const catalog = useWorkProviderCatalog(scope.environmentId);
   const view = useWorkRead(scope.environmentId, {
     projectId: scope.projectId,
     operation: "supervision",
@@ -77,7 +80,10 @@ export function WorkSupervisionSection({
             <ListRow
               key={binding.recordId}
               icon="person.crop.circle"
-              label={`${bindingPhase(binding.status).label} · ${binding.model}`}
+              label={`${bindingPhase(binding.status).label} · ${workRouteLabel(catalog, {
+                providerInstanceId: binding.providerInstanceId,
+                model: binding.model,
+              })}`}
               {...(accountingSummary(binding.accounting)
                 ? { description: accountingSummary(binding.accounting)!.text }
                 : {})}

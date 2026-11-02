@@ -375,6 +375,64 @@ export function withTeamEffort(
   return next.length === 0 ? undefined : next;
 }
 
+/** The provider catalog labels come from: the same entries the model pickers offer. */
+export interface WorkProviderCatalogEntry {
+  readonly instanceId: string;
+  readonly displayName?: string | undefined;
+  readonly models: ReadonlyArray<{
+    readonly slug: string;
+    readonly name: string;
+    readonly capabilities?:
+      | { readonly optionDescriptors?: ReadonlyArray<ProviderOptionDescriptor> | undefined }
+      | null
+      | undefined;
+  }>;
+}
+
+/** A provider's display name; its id when the catalog doesn't know it, such as when it's disabled. */
+export function workProviderLabel(
+  catalog: ReadonlyArray<WorkProviderCatalogEntry>,
+  instanceId: string,
+): string {
+  return catalog.find((entry) => entry.instanceId === instanceId)?.displayName ?? instanceId;
+}
+
+/** A model's display name on its provider; its slug when the catalog doesn't know it. */
+export function workModelLabel(
+  catalog: ReadonlyArray<WorkProviderCatalogEntry>,
+  instanceId: string | null | undefined,
+  model: string,
+): string {
+  return (
+    catalog
+      .find((entry) => entry.instanceId === instanceId)
+      ?.models.find((entry) => entry.slug === model)?.name ?? model
+  );
+}
+
+/** "Provider · Model · Effort", e.g. "Claude · Claude Opus 5.5 · High". */
+export function workRouteLabel(
+  catalog: ReadonlyArray<WorkProviderCatalogEntry>,
+  route: {
+    readonly providerInstanceId: string | null | undefined;
+    readonly model: string;
+    readonly options?: ReadonlyArray<ProviderOptionSelection> | undefined;
+  },
+): string {
+  const provider = catalog.find((entry) => entry.instanceId === route.providerInstanceId);
+  const effort = teamEffortControl(
+    provider?.models.find((model) => model.slug === route.model)?.capabilities?.optionDescriptors,
+  );
+  const value = teamEffortValue(route.options, effort?.descriptor.id);
+  return [
+    route.providerInstanceId ? workProviderLabel(catalog, route.providerInstanceId) : null,
+    workModelLabel(catalog, route.providerInstanceId, route.model),
+    value === null ? null : (effort?.choices.find((choice) => choice.id === value)?.label ?? value),
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
 /** The provider a profile or policy runs on: its own, else the team default. */
 export const teamProviderOf = (
   values: Pick<TeamConfigurationValues, "providerInstanceId">,

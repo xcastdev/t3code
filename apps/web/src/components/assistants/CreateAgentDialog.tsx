@@ -28,7 +28,7 @@ import {
   defaultAssistantConfiguration,
 } from "@t3tools/client-runtime/assistant-presentation";
 import { agentInitials, newAgentAvatar } from "./AgentAvatar";
-import { AssistantModelPicker } from "./AssistantParts";
+import { ModelSelectionPicker } from "../chat/ModelSelectionPicker";
 import {
   newAssistantCommandId,
   useAssistantConnection,
@@ -145,7 +145,7 @@ export function CreateAgentDialog({
               <WorkField label="Model">
                 {() => (
                   <div>
-                    <AssistantModelPicker
+                    <ModelSelectionPicker
                       environmentId={environmentId}
                       selection={selection}
                       disabled={pending || !connection.connected}

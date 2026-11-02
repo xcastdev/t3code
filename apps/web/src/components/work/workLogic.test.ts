@@ -33,6 +33,7 @@ import {
   retainCompleteWorkSet,
   syncModelPolicies,
   TEAM_ROLES,
+  workRouteLabel,
 } from "./workLogic";
 import type { WorkApprovalStep } from "./workModel";
 
@@ -360,6 +361,56 @@ describe("recordedTeamConfiguration", () => {
 
   it("starts at generation zero with nothing installed", () => {
     expect(recordedTeamConfiguration([])).toEqual({ kind: "none", generation: 0 });
+  });
+});
+
+describe("workRouteLabel", () => {
+  const catalog = [
+    {
+      instanceId: "claudeAgent",
+      displayName: "Claude",
+      models: [
+        {
+          slug: "claude-opus-5-5",
+          name: "Claude Opus 5.5",
+          capabilities: {
+            optionDescriptors: [
+              {
+                id: "effort",
+                label: "Reasoning",
+                type: "select" as const,
+                options: [
+                  { id: "medium", label: "Medium" },
+                  { id: "high", label: "High" },
+                ],
+              },
+            ],
+          },
+        },
+      ],
+    },
+  ];
+
+  it("names the provider, the model and the effort as the catalog shows them", () => {
+    expect(
+      workRouteLabel(catalog, {
+        providerInstanceId: "claudeAgent",
+        model: "claude-opus-5-5",
+        options: [{ id: "effort", value: "high" }],
+      }),
+    ).toBe("Claude · Claude Opus 5.5 · High");
+    expect(
+      workRouteLabel(catalog, { providerInstanceId: "claudeAgent", model: "claude-opus-5-5" }),
+    ).toBe("Claude · Claude Opus 5.5");
+  });
+
+  it("falls back to ids and slugs the catalog doesn't know", () => {
+    expect(workRouteLabel(catalog, { providerInstanceId: "codex", model: "gpt-6.1-sol" })).toBe(
+      "codex · gpt-6.1-sol",
+    );
+    expect(workRouteLabel([], { providerInstanceId: undefined, model: "gpt-6.1-sol" })).toBe(
+      "gpt-6.1-sol",
+    );
   });
 });
 
