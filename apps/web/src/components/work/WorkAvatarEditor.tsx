@@ -2,7 +2,6 @@ import {
   AGENT_AVATAR_MOODS,
   AGENT_AVATAR_TONES,
   generateAgentAvatar,
-  sameAgentAvatar,
   switchAgentAvatarMode,
 } from "@t3tools/client-runtime/project-work";
 import type { ProjectIconColor, ProjectTeamAvatar } from "@t3tools/contracts";
@@ -22,7 +21,6 @@ export function WorkAvatarEditor({
   preset,
   name,
   avatar,
-  recorded,
   others,
   onChange,
 }: {
@@ -32,7 +30,6 @@ export function WorkAvatarEditor({
   preset: ProjectTeamAvatar;
   name: string;
   avatar: ProjectTeamAvatar | null | undefined;
-  recorded: ProjectTeamAvatar | null | undefined;
   others: ReadonlyArray<ProjectTeamAvatar>;
   onChange: (avatar: ProjectTeamAvatar | null) => void;
 }) {
@@ -190,21 +187,6 @@ export function WorkAvatarEditor({
           )}
         </div>
       </div>
-      {!sameAgentAvatar(avatar, recorded) ? (
-        <div>
-          <Button
-            size="xs"
-            variant="ghost"
-            onClick={() => {
-              onChange(recorded ?? null);
-              setStashed(recorded ?? null);
-              setPreview(0);
-            }}
-          >
-            Revert avatar
-          </Button>
-        </div>
-      ) : null}
     </section>
   );
 }

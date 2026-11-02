@@ -171,7 +171,6 @@ export function CreateAgentDialog({
                   preset={initialAvatar}
                   name={name.trim() || "New agent"}
                   avatar={avatar}
-                  recorded={initialAvatar}
                   others={[]}
                   onChange={setAvatar}
                 />

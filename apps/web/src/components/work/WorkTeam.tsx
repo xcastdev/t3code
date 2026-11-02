@@ -390,7 +390,6 @@ function TeamForm({
                 preset={PROJECT_TEAM_PRESETS[profile.role].avatar}
                 name={profile.name?.trim() || workStateLabel(profile.role)}
                 avatar={profile.avatar}
-                recorded={recorded?.profiles.find((p) => p.role === profile.role)?.avatar}
                 others={values.profiles.flatMap((p, at) =>
                   at !== index && p.avatar ? [p.avatar] : [],
                 )}

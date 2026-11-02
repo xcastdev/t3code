@@ -15,14 +15,13 @@ function Editor({ initial = null }: { initial?: ProjectTeamAvatar | null }) {
       preset={PROJECT_TEAM_PRESETS.implementer.avatar}
       name="Otto"
       avatar={avatar}
-      recorded={initial}
       others={[]}
       onChange={setAvatar}
     />
   );
 }
 
-it("keeps color and mood overrides when switching modes and can revert to initials", async () => {
+it("keeps color and mood overrides when switching modes", async () => {
   await using screen = await render(<Editor />);
   await userEvent.click(screen.getByRole("button", { name: "Face", exact: true }));
   await expect
@@ -40,10 +39,6 @@ it("keeps color and mood overrides when switching modes and can revert to initia
   await userEvent.click(screen.getByRole("button", { name: "Face", exact: true }));
   await expect
     .element(screen.getByRole("img", { name: "Otto's avatar: smile, paper face" }))
-    .toBeVisible();
-  await userEvent.click(screen.getByRole("button", { name: "Revert avatar", exact: true }));
-  await expect
-    .element(screen.getByRole("img", { name: "Otto's avatar: initials O" }))
     .toBeVisible();
 });
 

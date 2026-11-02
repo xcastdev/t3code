@@ -193,7 +193,6 @@ function ConfigurationFields({
             preset={preset}
             name={configuration.name.trim() || "Agent"}
             avatar={configuration.avatar}
-            recorded={recorded}
             others={[]}
             onChange={(avatar) => {
               const { avatar: _avatar, ...initials } = configuration;
