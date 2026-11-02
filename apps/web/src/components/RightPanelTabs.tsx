@@ -345,6 +345,20 @@ function RightPanelEmptyState(props: {
   const [highlight, setHighlight] = useState(-1);
 
   const actions = [
+    ...(props.onAddSideChat
+      ? [
+          {
+            label: "Side chat",
+            group: "chat",
+            description: "Ask a side question while this thread keeps working.",
+            icon: MessagesSquare,
+            shortcut: "S",
+            available: props.sideChatAvailable && !props.sideChatDisabledReason,
+            disabledReason: props.sideChatDisabledReason ?? SURFACE_UNAVAILABLE_HINTS.sideChat,
+            onClick: props.onAddSideChat,
+          },
+        ]
+      : []),
     {
       label: "Diff",
       group: "git",
@@ -371,48 +385,6 @@ function RightPanelEmptyState(props: {
       available: props.pullRequestAvailable,
       disabledReason: SURFACE_UNAVAILABLE_HINTS.pullRequest,
       onClick: props.onAddPullRequest,
-    },
-    ...(props.onAddSideChat
-      ? [
-          {
-            label: "Side chat",
-            group: "workspace",
-            description: "Ask a side question while this thread keeps working.",
-            icon: MessagesSquare,
-            shortcut: "S",
-            available: props.sideChatAvailable && !props.sideChatDisabledReason,
-            disabledReason: props.sideChatDisabledReason ?? SURFACE_UNAVAILABLE_HINTS.sideChat,
-            onClick: props.onAddSideChat,
-          },
-        ]
-      : []),
-    {
-      label: "Files",
-      group: "workspace",
-      icon: Files,
-      shortcut: "F",
-      available: props.filesAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.files,
-      onClick: props.onAddFiles,
-    },
-    {
-      label: "Browser",
-      group: "workspace",
-      icon: Globe2,
-      shortcut: "B",
-      available: props.browserAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.browser,
-      onClick: props.onAddBrowser,
-    },
-    {
-      label: "Device",
-      group: "workspace",
-      description: "Watch an iOS Simulator or Android Emulator.",
-      icon: Smartphone,
-      shortcut: "M",
-      available: props.deviceAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.device,
-      onClick: props.onAddDevice,
     },
     {
       label: "Work overview",
@@ -443,6 +415,34 @@ function RightPanelEmptyState(props: {
       available: props.onAddWork !== undefined,
       disabledReason: SURFACE_UNAVAILABLE_HINTS.work,
       onClick: () => props.onAddWork?.("knowledge"),
+    },
+    {
+      label: "Files",
+      group: "workspace",
+      icon: Files,
+      shortcut: "F",
+      available: props.filesAvailable,
+      disabledReason: SURFACE_UNAVAILABLE_HINTS.files,
+      onClick: props.onAddFiles,
+    },
+    {
+      label: "Browser",
+      group: "workspace",
+      icon: Globe2,
+      shortcut: "B",
+      available: props.browserAvailable,
+      disabledReason: SURFACE_UNAVAILABLE_HINTS.browser,
+      onClick: props.onAddBrowser,
+    },
+    {
+      label: "Device",
+      group: "workspace",
+      description: "Watch an iOS Simulator or Android Emulator.",
+      icon: Smartphone,
+      shortcut: "M",
+      available: props.deviceAvailable,
+      disabledReason: SURFACE_UNAVAILABLE_HINTS.device,
+      onClick: props.onAddDevice,
     },
   ] as const;
 
@@ -1287,6 +1287,18 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
   };
 
   const addSurfaceActions = [
+    ...(props.onAddSideChat
+      ? [
+          {
+            label: "Side chat",
+            icon: MessagesSquare,
+            shortcut: "S",
+            available: props.sideChatAvailable === true && !props.sideChatDisabledReason,
+            disabledReason: props.sideChatDisabledReason ?? SURFACE_DISABLED_REASONS.sideChat,
+            onClick: props.onAddSideChat,
+          },
+        ]
+      : []),
     {
       label: "Diff",
       icon: FileDiff,
@@ -1311,18 +1323,14 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       disabledReason: SURFACE_DISABLED_REASONS.pullRequest,
       onClick: props.onAddPullRequest,
     },
-    ...(props.onAddSideChat
-      ? [
-          {
-            label: "Side chat",
-            icon: MessagesSquare,
-            shortcut: "S",
-            available: props.sideChatAvailable === true && !props.sideChatDisabledReason,
-            disabledReason: props.sideChatDisabledReason ?? SURFACE_DISABLED_REASONS.sideChat,
-            onClick: props.onAddSideChat,
-          },
-        ]
-      : []),
+    {
+      label: "Work",
+      icon: ListTodo,
+      shortcut: "W",
+      available: props.onAddWork !== undefined,
+      disabledReason: SURFACE_DISABLED_REASONS.work,
+      onClick: () => props.onAddWork?.("tasks"),
+    },
     {
       label: "Files",
       icon: Files,
@@ -1346,14 +1354,6 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       available: props.deviceAvailable,
       disabledReason: SURFACE_DISABLED_REASONS.device,
       onClick: props.onAddDevice,
-    },
-    {
-      label: "Work",
-      icon: ListTodo,
-      shortcut: "W",
-      available: props.onAddWork !== undefined,
-      disabledReason: SURFACE_DISABLED_REASONS.work,
-      onClick: () => props.onAddWork?.("tasks"),
     },
   ] as const;
 
