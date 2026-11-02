@@ -11,7 +11,7 @@ import { memo, use, useLayoutEffect, useRef, useState, type ReactNode } from "re
 import { LegendList, type LegendListRef } from "@legendapp/list/react";
 import { workEntryDisplayIndicatesToolFailure } from "../../session-logic";
 import ChatMarkdown from "../ChatMarkdown";
-import { Minimize2Icon, XIcon } from "lucide-react";
+import { ChevronRightIcon, Minimize2Icon, XIcon } from "lucide-react";
 import { Button } from "../ui/button";
 import { getVirtualizedScrollFadeClassName } from "../ui/scroll-area";
 import {
@@ -25,7 +25,8 @@ import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { Spinner } from "../ui/spinner";
 import { WorktreeSetupCard } from "./WorktreeSetupCard";
 import { cn } from "~/lib/utils";
-import { type TimestampFormat } from "@t3tools/contracts/settings";
+import { type ClientSettings, type TimestampFormat } from "@t3tools/contracts/settings";
+import { useClientSettings } from "../../hooks/useSettings";
 import {
   TimelineRowCtx,
   TimelineRowActivityCtx,
@@ -584,29 +585,100 @@ export function LiveWorkEntryTimelineRow({
  * A running turn's consecutive thoughts in one tinted block, set apart from tool calls. Each
  * thought shows in full; a rule marks where the next one starts.
  */
+const selectThoughtsCollapsed = (settings: ClientSettings) =>
+  settings.timelineThoughts === "collapsed";
+
 export function ThoughtsTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "thoughts" }> }) {
   const ctx = use(TimelineRowCtx);
+  const collapsedByDefault = useClientSettings(selectThoughtsCollapsed);
+  const [open, setOpen] = useState(false);
   const count = row.entries.length;
+  const label = row.streaming ? "Thinking" : "Thought";
+  if (collapsedByDefault && !open) {
+    const preview = liveThoughtLine(row.entries[0]?.detail ?? "");
+    const heading = count > 1 ? `${label} (×${count})` : label;
+    return (
+      <WorkLogRow
+        role="button"
+        tabIndex={0}
+        aria-expanded={false}
+        aria-label={preview ? `${heading}: ${preview}` : heading}
+        onClick={() => setOpen(true)}
+        onKeyDown={(event) => {
+          if (
+            event.target === event.currentTarget &&
+            (event.key === "Enter" || event.key === " ")
+          ) {
+            event.preventDefault();
+            setOpen(true);
+          }
+        }}
+        icon={
+          <span className="flex size-4 items-center justify-center">
+            <ToolActivityIconView
+              icon={undefined}
+              fallbackName="brain"
+              className="block size-4 shrink-0 stroke-2"
+              muted
+            />
+          </span>
+        }
+        label={
+          <p className="flex min-w-0 flex-1 items-baseline gap-1.5 overflow-hidden text-sm leading-relaxed">
+            <span
+              ref={row.streaming ? observeVisibleAnimation : undefined}
+              className={cn("shrink-0 text-secondary-label", row.streaming && "live-tool-shine")}
+            >
+              {heading}
+            </span>
+            {preview ? (
+              <span className="min-w-0 truncate text-foreground/80">{preview}</span>
+            ) : null}
+          </p>
+        }
+        trailing={
+          <span className="flex size-4 shrink-0 items-center justify-center" aria-hidden>
+            <ChevronRightIcon className="size-3 shrink-0 text-icon-muted opacity-70" />
+          </span>
+        }
+      />
+    );
+  }
+  const header = (
+    <>
+      <ToolActivityIconView
+        icon={undefined}
+        fallbackName="brain"
+        className="block size-3.5 shrink-0 stroke-2"
+        muted
+      />
+      <span
+        ref={row.streaming ? observeVisibleAnimation : undefined}
+        className={cn("font-medium", row.streaming && "live-tool-shine")}
+      >
+        {label}
+      </span>
+      {count > 1 ? <span className="tabular-nums">· {count} thoughts</span> : null}
+    </>
+  );
   return (
     <section
       aria-label={row.streaming ? "Thinking" : "Thoughts"}
       className="my-1 rounded-lg border border-border/70 border-s-2 border-s-muted-foreground/40 bg-secondary px-3 py-2"
     >
-      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-        <ToolActivityIconView
-          icon={undefined}
-          fallbackName="brain"
-          className="block size-3.5 shrink-0 stroke-2"
-          muted
-        />
-        <span
-          ref={row.streaming ? observeVisibleAnimation : undefined}
-          className={cn("font-medium", row.streaming && "live-tool-shine")}
+      {collapsedByDefault ? (
+        <button
+          type="button"
+          aria-expanded
+          className="flex w-full cursor-pointer items-center gap-1.5 rounded-sm text-left text-xs text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+          onClick={() => setOpen(false)}
         >
-          {row.streaming ? "Thinking" : "Thought"}
-        </span>
-        {count > 1 ? <span className="tabular-nums">· {count} thoughts</span> : null}
-      </div>
+          {header}
+          <ChevronRightIcon aria-hidden className="ms-auto size-3 shrink-0 rotate-90 opacity-70" />
+        </button>
+      ) : (
+        <div className="flex items-center gap-1.5 text-xs text-muted-foreground">{header}</div>
+      )}
       {row.entries.map((entry, index) => (
         <ChatMarkdown
           key={entry.id}

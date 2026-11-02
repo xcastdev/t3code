@@ -17,7 +17,12 @@ diff. A running command's output updates live, and long output shows only its mo
 - **Every step** shows each tool call and thought as its own row.
 
 With **Latest steps** and **Every step**, thoughts appear in full as they stream, in a shaded block
-set apart from tool calls. Thoughts in a row share one block, with a line between each.
+set apart from tool calls. Thoughts in a row share one block, with a line between each. Set
+**Thoughts** to **Collapsed** to show each run of thoughts as one line with its first sentence, such as
+**Thought (×3)**; select the line to read them in full.
+
+Turn on **Pin your last message** to keep the last message you sent at the top of the conversation
+once it scrolls out of view. Select it to jump back to it.
 
 ## When a turn ends
 

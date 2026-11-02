@@ -337,6 +337,7 @@ const NO_TURN_CHECKLISTS: TimelineRowSharedState["turnChecklists"] = new Map();
 const selectTimelineDisplay = (settings: ClientSettings) => ({
   liveActivity: settings.timelineLiveActivity,
   turnEnd: settings.timelineTurnEnd,
+  pinLastUserMessage: settings.pinLastUserMessage,
 });
 
 const ConversationTimeline = memo(function ConversationTimeline({
@@ -418,7 +419,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
   topFadeEnabled = false,
   historyControls,
 }: MessagesTimelineProps) {
-  const { liveActivity, turnEnd } = useClientSettings(selectTimelineDisplay);
+  const { liveActivity, turnEnd, pinLastUserMessage } = useClientSettings(selectTimelineDisplay);
   const listIdentityKey = displayThreadKey ?? routeThreadKey;
   // Snapshot restore positions on identity changes; ongoing scroll writes must not move them.
   // Find open at the opening is part of the snapshot: opening find later
@@ -717,6 +718,9 @@ const ConversationTimeline = memo(function ConversationTimeline({
   const runs = useStableHandoffRuns(runsProp);
   const minimapItems = deriveTimelineMinimapItems(rows);
   const minimapRowIndices = minimapItems.map((item) => item.rowIndex);
+  const lastUserItem = minimapItems.at(-1);
+  // Set from the scroll frame: the last user message has scrolled above the viewport.
+  const [lastUserScrolledAway, setLastUserScrolledAway] = useState(false);
   const restoreRowIndex =
     restoringThreadPosition && rememberedPosition?.atEnd === false
       ? rows.findIndex((row) => row.id === rememberedPosition.rowId)
@@ -895,6 +899,12 @@ const ConversationTimeline = memo(function ConversationTimeline({
     });
     setMinimapCurrentIndex((current) =>
       current === nextCurrentIndex ? current : nextCurrentIndex,
+    );
+    const lastUser = minimapItems.at(-1);
+    setLastUserScrolledAway(
+      lastUser !== undefined &&
+        visibleRange.start !== null &&
+        lastUser.rowIndex < visibleRange.start,
     );
   });
 
@@ -1371,6 +1381,19 @@ const ConversationTimeline = memo(function ConversationTimeline({
               ListHeaderComponent={listHeader}
               ListFooterComponent={timelineListFooter}
             />
+            {pinLastUserMessage && lastUserScrolledAway && lastUserItem ? (
+              <PinnedUserMessage
+                text={lastUserItem.userText ?? ""}
+                onSelect={() => {
+                  navigateTimeline();
+                  void listRef.current?.scrollToIndex({
+                    index: lastUserItem.rowIndex,
+                    animated: !window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+                    viewOffset: 24,
+                  });
+                }}
+              />
+            ) : null}
             <TimelineMinimap
               items={minimapItems}
               hasPersistentGutter={minimapHasPersistentGutter}
@@ -1393,6 +1416,25 @@ const ConversationTimeline = memo(function ConversationTimeline({
     </>
   );
 });
+
+function PinnedUserMessage(props: { readonly text: string; readonly onSelect: () => void }) {
+  const text = props.text.replace(/\s+/g, " ").trim();
+  return (
+    // Same insets and padding as the messages, so it stays clear of the thread details card.
+    <div className="chat-banner-lane pointer-events-none absolute top-2 z-30 px-3 sm:px-12">
+      <div className="chat-content-lane flex justify-end">
+        <button
+          type="button"
+          aria-label="Scroll to your last message"
+          onClick={props.onSelect}
+          className="pointer-events-auto max-w-[80%] cursor-pointer rounded-2xl border border-border/70 bg-secondary/95 px-4 py-2 text-left text-sm text-foreground shadow-sm backdrop-blur outline-none hover:bg-secondary focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        >
+          <span className="line-clamp-2 break-words">{text || "Your last message"}</span>
+        </button>
+      </div>
+    </div>
+  );
+}
 
 function TimelineHistoryControl(props: MessagesTimelineHistoryControls) {
   if (!props.hasMoreHistory && props.error === null) {

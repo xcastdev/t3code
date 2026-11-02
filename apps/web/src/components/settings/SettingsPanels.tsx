@@ -548,6 +548,12 @@ export function useSettingsRestore(onRestored?: () => void) {
     ...(settings.timelineTurnEnd !== DEFAULT_UNIFIED_SETTINGS.timelineTurnEnd
       ? ["When a turn ends"]
       : []),
+    ...(settings.timelineThoughts !== DEFAULT_UNIFIED_SETTINGS.timelineThoughts
+      ? ["Thoughts"]
+      : []),
+    ...(settings.pinLastUserMessage !== DEFAULT_UNIFIED_SETTINGS.pinLastUserMessage
+      ? ["Pin your last message"]
+      : []),
     ...(settings.contextWindowMeterEnabled !== DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled
       ? ["Context window indicator"]
       : []),
@@ -664,6 +670,8 @@ export function useSettingsRestore(onRestored?: () => void) {
       followUpBehavior: DEFAULT_UNIFIED_SETTINGS.followUpBehavior,
       timelineLiveActivity: DEFAULT_UNIFIED_SETTINGS.timelineLiveActivity,
       timelineTurnEnd: DEFAULT_UNIFIED_SETTINGS.timelineTurnEnd,
+      timelineThoughts: DEFAULT_UNIFIED_SETTINGS.timelineThoughts,
+      pinLastUserMessage: DEFAULT_UNIFIED_SETTINGS.pinLastUserMessage,
       contextWindowMeterEnabled: DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled,
       environmentIdentificationMode: DEFAULT_UNIFIED_SETTINGS.environmentIdentificationMode,
       glassOpacity: DEFAULT_UNIFIED_SETTINGS.glassOpacity,
@@ -1282,6 +1290,57 @@ export function ChatSettingsPanel() {
                 <SelectItem value="keep">Keep every step</SelectItem>
               </SelectPopup>
             </Select>
+          }
+        />
+        <SettingsRow
+          {...searchableSetting("timeline-thoughts")}
+          description={
+            settings.timelineThoughts === "expanded"
+              ? "Thoughts show in full as the agent thinks."
+              : "Thoughts show as one line with their first sentence. Thoughts in a row share a line. Select it to read them in full."
+          }
+          resetAction={
+            settings.timelineThoughts !== DEFAULT_UNIFIED_SETTINGS.timelineThoughts ? (
+              <SettingResetButton
+                label="thoughts"
+                onClick={() =>
+                  updateSettings({ timelineThoughts: DEFAULT_UNIFIED_SETTINGS.timelineThoughts })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Select
+              value={settings.timelineThoughts}
+              onValueChange={(value) => {
+                if (value === "expanded" || value === "collapsed") {
+                  updateSettings({ timelineThoughts: value });
+                }
+              }}
+            >
+              <SelectTrigger size="sm" className="w-auto min-w-0" aria-label="Thoughts">
+                <SelectValue>
+                  {settings.timelineThoughts === "expanded" ? "Expanded" : "Collapsed"}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectPopup align="end" alignItemWithTrigger={false}>
+                <SelectItem value="expanded">Expanded</SelectItem>
+                <SelectItem value="collapsed">Collapsed</SelectItem>
+              </SelectPopup>
+            </Select>
+          }
+        />
+        <SettingsRow
+          {...searchableSetting("pin-last-user-message")}
+          description="Keeps the last message you sent at the top of the conversation once it scrolls out of view."
+          control={
+            <Switch
+              checked={settings.pinLastUserMessage}
+              onCheckedChange={(checked) =>
+                updateSettings({ pinLastUserMessage: Boolean(checked) })
+              }
+              aria-label="Pin your last message"
+            />
           }
         />
       </SettingsSection>

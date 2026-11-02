@@ -614,6 +614,18 @@ export const SETTINGS_SEARCH_ITEMS = [
     ],
   },
   {
+    id: "timeline-thoughts",
+    title: "Thoughts",
+    to: "/settings/chat",
+    searchTerms: ["thoughts thinking reasoning collapse expand one line preview turn activity"],
+  },
+  {
+    id: "pin-last-user-message",
+    title: "Pin your last message",
+    to: "/settings/chat",
+    searchTerms: ["pin sticky last message prompt top scroll keep in view conversation"],
+  },
+  {
     id: "follow-up-behavior",
     title: "Follow-up behavior",
     to: "/settings/chat",

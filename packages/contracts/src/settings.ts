@@ -65,6 +65,9 @@ export type TimelineLiveActivity = typeof TimelineLiveActivity.Type;
 export const TimelineTurnEnd = Schema.Literals(["fold", "keep"]);
 export type TimelineTurnEnd = typeof TimelineTurnEnd.Type;
 
+export const TimelineThoughts = Schema.Literals(["expanded", "collapsed"]);
+export type TimelineThoughts = typeof TimelineThoughts.Type;
+
 export const SidebarProjectSortOrder = Schema.Literals(["updated_at", "created_at", "manual"]);
 export type SidebarProjectSortOrder = typeof SidebarProjectSortOrder.Type;
 export const DEFAULT_SIDEBAR_PROJECT_SORT_ORDER: SidebarProjectSortOrder = "updated_at";
@@ -478,6 +481,10 @@ export const ClientSettingsSchema = Schema.Struct({
   ),
   /** Whether a finished turn folds its steps under a report. */
   timelineTurnEnd: TimelineTurnEnd.pipe(Schema.withDecodingDefault(Effect.succeed("fold"))),
+  /** Whether a running turn's thoughts show in full or as one line you can open. */
+  timelineThoughts: TimelineThoughts.pipe(Schema.withDecodingDefault(Effect.succeed("expanded"))),
+  /** Keeps the last message you sent in view at the top once it scrolls away. */
+  pinLastUserMessage: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   composerRichTextEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   sendShortcut: Schema.Literals(["enter", "mod-enter-multiline", "mod-enter"]).pipe(
     Schema.withDecodingDefault(Effect.succeed("enter")),
@@ -1851,6 +1858,8 @@ export const ClientSettingsPatch = Schema.Struct({
   contextWindowMeterEnabled: Schema.optionalKey(Schema.Boolean),
   timelineLiveActivity: Schema.optionalKey(TimelineLiveActivity),
   timelineTurnEnd: Schema.optionalKey(TimelineTurnEnd),
+  timelineThoughts: Schema.optionalKey(TimelineThoughts),
+  pinLastUserMessage: Schema.optionalKey(Schema.Boolean),
   composerRichTextEnabled: Schema.optionalKey(Schema.Boolean),
   sendShortcut: Schema.optionalKey(Schema.Literals(["enter", "mod-enter-multiline", "mod-enter"])),
   followUpBehavior: Schema.optionalKey(Schema.Literals(["queue", "steer"])),

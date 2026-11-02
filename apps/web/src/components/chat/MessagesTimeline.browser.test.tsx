@@ -31,6 +31,7 @@ import { describe, expect, it, onTestFinished, vi } from "vite-plus/test";
 
 import "~/index.css";
 
+import { updateClientSettings } from "../../hooks/useSettings";
 import { environmentThreadDetails } from "../../state/threads";
 import { act, fakeTimers, render, stubGlobal } from "../../../test/render";
 import { ChangedFilesCard } from "./ChangedFilesTree";
@@ -1478,4 +1479,69 @@ it("keeps concurrent approvals actionable outside collapsed work and restores se
   await expect
     .element(screen.getByRole("button", { name: "Open the current tab", exact: true }))
     .toBeVisible();
+});
+
+describe("collapsed thoughts", () => {
+  it("shows consecutive thoughts as one line that opens to the full block", async () => {
+    await updateClientSettings({ timelineThoughts: "collapsed" });
+    onTestFinished(() => updateClientSettings({ timelineThoughts: "expanded" }));
+    const runId = RunId.make("thinking-run");
+    const thought = (id: string, detail: string): Entry =>
+      work(id, {
+        runId,
+        label: "Thinking",
+        tone: "thinking",
+        itemType: "reasoning",
+        detail,
+        toolLifecycleStatus: "completed",
+      });
+    await using screen = await renderTimeline(
+      [
+        message("Plan the change", {}, "prompt"),
+        thought("a", "Read the config first. Then check the tests."),
+        thought("b", "The tests cover the default case."),
+      ],
+      {
+        isWorking: true,
+        activeTurnStartedAt: CREATED_AT,
+        latestRun: { runId, status: "running", startedAt: CREATED_AT, completedAt: null },
+      },
+    );
+    const line = screen.getByRole("button", {
+      name: "Thought (×2): Read the config first.",
+    });
+    await expect.element(line).toBeVisible();
+    expect(screen.text()).not.toContain("The tests cover the default case.");
+
+    await line.click();
+    await expect.element(screen.getByText("The tests cover the default case.")).toBeVisible();
+  });
+});
+
+describe("pinned last message", () => {
+  it("keeps the last message in view once it scrolls away, and jumps back to it", async () => {
+    await updateClientSettings({ pinLastUserMessage: true });
+    onTestFinished(() => updateClientSettings({ pinLastUserMessage: false }));
+    const props = baseProps();
+    const container = document.createElement("div");
+    container.style.cssText = "height: 600px; width: 900px; display: flex; flex-direction: column;";
+    await using screen = await render(
+      <MessagesTimeline
+        {...props}
+        timelineEntries={[
+          message("Earlier question", {}, "earlier"),
+          message("Earlier answer", { role: "assistant" }, "earlier-answer"),
+          message("Why does the build fail on CI?", {}, "last"),
+          message("Long answer line\n\n".repeat(80), { role: "assistant" }, "answer"),
+        ]}
+      />,
+      { container },
+    );
+    const pinned = screen.getByRole("button", { name: "Scroll to your last message" });
+    await expect.element(pinned).toBeVisible();
+    await expect.element(pinned).toHaveTextContent("Why does the build fail on CI?");
+
+    await pinned.click();
+    await expect.element(pinned).not.toBeInTheDocument();
+  });
 });
