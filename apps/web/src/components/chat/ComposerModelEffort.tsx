@@ -640,18 +640,35 @@ function PermissionsMenu(props: {
 /** The model picker's footer: speed stays one click away, permissions sit one menu deeper. */
 export function ComposerPickerFooter(props: {
   traits: TraitsSelectionInput | null;
-  runtimeMode: RuntimeMode;
-  runtimeModeOptions: ReadonlyArray<RuntimeModeOption>;
-  onRuntimeModeChange: (mode: RuntimeMode) => void;
+  /** Absent where the selection has no permissions of its own, leaving just the speed control. */
+  permissions?: {
+    readonly runtimeMode: RuntimeMode;
+    readonly runtimeModeOptions: ReadonlyArray<RuntimeModeOption>;
+    readonly onRuntimeModeChange: (mode: RuntimeMode) => void;
+  };
 }) {
   return (
     <div className="flex flex-wrap items-center gap-2 border-t border-border/70 bg-muted/40 px-3 py-2">
       {props.traits ? <SpeedControl traits={props.traits} /> : null}
-      <PermissionsMenu
-        runtimeMode={props.runtimeMode}
-        options={props.runtimeModeOptions}
-        onChange={props.onRuntimeModeChange}
-      />
+      {props.permissions ? (
+        <PermissionsMenu
+          runtimeMode={props.permissions.runtimeMode}
+          options={props.permissions.runtimeModeOptions}
+          onChange={props.permissions.onRuntimeModeChange}
+        />
+      ) : null}
     </div>
   );
+}
+
+/** Whether a model offers the footer's speed control (Codex service tiers or Fast mode). */
+export function hasComposerSpeedControl(traits: TraitsSelectionInput | null): boolean {
+  if (!traits) return false;
+  const visibility = getTraitsSectionVisibility(traits);
+  const { speedSelect, fastToggle } = splitSpeed(
+    traits.provider,
+    visibility.selectDescriptors,
+    visibility.booleanDescriptors,
+  );
+  return speedSelect !== null || fastToggle !== null;
 }

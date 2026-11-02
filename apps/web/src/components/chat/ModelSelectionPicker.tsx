@@ -16,6 +16,7 @@ import {
   ComposerEffortColumn,
   ComposerPickerFooter,
   describeComposerEffort,
+  hasComposerSpeedControl,
 } from "./ComposerModelEffort";
 import { ProviderModelPicker } from "./ProviderModelPicker";
 import { resolveCompatibleRuntimeMode, runtimeModeConfig } from "./runtimeModeConfig";
@@ -115,10 +116,15 @@ export function ModelSelectionPicker({
         runtimeMode !== undefined && onRuntimeModeChange ? (
           <ComposerPickerFooter
             traits={traits}
-            runtimeMode={modes.mode}
-            runtimeModeOptions={modes.modes.map((mode) => ({ mode, ...runtimeModeConfig[mode] }))}
-            onRuntimeModeChange={onRuntimeModeChange}
+            permissions={{
+              runtimeMode: modes.mode,
+              runtimeModeOptions: modes.modes.map((mode) => ({ mode, ...runtimeModeConfig[mode] })),
+              onRuntimeModeChange,
+            }}
           />
+        ) : hasComposerSpeedControl(traits) ? (
+          // Without permissions of its own, a selection still offers the model's speed.
+          <ComposerPickerFooter traits={traits} />
         ) : undefined
       }
       onInstanceModelChange={(instanceId, model) =>

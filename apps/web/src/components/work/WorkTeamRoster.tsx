@@ -9,6 +9,9 @@ import { WorkRecordsNotice, WorkNotice } from "./WorkNotice";
 import { WorkTaskLink } from "./WorkTaskRefs";
 import { useWorkTeamRoster } from "./useWorkTeamRoster";
 import { recordedTeamConfiguration } from "./workLogic";
+import { PencilIcon } from "lucide-react";
+
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { useWorkProviderCatalog } from "./useWorkProviderCatalog";
 import { workRouteLabel } from "./workLogic";
 import { workStateLabel } from "./workModel";
@@ -20,10 +23,13 @@ export function WorkTeamMembers({
   scope,
   compact = false,
   onOpenTask,
+  onEditMember,
 }: {
   scope: ProjectWorkScope;
   compact?: boolean;
   onOpenTask: (id: ProjectWorkTaskId) => void;
+  /** Absent while the team can't be changed here; each card then hides its edit button. */
+  onEditMember?: (role: string) => void;
 }) {
   const { roster, members, roles, view, records } = useWorkTeamRoster(scope);
   const catalog = useWorkProviderCatalog(scope.environmentId);
@@ -105,6 +111,24 @@ export function WorkTeamMembers({
                       tone={member.activity.tone}
                     />
                   </span>
+                  {onEditMember ? (
+                    <Tooltip>
+                      <TooltipTrigger
+                        render={
+                          <Button
+                            size="icon-xs"
+                            variant="ghost"
+                            className="-me-1.5 -mt-0.5 shrink-0"
+                            aria-label={`Edit ${member.name}`}
+                            onClick={() => onEditMember(member.role)}
+                          />
+                        }
+                      >
+                        <PencilIcon />
+                      </TooltipTrigger>
+                      <TooltipPopup>Edit {member.name}</TooltipPopup>
+                    </Tooltip>
+                  ) : null}
                 </div>
                 {specialty ? (
                   <p className="line-clamp-2 min-h-[2lh] px-4 text-xs leading-relaxed text-muted-foreground">
@@ -145,11 +169,7 @@ export function WorkTeamMembers({
                       onOpen={onOpenTask}
                     />
                   ) : (
-                    <WorkMeta className="px-2">
-                      {member.status !== member.activity.state
-                        ? `Member ${workStateLabel(member.status).toLowerCase()}`
-                        : "No task"}
-                    </WorkMeta>
+                    <WorkMeta className="px-2">No task</WorkMeta>
                   )}
                 </div>
               </article>

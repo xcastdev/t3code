@@ -56,8 +56,15 @@ interface Draft {
   readonly generation: number;
   /** The configured values the draft was opened from. */
   readonly recorded: TeamConfigurationValues | null;
-  readonly toggle: boolean;
+  readonly view: DraftView;
 }
+
+/** A configured team is edited one member, or the team settings, at a time. */
+type DraftView =
+  | { readonly kind: "setup" }
+  | { readonly kind: "member"; readonly role: TeamProfile["role"] }
+  | { readonly kind: "settings" }
+  | { readonly kind: "toggle" };
 
 /** Human team setup. Saving records profiles and limits only; workers stay off. */
 export function WorkTeamSection({
@@ -132,7 +139,8 @@ export function WorkTeamSection({
   const built = build(VALIDATION_COMMAND_ID);
   const buildReason = built !== null && "reason" in built ? built.reason : null;
 
-  const open = (toggle: boolean) => {
+  const open = (view: DraftView) => {
+    const toggle = view.kind === "toggle";
     if (recorded === null || revision === null) return;
     const empty = emptyTeamConfiguration();
     // A new team starts every member on the first enabled provider; each can change it.
@@ -154,7 +162,7 @@ export function WorkTeamSection({
       selected: current,
       generation: recorded.generation,
       recorded: recorded.kind === "configured" ? recorded.values : null,
-      toggle,
+      view,
     });
   };
   const save = async () => {
@@ -165,6 +173,9 @@ export function WorkTeamSection({
   const update = (values: TeamConfigurationValues) =>
     draft && setDraft({ ...draft, values: syncModelPolicies(values) });
   const configured = recorded?.kind === "configured" ? recorded.values : null;
+  const dirty =
+    draft !== null &&
+    (draft.recorded === null || JSON.stringify(draft.values) !== JSON.stringify(draft.recorded));
   const providerName = (id: string) => {
     const entry = providers.find((item) => item.instanceId === id);
     return entry ? (entry.displayName ?? entry.instanceId) : `${id} (unavailable)`;
@@ -231,22 +242,44 @@ export function WorkTeamSection({
                 label={configured.enabled ? "Disable team…" : "Enable team…"}
                 {...(blocked ? { description: blocked } : {})}
                 disabled={blocked !== null}
-                onPress={() => open(true)}
+                onPress={() => open({ kind: "toggle" })}
               />
             ) : null}
-            <ListActionRow
-              icon="pencil"
-              label={configured ? "Edit team" : "Set up team"}
-              {...(blocked ? { description: blocked } : {})}
-              disabled={blocked !== null}
-              onPress={() => open(false)}
-            />
+            {configured ? (
+              <>
+                {configured.profiles.map((profile) => (
+                  <ListActionRow
+                    key={profile.role}
+                    icon="pencil"
+                    label={`Edit ${profile.name ?? workStateLabel(profile.role)}`}
+                    {...(blocked ? { description: blocked } : {})}
+                    disabled={blocked !== null}
+                    onPress={() => open({ kind: "member", role: profile.role })}
+                  />
+                ))}
+                <ListActionRow
+                  icon="slider.horizontal.3"
+                  label="Team settings"
+                  {...(blocked ? { description: blocked } : {})}
+                  disabled={blocked !== null}
+                  onPress={() => open({ kind: "settings" })}
+                />
+              </>
+            ) : (
+              <ListActionRow
+                icon="pencil"
+                label="Set up team"
+                {...(blocked ? { description: blocked } : {})}
+                disabled={blocked !== null}
+                onPress={() => open({ kind: "setup" })}
+              />
+            )}
           </>
         ) : null}
       </ListSection>
       {draft !== null ? (
         <>
-          {draft.toggle ? (
+          {draft.view.kind === "toggle" ? (
             <ListSection title={draft.values.enabled ? "Enable team" : "Disable team"}>
               <WorkBlock>
                 <WorkText>
@@ -257,6 +290,7 @@ export function WorkTeamSection({
             </ListSection>
           ) : (
             <TeamForm
+              view={draft.view}
               values={draft.values}
               recorded={draft.recorded}
               providers={providers.map((entry) => ({
@@ -273,10 +307,14 @@ export function WorkTeamSection({
           )}
           <WorkFormActions
             submitLabel={
-              draft.toggle ? (draft.values.enabled ? "Enable team" : "Disable team") : "Save team"
+              draft.view.kind === "toggle"
+                ? draft.values.enabled
+                  ? "Enable team"
+                  : "Disable team"
+                : "Save"
             }
             pending={writer.pendingKey === key}
-            disabled={blocked !== null || buildReason !== null}
+            disabled={blocked !== null || buildReason !== null || !dirty}
             failure={writer.failureFor(key) ?? (changed ? null : buildReason)}
             changed={changed}
             onReview={() => setDraft(null)}
@@ -303,6 +341,7 @@ interface ProviderChoice {
 const withoutOptions = ({ options: _options, ...profile }: TeamProfile): TeamProfile => profile;
 
 function TeamForm(props: {
+  view: Exclude<DraftView, { kind: "toggle" }>;
   values: TeamConfigurationValues;
   recorded: TeamConfigurationValues | null;
   providers: ReadonlyArray<ProviderChoice>;
@@ -315,16 +354,19 @@ function TeamForm(props: {
   } | null>(null);
   const toggle = (role: string, field: "provider" | "model" | "effort") =>
     setChoosing(choosing?.role === role && choosing.field === field ? null : { role, field });
+  const { view } = props;
   return (
     <>
-      <ListSection title="Team setup">
-        <ListToggleRow
-          label="Team enabled"
-          value={values.enabled}
-          onValueChange={(enabled) => onChange({ ...values, enabled })}
-        />
-      </ListSection>
-      {props.providers.length === 0 ? (
+      {view.kind !== "setup" ? null : (
+        <ListSection title="Team setup">
+          <ListToggleRow
+            label="Team enabled"
+            value={values.enabled}
+            onValueChange={(enabled) => onChange({ ...values, enabled })}
+          />
+        </ListSection>
+      )}
+      {props.providers.length === 0 && view.kind !== "settings" ? (
         <ListSection title="Providers">
           <WorkBlock>
             <WorkText muted>No providers are enabled on this environment.</WorkText>
@@ -332,6 +374,8 @@ function TeamForm(props: {
         </ListSection>
       ) : null}
       {values.profiles.map((profile, index) => {
+        if (view.kind === "settings" || (view.kind === "member" && profile.role !== view.role))
+          return null;
         const set = (patch: Partial<typeof profile>) =>
           onChange({
             ...values,
@@ -474,7 +518,7 @@ function TeamForm(props: {
           </ListSection>
         );
       })}
-      {values.modelPolicies.length > 0 ? (
+      {view.kind !== "member" && values.modelPolicies.length > 0 ? (
         <ListSection title="Limits per provider and model">
           {values.modelPolicies.map((policy, index) => {
             const set = (patch: Partial<typeof policy>) =>
@@ -526,25 +570,27 @@ function TeamForm(props: {
           })}
         </ListSection>
       ) : null}
-      <ListSection title="Limits">
-        <WorkBlock>
-          {LIMIT_FIELDS.map(([field, label, max]) => (
-            <NumberField
-              key={field}
-              label={label}
-              min={0}
-              max={max}
-              value={values[field] ?? 0}
-              onValueChange={(value) => onChange({ ...values, [field]: value })}
-            />
-          ))}
-          {values.taskPriorities.length > 0 ? (
-            <WorkText muted>
-              {values.taskPriorities.length} recorded task priorities are kept.
-            </WorkText>
-          ) : null}
-        </WorkBlock>
-      </ListSection>
+      {view.kind === "member" ? null : (
+        <ListSection title="Limits">
+          <WorkBlock>
+            {LIMIT_FIELDS.map(([field, label, max]) => (
+              <NumberField
+                key={field}
+                label={label}
+                min={0}
+                max={max}
+                value={values[field] ?? 0}
+                onValueChange={(value) => onChange({ ...values, [field]: value })}
+              />
+            ))}
+            {values.taskPriorities.length > 0 ? (
+              <WorkText muted>
+                {values.taskPriorities.length} recorded task priorities are kept.
+              </WorkText>
+            ) : null}
+          </WorkBlock>
+        </ListSection>
+      )}
     </>
   );
 }
