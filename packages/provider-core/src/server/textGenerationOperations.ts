@@ -14,6 +14,7 @@ import type { ProviderTextGeneration } from "./textGeneration.ts";
 import {
   buildBranchNamePrompt,
   buildCommitMessagePrompt,
+  buildImageDescriptionPrompt,
   buildPrContentPrompt,
   buildReviewGuidePrompt,
   buildThreadTitlePrompt,
@@ -33,6 +34,10 @@ export interface Request<S extends Schema.Top> {
   readonly outputSchema: S;
   readonly modelSelection: ModelSelection;
   readonly attachments?: ReadonlyArray<ChatAttachment> | undefined;
+  /** Vetted image files to show the model; only runners built with `viewsImages` get them. */
+  readonly imageFiles?:
+    | ReadonlyArray<{ readonly path: string; readonly mimeType: string }>
+    | undefined;
   /** Investigate cwd with read-only tools across turns; fail if the runner cannot guarantee read-only access. */
   readonly investigate?: { readonly timeoutMs: number } | undefined;
 }
@@ -87,7 +92,17 @@ export const decodeJsonReply = <S extends Schema.Top>(
   );
 };
 
-export function fromRunner(name: string, run: Runner): ProviderTextGeneration {
+export const imagesUnsupported = () =>
+  new TextGenerationError({
+    operation: "describeImage",
+    detail: "This provider cannot look at images. Choose a Codex or OpenCode vision model.",
+  });
+
+export function fromRunner(
+  name: string,
+  run: Runner,
+  options?: { readonly viewsImages?: boolean },
+): ProviderTextGeneration {
   const extractMemoryFacts: ProviderTextGeneration["extractMemoryFacts"] = Effect.fn(
     `${name}.extractMemoryFacts`,
   )(function* (input) {
@@ -130,9 +145,7 @@ export function fromRunner(name: string, run: Runner): ProviderTextGeneration {
       ),
     );
     // Some native runners decode output themselves; validate again at the operation boundary.
-    return yield* Schema.decodeEffect(MemoryExtractionResult, { onExcessProperty: "error" })(
-      generated,
-    ).pipe(
+    return yield* decodeMemoryExtraction(generated).pipe(
       Effect.mapError(
         () =>
           new TextGenerationError({
@@ -239,6 +252,27 @@ export function fromRunner(name: string, run: Runner): ProviderTextGeneration {
     });
   });
 
+  const describeImage: ProviderTextGeneration["describeImage"] = Effect.fn(`${name}.describeImage`)(
+    function* (input) {
+      if (options?.viewsImages !== true) return yield* imagesUnsupported();
+      const generated = yield* run({
+        operation: "describeImage",
+        cwd: input.cwd,
+        modelSelection: input.modelSelection,
+        imageFiles: [{ path: input.imagePath, mimeType: input.mimeType }],
+        ...buildImageDescriptionPrompt({ instructions: input.instructions }),
+      });
+      const description = generated.description.trim();
+      if (description.length === 0) {
+        return yield* new TextGenerationError({
+          operation: "describeImage",
+          detail: `${name} returned an empty description.`,
+        });
+      }
+      return { description };
+    },
+  );
+
   return {
     extractMemoryFacts,
     generateCommitMessage,
@@ -246,5 +280,6 @@ export function fromRunner(name: string, run: Runner): ProviderTextGeneration {
     generateBranchName,
     generateThreadTitle,
     generateReviewGuide,
+    describeImage,
   } satisfies ProviderTextGeneration;
 }

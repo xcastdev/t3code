@@ -56,6 +56,7 @@ const fixture = (extract: TextGeneration.TextGeneration["Service"]["extractMemor
       generateBranchName: unused,
       generateThreadTitle: unused,
       generateReviewGuide: unused,
+      describeImage: unused,
       extractMemoryFacts: extract,
     }),
     Layer.succeed(Routes.ProjectMemoryModelRoutes, { extract: unused, embed: unused }),

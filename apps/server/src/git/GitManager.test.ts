@@ -289,6 +289,7 @@ function createTextGeneration(
       }),
     generateReviewGuide: () => Effect.succeed({ stops: [] }),
     extractMemoryFacts: () => Effect.succeed({ facts: [] }),
+    describeImage: () => Effect.die("unused"),
     ...overrides,
   };
 
@@ -339,6 +340,7 @@ function createTextGeneration(
       ),
     generateReviewGuide: (input) => implementation.generateReviewGuide(input),
     extractMemoryFacts: (input) => implementation.extractMemoryFacts(input),
+    describeImage: (input) => implementation.describeImage(input),
   };
 }
 

@@ -49,6 +49,9 @@ import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
 import { OrchestratorToolkit } from "./toolkits/orchestrator/tools.ts";
 import { PreviewToolkit } from "./toolkits/preview/tools.ts";
 import { ProjectToolkit } from "./toolkits/project/tools.ts";
+import * as ViewImageHandlers from "./toolkits/viewImage/handlers.ts";
+import { ViewImageToolkit } from "./toolkits/viewImage/tools.ts";
+import * as ViewImageMcpService from "./ViewImageMcpService.ts";
 
 const environmentId = EnvironmentId.make("environment-mcp-test");
 const threadId = ThreadId.make("thread-mcp-test");
@@ -1249,6 +1252,121 @@ it.effect("hides tools for links and refuses another environment while the beta 
       });
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect(
+  "lists t3_view_image only while it is on with a vision model, rooted at the worktree",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const token = "viewImageToken";
+        const scope: McpInvocationContext.McpThreadInvocationScope = {
+          environmentId,
+          requestNamespace: token,
+          thread: {
+            threadId: ThreadId.make("thread-view-image"),
+            providerSessionId: token,
+            providerInstanceId: ProviderInstanceId.make("opencode"),
+          },
+          client: undefined,
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 1,
+        };
+        const roots: Array<string> = [];
+        const settingsContext = yield* Layer.build(ServerSettings.layerTest());
+        const settings = Context.get(settingsContext, ServerSettings.ServerSettingsService);
+        const serverLayer = McpHttpServer.toolkitRegistration(
+          ViewImageToolkit,
+          ViewImageHandlers.layer,
+        ).pipe(
+          Layer.provideMerge(
+            McpHttpServer.layerMcpTransport.pipe(
+              Layer.provide(Layer.succeedContext(settingsContext)),
+            ),
+          ),
+          Layer.provide(
+            Layer.mergeAll(
+              Layer.mock(ThreadManagementService.ThreadManagementService)({
+                getThreadShell: (id) =>
+                  Effect.succeed({
+                    ...McpToolAccessTestkit.liveThreadShell(id),
+                    worktreePath: "/repo/.t3/worktrees/feature",
+                  }),
+              }),
+              Layer.mock(ProjectService.ProjectService)({
+                getById: () => Effect.die("the worktree is the root"),
+              }),
+              Layer.mock(ViewImageMcpService.ViewImageMcpService)({
+                view: (input) =>
+                  Effect.sync(() => {
+                    roots.push(input.root);
+                    return { description: "A chart." };
+                  }),
+              }),
+              Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+                resolve: (presented) => Effect.succeed(presented === token ? scope : undefined),
+              }),
+            ),
+          ),
+        );
+        yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
+          Layer.build,
+        );
+        const httpClient = yield* HttpClient.HttpClient;
+        const headers = {
+          accept: "application/json, text/event-stream",
+          authorization: `Bearer ${token}`,
+        };
+        const initialize = yield* httpClient.post("/mcp", {
+          headers,
+          body: HttpBody.text(
+            `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1.0.0"}}}`,
+            "application/json",
+          ),
+        });
+        const rpc = (method: string, params: object) =>
+          httpClient
+            .post("/mcp", {
+              headers: {
+                ...headers,
+                "mcp-session-id": initialize.headers["mcp-session-id"]!,
+                "mcp-protocol-version": "2025-06-18",
+              },
+              body: HttpBody.text(
+                JSON.stringify({ jsonrpc: "2.0", id: 2, method, params }),
+                "application/json",
+              ),
+            })
+            .pipe(Effect.flatMap((response) => response.json));
+        const listed = () =>
+          rpc("tools/list", {}).pipe(
+            Effect.map((body) =>
+              (body as { result: { tools: ReadonlyArray<{ name: string }> } }).result.tools.map(
+                (tool) => tool.name,
+              ),
+            ),
+          );
+        const visionModelSelection = { instanceId: ProviderInstanceId.make("codex"), model: "m" };
+
+        expect(yield* listed()).toEqual([]);
+        yield* settings.updateSettings({ viewImageToolEnabled: true });
+        expect(yield* listed()).toEqual([]);
+        yield* settings.updateSettings({ visionModelSelection });
+        expect(yield* listed()).toEqual(["t3_view_image"]);
+        yield* settings.updateSettings({ viewImageToolEnabled: false });
+        expect(yield* listed()).toEqual([]);
+
+        yield* settings.updateSettings({ viewImageToolEnabled: true });
+        const called = yield* rpc("tools/call", {
+          name: "t3_view_image",
+          arguments: { instructions: "Name the chart type.", path: "docs/chart.png" },
+        });
+        expect(called).toMatchObject({
+          result: { structuredContent: { description: "A chart." } },
+        });
+        expect(roots).toEqual(["/repo/.t3/worktrees/feature"]);
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
 it.effect("lists pull request watch tools only to threads that are not delegated children", () =>

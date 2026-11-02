@@ -278,6 +278,9 @@ export const isProviderAvailable = (snapshot: ServerProvider): boolean =>
 export const isProviderTextGenerationCapable = (snapshot: ServerProvider): boolean =>
   snapshot.supportsTextGeneration !== false;
 
+/** Drivers whose text generation can look at an image file, for the view image tool. */
+export const VISION_MODEL_DRIVERS: ReadonlySet<string> = new Set(["codex", "opencode"]);
+
 export const OtlpEndpointSource = Schema.Literals(["environment", "bootstrap", "settings"]);
 export type OtlpEndpointSource = typeof OtlpEndpointSource.Type;
 

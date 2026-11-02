@@ -45,6 +45,7 @@ const makeInstance = (
       generatePrContent: unsupported,
       generateThreadTitle: unsupported,
       generateReviewGuide: unsupported,
+      describeImage: unsupported,
     },
   };
 };

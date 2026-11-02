@@ -162,6 +162,11 @@ function selectOpenCodeRuntimeTextGeneration(
         v1: v1.generateReviewGuide(input),
         v2: v2.generateReviewGuide(input),
       }),
+    describeImage: (input) =>
+      byOpenCodeRuntime(probe.get, {
+        v1: v1.describeImage(input),
+        v2: v2.describeImage(input),
+      }),
   };
 }
 

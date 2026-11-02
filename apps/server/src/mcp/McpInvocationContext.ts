@@ -134,6 +134,8 @@ export interface McpInvocationScope {
   readonly client: McpClientCaller | undefined;
   /** False while the Linked environments beta is off here; `/mcp` reads it per request. */
   readonly linkedEnvironments?: boolean;
+  /** True while the view image tool is on and has a vision model; `/mcp` reads it per request. */
+  readonly viewImage?: boolean;
 }
 
 /**
@@ -177,6 +179,13 @@ export const hiddenWhileLinksOff = (): boolean => {
   const fiber = Fiber.getCurrent();
   const scope = fiber && Context.getOrUndefined(fiber.context, McpInvocationContext);
   return scope?.linkedEnvironments !== false;
+};
+
+/** `McpSchema.EnabledWhen` for `t3_view_image`, listed only while its setting is on. */
+export const visibleWhileViewImageOn = (): boolean => {
+  const fiber = Fiber.getCurrent();
+  const scope = fiber && Context.getOrUndefined(fiber.context, McpInvocationContext);
+  return scope?.viewImage === true;
 };
 
 export type McpCapabilityError<C extends McpCapability> = C extends "preview"

@@ -1,4 +1,6 @@
 // Generate endpoints return 403 on the free tier; use and remove a temporary prompt session.
+import * as NodeURL from "node:url";
+
 import { AbsolutePath, Location, Model, Provider, Session } from "@opencode/client/effect";
 import { TextGenerationError } from "@t3tools/contracts";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
@@ -131,11 +133,17 @@ const runOnServer = Effect.fn("Opencode2TextGeneration.runOnServer")(function* (
         .remove({ sessionID: session.id })
         .pipe(Effect.timeout("5 seconds"), Effect.ignore({ log: true })),
     );
-    const images = (input.attachments ?? []).flatMap((attachment) => {
-      if (attachment.type !== "image") return [];
-      const path = resolveAttachmentPath(attachment);
-      return path === null ? [] : [{ uri: `file://${path}`, name: attachment.name }];
-    });
+    const images = [
+      ...(input.attachments ?? []).flatMap((attachment) => {
+        if (attachment.type !== "image") return [];
+        const path = resolveAttachmentPath(attachment);
+        return path === null ? [] : [{ uri: `file://${path}`, name: attachment.name }];
+      }),
+      ...(input.imageFiles ?? []).map((file) => ({
+        uri: NodeURL.pathToFileURL(file.path).href,
+        name: `image.${file.mimeType.slice("image/".length)}`,
+      })),
+    ];
     yield* client.session.prompt({
       sessionID: session.id,
       text: input.prompt,
@@ -198,5 +206,6 @@ export const make = Effect.fn("OpenCode2TextGeneration.make")(function* () {
   return TextGenerationOperations.fromRunner(
     "OpenCode2TextGeneration",
     TextGenerationOperations.withoutInvestigation("OpenCode", run),
+    { viewsImages: true },
   );
 });

@@ -6,6 +6,7 @@ import {
   isProviderAvailable,
   isProviderTextGenerationCapable,
   resolveProjectProviderInstanceEnabled,
+  VISION_MODEL_DRIVERS,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import { exhaustedUsageWindow } from "@t3tools/shared/usageLimits";
@@ -46,7 +47,8 @@ type TextGenerationOp =
   | "generateBranchName"
   | "generateThreadTitle"
   | "generateReviewGuide"
-  | "extractMemoryFacts";
+  | "extractMemoryFacts"
+  | "describeImage";
 
 const resolveInstance = (
   registry: ProviderInstanceRegistry.ProviderInstanceRegistry["Service"],
@@ -55,14 +57,21 @@ const resolveInstance = (
 ): Effect.Effect<ProviderInstance["textGeneration"], TextGenerationError> =>
   registry.getInstance(instanceId).pipe(
     Effect.flatMap((instance) =>
-      instance
-        ? Effect.succeed(instance.textGeneration)
-        : Effect.fail(
+      !instance
+        ? Effect.fail(
             new TextGenerationError({
               operation,
               detail: `No provider instance registered for id '${instanceId}'.`,
             }),
-          ),
+          )
+        : operation === "describeImage" && !VISION_MODEL_DRIVERS.has(instance.driverKind)
+          ? Effect.fail(
+              new TextGenerationError({
+                operation,
+                detail: `'${instanceId}' runs ${instance.driverKind}, which cannot look at images. Choose a Codex or OpenCode vision model.`,
+              }),
+            )
+          : Effect.succeed(instance.textGeneration),
     ),
   );
 
@@ -118,6 +127,7 @@ export const make = Effect.gen(function* () {
               isProviderAvailable(provider) &&
               isProviderTextGenerationCapable(provider) &&
               (operation !== "generateReviewGuide" || INVESTIGATING_DRIVERS.has(driver)) &&
+              (operation !== "describeImage" || VISION_MODEL_DRIVERS.has(driver)) &&
               !exhaustedUsageWindow(provider, now, defaultTextGenerationModel(driver))
             );
           },
@@ -152,6 +162,11 @@ export const make = Effect.gen(function* () {
     generateReviewGuide: Effect.fn("TextGeneration.generateReviewGuide")(function (input) {
       return generate("generateReviewGuide", input.modelSelection, (service, modelSelection) =>
         service.generateReviewGuide({ ...input, modelSelection }),
+      );
+    }),
+    describeImage: Effect.fn("TextGeneration.describeImage")(function (input) {
+      return generate("describeImage", input.modelSelection, (service, modelSelection) =>
+        service.describeImage({ ...input, modelSelection }),
       );
     }),
     generateThreadTitle: Effect.fn("TextGeneration.generateThreadTitle")(function (input) {

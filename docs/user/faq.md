@@ -63,6 +63,10 @@ A separate work account is fine. Setup for two: [Codex](./providers-codex.md#use
 
 Yes. Add another provider instance in Settings and give it its own keys and endpoint. Claude has a full OpenRouter recipe. Your subscription setup stays untouched. [OpenRouter](./providers-claude.md#openrouter) · [Provider instances](./install.md#providers)
 
+## My model can't see images. Can it still read a screenshot?
+
+Yes. Turn on **View image tool** in **Settings → Threads → Image viewing** and choose a Codex or OpenCode vision model. New agent sessions get a `t3_view_image` tool: the agent says what to look for and names an image file in its workspace, and the vision model's description comes back to it. PNG, JPEG, WebP and GIF files up to 10 MiB work. Each call is a request to the vision model's provider.
+
 ## Does T3 Code support local models?
 
 No. T3 Code is a serious developer tool. Locally runnable models are not capable of meaningful engineering work.

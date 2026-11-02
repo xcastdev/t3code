@@ -464,6 +464,32 @@ it.layer(layerCodexTextGenerationTest)("CodexTextGeneration", (it) => {
         }),
     ),
   );
+
+  it.effect("shows codex the vetted image file when describing an image", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-codex-image-" });
+      const imagePath = path.join(dir, "screen.png");
+      yield* fs.writeFile(imagePath, Buffer.from("png"));
+      const described = yield* withFakeCodexEnv(
+        {
+          output: JSON.stringify({ description: "  A red error banner.  " }),
+          requireArg: `--image ${imagePath}`,
+          stdinMustContain: "Read the banner text.",
+        },
+        (textGeneration) =>
+          textGeneration.describeImage({
+            cwd: dir,
+            imagePath,
+            mimeType: "image/png",
+            instructions: "Read the banner text.",
+            modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+          }),
+      );
+      expect(described).toEqual({ description: "A red error banner." });
+    }).pipe(Effect.scoped),
+  );
 });
 
 it.effect.each([false, true])("text generation preflight: exhausted=%s", (exhausted) =>
@@ -476,6 +502,7 @@ it.effect.each([false, true])("text generation preflight: exhausted=%s", (exhaus
       options: [{ id: "effort", value: "high" }],
     };
     const calls: ModelSelection[] = [];
+    const imageCalls: ModelSelection[] = [];
     const instances: ProviderInstance[] = [primary, fallback].map((instanceId) => {
       const driver = ProviderDriverKind.make(instanceId === primary ? "codex" : "claudeAgent");
       const snapshot: ServerProvider = {
@@ -513,6 +540,11 @@ it.effect.each([false, true])("text generation preflight: exhausted=%s", (exhaus
           generateBranchName: () => Effect.die("unused"),
           generateReviewGuide: () => Effect.die("unused"),
           extractMemoryFacts: () => Effect.die("unused"),
+          describeImage: (input) =>
+            Effect.sync(() => {
+              imageCalls.push(input.modelSelection);
+              return { description: "Seen" };
+            }),
           generateThreadTitle: (input) =>
             Effect.sync(() => {
               calls.push(input.modelSelection);
@@ -557,5 +589,21 @@ it.effect.each([false, true])("text generation preflight: exhausted=%s", (exhaus
           }
         : selection,
     ]);
+
+    const image = {
+      cwd: "/tmp",
+      imagePath: "/tmp/a.png",
+      mimeType: "image/png",
+      instructions: "x",
+    };
+    // Only Codex and OpenCode see images, so an exhausted Codex has no fallback here.
+    expect(yield* service.describeImage({ ...image, modelSelection: selection })).toEqual({
+      description: "Seen",
+    });
+    const refused = yield* Effect.flip(
+      service.describeImage({ ...image, modelSelection: { instanceId: fallback, model: "m" } }),
+    );
+    expect(refused.detail).toContain("cannot look at images");
+    expect(imageCalls).toEqual([selection]);
   }),
 );

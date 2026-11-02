@@ -279,7 +279,7 @@ it("rebuilds the template from this checkout and sends a child T3's task prompt"
   assert.notEqual(prompt?.text, childCase.prompt);
 });
 
-it("lists link tools only while a case turns the beta on, and sends chips as T3 projects them", () => {
+it("lists link and view image tools only while a case turns them on, and sends chips as T3 projects them", () => {
   const off = buildBase(template, { model: "claude-sonnet-5-5", keepUserInstructions: false });
   const on = buildBase(template, {
     model: "claude-sonnet-5-5",
@@ -293,6 +293,18 @@ it("lists link tools only while a case turns the beta on, and sends chips as T3 
   assert.include(
     on.t3.map((tool) => tool.name),
     "mcp__t3-code__t3_environment_link",
+  );
+  assert.notInclude(
+    off.t3.map((tool) => tool.name),
+    "mcp__t3-code__t3_view_image",
+  );
+  assert.include(
+    buildBase(template, {
+      model: "claude-sonnet-5-5",
+      keepUserInstructions: false,
+      viewImage: true,
+    }).t3.map((tool) => tool.name),
+    "mcp__t3-code__t3_view_image",
   );
 
   const testCase: McpToolUseCase = {

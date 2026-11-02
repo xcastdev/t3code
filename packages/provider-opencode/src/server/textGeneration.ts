@@ -1,3 +1,5 @@
+import * as NodeURL from "node:url";
+
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
@@ -19,6 +21,7 @@ const OpenCodeTextGenerationOperation = Schema.Literals([
   "generateBranchName",
   "generateThreadTitle",
   "generateReviewGuide",
+  "describeImage",
 ]);
 
 const openCodeTextGenerationErrorContext = {
@@ -171,10 +174,18 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
       });
     }
 
-    const fileParts = OpenCodeRuntime.toOpenCodeFileParts({
-      attachments: input.attachments?.filter((attachment) => attachment.type === "image"),
-      resolveAttachmentPath: host.resolveAttachmentPath,
-    });
+    const fileParts = [
+      ...OpenCodeRuntime.toOpenCodeFileParts({
+        attachments: input.attachments?.filter((attachment) => attachment.type === "image"),
+        resolveAttachmentPath: host.resolveAttachmentPath,
+      }),
+      ...(input.imageFiles ?? []).map((file) => ({
+        type: "file" as const,
+        mime: file.mimeType,
+        filename: `image.${file.mimeType.slice("image/".length)}`,
+        url: NodeURL.pathToFileURL(file.path).href,
+      })),
+    ];
 
     const runAgainstServer = Effect.fn("runOpenCodeJson.runAgainstServer")(
       function* (
@@ -370,5 +381,6 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
   return TextGenerationOperations.fromRunner(
     "OpenCodeTextGeneration",
     TextGenerationOperations.withoutInvestigation("OpenCode", runOpenCodeJson),
+    { viewsImages: true },
   );
 });

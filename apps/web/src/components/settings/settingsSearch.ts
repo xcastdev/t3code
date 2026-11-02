@@ -729,6 +729,20 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["generated thread titles source control content default provider"],
   },
   {
+    id: "view-image-tool",
+    title: "View image tool",
+    to: "/settings/threads",
+    searchTerms: [
+      "t3_view_image screenshot picture vision describe agents models can't see images",
+    ],
+  },
+  {
+    id: "vision-model",
+    title: "Vision model",
+    to: "/settings/threads",
+    searchTerms: ["image viewing describe screenshot picture codex opencode"],
+  },
+  {
     id: "thread-title-instructions",
     title: "Thread title instructions",
     to: "/settings/threads",

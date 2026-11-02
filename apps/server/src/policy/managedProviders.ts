@@ -391,6 +391,9 @@ export function makeManagedProviders(
       reviewGuideModelSelection: allowedSelection(settings, settings.reviewGuideModelSelection)
         ? settings.reviewGuideModelSelection
         : null,
+      visionModelSelection: allowedSelection(settings, settings.visionModelSelection)
+        ? settings.visionModelSelection
+        : null,
     };
     cache.set(settings, result);
     return result;

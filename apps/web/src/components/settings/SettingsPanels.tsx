@@ -42,6 +42,7 @@ import {
   resolveDesktopUpdateButtonAction,
 } from "../../components/desktopUpdate.logic";
 import { ProviderModelPicker } from "../chat/ProviderModelPicker";
+import { ViewImageToolSection } from "./ViewImageToolSettings";
 import { TraitsPicker } from "../chat/TraitsPicker";
 import { isElectron } from "../../env";
 import { buildHostedChannelSelectionUrl, type HostedAppChannel } from "../../hostedPairing";
@@ -2088,6 +2089,7 @@ export function ThreadsSettingsPanel() {
           />
         </AdvancedSettings>
       </SettingsSection>
+      <ViewImageToolSection />
     </SettingsPageContainer>
   );
 }

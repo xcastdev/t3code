@@ -86,6 +86,9 @@ import {
   DeviceScreenshotToolkit,
   DeviceStandardToolkit,
 } from "./toolkits/device/tools.ts";
+import * as ViewImageHandlers from "./toolkits/viewImage/handlers.ts";
+import { ViewImageToolkit } from "./toolkits/viewImage/tools.ts";
+import * as ViewImageMcpService from "./ViewImageMcpService.ts";
 import * as HtmlHandlers from "./toolkits/html/handlers.ts";
 import { HtmlPreviewTool, HtmlPreviewToolkit, HtmlRenderToolkit } from "./toolkits/html/tools.ts";
 
@@ -208,9 +211,12 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
   const clients = yield* Effect.serviceOption(McpClientAuthenticator);
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const runtimeModeCeiling = serverSettings.managedPolicy?.limits?.maxRuntimeMode;
-  const linksEnabled = serverSettings.getSettings.pipe(
-    Effect.map((settings) => settings.linkedEnvironmentsEnabled),
-    Effect.orElseSucceed(() => false),
+  const settingFlags = serverSettings.getSettings.pipe(
+    Effect.map((settings) => ({
+      linkedEnvironments: settings.linkedEnvironmentsEnabled,
+      viewImage: settings.viewImageToolEnabled && settings.visionModelSelection !== null,
+    })),
+    Effect.orElseSucceed(() => ({ linkedEnvironments: false, viewImage: false })),
   );
   return Effect.fn("McpHttpServer.authenticateRequest")(function* (httpEffect) {
     const request = yield* HttpServerRequest.HttpServerRequest;
@@ -241,13 +247,10 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
     const asked = withModeLimit(invocation, request);
     if (asked === undefined) return invalidModeLimit;
     const limited = McpInvocationContext.withRuntimeModeCeiling(asked, runtimeModeCeiling);
-    const linkedEnvironments = yield* linksEnabled;
-    if (limited.client?.linked === true && !linkedEnvironments) return linkedEnvironmentsOff;
+    const flags = yield* settingFlags;
+    if (limited.client?.linked === true && !flags.linkedEnvironments) return linkedEnvironmentsOff;
     return yield* httpEffect.pipe(
-      Effect.provideService(McpInvocationContext.McpInvocationContext, {
-        ...limited,
-        linkedEnvironments,
-      }),
+      Effect.provideService(McpInvocationContext.McpInvocationContext, { ...limited, ...flags }),
       Effect.map(normalizeMcpHttpResponse),
     );
   }) satisfies McpAuthMiddleware;
@@ -1141,6 +1144,10 @@ const layerEnvironmentToolkit = toolkitRegistration(
 
 export const layerProjectRegistration = toolkitRegistration(ProjectToolkit, ProjectHandlers.layer);
 
+const layerViewImageToolkit = toolkitRegistration(ViewImageToolkit, ViewImageHandlers.layer).pipe(
+  Layer.provide(ViewImageMcpService.layer),
+);
+
 export const layerAttachmentToolkit = toolkitRegistration(
   AttachmentToolkit,
   AttachmentHandlers.layer,
@@ -1192,6 +1199,7 @@ export const layerTools = Layer.mergeAll(
   layerPullRequestsToolkit,
   layerDeviceToolkit,
   layerHtmlToolkit,
+  layerViewImageToolkit,
 );
 
 export const layer = layerTools.pipe(Layer.provideMerge(layerMcpTransport));

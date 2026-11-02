@@ -104,6 +104,19 @@ export interface MemoryExtractionInput {
   readonly modelSelection: ModelSelection;
 }
 
+export interface ImageDescriptionInput {
+  readonly cwd: string;
+  /** Absolute path to an image file the caller has already vetted. */
+  readonly imagePath: string;
+  readonly mimeType: string;
+  readonly instructions: string;
+  readonly modelSelection: ModelSelection;
+}
+
+export interface ImageDescriptionResult {
+  readonly description: string;
+}
+
 export interface ProviderTextGeneration {
   readonly extractMemoryFacts: (
     input: MemoryExtractionInput,
@@ -128,4 +141,9 @@ export interface ProviderTextGeneration {
   readonly generateReviewGuide: (
     input: ReviewGuideGenerationInput,
   ) => Effect.Effect<ReviewGuideGenerationResult, TextGenerationError>;
+
+  /** Only drivers in `VISION_MODEL_DRIVERS` see the image; the rest fail. */
+  readonly describeImage: (
+    input: ImageDescriptionInput,
+  ) => Effect.Effect<ImageDescriptionResult, TextGenerationError>;
 }

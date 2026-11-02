@@ -130,3 +130,33 @@ describe("memory extraction operation", () => {
     }),
   );
 });
+
+describe("image description operation", () => {
+  const image = {
+    cwd: "/tmp/project",
+    imagePath: "/tmp/project/screen.png",
+    mimeType: "image/png",
+    instructions: "Read the error banner.",
+    modelSelection: input.modelSelection,
+  };
+
+  it.effect("shows only runners that view images the file, and refuses the rest", () =>
+    Effect.gen(function* () {
+      const requests: Array<Parameters<Runner>[0]> = [];
+      const runner: Runner = (request) => {
+        requests.push(request);
+        return decodeJsonReply(request, "FakeNative", '{"description":"A red banner."}');
+      };
+      expect(
+        yield* fromRunner("FakeNative", runner, { viewsImages: true }).describeImage(image),
+      ).toEqual({ description: "A red banner." });
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.imageFiles).toEqual([{ path: image.imagePath, mimeType: "image/png" }]);
+      expect(requests[0]?.prompt).toContain("Read the error banner.");
+
+      const refused = yield* Effect.flip(fromRunner("FakeNative", runner).describeImage(image));
+      expect(refused.detail).toContain("cannot look at images");
+      expect(requests).toHaveLength(1);
+    }),
+  );
+});

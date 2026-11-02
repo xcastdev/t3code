@@ -19,6 +19,7 @@ import { museModelCapabilities, resolveMuseReasoningEffort } from "./modelCatalo
 import type { ProviderTextGeneration } from "@t3tools/provider-core/server/textGeneration";
 import {
   fromRunner,
+  imagesUnsupported,
   investigationUnsupported,
 } from "@t3tools/provider-core/server/textGenerationOperations";
 import {
@@ -357,5 +358,6 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
     generateBranchName,
     generateThreadTitle,
     generateReviewGuide,
+    describeImage: () => Effect.fail(imagesUnsupported()),
   } satisfies ProviderTextGeneration;
 });

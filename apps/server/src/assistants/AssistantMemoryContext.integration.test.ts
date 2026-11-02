@@ -156,6 +156,7 @@ const fixture = () => {
       generateThreadTitle: unused,
       generatePrContent: unused,
       generateReviewGuide: unused,
+      describeImage: unused,
       extractMemoryFacts: Effect.fn("AssistantMemoryContextIntegration.extract")(function* (
         input: Generation.MemoryExtractionInput,
       ) {
