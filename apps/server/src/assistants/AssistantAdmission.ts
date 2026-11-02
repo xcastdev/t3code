@@ -223,6 +223,7 @@ const make = Effect.gen(function* () {
       "providerThreads",
       "providerSessions",
       "providerTurns",
+      "nodes",
     ]);
     const candidates =
       input.runId === undefined
@@ -259,7 +260,16 @@ const make = Effect.gen(function* () {
       (run.activeAttemptId !== target.runAttemptId ||
         run.providerThreadId !== target.providerThreadId ||
         providerThread?.providerSessionId !== target.providerSessionId ||
-        (target.nodeId !== undefined && run.rootNodeId !== target.nodeId) ||
+        // Approvals and questions arrive on their own node under the turn, not on its root.
+        (target.nodeId !== undefined &&
+          !records.nodes.some(
+            (node) =>
+              node.id === target.nodeId &&
+              node.runId === run.id &&
+              node.providerThreadId === target.providerThreadId &&
+              (target.providerTurnId === undefined ||
+                node.providerTurnId === target.providerTurnId),
+          )) ||
         (target.providerTurnId !== undefined &&
           !records.providerTurns.some(
             (turn) =>

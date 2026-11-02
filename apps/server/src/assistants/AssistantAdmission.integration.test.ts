@@ -1120,6 +1120,55 @@ it.live.each(["disable", "archive"] as const)(
             completedAt: null,
           },
         },
+        // Providers raise approvals on their own node under the tool call, not on the root turn.
+        ...(
+          [
+            ["native-tool", "tool_call", nodeId],
+            ["native-approval", "approval_request", NodeId.make("native-tool")],
+          ] as const
+        ).map(([id, kind, parentNodeId]): OrchestrationV2DomainEvent => ({
+          id: EventId.make(`${id}-node`),
+          type: "node.updated",
+          threadId: home.id,
+          runId: run.id,
+          occurredAt: now,
+          payload: {
+            id: NodeId.make(id),
+            threadId: home.id,
+            runId: run.id,
+            parentNodeId,
+            rootNodeId: nodeId,
+            kind,
+            status: "running",
+            countsForRun: true,
+            providerThreadId,
+            providerTurnId,
+            nativeItemRef: null,
+            runtimeRequestId: null,
+            checkpointScopeId: null,
+            startedAt: now,
+            completedAt: null,
+          },
+        })),
+        {
+          id: EventId.make("native-approval"),
+          type: "runtime-request.updated",
+          threadId: home.id,
+          runId: run.id,
+          nodeId: NodeId.make("native-approval"),
+          occurredAt: now,
+          payload: {
+            id: RuntimeRequestId.make("native-approval"),
+            nodeId: NodeId.make("native-approval"),
+            providerTurnId,
+            nativeRequestRef: null,
+            kind: "command",
+            status: "resolved",
+            responseCapability: { type: "live", providerSessionId },
+            createdAt: now,
+            resolvedAt: now,
+          },
+        },
         ...(["command", "user_input"] as const).map((kind): OrchestrationV2DomainEvent => ({
           id: EventId.make(`native-${kind}`),
           type: "runtime-request.updated",
@@ -1182,6 +1231,12 @@ it.live.each(["disable", "archive"] as const)(
           requestId: RuntimeRequestId.make("native-command"),
           decision: "accept",
         });
+        yield* service.respond({
+          threadId: home.id,
+          providerSessionId,
+          requestId: RuntimeRequestId.make("native-approval"),
+          decision: "accept",
+        });
         yield* repository.lifecycle({
           environmentId,
           assistantId: binding.assistantId,
@@ -1197,6 +1252,7 @@ it.live.each(["disable", "archive"] as const)(
         });
         assert.deepStrictEqual(acknowledgements, [
           { requestId: RuntimeRequestId.make("native-command"), decision: "accept" },
+          { requestId: RuntimeRequestId.make("native-approval"), decision: "accept" },
           {
             requestId: RuntimeRequestId.make("native-user_input"),
             answers: { choice: ["continue"] },
@@ -1273,7 +1329,7 @@ it.live.each(["disable", "archive"] as const)(
         );
         const next = yield* createRun(home, "future-run", "queued", 2);
         assert.equal(next.result.receipt.status, "rejected");
-        assert.equal(acknowledgements.length, 2);
+        assert.equal(acknowledgements.length, 3);
       }).pipe(Effect.provide(native));
     }).pipe(Effect.provide(testLayer)),
 );
