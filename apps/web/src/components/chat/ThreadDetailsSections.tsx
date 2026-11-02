@@ -1,4 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
+import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
   isProjectTerminalRunning,
   projectTerminalStatusLabel,
@@ -31,11 +32,14 @@ import {
 
 import { formatContextWindowTokens, type ContextWindowSnapshot } from "~/lib/contextWindow";
 import { revealThreadTerminal } from "~/lib/revealThreadTerminal";
+import { confirmTerminalClose } from "~/lib/terminalCloseConfirm";
 import { cn } from "~/lib/utils";
 import { useThreadDiscoveredPorts } from "~/portDiscoveryState";
+import { selectThreadRightPanelState, useRightPanelStore } from "~/rightPanelStore";
 import { orchestrationEnvironment } from "~/state/orchestration";
 import { projectTerminalEnvironment, useProjectTerminalDock } from "~/state/projectTerminals";
 import { terminalEnvironment } from "~/state/terminal";
+import { useTerminalUiStateStore } from "~/terminalUiStateStore";
 import { useKnownTerminalSessions } from "~/state/terminalSessions";
 import { threadEnvironment } from "~/state/threads";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -296,6 +300,8 @@ export function ThreadDetailsProcessesSection(props: {
   readonly threadId: ThreadId;
   readonly projectId: ProjectId;
   readonly pendingBackgroundTasks: ReadonlyArray<OrchestrationV2PendingBackgroundTask>;
+  /** The "Terminals" item in "Choose what to show". */
+  readonly showTerminals: boolean;
   /** The "Servers" item in "Choose what to show". */
   readonly showServers: boolean;
 }) {
@@ -312,6 +318,9 @@ export function ThreadDetailsProcessesSection(props: {
   const canInterruptTerminal = useAtomValue(
     terminalEnvironment.write.permissionAtom(props.environmentId),
   );
+  const canCloseTerminal = useAtomValue(
+    terminalEnvironment.close.permissionAtom(props.environmentId),
+  );
   const canKillAgentShell = useAtomValue(
     projectTerminalEnvironment.kill.permissionAtom(props.environmentId),
   );
@@ -319,6 +328,7 @@ export function ThreadDetailsProcessesSection(props: {
     orchestrationEnvironment.stopBackgroundTask.permissionAtom(props.environmentId),
   );
   const writeTerminal = useAtomCommand(terminalEnvironment.write, { reportFailure: false });
+  const closeTerminal = useAtomCommand(terminalEnvironment.close, { reportFailure: false });
   const killAgentShell = useAtomCommand(projectTerminalEnvironment.kill, {
     reportFailure: false,
   });
@@ -327,7 +337,9 @@ export function ThreadDetailsProcessesSection(props: {
   });
 
   const servers = props.showServers ? discoveredServers : [];
-  const shells = (terminals ?? []).filter((session) => session.state.status !== "closed");
+  const shells = props.showTerminals
+    ? (terminals ?? []).filter((session) => session.state.status !== "closed")
+    : [];
   const agentShells = dock.terminals.filter(
     (terminal) =>
       terminal.creatingThreadId === props.threadId &&
@@ -377,6 +389,7 @@ export function ThreadDetailsProcessesSection(props: {
           const summary = session.state.summary;
           const busy = session.state.hasRunningSubprocess;
           const terminalId = session.target.terminalId;
+          const label = summary?.label || getTerminalLabel(terminalId);
           const status = busy
             ? "Running"
             : summary?.exitCode !== null && summary?.exitCode !== undefined
@@ -397,7 +410,7 @@ export function ThreadDetailsProcessesSection(props: {
                   />
                 </span>
               }
-              title={summary?.label || getTerminalLabel(terminalId)}
+              title={label}
               detail={["Terminal", status].filter(Boolean).join(" · ")}
               open={{
                 tooltip: "Open in the terminal panel",
@@ -410,9 +423,9 @@ export function ThreadDetailsProcessesSection(props: {
               {...(busy && canInterruptTerminal
                 ? {
                     stop: {
-                      label: `Stop what runs in ${summary?.label || getTerminalLabel(terminalId)}`,
+                      label: `Stop what runs in ${label}`,
                       tooltip: "Stop the running command (Ctrl-C)",
-                      onStop: async () => {
+                      onAction: async () => {
                         reportFailure(
                           "Could not stop the command",
                           await writeTerminal({
@@ -420,6 +433,36 @@ export function ThreadDetailsProcessesSection(props: {
                             input: { threadId: props.threadId, terminalId, data: "\u0003" },
                           }),
                         );
+                      },
+                    },
+                  }
+                : {})}
+              {...(canCloseTerminal
+                ? {
+                    remove: {
+                      label: `Delete ${label}`,
+                      tooltip: "Delete terminal",
+                      onAction: async () => {
+                        if (!(await confirmTerminalClose([label]))) return;
+                        const result = await closeTerminal({
+                          environmentId: props.environmentId,
+                          input: { threadId: props.threadId, terminalId, deleteHistory: true },
+                        });
+                        if (result._tag === "Failure") {
+                          reportFailure("Could not delete the terminal", result);
+                          return;
+                        }
+                        const threadRef = scopeThreadRef(props.environmentId, props.threadId);
+                        useTerminalUiStateStore.getState().closeTerminal(threadRef, terminalId);
+                        const panels = useRightPanelStore.getState();
+                        const surface = selectThreadRightPanelState(
+                          panels.byThreadKey,
+                          threadRef,
+                        ).surfaces.find(
+                          (entry) =>
+                            entry.kind === "terminal" && entry.terminalIds.includes(terminalId),
+                        );
+                        if (surface) panels.closeTerminal(threadRef, surface.id, terminalId);
                       },
                     },
                   }
@@ -447,7 +490,7 @@ export function ThreadDetailsProcessesSection(props: {
                   stop: {
                     label: `Stop ${terminal.label || terminal.terminalId}`,
                     tooltip: "Stop agent shell",
-                    onStop: async () => {
+                    onAction: async () => {
                       reportFailure(
                         "Could not stop the agent shell",
                         await killAgentShell({
@@ -484,7 +527,7 @@ export function ThreadDetailsProcessesSection(props: {
                     stop: {
                       label: `Stop ${item.label}`,
                       tooltip: `Stop ${kind.toLowerCase()}`,
-                      onStop: async () => {
+                      onAction: async () => {
                         reportFailure(
                           `Could not stop the ${kind.toLowerCase()}`,
                           await stopTask({

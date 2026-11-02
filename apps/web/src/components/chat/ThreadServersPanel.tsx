@@ -101,7 +101,7 @@ export function ThreadServerRows(props: {
             stop: {
               label: `Stop localhost:${server.port}`,
               tooltip: "Stop server",
-              onStop: () => stop(server),
+              onAction: () => stop(server),
             },
           }
         : {})}

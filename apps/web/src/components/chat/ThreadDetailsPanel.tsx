@@ -172,6 +172,7 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                   threadId={props.threadId}
                   projectId={props.projectId}
                   pendingBackgroundTasks={props.pendingBackgroundTasks}
+                  showTerminals={visible.terminals}
                   showServers={!props.draftId && visible.servers}
                 />
               </ThreadDetailsAutoCollapse>
@@ -281,6 +282,7 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                     threadId={props.threadId}
                     projectId={props.projectId}
                     pendingBackgroundTasks={props.pendingBackgroundTasks}
+                    showTerminals={visible.terminals}
                     showServers={!props.draftId && visible.servers}
                   />
                 </ThreadDetailsAutoCollapse>

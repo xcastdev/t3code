@@ -1,4 +1,4 @@
-import { LoaderCircleIcon, SquareIcon } from "lucide-react";
+import { LoaderCircleIcon, SquareIcon, Trash2Icon } from "lucide-react";
 import { type MouseEvent, type ReactNode, useState } from "react";
 
 import { cn } from "../../lib/utils";
@@ -16,17 +16,22 @@ export function ThreadProcessRow(props: {
     readonly disabled?: boolean;
     readonly onOpen: (event: MouseEvent<HTMLElement>) => void;
   };
-  readonly stop?: {
-    readonly label: string;
-    readonly tooltip: string;
-    readonly onStop: () => Promise<void>;
-  };
+  readonly stop?: RowAction;
+  readonly remove?: RowAction;
 }) {
-  const [stopping, setStopping] = useState(false);
-  const stop = props.stop;
+  const actions = [
+    props.stop ? { ...props.stop, icon: "stop" as const } : null,
+    props.remove ? { ...props.remove, icon: "remove" as const } : null,
+  ].filter((action) => action !== null);
   const text = (
-    // The end padding keeps text clear of the stop button.
-    <span className={cn("flex min-w-0 flex-1 flex-col gap-0.5 text-left", stop && "pe-6")}>
+    // The end padding keeps text clear of the action buttons.
+    <span
+      className={cn(
+        "flex min-w-0 flex-1 flex-col gap-0.5 text-left",
+        actions.length === 1 && "pe-6",
+        actions.length === 2 && "pe-12",
+      )}
+    >
       <span className="truncate text-sm font-medium leading-4 text-foreground/85">
         {props.title}
       </span>
@@ -69,35 +74,55 @@ export function ThreadProcessRow(props: {
           {text}
         </div>
       )}
-      {stop ? (
-        <div className="pointer-events-none absolute right-1 top-1/2 -translate-y-1/2 opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100">
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <ThreadDetailsControl
-                  size="icon-xs"
-                  variant="ghost"
-                  part="icon"
-                  tone="destructive"
-                  aria-label={stop.label}
-                  disabled={stopping}
-                  onClick={() => {
-                    setStopping(true);
-                    void stop.onStop().finally(() => setStopping(false));
-                  }}
-                />
-              }
-            >
-              {stopping ? (
-                <LoaderCircleIcon aria-hidden className="size-3 animate-spin" />
-              ) : (
-                <SquareIcon aria-hidden className="size-3 fill-current" />
-              )}
-            </TooltipTrigger>
-            <TooltipPopup side="left">{stop.tooltip}</TooltipPopup>
-          </Tooltip>
+      {actions.length > 0 ? (
+        <div className="pointer-events-none absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100">
+          {actions.map((action) => (
+            <RowActionButton key={action.icon} action={action} />
+          ))}
         </div>
       ) : null}
     </li>
+  );
+}
+
+interface RowAction {
+  readonly label: string;
+  readonly tooltip: string;
+  readonly onAction: () => Promise<void>;
+}
+
+function RowActionButton(props: {
+  readonly action: RowAction & { readonly icon: "stop" | "remove" };
+}) {
+  const [pending, setPending] = useState(false);
+  const { action } = props;
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <ThreadDetailsControl
+            size="icon-xs"
+            variant="ghost"
+            part="icon"
+            tone="destructive"
+            aria-label={action.label}
+            disabled={pending}
+            onClick={() => {
+              setPending(true);
+              void action.onAction().finally(() => setPending(false));
+            }}
+          />
+        }
+      >
+        {pending ? (
+          <LoaderCircleIcon aria-hidden className="size-3 animate-spin" />
+        ) : action.icon === "stop" ? (
+          <SquareIcon aria-hidden className="size-3 fill-current" />
+        ) : (
+          <Trash2Icon aria-hidden className="size-3" />
+        )}
+      </TooltipTrigger>
+      <TooltipPopup side="left">{action.tooltip}</TooltipPopup>
+    </Tooltip>
   );
 }
