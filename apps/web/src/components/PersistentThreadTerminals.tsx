@@ -273,6 +273,7 @@ export const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerm
           keybindings={keybindings}
           onActiveTerminalChange={activateTerminal}
           onCloseTerminal={closeTerminal}
+          onHide={() => useTerminalUiStateStore.getState().setTerminalOpen(threadRef, false)}
           onHeightChange={setTerminalHeight}
           onAddTerminalContext={handleAddTerminalContext}
           terminalLabelsById={terminalLabelsById}

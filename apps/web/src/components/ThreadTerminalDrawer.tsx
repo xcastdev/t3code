@@ -18,6 +18,7 @@ import {
   SquareSplitVertical,
   TerminalSquare,
   Trash2,
+  X,
 } from "lucide-react";
 import {
   AuthPreviewOperateScope,
@@ -1195,6 +1196,8 @@ interface ThreadTerminalDrawerProps {
   closeShortcutLabel?: string | undefined;
   onActiveTerminalChange: (terminalId: string) => void;
   onCloseTerminal: (terminalId: string, threadRef?: ScopedThreadRef) => void;
+  /** Hides the dock and leaves its terminals running; only the drawer has one. */
+  onHide?: () => void;
   onHeightChange: (height: number) => void;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
   keybindings: ResolvedKeybindingsConfig;
@@ -1451,6 +1454,7 @@ export default function ThreadTerminalDrawer({
   closeShortcutLabel,
   onActiveTerminalChange,
   onCloseTerminal,
+  onHide,
   onHeightChange,
   onAddTerminalContext,
   keybindings,
@@ -1846,6 +1850,18 @@ export default function ThreadTerminalDrawer({
             >
               <Trash2 className="size-3.25" />
             </TerminalActionButton>
+            {onHide ? (
+              <>
+                <div className="h-4 w-px bg-border/80" />
+                <TerminalActionButton
+                  className="p-1 text-foreground/90 transition-colors hover:bg-accent"
+                  onClick={onHide}
+                  label="Hide terminal"
+                >
+                  <X className="size-3.25" />
+                </TerminalActionButton>
+              </>
+            ) : null}
           </div>
         </div>
       )}
@@ -1919,6 +1935,15 @@ export default function ThreadTerminalDrawer({
                   >
                     <Trash2 className="size-3.25" />
                   </TerminalActionButton>
+                  {onHide ? (
+                    <TerminalActionButton
+                      className="inline-flex h-full items-center border-l border-border/70 px-1 text-foreground/90 transition-colors hover:bg-accent/70"
+                      onClick={onHide}
+                      label="Hide terminal"
+                    >
+                      <X className="size-3.25" />
+                    </TerminalActionButton>
+                  ) : null}
                 </div>
               </div>
 
