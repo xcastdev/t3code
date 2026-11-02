@@ -20,6 +20,15 @@ import { useWorkTeamRoster } from "./useWorkTeamRoster";
 import { WorkAvatarEditor } from "./WorkAvatarEditor";
 import { WorkMemberAvatar } from "./WorkMemberAvatar";
 import { memberAvatarIdentity } from "./workTeamView";
+import {
+  AlertDialog,
+  AlertDialogClose,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from "../ui/alert-dialog";
 import { Input } from "../ui/input";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
@@ -35,14 +44,7 @@ import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../
 import { Switch } from "../ui/switch";
 import { Textarea } from "../ui/textarea";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
-import {
-  WorkField,
-  WorkFormStatus,
-  WorkMeta,
-  WorkRevision,
-  WorkRow,
-  WorkSection,
-} from "./WorkLayout";
+import { WorkField, WorkFormStatus, WorkMeta, WorkRow, WorkSection } from "./WorkLayout";
 import { WorkRecordsNotice, WorkReviewChanged } from "./WorkNotice";
 import { workRecordsBlockedReason } from "./useWorkRecords";
 import type { WorkWriter } from "./useWorkWriter";
@@ -254,7 +256,9 @@ export function WorkTeam({
       grouped={false}
       className="mx-auto w-full max-w-6xl gap-3"
       actions={
-        draft === null && recorded !== null && recorded.kind !== "unreadable" ? (
+        (draft === null || draft.view.kind === "toggle") &&
+        recorded !== null &&
+        recorded.kind !== "unreadable" ? (
           configured ? (
             <>
               <EditIconButton
@@ -364,23 +368,56 @@ export function WorkTeam({
             : {})}
         />
       ) : null}
-      {draft !== null && !editing ? (
+      {configured ? (
+        <AlertDialog
+          open={draft?.view.kind === "toggle"}
+          onOpenChange={(open) => {
+            if (!open && writer.pendingKey !== key) setDraft(null);
+          }}
+        >
+          <AlertDialogPopup>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {configured.enabled ? "Disable the team?" : "Enable the team?"}
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                {configured.enabled
+                  ? "Members pause and no new worker starts. Work already running keeps going."
+                  : "Members become available. Nothing starts until you start an approved task."}{" "}
+                Profiles and limits stay the same.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            {changed ? <WorkReviewChanged onReview={reviewLatest} /> : null}
+            <WorkFormStatus message={writer.failureFor(key)} />
+            <AlertDialogFooter>
+              <AlertDialogClose render={<Button variant="outline" />}>Cancel</AlertDialogClose>
+              <Button
+                variant={configured.enabled ? "destructive" : "default"}
+                disabled={
+                  changed || blocked !== null || buildReason !== null || writer.pendingKey !== null
+                }
+                onClick={() => void save()}
+              >
+                {writer.pendingKey === key
+                  ? "Saving…"
+                  : configured.enabled
+                    ? "Disable team"
+                    : "Enable team"}
+              </Button>
+            </AlertDialogFooter>
+          </AlertDialogPopup>
+        </AlertDialog>
+      ) : null}
+      {draft !== null && !editing && draft.view.kind !== "toggle" ? (
         <WorkRow className="gap-4 rounded-xl border border-border/60 bg-card/40 py-4">
           {changed ? <WorkReviewChanged onReview={reviewLatest} /> : null}
-          {draft.view.kind === "toggle" ? (
-            <p className="text-sm">
-              {draft.values.enabled ? "Enable" : "Disable"} the recorded team at generation{" "}
-              <WorkRevision>{draft.generation}</WorkRevision>? Profiles and limits stay the same.
-            </p>
-          ) : (
-            <TeamForm
-              environmentId={scope.environmentId}
-              values={draft.values}
-              recorded={draft.recorded}
-              providers={providerChoices}
-              onChange={update}
-            />
-          )}
+          <TeamForm
+            environmentId={scope.environmentId}
+            values={draft.values}
+            recorded={draft.recorded}
+            providers={providerChoices}
+            onChange={update}
+          />
           <div className="flex flex-wrap gap-2">
             <Button
               size="sm"
@@ -389,13 +426,7 @@ export function WorkTeam({
               }
               onClick={() => void save()}
             >
-              {writer.pendingKey === key
-                ? "Saving…"
-                : draft.view.kind === "toggle"
-                  ? draft.values.enabled
-                    ? "Enable team"
-                    : "Disable team"
-                  : "Save team"}
+              {writer.pendingKey === key ? "Saving…" : "Save team"}
             </Button>
             <Button size="sm" variant="ghost" onClick={() => setDraft(null)}>
               Cancel
