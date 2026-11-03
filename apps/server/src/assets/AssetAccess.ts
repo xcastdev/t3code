@@ -1,5 +1,7 @@
 import type { AssetResource } from "@t3tools/contracts";
 import {
+  PluginContributionId,
+  PluginId,
   AssetAttachmentNotFoundError,
   AssetSourceControlMediaUrlValidationError,
   AssetPreviewTypeValidationError,
@@ -59,6 +61,7 @@ import { parseAttachmentFileExtension, resolveAttachmentPathById } from "../atta
 import * as ServerConfig from "../config.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
+import * as PluginPackageStore from "../plugins/PluginPackageStore.ts";
 import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
 import { isWithinRoot } from "../workspace/KnownWorkspaces.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
@@ -177,6 +180,14 @@ const AssetClaimsSchema = Schema.Union([
     cwd: Schema.String,
     expiresAt: Schema.Number,
   }),
+  Schema.Struct({
+    version: Schema.Literal(1),
+    kind: Schema.Literal("plugin-panel"),
+    pluginId: PluginId,
+    panelId: PluginContributionId,
+    pluginVersion: Schema.String,
+    expiresAt: Schema.Number,
+  }),
 ]);
 type AssetClaims = typeof AssetClaimsSchema.Type;
 
@@ -192,7 +203,7 @@ export type ResolvedAsset =
       readonly fileName?: string;
       readonly mimeType?: string;
       readonly file?: OpenMediaFile;
-      readonly renderIntent?: "mcp-app";
+      readonly renderIntent?: "mcp-app" | "plugin-panel";
     }
   | {
       readonly kind: "bytes";
@@ -236,6 +247,25 @@ export const readMcpAppHtml = Effect.fn("AssetAccess.readMcpAppHtml")(function* 
     position += chunk.byteLength;
   }
   return bytes;
+});
+
+/** Only the active version of an installed, enabled plugin serves its panels. */
+const resolvePluginPanelPath = Effect.fn("AssetAccess.resolvePluginPanelPath")(function* (input: {
+  readonly pluginId: PluginId;
+  readonly panelId: string;
+  readonly version: string;
+}) {
+  const store = yield* PluginPackageStore.PluginPackageStore;
+  const record = (yield* store.snapshot).installed.find(
+    (plugin) => plugin.pluginId === input.pluginId,
+  );
+  const panel = record?.manifest.ui?.panels.find((candidate) => candidate.id === input.panelId);
+  if (!record?.enabled || record.version !== input.version || !panel) return null;
+  const path = yield* Path.Path;
+  const fileSystem = yield* FileSystem.FileSystem;
+  const panelPath = path.join(store.paths(input.pluginId, input.version).packageDir, panel.entry);
+  const info = yield* ProjectFaviconResolver.optionOnNotFound(fileSystem.stat(panelPath));
+  return Option.isSome(info) && info.value.type === "File" ? panelPath : null;
 });
 
 const readToolOutputImage = Effect.fn("AssetAccess.readToolOutputImage")(function* (input: {
@@ -846,6 +876,26 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
       fileName = media.fileName;
       break;
     }
+    case "plugin-panel": {
+      const panelPath = yield* resolvePluginPanelPath(input.resource).pipe(
+        Effect.mapError(
+          (cause) => new AssetWorkspaceAssetInspectionError({ resource: input.resource, cause }),
+        ),
+      );
+      if (panelPath === null) {
+        return yield* new AssetWorkspaceAssetNotFoundError({ resource: input.resource });
+      }
+      claims = {
+        version: 1,
+        kind: "plugin-panel",
+        pluginId: input.resource.pluginId,
+        panelId: input.resource.panelId,
+        pluginVersion: input.resource.version,
+        expiresAt,
+      };
+      fileName = `${input.resource.panelId}.html`;
+      break;
+    }
   }
 
   const secretStore = yield* ServerSecretStore.ServerSecretStore;
@@ -865,7 +915,10 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
       PROJECT_FAVICON_TOKEN_BUCKET_MS;
     claims = { ...claims, expiresAt };
   }
-  if (claims.kind === "attachment" && claims.mimeType === "text/html") {
+  if (
+    (claims.kind === "attachment" && claims.mimeType === "text/html") ||
+    claims.kind === "plugin-panel"
+  ) {
     // Stable URLs let immutable HTML reloads hit the cache; image retries need fresh URLs.
     expiresAt =
       Math.ceil(expiresAt / HTML_ATTACHMENT_TOKEN_BUCKET_MS) * HTML_ATTACHMENT_TOKEN_BUCKET_MS;
@@ -975,6 +1028,31 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
       Effect.orElseSucceed(() => null),
     );
     return image ? ({ kind: "bytes", ...image } satisfies ResolvedAsset) : null;
+  }
+
+  if (claims.kind === "plugin-panel") {
+    const panelPath = yield* resolvePluginPanelPath({
+      pluginId: claims.pluginId,
+      panelId: claims.panelId,
+      version: claims.pluginVersion,
+    }).pipe(
+      Effect.tapError((cause) =>
+        Effect.logError("Failed to inspect plugin panel asset.", {
+          pluginId: claims.pluginId,
+          panelId: claims.panelId,
+          cause,
+        }),
+      ),
+      Effect.orElseSucceed(() => null),
+    );
+    return panelPath
+      ? ({
+          kind: "file",
+          path: panelPath,
+          mimeType: "text/html",
+          renderIntent: "plugin-panel",
+        } satisfies ResolvedAsset)
+      : null;
   }
 
   if (claims.kind === "native-app-icon") {

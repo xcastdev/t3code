@@ -259,6 +259,7 @@ function useSettingsIndexSections(): SettingsListSection[] {
         serverPage("SettingsThreads", "text.bubble", "Threads"),
         page("SettingsAgents", "person.crop.circle", "Agents"),
         page("SettingsResources", "sparkles", "Skills and commands"),
+        page("SettingsPlugins", "puzzlepiece.extension", "Plugins"),
         page("SettingsScheduledTasks", "clock", "Scheduled tasks"),
       ],
     },

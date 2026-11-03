@@ -36,6 +36,7 @@ import { restrictToFirstScrollableAncestor, restrictToHorizontalAxis } from "@dn
 import { horizontalListSortingStrategy, SortableContext, useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import {
+  Puzzle,
   Smartphone,
   ChevronDown,
   ChevronLeft,
@@ -812,6 +813,8 @@ function surfaceTitle(
       return surface.title ?? surface.target?.name ?? "Device";
     case "side-chat":
       return "Side chat";
+    case "plugin":
+      return surface.title;
     case "preview": {
       const snapshot = surface.resourceId ? sessions[surface.resourceId] : null;
       if (!snapshot || snapshot.navStatus._tag === "Idle") return "Browser";
@@ -908,6 +911,8 @@ function SurfaceIcon({
       return <SquareCheckBig className="size-3 shrink-0" />;
     case "side-chat":
       return <SideChatTabIcon environmentId={environmentId} threadId={surface.threadId} />;
+    case "plugin":
+      return <Puzzle className="size-3 shrink-0" />;
     case "device":
       return surface.target?.platform === "ios" ? (
         <AppleIcon className="size-3 shrink-0" />
@@ -1595,7 +1600,11 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                     <RightPanelTab
                       key={surface.id}
                       surface={surface}
-                      dragDisabled={!props.onMoveSurface || renamingDevice === surface.id}
+                      dragDisabled={
+                        !props.onMoveSurface ||
+                        renamingDevice === surface.id ||
+                        surface.kind === "plugin"
+                      }
                       active={surface.id === props.activeSurfaceId}
                       pending={props.pendingSurfaceIds.has(surface.id)}
                       title={surfaceTitle(surface, props.previewSessions, props.terminalLabelsById)}

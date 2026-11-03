@@ -151,6 +151,7 @@ import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as ThreadManagementService from "./orchestration-v2/ThreadManagementService.ts";
 import * as CommandOutputHub from "./orchestration-v2/CommandOutputHub.ts";
 import * as McpAppRequests from "./mcpApps/McpAppRequests.ts";
+import * as PluginService from "./plugins/PluginService.ts";
 import * as McpCatalogClientService from "./mcp/McpCatalogClientService.ts";
 import { RPC_REQUIRED_SCOPES } from "./auth/RpcAuthorization.ts";
 import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManager.ts";
@@ -742,8 +743,34 @@ const pullRequestRpcMethods = [
   WS_METHODS.pullRequestsLabelCandidates,
   WS_METHODS.pullRequestsSetLabels,
 ] as const;
+const pluginRpcMethods = [
+  WS_METHODS.pluginsList,
+  WS_METHODS.pluginsSubscribeRegistry,
+  WS_METHODS.pluginsInstall,
+  WS_METHODS.pluginsUpdate,
+  WS_METHODS.pluginsUninstall,
+  WS_METHODS.pluginsDeleteData,
+  WS_METHODS.pluginsSetEnabled,
+  WS_METHODS.pluginsStart,
+  WS_METHODS.pluginsStop,
+  WS_METHODS.pluginsRestart,
+  WS_METHODS.pluginsConfigure,
+  WS_METHODS.pluginsReadConfig,
+  WS_METHODS.pluginsLogs,
+  WS_METHODS.pluginsQuery,
+  WS_METHODS.pluginsMutate,
+  WS_METHODS.pluginsSubscribe,
+  WS_METHODS.pluginsResolveReference,
+] as const;
+const PluginServerWsRpcGroup = ServerWsRpcGroup.omit(
+  ...[...ServerWsRpcGroup.requests.keys()].filter(
+    (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, (typeof pluginRpcMethods)[number]> =>
+      !(pluginRpcMethods as ReadonlyArray<string>).includes(tag),
+  ),
+);
 export const CoreServerWsRpcGroup = ServerWsRpcGroup.omit(
   ...pullRequestRpcMethods,
+  ...pluginRpcMethods,
   ...resourceRpcMethods,
   WS_METHODS.mcpCatalogSessionSubscribeForThread,
   WS_METHODS.mcpCatalogSessionForThread,
@@ -3540,6 +3567,7 @@ const layerCoreWsRpc = (
               input.resource._tag === "attachment" ||
               input.resource._tag === "native-app-icon" ||
               input.resource._tag === "tool-output-image" ||
+              input.resource._tag === "plugin-panel" ||
               input.resource._tag === SOURCE_CONTROL_MEDIA_ASSET ||
               // A network path is served only from the thread's project, looked up below.
               (input.resource._tag === "media-file" &&
@@ -4106,6 +4134,34 @@ export const layerWsRpc = (
             mcpCatalog.oauthContinue(input, currentSessionId),
           [WS_METHODS.mcpCatalogOAuthDisconnect]: (input) =>
             mcpCatalog.oauthDisconnect(input, currentSessionId),
+        });
+      }),
+    ),
+    PluginServerWsRpcGroup.toLayer(
+      Effect.gen(function* () {
+        const plugins = yield* PluginService.PluginService;
+        const crypto = yield* Crypto.Crypto;
+        // RPC client ids are only unique within one socket; subscription limits count per socket.
+        const connectionId = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
+        return PluginServerWsRpcGroup.of({
+          [WS_METHODS.pluginsList]: (_input) => plugins.list,
+          [WS_METHODS.pluginsSubscribeRegistry]: (_input) => plugins.subscribeRegistry,
+          [WS_METHODS.pluginsInstall]: (input) => plugins.install(input),
+          [WS_METHODS.pluginsUpdate]: (input) => plugins.update(input),
+          [WS_METHODS.pluginsUninstall]: (input) => plugins.uninstall(input.pluginId),
+          [WS_METHODS.pluginsDeleteData]: (input) => plugins.deleteData(input.pluginId),
+          [WS_METHODS.pluginsSetEnabled]: (input) =>
+            plugins.setEnabled(input.pluginId, input.enabled),
+          [WS_METHODS.pluginsStart]: (input) => plugins.start(input.pluginId),
+          [WS_METHODS.pluginsStop]: (input) => plugins.stop(input.pluginId),
+          [WS_METHODS.pluginsRestart]: (input) => plugins.restart(input.pluginId),
+          [WS_METHODS.pluginsConfigure]: (input) => plugins.configure(input),
+          [WS_METHODS.pluginsReadConfig]: (input) => plugins.readConfig(input.pluginId),
+          [WS_METHODS.pluginsLogs]: (input) => plugins.logs(input),
+          [WS_METHODS.pluginsQuery]: (input) => plugins.query(input),
+          [WS_METHODS.pluginsMutate]: (input) => plugins.mutate(input),
+          [WS_METHODS.pluginsSubscribe]: (input) => plugins.subscribe({ ...input, connectionId }),
+          [WS_METHODS.pluginsResolveReference]: (input) => plugins.resolveReference(input),
         });
       }),
     ),

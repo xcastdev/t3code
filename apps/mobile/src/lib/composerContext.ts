@@ -13,6 +13,7 @@ import {
   type ServerProviderSkill,
   type EnvironmentContextRecord,
   type EnvironmentId,
+  type PluginInstallRecord,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import {
@@ -111,6 +112,27 @@ export function environmentComposerContext(
     label: sanitizeComposerContextLabel(label, "environment"),
     environmentId,
   };
+}
+
+/**
+ * Plugin references whose plugin is not installed and enabled in the message's environment.
+ * `installed` is null while the registry loads, which marks nothing unavailable yet.
+ */
+export function unavailablePluginReferenceIds(
+  records: ReadonlyArray<ComposerContextRecord> | undefined,
+  environmentId: EnvironmentId,
+  installed: ReadonlyArray<Pick<PluginInstallRecord, "pluginId" | "enabled">> | null,
+): ReadonlySet<string> {
+  const unavailable = new Set<string>();
+  if (installed === null) return unavailable;
+  for (const record of records ?? []) {
+    if (record.kind !== "plugin-reference" || !("pluginId" in record)) continue;
+    const available =
+      record.environmentId === environmentId &&
+      installed.some((entry) => entry.pluginId === record.pluginId && entry.enabled);
+    if (!available) unavailable.add(record.contextId);
+  }
+  return unavailable;
 }
 
 export function pullRequestComposerContext(

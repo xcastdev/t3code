@@ -1,5 +1,6 @@
 import * as Schema from "effect/Schema";
 import { ForwardCompatibleArray, TrimmedString } from "./baseSchemas.ts";
+import { PLUGIN_OPEN_COMMAND_PATTERN } from "./plugins.ts";
 
 const MAX_KEYBINDING_VALUE_LENGTH = 64;
 const MAX_KEYBINDING_WHEN_LENGTH = 256;
@@ -130,6 +131,7 @@ export const SCRIPT_RUN_COMMAND_PATTERN = Schema.TemplateLiteral([
 export const KeybindingCommand = Schema.Union([
   Schema.Literals(STATIC_KEYBINDING_COMMANDS),
   SCRIPT_RUN_COMMAND_PATTERN,
+  PLUGIN_OPEN_COMMAND_PATTERN,
 ]);
 export type KeybindingCommand = typeof KeybindingCommand.Type;
 

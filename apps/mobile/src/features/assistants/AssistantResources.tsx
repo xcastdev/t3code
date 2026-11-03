@@ -1,9 +1,13 @@
 import { effectiveMcpCatalogDefinitions } from "@t3tools/client-runtime/resource-actions";
 import { assistantHomeTarget } from "@t3tools/client-runtime/state/assistants";
-import type {
-  AssistantHomeBinding,
-  AssistantResourceSelection,
-  ProviderInstanceId,
+import {
+  ASSISTANT_TOOL_LIMIT,
+  assistantSelectedToolCount,
+  type AssistantHomeBinding,
+  type AssistantResourceSelection,
+  type PluginInstallRecord,
+  type PluginOperationDecl,
+  type ProviderInstanceId,
 } from "@t3tools/contracts";
 import { useState } from "react";
 import { View } from "react-native";
@@ -11,6 +15,7 @@ import { View } from "react-native";
 import { ListActionRow } from "../../components/ui/ListActionRow";
 import { ListChoiceRow } from "../../components/ui/ListChoiceRow";
 import { ListSection } from "../../components/ui/ListSection";
+import { pluginEnvironment } from "../../state/plugins";
 import { useEnvironmentQuery } from "../../state/query";
 import {
   managedTextEnvironment,
@@ -21,10 +26,21 @@ import {
 import { WorkBlock, WorkText } from "../work/WorkParts";
 import {
   setAssistantMcpTools,
+  setAssistantPluginOperations,
   toggleAssistantInstruction,
   toggleAssistantSkill,
 } from "@t3tools/client-runtime/assistant-presentation";
 import { AgentInput } from "./AssistantParts";
+
+function pluginOperationDescription(
+  record: PluginInstallRecord,
+  operation: PluginOperationDecl,
+): string | undefined {
+  const notes: Array<string> = [];
+  if (!record.enabled) notes.push("Disabled");
+  if (operation.mutates) notes.push("Changes state");
+  return notes.length === 0 ? undefined : notes.join(" · ");
+}
 
 /**
  * Chooses from the catalogs the agent's home thread actually resolves, the
@@ -64,6 +80,9 @@ export function AgentResourceBindings(props: {
       input: { scope: "global", scopeId: target.environmentId },
     }),
   );
+  const pluginRegistry = useEnvironmentQuery(
+    pluginEnvironment.registry({ environmentId: target.environmentId, input: {} }),
+  );
   const projectMcp = useEnvironmentQuery(
     mcpCatalogEnvironment.read({
       environmentId: target.environmentId,
@@ -91,6 +110,17 @@ export function AgentResourceBindings(props: {
   const missingInstructions = value.instructions.filter(
     (selected) => !instructions.some((entry) => entry.id === selected.resourceId),
   );
+  const pluginTools = (pluginRegistry.data?.installed ?? []).flatMap((record) => {
+    const operations = (record.manifest.backend?.operations ?? []).filter((op) => op.agent);
+    return operations.length === 0 ? [] : [{ record, operations }];
+  });
+  const missingPlugins =
+    pluginRegistry.data === null
+      ? []
+      : (value.plugins ?? []).filter(
+          (selected) => !pluginTools.some(({ record }) => record.pluginId === selected.pluginId),
+        );
+  const atToolLimit = assistantSelectedToolCount(value) >= ASSISTANT_TOOL_LIMIT;
   const servers = [
     ...(definitions ?? []).map((definition) => ({
       definitionId: definition.definitionId,
@@ -248,6 +278,56 @@ export function AgentResourceBindings(props: {
             />
           ))
         )}
+      </ListSection>
+      <ListSection
+        title="Plugin tools"
+        footer={`Operations of plugins installed in this environment that the agent may call. ${ASSISTANT_TOOL_LIMIT} tools max.`}
+      >
+        {pluginRegistry.data === null ? (
+          <WorkBlock>
+            <WorkText muted>
+              {pluginRegistry.error ? "Plugins aren't available." : "Loading plugins…"}
+            </WorkText>
+          </WorkBlock>
+        ) : pluginTools.length === 0 && missingPlugins.length === 0 ? (
+          <WorkBlock>
+            <WorkText muted>No installed plugin offers agent tools here.</WorkText>
+          </WorkBlock>
+        ) : (
+          pluginTools.flatMap(({ record, operations }) => {
+            const selected =
+              value.plugins?.find((entry) => entry.pluginId === record.pluginId)?.operations ?? [];
+            return operations.map((operation) => (
+              <ListChoiceRow
+                key={`${record.pluginId}:${operation.name}`}
+                label={`${record.name}: ${operation.title}`}
+                description={pluginOperationDescription(record, operation)}
+                selected={selected.includes(operation.name)}
+                disabled={disabled || (atToolLimit && !selected.includes(operation.name))}
+                onPress={() =>
+                  onChange(
+                    setAssistantPluginOperations(
+                      value,
+                      record.pluginId,
+                      operations
+                        .map((candidate) => candidate.name)
+                        .filter((name) => selected.includes(name) !== (name === operation.name)),
+                    ),
+                  )
+                }
+              />
+            ));
+          })
+        )}
+        {missingPlugins.map((entry) => (
+          <ListActionRow
+            key={entry.pluginId}
+            label="Remove an unavailable plugin"
+            tone="danger"
+            disabled={disabled}
+            onPress={() => onChange(setAssistantPluginOperations(value, entry.pluginId, []))}
+          />
+        ))}
       </ListSection>
     </>
   );

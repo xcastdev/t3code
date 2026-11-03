@@ -52,6 +52,8 @@ import { environmentShell } from "./state/shell";
 import { installChatRouteCommands } from "./shortcuts/chatRouteCommands";
 import { startWorkspaceFocus } from "./lib/workspaceFocus";
 import { installCommandPaletteCommands } from "./shortcuts/commandPaletteCommands";
+import { installPluginCommands } from "./shortcuts/pluginCommands";
+import { startRecentChatTracking } from "./plugins/recentChat";
 import { registerOpenFavoriteEditorCommand } from "./components/chat/OpenInPickerShortcut";
 import { environmentThreadShells } from "./state/threads";
 import { resolveThreadRouteTarget } from "./threadRoutes";
@@ -190,6 +192,8 @@ export function startAppServices(): AppRouter {
   startBrowserProfileReporting();
   installChatRouteCommands(router);
   installCommandPaletteCommands(router);
+  installPluginCommands(router);
+  startRecentChatTracking(router);
   registerOpenFavoriteEditorCommand();
   startThreadOverlayRetention(router);
   // Drafts promote as their server threads arrive, wherever the user is.

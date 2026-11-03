@@ -3,6 +3,7 @@ import {
   scopedThreadKey,
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
+import type { PluginPanelKey } from "@t3tools/client-runtime/plugins/commands";
 import { EnvironmentId, RunId, ThreadId, type ScopedThreadRef } from "@t3tools/contracts";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
@@ -26,6 +27,7 @@ const RIGHT_PANEL_KINDS = [
   "work",
   "work-task",
   "side-chat",
+  "plugin",
 ] as const;
 export type RightPanelKind = (typeof RIGHT_PANEL_KINDS)[number];
 
@@ -84,10 +86,12 @@ export type RightPanelSurface =
   /** One view of the thread's project Work; each view is its own tab. */
   | { id: `work:${WorkSection}`; kind: "work"; view: WorkSection }
   | { id: `work-task:${string}`; kind: "work-task"; taskId: string; title?: string }
-  | { id: `side-chat:${string}`; kind: "side-chat"; threadId: ThreadId };
+  | { id: `side-chat:${string}`; kind: "side-chat"; threadId: ThreadId }
+  /** Derived from pluginPanelStore for tabs only; thread state never stores it. */
+  | { id: `plugin:${string}`; kind: "plugin"; panelKey: PluginPanelKey; title: string };
 
 const RIGHT_PANEL_STORAGE_KEY = "t3code:right-panel-state:v2";
-const RIGHT_PANEL_STORAGE_VERSION = 14;
+const RIGHT_PANEL_STORAGE_VERSION = 15;
 
 export const PULL_REQUESTS_PANEL_REF = scopeThreadRef(
   EnvironmentId.make("pull-requests-panel"),
@@ -133,7 +137,7 @@ interface RightPanelStoreState {
     ref: ScopedThreadRef,
     kind: Exclude<
       RightPanelKind,
-      "file" | "terminal" | "pull-request" | "work" | "work-task" | "side-chat"
+      "file" | "terminal" | "pull-request" | "work" | "work-task" | "side-chat" | "plugin"
     >,
   ) => void;
   openWork: (ref: ScopedThreadRef, view: WorkSection) => void;
@@ -200,7 +204,7 @@ interface RightPanelStoreState {
     ref: ScopedThreadRef,
     kind: Exclude<
       RightPanelKind,
-      "file" | "terminal" | "pull-request" | "work" | "work-task" | "side-chat"
+      "file" | "terminal" | "pull-request" | "work" | "work-task" | "side-chat" | "plugin"
     >,
   ) => void;
   setThreadPanelOpen: (
@@ -226,7 +230,7 @@ const DEFAULT_THREAD_PANEL_VISIBILITY: ThreadPanelVisibility = {
 const singletonSurface = (
   kind: Exclude<
     RightPanelKind,
-    "file" | "preview" | "terminal" | "pull-request" | "work" | "work-task" | "side-chat"
+    "file" | "preview" | "terminal" | "pull-request" | "work" | "work-task" | "side-chat" | "plugin"
   >,
 ): RightPanelSurface => {
   switch (kind) {
@@ -523,7 +527,7 @@ export function migratePersistedRightPanelState(persistedState: unknown): {
               const surfaces = Array.isArray(validThreadState?.surfaces)
                 ? validThreadState.surfaces.flatMap<RightPanelSurface>((surface) => {
                     const kind = (surface as { kind?: string }).kind;
-                    if (kind === "plan" || kind === "agents") return [];
+                    if (kind === "plan" || kind === "agents" || kind === "plugin") return [];
                     if (
                       (surface.kind === "file" || surface.kind === "files") &&
                       "folderTrail" in surface &&

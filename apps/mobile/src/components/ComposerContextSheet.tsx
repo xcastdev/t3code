@@ -327,6 +327,16 @@ export function ComposerContextSheet(props: {
             {record.kind === "environment" ? (
               <ContextField label="Machine" value={record.label} />
             ) : null}
+            {record.kind === "plugin-reference" ? (
+              <>
+                <ContextField label="Plugin" value={record.pluginName} />
+                <ContextField
+                  label={record.snapshotTruncated ? "Snapshot (truncated)" : "Snapshot"}
+                  value={record.snapshot}
+                  code
+                />
+              </>
+            ) : null}
             {record.kind === "skill" ? (
               <View className="gap-3">
                 <ContextField label="Skill" value={record.name} />

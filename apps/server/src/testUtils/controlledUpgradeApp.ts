@@ -25,6 +25,8 @@ import {
   layerControlledNotificationRuntime,
 } from "./controlledNotifications.ts";
 import * as Cleanup from "../orchestration-v2/ResourceCleanupService.ts";
+import * as PluginPackageStore from "../plugins/PluginPackageStore.ts";
+import * as PluginService from "../plugins/PluginService.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import * as WorktreeSetup from "../project/WorktreeSetupTracker.ts";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
@@ -226,6 +228,11 @@ export function controlledUpgradeApplicationLayer(
     ),
     Layer.mock(OwnerDeadline.OwnerDeadlineControl)({}),
     Layer.mock(Cleanup.ResourceCleanupService)({}),
+    // The fixture runs no plugin workers and serves no plugin panels.
+    Layer.mock(PluginService.PluginService)({}),
+    Layer.mock(PluginPackageStore.PluginPackageStore)({
+      paths: () => ({ packageDir: "/unused", dataDir: "/unused", configPath: "/unused" }),
+    }),
     WorkspacePaths.layer,
     WorktreeSetup.layer,
     OrchestrationEvents.layer,

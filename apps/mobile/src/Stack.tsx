@@ -128,6 +128,8 @@ import { SettingsProjectGroupingRouteScreen } from "./features/settings/Settings
 import { SettingsProjectOverviewRouteScreen } from "./features/settings/SettingsProjectOverviewRouteScreen";
 import { UsageLimitAccountScreen } from "./features/usage/UsageLimitsPooled";
 import { UsageRouteScreen } from "./features/usage/UsageRouteScreen";
+import { PluginPanelRouteScreen } from "./features/plugins/PluginPanelRouteScreen";
+import { PluginsSettingsRouteScreen } from "./features/plugins/PluginsSettingsRouteScreen";
 import {
   SettingsWorkProjectRouteScreen,
   SettingsWorkRouteScreen,
@@ -479,6 +481,11 @@ const SETTINGS_SCREENS = {
       ...SETTINGS_PAGE_OPTIONS,
       title: "Usage",
     },
+  }),
+  SettingsPlugins: createNativeStackScreen({
+    screen: PluginsSettingsRouteScreen,
+    linking: "settings/plugins",
+    options: { ...SETTINGS_PAGE_OPTIONS, title: "Plugins" },
   }),
   SettingsWork: createNativeStackScreen({
     screen: SettingsWorkRouteScreen,
@@ -1048,6 +1055,11 @@ const RootStackConfig = createWorkspaceStackNavigator({
         sheetAllowedDetents: [0.55, 0.7],
         sheetGrabberVisible: true,
       },
+    }),
+    PluginPanel: createNativeStackScreen({
+      screen: PluginPanelRouteScreen,
+      linking: "plugins/:scope/:pluginId/:panelId",
+      options: GLASS_HEADER_OPTIONS,
     }),
     ...SETTINGS_SCREENS,
     SettingsLegal: createNativeStackScreen({

@@ -19,6 +19,8 @@ import {
   mockOutput,
   normalizeToolInput,
   normalizeToolName,
+  pluginFailure,
+  resolveMock,
   type SampleRun,
   shellOutput,
   shellRequest,
@@ -29,12 +31,15 @@ import {
 } from "./run.ts";
 import { briefRoute, gradeDevice, shellInvocations } from "./device-grading.ts";
 import { taskPrompt } from "../../apps/server/src/mcp/delegatedTaskModes.ts";
+import { PLUGIN_MUTATION_REFUSED_MESSAGE } from "../../apps/server/src/mcp/McpCatalogGateway.ts";
+import { REPLAY_DETAILS } from "../../packages/plugin-request-inspector/backend/refusals.ts";
 
 it("grades Codex shell and subagent calls with the shared rules", () => {
   const calls = [
     { name: "exec_command", input: { cmd: "sleep 60" } },
     { name: "collaboration.spawn_agent", input: { task: "review" } },
     { name: "mcp__t3_code__delegate_task", input: {} },
+    { name: "mcp__t3_catalog__plugin_request_inspector__get_request", input: {} },
   ].map(({ name, input }) => ({
     step: 0,
     tool: normalizeToolName(name),
@@ -42,7 +47,7 @@ it("grades Codex shell and subagent calls with the shared rules", () => {
   }));
   assert.deepEqual(
     calls.map((c) => c.tool),
-    ["Bash", "Agent", "delegate_task"],
+    ["Bash", "Agent", "delegate_task", "plugin_request_inspector__get_request"],
   );
   assert.deepEqual(
     failed(
@@ -107,6 +112,13 @@ it("passes a good run and names every rule a bad run breaks", () => {
   const expect = {
     calls: [{ tool: "delegate_task", args: { task: "~FINDING", "target.options": "~max" } }],
     callsMustNot: [{ tool: "delegate_task", args: { runtimeMode: "approval-required" } }],
+    callsAny: [
+      [
+        { tool: "delegate_task", args: { "target.options": "~max" } },
+        { tool: "task_status", args: { taskId: "task-0" } },
+      ],
+    ],
+    everyCall: [{ tool: "delegate_task", args: { task: "~Prior" } }],
     notCalls: ["t3_thread_send"],
     order: ["orchestrator_capabilities", "delegate_task"],
     minCalls: { orchestrator_capabilities: 1 },
@@ -150,6 +162,8 @@ it("passes a good run and names every rule a bad run breaks", () => {
   assert.deepEqual(failed(expect, bad), [
     'calls delegate_task {"task":"~FINDING","target.options":"~max"}',
     'callsMustNot delegate_task {"runtimeMode":"approval-required"}',
+    'callsAny delegate_task {"target.options":"~max"} | task_status {"taskId":"task-0"}',
+    'everyCall delegate_task {"task":"~Prior"}',
     "notCalls t3_thread_send",
     "order orchestrator_capabilities > delegate_task",
     "minCalls orchestrator_capabilities >= 1",
@@ -306,6 +320,24 @@ it("lists link and view image tools only while a case turns them on, and sends c
     }).t3.map((tool) => tool.name),
     "mcp__t3-code__t3_view_image",
   );
+  const pluginTool = "mcp__t3_catalog__plugin_request_inspector__search_requests";
+  assert.notInclude(
+    off.t3.map((tool) => tool.name),
+    pluginTool,
+  );
+  const withPlugin = buildBase(template, {
+    model: "claude-sonnet-5-5",
+    keepUserInstructions: false,
+    plugins: ["request-inspector"],
+  });
+  assert.include(
+    withPlugin.t3.map((tool) => tool.name),
+    pluginTool,
+  );
+  assert.notInclude(
+    withPlugin.t3.map((tool) => tool.name),
+    "mcp__t3_catalog__plugin_request_inspector__list_captures",
+  );
 
   const testCase: McpToolUseCase = {
     ...childCase,
@@ -331,6 +363,29 @@ it("lists link and view image tools only while a case turns them on, and sends c
     projectComposerContextForProvider({ text: testCase.prompt, ...testCase.promptContext! }),
   );
   assert.include(prompt?.text, "environmentId: environment-vps");
+});
+
+it("refuses mutating plugin tools outside full access, fails plugin error mocks with the plugin's text, and answers ByArgs mocks by args", () => {
+  const replay = "plugin_request_inspector__replay_request";
+  const refused = `MCP error -32603: ${PLUGIN_MUTATION_REFUSED_MESSAGE}`;
+  assert.equal(pluginFailure("approval-required", replay, { replayId: "r1" }), refused);
+  assert.isUndefined(
+    pluginFailure("approval-required", "plugin_request_inspector__get_replay", undefined),
+  );
+  assert.isUndefined(pluginFailure("full-access", replay, { replayId: "r1" }));
+  const expired = { _tag: "PluginRequestError", reason: "operation-failed", detailKey: "expired" };
+  assert.include(String(pluginFailure("full-access", replay, expired)), REPLAY_DETAILS.expired);
+  assert.throws(() => pluginFailure("full-access", replay, { ...expired, detailKey: "nope" }));
+  assert.isUndefined(pluginFailure("approval-required", "delegate_task", expired));
+
+  const byArgs = {
+    _tag: "ByArgs",
+    cases: [{ args: { bodies: "response" }, result: "with body" }],
+    otherwise: "headers only",
+  };
+  assert.equal(resolveMock(byArgs, { requestId: "1", bodies: "response" }), "with body");
+  assert.equal(resolveMock(byArgs, { requestId: "1" }), "headers only");
+  assert.equal(resolveMock(expired, {}), expired);
 });
 
 it("replays earlier capability results with the model under test as the caller", () => {

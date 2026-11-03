@@ -6,6 +6,9 @@ import {
   AssetAccessError,
   AssetCreateUrlInput,
   AssetPreviewTypeValidationError,
+  PluginId,
+  type PluginManifest,
+  type PluginRegistrySnapshot,
   SOURCE_CONTROL_MEDIA_ASSET,
   ThreadId,
   TurnItemId,
@@ -19,6 +22,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import { HttpClientRequest, HttpClientResponse, HttpServerResponse } from "effect/http";
@@ -27,6 +31,7 @@ import { vi } from "vite-plus/test";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as PluginPackageStore from "../plugins/PluginPackageStore.ts";
 import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
 import * as T3ProjectFileLoader from "../project/T3ProjectFileLoader.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
@@ -99,8 +104,75 @@ const oversizedScreenshotItem = {
   },
 };
 
+const echoPluginId = PluginId.make("echo");
+const echoManifest = (version: string): PluginManifest => ({
+  manifestVersion: 1,
+  id: echoPluginId,
+  name: "Echo",
+  version,
+  hostApi: "1.0",
+  author: "T3 Tests",
+  ui: { panels: [{ id: "main", title: "Main", entry: "panels/main.html" }], commands: [] },
+  capabilities: [],
+});
+
+const makePluginStore = Effect.fn("test.makePluginStore")(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-plugin-panels-" });
+  const registry = yield* Ref.make<PluginRegistrySnapshot>({ installed: [], retainedData: [] });
+  const paths = (pluginId: PluginId, version: string) => ({
+    packageDir: path.join(root, "packages", pluginId, version),
+    dataDir: path.join(root, "data", pluginId),
+    configPath: path.join(root, "config", `${pluginId}.json`),
+  });
+  const panelPath = (version: string) =>
+    path.join(paths(echoPluginId, version).packageDir, "panels", "main.html");
+  const stage = Effect.fn("test.stagePluginVersion")(function* (version: string) {
+    yield* fs.makeDirectory(path.dirname(panelPath(version)), { recursive: true });
+    yield* fs.writeFileString(panelPath(version), `<html>panel ${version}</html>`);
+  });
+  const activate = (version: string | null, enabled = true) =>
+    Ref.set(registry, {
+      installed:
+        version === null
+          ? []
+          : [
+              {
+                pluginId: echoPluginId,
+                version,
+                name: "Echo",
+                author: "T3 Tests",
+                enabled,
+                status: enabled ? "stopped" : "disabled",
+                manifest: echoManifest(version),
+              },
+            ],
+      retainedData: [],
+    });
+  return {
+    layer: Layer.mock(PluginPackageStore.PluginPackageStore)({
+      snapshot: Ref.get(registry),
+      paths,
+    }),
+    panelPath,
+    stage,
+    activate,
+  };
+});
+
+const resolveIssuedUrl = (relativeUrl: string) => {
+  const suffix = relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+  const separator = suffix.indexOf("/");
+  return resolveAsset(suffix.slice(0, separator), suffix.slice(separator + 1));
+};
+
 const layerTest = Layer.mergeAll(
   NodeHttpPlatform.layer,
+  Layer.mock(PluginPackageStore.PluginPackageStore)({
+    snapshot: Effect.succeed({ installed: [], retainedData: [] }),
+    paths: () => ({ packageDir: "", dataDir: "", configPath: "" }),
+  }),
   Layer.mock(Orchestrator.OrchestratorV2)({
     getTurnItem: ({ itemId }) =>
       Effect.succeed(
@@ -1535,4 +1607,81 @@ describe("AssetAccess", () => {
       }
     }).pipe(Effect.provide(layerTest)),
   );
+
+  describe("plugin panels", () => {
+    const panel = (version: string) => ({
+      _tag: "plugin-panel" as const,
+      pluginId: echoPluginId,
+      panelId: "main",
+      version,
+    });
+
+    it.effect("mints and serves plugin-panel html with its render intent", () =>
+      Effect.gen(function* () {
+        const store = yield* makePluginStore();
+        yield* store.stage("1.0.0");
+        yield* store.activate("1.0.0");
+        yield* Effect.gen(function* () {
+          const result = yield* issueAssetUrl({ resource: panel("1.0.0") });
+          expect(result.relativeUrl.endsWith("/main.html")).toBe(true);
+          expect(yield* resolveIssuedUrl(result.relativeUrl)).toEqual({
+            kind: "file",
+            path: store.panelPath("1.0.0"),
+            mimeType: "text/html",
+            renderIntent: "plugin-panel",
+          });
+          const missingPanel = yield* issueAssetUrl({
+            resource: { ...panel("1.0.0"), panelId: "other" },
+          }).pipe(Effect.flip);
+          expect(missingPanel._tag).toBe("AssetWorkspaceAssetNotFoundError");
+        }).pipe(Effect.provide(store.layer));
+      }).pipe(Effect.provide(layerTest)),
+    );
+
+    it.effect("returns not found for a disabled or uninstalled plugin", () =>
+      Effect.gen(function* () {
+        const store = yield* makePluginStore();
+        yield* store.stage("1.0.0");
+        yield* store.activate("1.0.0");
+        yield* Effect.gen(function* () {
+          const { relativeUrl } = yield* issueAssetUrl({ resource: panel("1.0.0") });
+          for (const [version, enabled] of [
+            ["1.0.0", false],
+            [null, true],
+          ] as const) {
+            yield* store.activate(version, enabled);
+            const error = yield* issueAssetUrl({ resource: panel("1.0.0") }).pipe(Effect.flip);
+            expect(error._tag).toBe("AssetWorkspaceAssetNotFoundError");
+            expect(error.message).toBe("Plugin panel was not found.");
+            expect(yield* resolveIssuedUrl(relativeUrl)).toBeNull();
+          }
+        }).pipe(Effect.provide(store.layer));
+      }).pipe(Effect.provide(layerTest)),
+    );
+
+    it.effect(
+      "a resource naming a non-active version is not found, before and after update to B",
+      () =>
+        Effect.gen(function* () {
+          const store = yield* makePluginStore();
+          yield* store.stage("1.0.0");
+          yield* store.stage("2.0.0");
+          yield* store.activate("1.0.0");
+          yield* Effect.gen(function* () {
+            const staged = yield* issueAssetUrl({ resource: panel("2.0.0") }).pipe(Effect.flip);
+            expect(staged._tag).toBe("AssetWorkspaceAssetNotFoundError");
+            const before = yield* issueAssetUrl({ resource: panel("1.0.0") });
+
+            yield* store.activate("2.0.0");
+            expect(yield* resolveIssuedUrl(before.relativeUrl)).toBeNull();
+            const stale = yield* issueAssetUrl({ resource: panel("1.0.0") }).pipe(Effect.flip);
+            expect(stale._tag).toBe("AssetWorkspaceAssetNotFoundError");
+            const after = yield* issueAssetUrl({ resource: panel("2.0.0") });
+            expect(after.relativeUrl).not.toBe(before.relativeUrl);
+            const resolved = yield* resolveIssuedUrl(after.relativeUrl);
+            expect(resolved?.kind === "file" ? resolved.path : null).toBe(store.panelPath("2.0.0"));
+          }).pipe(Effect.provide(store.layer));
+        }).pipe(Effect.provide(layerTest)),
+    );
+  });
 });

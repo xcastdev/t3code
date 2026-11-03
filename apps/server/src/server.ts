@@ -158,6 +158,9 @@ import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as AuthHttp from "./auth/http.ts";
 import * as ReplayMarkers from "./auth/replayMarkers.ts";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
+import * as PluginPackageStore from "./plugins/PluginPackageStore.ts";
+import * as PluginService from "./plugins/PluginService.ts";
+import * as PluginWorkerSupervisor from "./plugins/PluginWorkerSupervisor.ts";
 import * as CodexManagedTokenBroker from "./provider/CodexManagedTokenBroker.ts";
 import * as WebhookRoute from "./scheduledTasks/webhookRoute.ts";
 import * as RelayDeliveryProof from "./scheduledTasks/RelayDeliveryProof.ts";
@@ -546,6 +549,13 @@ const layerProjectFaviconResolver = ProjectFaviconResolver.layer.pipe(
 
 const layerServerEnvironment = ServerEnvironment.layer.pipe(Layer.provide(ServerSecretStore.layer));
 
+// Exposes the store too: asset delivery resolves panel files through it.
+const layerPlugins = PluginService.layer.pipe(
+  Layer.provideMerge(PluginWorkerSupervisor.layer),
+  Layer.provideMerge(PluginPackageStore.layer),
+  Layer.provide(ServerSecretStore.layer),
+);
+
 const layerAuth = EnvironmentAuth.layer.pipe(
   Layer.provideMerge(layerPersistence),
   Layer.provide(layerServerEnvironment),
@@ -774,6 +784,7 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
     ),
   ),
   Layer.provideMerge(layerWorkspace),
+  Layer.provideMerge(layerPlugins),
   Layer.provideMerge(ProjectEnrichmentService.layer),
   Layer.provideMerge(Layer.mergeAll(NativeAppIconResolver.layer, layerProjectFaviconResolver)),
   Layer.provideMerge(layerRepositoryIdentityResolver),

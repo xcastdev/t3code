@@ -115,6 +115,7 @@ This API replay measures routing and recovery decisions. Screenshots return prod
 - `apps/server/src/provider/CodexDeveloperInstructions.ts`
 - `apps/server/src/mcp/toolkits/*/tools.ts` (tool descriptions)
 - `packages/contracts/src/*Mcp.ts` (parameter descriptions and result text)
+- `packages/plugin-*/t3-plugin.json` (plugin operation descriptions and schemas, which the catalog gateway lists as tools for a case's `setup.plugins`; `setup.runtimeMode` decides whether it refuses mutating ones)
 
 ## Templates
 

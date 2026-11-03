@@ -1,5 +1,7 @@
 import {
   ComposerContextId,
+  EnvironmentId,
+  PluginId,
   type OrchestrationMessageContext,
   type ServerProviderSkill,
 } from "@t3tools/contracts";
@@ -22,6 +24,7 @@ import {
   uploadedComposerContext,
   serializeComposerMessageForServer,
   pullRequestComposerContext,
+  unavailablePluginReferenceIds,
 } from "./composerContext";
 
 const terminal = {
@@ -258,6 +261,42 @@ describe("mobile composer context", () => {
     });
     expect(prompt).toContain("4 | build failed\n5 | retry");
     expect(prompt).not.toContain('unavailable="true"');
+  });
+
+  it("marks plugin references unavailable unless their plugin is enabled in that environment", () => {
+    const environmentId = EnvironmentId.make("env-local");
+    const inspector = PluginId.make("request-inspector");
+    const capture = (contextId: string, recordEnvironmentId: EnvironmentId) => ({
+      version: 1 as const,
+      kind: "plugin-reference" as const,
+      contextId: ComposerContextId.make(contextId),
+      label: "POST /login 500",
+      referenceVersion: 1 as const,
+      environmentId: recordEnvironmentId,
+      pluginId: inspector,
+      pluginName: "Request Inspector",
+      locator: { requestId: "42" },
+      snapshot: "HTTP/1.1 500",
+      snapshotTruncated: false,
+    });
+    const records = [
+      capture("local", environmentId),
+      capture("remote", EnvironmentId.make("env-remote")),
+    ];
+    expect(unavailablePluginReferenceIds(records, environmentId, null)).toEqual(new Set());
+    expect(
+      unavailablePluginReferenceIds(records, environmentId, [
+        { pluginId: inspector, enabled: true },
+      ]),
+    ).toEqual(new Set(["remote"]));
+    expect(
+      unavailablePluginReferenceIds(records, environmentId, [
+        { pluginId: inspector, enabled: false },
+      ]),
+    ).toEqual(new Set(["local", "remote"]));
+    expect(unavailablePluginReferenceIds(records, environmentId, [])).toEqual(
+      new Set(["local", "remote"]),
+    );
   });
 });
 

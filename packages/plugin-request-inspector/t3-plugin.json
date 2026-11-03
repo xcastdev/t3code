@@ -1,0 +1,307 @@
+{
+  "manifestVersion": 1,
+  "id": "request-inspector",
+  "name": "Request Inspector",
+  "version": "0.1.0",
+  "hostApi": "1.0",
+  "author": "T3 Tools",
+  "description": "Captures HTTP traffic routed through a local mitmproxy, lets you search and inspect it, and replays requests.",
+  "ui": {
+    "panels": [{ "id": "inspector", "title": "Request Inspector", "entry": "ui/inspector.html" }],
+    "commands": [
+      { "id": "open", "title": "Open Request Inspector", "opens": { "panel": "inspector" } }
+    ]
+  },
+  "backend": {
+    "entry": "backend/index.cjs",
+    "operations": [
+      {
+        "name": "start_capture",
+        "title": "Start capture",
+        "description": "Starts the inspector's mitmproxy capture on the configured listen host and port. Only traffic a client is explicitly configured to send through that proxy is captured. Returns the new capture's id and listen address.",
+        "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "stop_capture",
+        "title": "Stop capture",
+        "description": "Stops the running capture. Captured requests are kept. Replays still in progress through this capture end as unknown, because the upstream may already have received them.",
+        "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "search_requests",
+        "title": "Search requests",
+        "description": "Searches captured requests, newest first, and returns short summaries (method, host, path, status, sizes) without headers or bodies. query matches text in the host or path. Pass the returned cursor to get the next, older page; cursor is null when there are no more. Use get_request for the details of one request.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": { "type": "string", "maxLength": 512 },
+            "method": { "type": "string", "maxLength": 32 },
+            "host": { "type": "string", "maxLength": 255 },
+            "status": { "type": "integer", "minimum": 100, "maximum": 999 },
+            "captureId": { "type": "string", "maxLength": 32 },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 },
+            "cursor": { "type": "string", "maxLength": 1024 }
+          },
+          "additionalProperties": false
+        },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "get_request",
+        "title": "Get request",
+        "description": "Returns one captured request and its response: ordered headers (long values are cut and flagged headersTruncated) and per-body metadata. Authorization, cookie, set-cookie and proxy-authorization values are hidden unless includeSensitiveHeaders is true; only ask for them when the user needs them. Bodies are omitted unless bodies names a side; then a decoded preview of at most previewBytes is included. Use read_body to page through a larger body.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "requestId": { "type": "string", "minLength": 1, "maxLength": 32 },
+            "previewBytes": { "type": "integer", "minimum": 0, "maximum": 32768, "default": 8192 },
+            "bodies": {
+              "type": "string",
+              "enum": ["none", "request", "response", "both"],
+              "default": "none"
+            },
+            "includeSensitiveHeaders": { "type": "boolean", "default": false }
+          },
+          "required": ["requestId"],
+          "additionalProperties": false
+        },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "read_body",
+        "title": "Read body",
+        "description": "Reads one chunk of a captured request or response body as base64, at most 131072 bytes per call. Call again with offset + length until eof is true. decoded: false returns the raw stored bytes, still content-encoded; decoded: true returns the body after gzip, deflate or br decoding. truncatedAtCapture means the inspector kept only the start of the body.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "requestId": { "type": "string", "minLength": 1, "maxLength": 32 },
+            "side": { "type": "string", "enum": ["request", "response"] },
+            "offset": { "type": "integer", "minimum": 0 },
+            "length": { "type": "integer", "minimum": 1, "maximum": 131072 },
+            "decoded": { "type": "boolean", "default": false }
+          },
+          "required": ["requestId", "side", "offset", "length"],
+          "additionalProperties": false
+        },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "preview_replay",
+        "title": "Preview replay",
+        "description": "Shows where a replay of a captured request would go (scheme, host, port, method, path, body size) and whether it would be refused, without sending anything. Takes the same input as replay_request without idempotencyKey. Each call returns a fresh idempotencyKey. A key is for one replay only: pass it to replay_request, and if you retry that replay, pass the same key unchanged.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "requestId": { "type": "string", "minLength": 1, "maxLength": 32 },
+            "edits": { "$ref": "#/$defs/edits" }
+          },
+          "required": ["requestId"],
+          "additionalProperties": false,
+          "$defs": {
+            "edits": {
+              "type": "object",
+              "properties": {
+                "method": { "type": "string", "minLength": 1, "maxLength": 32 },
+                "url": { "type": "string", "minLength": 1, "maxLength": 8192 },
+                "headers": {
+                  "type": "array",
+                  "maxItems": 256,
+                  "items": {
+                    "type": "array",
+                    "prefixItems": [{ "type": "string" }, { "type": "string" }],
+                    "minItems": 2,
+                    "maxItems": 2
+                  }
+                },
+                "body": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": { "const": "inline" },
+                        "base64": { "type": "string", "maxLength": 174764 }
+                      },
+                      "required": ["kind", "base64"],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": { "const": "draft" },
+                        "draftId": { "type": "string", "maxLength": 64 }
+                      },
+                      "required": ["kind", "draftId"],
+                      "additionalProperties": false
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "replay_request",
+        "title": "Replay request",
+        "description": "Sends a captured request again, as stored or with edits, through mitmproxy. Call preview_replay first and pass its idempotencyKey; get a new key from preview_replay for each distinct replay. Returns replayId and state as soon as the replay is accepted, usually pending; then call get_replay with waitMs for the outcome. After a timed-out or unclear result, retry with the exact same key or call get_replay, never a new key. A key protects only exact retries: a request with a new key is a new replay. If a retry is refused as expired or not issued, tell the user the earlier replay may have been sent and ask before requesting a new key. Only failed with dispatched false means the request was definitely not sent; unknown, or failed with dispatched true, means it may have been.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "requestId": { "type": "string", "minLength": 1, "maxLength": 32 },
+            "idempotencyKey": { "type": "string", "minLength": 1, "maxLength": 96 },
+            "edits": { "$ref": "#/$defs/edits" }
+          },
+          "required": ["requestId", "idempotencyKey"],
+          "additionalProperties": false,
+          "$defs": {
+            "edits": {
+              "type": "object",
+              "properties": {
+                "method": { "type": "string", "minLength": 1, "maxLength": 32 },
+                "url": { "type": "string", "minLength": 1, "maxLength": 8192 },
+                "headers": {
+                  "type": "array",
+                  "maxItems": 256,
+                  "items": {
+                    "type": "array",
+                    "prefixItems": [{ "type": "string" }, { "type": "string" }],
+                    "minItems": 2,
+                    "maxItems": 2
+                  }
+                },
+                "body": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": { "const": "inline" },
+                        "base64": { "type": "string", "maxLength": 174764 }
+                      },
+                      "required": ["kind", "base64"],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": { "const": "draft" },
+                        "draftId": { "type": "string", "maxLength": 64 }
+                      },
+                      "required": ["kind", "draftId"],
+                      "additionalProperties": false
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "get_replay",
+        "title": "Get replay",
+        "description": "Returns a replay's state: pending, completed, failed or unknown, whether it was dispatched, a detail, and resultRequestId for the stored response. With waitMs, waits up to that long for the replay to leave pending, so you need no polling loop. unknown, or failed with dispatched true, means the upstream may have received the request. not-found means the replay settled long ago and is no longer kept.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "replayId": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "waitMs": { "type": "integer", "minimum": 0, "maximum": 20000, "default": 0 }
+          },
+          "required": ["replayId"],
+          "additionalProperties": false
+        },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "body_draft_write",
+        "title": "Write body draft",
+        "description": "Writes one chunk of an edited replay body into a draft. Omit draftId to start a new draft.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "draftId": { "type": "string", "maxLength": 64 },
+            "offset": { "type": "integer", "minimum": 0 },
+            "base64": { "type": "string", "maxLength": 174764 }
+          },
+          "required": ["offset", "base64"],
+          "additionalProperties": false
+        },
+        "mutates": true,
+        "agent": false
+      },
+      {
+        "name": "delete_capture",
+        "title": "Delete capture",
+        "description": "Deletes a stopped capture and its requests.",
+        "inputSchema": {
+          "type": "object",
+          "properties": { "captureId": { "type": "string", "minLength": 1, "maxLength": 32 } },
+          "required": ["captureId"],
+          "additionalProperties": false
+        },
+        "mutates": true,
+        "agent": false
+      },
+      {
+        "name": "list_captures",
+        "title": "List captures",
+        "description": "Lists captures, newest first, with their request counts.",
+        "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+        "mutates": false,
+        "agent": false
+      }
+    ],
+    "topics": [{ "name": "capture_status" }, { "name": "requests" }],
+    "resources": [],
+    "prerequisites": [
+      {
+        "executable": "mitmdump",
+        "hint": "Install mitmproxy (https://mitmproxy.org) and make mitmdump available on PATH."
+      }
+    ]
+  },
+  "settings": {
+    "client": [],
+    "environment": [
+      {
+        "key": "listenHost",
+        "label": "Proxy listen host",
+        "type": "string",
+        "default": "127.0.0.1"
+      },
+      { "key": "listenPort", "label": "Proxy listen port", "type": "number", "default": 8080 },
+      {
+        "key": "maxBodyBytes",
+        "label": "Bytes kept per body (0 to 16 MiB)",
+        "type": "number",
+        "default": 1048576
+      },
+      {
+        "key": "maxDiskBytes",
+        "label": "Storage budget in bytes (at least 64 MiB)",
+        "type": "number",
+        "default": 536870912
+      },
+      {
+        "key": "maxRequestsPerCapture",
+        "label": "Requests kept per capture",
+        "type": "number",
+        "default": 50000
+      }
+    ]
+  },
+  "capabilities": ["chat.attach", "chat.reference"]
+}

@@ -40,6 +40,15 @@ import { useLogicalProjectEnvironments } from "../hooks/useLogicalProjectEnviron
 import { useStableCallback } from "../hooks/useStableCallback";
 import { useProjectScriptEditing } from "./chat/useProjectScriptEditing";
 import { RightPanelSurfaceContent } from "./chat/RightPanelSurfaceContent";
+import { PluginPanelSurface } from "./plugins/PluginPanelSurface";
+import { listPluginPanelTargets } from "@t3tools/client-runtime/plugins/commands";
+import {
+  combineRightPanelSurfaces,
+  pluginRightPanelSurface,
+  selectDockedPluginPanels,
+  usePluginPanelStore,
+} from "../pluginPanelStore";
+import { useAllPluginInstalls } from "../plugins/pluginInstalls";
 import { usePendingThreadRequests } from "./chat/usePendingThreadRequests";
 import { isScratchProject } from "@t3tools/client-runtime/state/projects";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
@@ -155,6 +164,7 @@ import {
   selectThreadPanelOpen,
   selectThreadRightPanelState,
   useRightPanelStore,
+  type RightPanelSurface,
 } from "../rightPanelStore";
 import type { WorkSection } from "../routes/-workSearch";
 import { isPreviewSupportedInRuntime, useThreadPreviewState } from "../previewStateStore";
@@ -217,6 +227,7 @@ import {
 } from "../sidebarPendingFileDropStore";
 import {
   composerDraftHasUserContent,
+  composerTargetKey,
   type ComposerFileAttachment,
   type ComposerImageAttachment,
   type DraftThreadEnvMode,
@@ -1057,6 +1068,26 @@ export default function ChatView(props: ChatViewProps) {
   const activeRightPanelSurface = useRightPanelStore((state) =>
     selectActiveRightPanelSurface(state.byThreadKey, activeThreadRef),
   );
+  // Docked plugin panels belong to the chat's environment, not the thread, so they stay put
+  // across thread switches; the thread's own surfaces come first in the tab strip.
+  const pluginChatEnvironmentId = embedded ? null : (activeThreadRef?.environmentId ?? null);
+  const dockedPlugins = selectDockedPluginPanels(
+    usePluginPanelStore((state) => state.byEnvironment),
+    pluginChatEnvironmentId,
+  );
+  const pluginPanelTitles = new Map(
+    listPluginPanelTargets(useAllPluginInstalls()).flatMap((target) =>
+      target.kind === "panel" ? [[target.key, target.title] as const] : [],
+    ),
+  );
+  const pluginSurfaces = dockedPlugins.open.map((panelKey) =>
+    pluginRightPanelSurface(panelKey, pluginPanelTitles.get(panelKey) ?? "Plugin"),
+  );
+  const dockedPluginSurface =
+    pluginSurfaces.find(
+      (surface) => surface.kind === "plugin" && surface.panelKey === dockedPlugins.focused,
+    ) ?? null;
+  const displayedRightPanelSurface = dockedPluginSurface ?? activeRightPanelSurface;
   const activePreviewState = useThreadPreviewState(activeThreadRef);
   const activePreviewServerEpoch = activePreviewState.serverEpoch;
   const resolvePreviewRuntimeTabId = activeThreadRef
@@ -1071,13 +1102,13 @@ export default function ChatView(props: ChatViewProps) {
     ),
   );
   const canReuseTerminal = activeThreadKnownSessionsRaw !== null;
-  const previewPanelOpen = activeRightPanelKind === "preview" && browserAvailable;
-  const rightPanelOpen = rightPanelState.isOpen;
+  const previewPanelOpen = displayedRightPanelSurface?.kind === "preview" && browserAvailable;
+  const rightPanelOpen = rightPanelState.isOpen || dockedPluginSurface !== null;
   const { active: panelAnimationsActive, durationMs: panelAnimationDurationMs } =
     usePanelAnimationSettings();
   const rightPanelPresenceValue = {
-    activeSurface: activeRightPanelSurface,
-    surfaces: rightPanelState.surfaces,
+    activeSurface: displayedRightPanelSurface,
+    surfaces: combineRightPanelSurfaces(rightPanelState.surfaces, pluginSurfaces),
   };
   const rightPanelPresence = usePanelPresence(
     rightPanelOpen && activeThreadRef !== null,
@@ -1098,7 +1129,7 @@ export default function ChatView(props: ChatViewProps) {
   );
   // With no tabs the inline panel is a narrow launcher rail, too thin to hold the titlebar controls.
   const rightPanelRail =
-    rightPanelOpen && !shouldUsePlanSidebarSheet && activeRightPanelSurface === null;
+    rightPanelOpen && !shouldUsePlanSidebarSheet && displayedRightPanelSurface === null;
   const canMaximizeRightPanel = rightPanelOpen && !rightPanelRail;
   // An embedded side chat has no panel; a stale maximized flag would hide its own column.
   const rightPanelMaximized =
@@ -2064,14 +2095,49 @@ export default function ChatView(props: ChatViewProps) {
   }, [canMaximizeRightPanel, routeThreadRef]);
   const {
     closeSurface: closeRightPanelSurface,
-    closeOtherSurfaces: closeOtherRightPanelSurfacesStable,
-    closeSurfacesToRight: closeRightPanelSurfacesToRightStable,
-    closeAllSurfaces: closeAllRightPanelSurfacesStable,
+    closeOtherSurfaces: closeOtherThreadRightPanelSurfaces,
+    closeSurfacesToRight: closeThreadRightPanelSurfacesToRight,
+    closeAllSurfaces: closeAllThreadRightPanelSurfaces,
   } = useRightPanelSurfaceClose({
     threadRef: activeThreadRef,
     terminalLabelsById: activeTerminalLabelsById,
   });
-  const closeRightPanelSurfaceStable = closeRightPanelSurface;
+  const closeRightPanelSurfaceStable = useStableCallback((surface: RightPanelSurface) => {
+    if (surface.kind === "plugin") usePluginPanelStore.getState().close(surface.panelKey);
+    else closeRightPanelSurface(surface);
+  });
+  // Plugin tabs follow the thread's tabs in the strip and close through the plugin store.
+  const closePluginSurfaces = (surfaces: readonly RightPanelSurface[]) => {
+    for (const surface of surfaces) {
+      if (surface.kind === "plugin") usePluginPanelStore.getState().close(surface.panelKey);
+    }
+  };
+  const closeOtherRightPanelSurfacesStable = useStableCallback((surface: RightPanelSurface) => {
+    if (surface.kind === "plugin") {
+      closeAllThreadRightPanelSurfaces();
+      closePluginSurfaces(pluginSurfaces.filter((entry) => entry.id !== surface.id));
+      // Closing the thread's tabs is a user action, which blurs the plugin the user kept.
+      if (pluginChatEnvironmentId !== null) {
+        usePluginPanelStore.getState().focus(surface.panelKey, pluginChatEnvironmentId);
+      }
+    } else {
+      closeOtherThreadRightPanelSurfaces(surface);
+      closePluginSurfaces(pluginSurfaces);
+    }
+  });
+  const closeRightPanelSurfacesToRightStable = useStableCallback((surface: RightPanelSurface) => {
+    if (surface.kind === "plugin") {
+      const index = pluginSurfaces.findIndex((entry) => entry.id === surface.id);
+      if (index >= 0) closePluginSurfaces(pluginSurfaces.slice(index + 1));
+    } else {
+      closeThreadRightPanelSurfacesToRight(surface);
+      closePluginSurfaces(pluginSurfaces);
+    }
+  });
+  const closeAllRightPanelSurfacesStable = useStableCallback(() => {
+    closeAllThreadRightPanelSurfaces();
+    closePluginSurfaces(pluginSurfaces);
+  });
   const persistThreadSettingsForNextTurn = async (input: {
     threadId: ThreadId;
     createdAt: string;
@@ -2410,7 +2476,7 @@ export default function ChatView(props: ChatViewProps) {
     activeWorkspaceRoot,
     activeThreadRef,
     activeProject,
-    activeRightPanelSurface,
+    activeRightPanelSurface: displayedRightPanelSurface,
     activePreviewState,
     deviceState,
     deviceStateLoaded,
@@ -2432,9 +2498,18 @@ export default function ChatView(props: ChatViewProps) {
     activeProjectCwd,
     explicitDiffOpenRef,
     onDiffPanelOpen,
-    closeRightPanelSurface,
+    closeRightPanelSurface: closeRightPanelSurfaceStable,
   });
   const pullRequestSurfaceAvailable = supportsPullRequests && pullRequestPanelTarget !== null;
+  const activateRightPanelOrPluginSurfaceStable = useStableCallback(
+    (surface: RightPanelSurface) => {
+      if (surface.kind !== "plugin") {
+        activateRightPanelSurfaceStable(surface);
+      } else if (pluginChatEnvironmentId !== null) {
+        usePluginPanelStore.getState().focus(surface.panelKey, pluginChatEnvironmentId);
+      }
+    },
+  );
   const {
     acknowledgeActiveThreadWoke,
     activeBranchMismatchKey,
@@ -3262,59 +3337,71 @@ export default function ChatView(props: ChatViewProps) {
         onComposerFocusRequest={scheduleComposerFocusStable}
       />
     ) : undefined;
-  const rightPanelContent = activeThreadRef ? (
-    <RightPanelSurfaceContent
-      sourceControlBranchControl={sourceControlBranchControl}
-      surface={renderedRightPanelSurface}
-      activeSurfaceId={activeRightPanelSurface?.id ?? null}
-      threadRef={activeThreadRef}
-      environmentId={activeThread.environmentId}
-      projectId={activeThread.projectId}
-      visible={rightPanelOpen}
-      composerDraftTarget={composerDraftTarget}
-      keybindings={keybindings}
-      configuredPreviewUrls={configuredPreviewUrls}
-      workspaceMutationId={workspaceMutationId}
-      getShortcutContext={getShortcutContextStable}
-      onSendAnnotation={sendPreviewAnnotationStable}
-      onCloseSurface={closeRightPanelSurface}
-      sideChatParentPanel={sideChatParentPanel}
-      terminal={{
-        launchContext: activeTerminalLaunchContext ?? null,
-        keybindings,
-        onAddTerminalContext: addTerminalContextToDraftStable,
-        onSplitTerminal: splitPanelTerminalStable,
-        onSplitTerminalVertical: splitPanelTerminalVerticalStable,
-        onNewTerminal: addDrawerTerminalStable,
-        onActiveTerminalChange: activatePanelTerminalStable,
-        onCloseTerminal: closePanelTerminalStable,
-        splitShortcutLabel: splitTerminalShortcutLabel ?? undefined,
-        splitVerticalShortcutLabel: splitTerminalVerticalShortcutLabel ?? undefined,
-        newShortcutLabel: newTerminalShortcutLabel ?? undefined,
-        closeShortcutLabel: closeTerminalShortcutLabel ?? undefined,
-      }}
-      pullRequest={{
-        capabilityKnown: pullRequestsCapabilityKnown,
-        supported: supportsPullRequests,
-        projectId: activeThread.projectId,
-        pullRequests: visiblePullRequests,
-        linkedPullRequest: linkedThreadPullRequest,
-        branchPullRequest: activeThreadShell?.branchPullRequest ?? activeThread.branchPullRequest,
-        onBack:
-          pullRequestsSurfaceAvailable && visiblePullRequestCount > 1
-            ? addPullRequestsSurfaceStable
-            : undefined,
-      }}
-      files={{
-        projectName: activeProject?.title ?? null,
-        workspaceRoot: activeWorkspaceRoot,
-        availableEditors,
-        pendingSurfaceIds: pendingFileSurfaceIds,
-        onOpenFile: openFileSurfaceStable,
-        onPendingChange: handleFilePendingChangeStable,
-      }}
-    />
-  ) : null;
+  const rightPanelContent =
+    renderedRightPanelSurface?.kind === "plugin" ? (
+      <PluginPanelSurface
+        key={renderedRightPanelSurface.panelKey}
+        panelKey={renderedRightPanelSurface.panelKey}
+        chatTarget={{
+          key: composerTargetKey(composerDraftTarget),
+          title: activeThread?.title ?? "Chat",
+          composerTarget: composerDraftTarget,
+          environmentId,
+        }}
+      />
+    ) : activeThreadRef ? (
+      <RightPanelSurfaceContent
+        sourceControlBranchControl={sourceControlBranchControl}
+        surface={renderedRightPanelSurface}
+        activeSurfaceId={activeRightPanelSurface?.id ?? null}
+        threadRef={activeThreadRef}
+        environmentId={activeThread.environmentId}
+        projectId={activeThread.projectId}
+        visible={rightPanelOpen}
+        composerDraftTarget={composerDraftTarget}
+        keybindings={keybindings}
+        configuredPreviewUrls={configuredPreviewUrls}
+        workspaceMutationId={workspaceMutationId}
+        getShortcutContext={getShortcutContextStable}
+        onSendAnnotation={sendPreviewAnnotationStable}
+        onCloseSurface={closeRightPanelSurface}
+        sideChatParentPanel={sideChatParentPanel}
+        terminal={{
+          launchContext: activeTerminalLaunchContext ?? null,
+          keybindings,
+          onAddTerminalContext: addTerminalContextToDraftStable,
+          onSplitTerminal: splitPanelTerminalStable,
+          onSplitTerminalVertical: splitPanelTerminalVerticalStable,
+          onNewTerminal: addDrawerTerminalStable,
+          onActiveTerminalChange: activatePanelTerminalStable,
+          onCloseTerminal: closePanelTerminalStable,
+          splitShortcutLabel: splitTerminalShortcutLabel ?? undefined,
+          splitVerticalShortcutLabel: splitTerminalVerticalShortcutLabel ?? undefined,
+          newShortcutLabel: newTerminalShortcutLabel ?? undefined,
+          closeShortcutLabel: closeTerminalShortcutLabel ?? undefined,
+        }}
+        pullRequest={{
+          capabilityKnown: pullRequestsCapabilityKnown,
+          supported: supportsPullRequests,
+          projectId: activeThread.projectId,
+          pullRequests: visiblePullRequests,
+          linkedPullRequest: linkedThreadPullRequest,
+          branchPullRequest: activeThreadShell?.branchPullRequest ?? activeThread.branchPullRequest,
+          onBack:
+            pullRequestsSurfaceAvailable && visiblePullRequestCount > 1
+              ? addPullRequestsSurfaceStable
+              : undefined,
+        }}
+        files={{
+          projectName: activeProject?.title ?? null,
+          workspaceRoot: activeWorkspaceRoot,
+          availableEditors,
+          pendingSurfaceIds: pendingFileSurfaceIds,
+          onOpenFile: openFileSurfaceStable,
+          onPendingChange: handleFilePendingChangeStable,
+        }}
+      />
+    ) : null;
   const panelToggleControlProps = {
     terminalAvailable: activeProject !== null,
     terminalOpen: terminalUiState.terminalOpen,
@@ -4064,7 +4151,7 @@ export default function ChatView(props: ChatViewProps) {
           desktopByTabId={activePreviewState.desktopByTabId}
           previewRuntimeTabId={resolvePreviewRuntimeTabId}
           terminalLabelsById={activeTerminalLabelsById}
-          onActivate={activateRightPanelSurfaceStable}
+          onActivate={activateRightPanelOrPluginSurfaceStable}
           onCloseSurface={closeRightPanelSurfaceStable}
           onRenameDevice={(surfaceId, title) => {
             if (activeThreadRef)

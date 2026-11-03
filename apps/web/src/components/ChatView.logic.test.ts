@@ -1056,6 +1056,7 @@ describe("snapshotComposerSend", () => {
       reviewComments: [],
       threadContexts: [],
       environmentContexts: [],
+      pluginReferences: [],
     });
 
     expect(snapshot.terminalContexts).toEqual([live]);
@@ -1158,6 +1159,7 @@ describe("restorePlanFollowUpComposer", () => {
       snapshot: {
         prompt: "Tighten step 2",
         environmentContexts: [],
+        pluginReferences: [],
         terminalContexts: [],
         reviewComments: [],
         previewAnnotations: [],
@@ -1176,6 +1178,7 @@ describe("restorePlanFollowUpComposer", () => {
       writePreviewAnnotations: () => undefined,
       writeThreadContexts: () => undefined,
       writeEnvironmentContexts: () => undefined,
+      writePluginReferences: () => undefined,
       resetCursor: ({ prompt }) => {
         composer.cursor = prompt;
       },

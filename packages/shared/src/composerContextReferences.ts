@@ -185,16 +185,26 @@ function kindDisplayName(kind: ComposerContextKind): string {
   return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
+function cleanMarkerText(text: string): string {
+  return escapeComposerContextPayloadText(
+    text
+      .replace(/[\r\n;\]]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+}
+
 function formatComposerContextProviderMarker(
   kind: ComposerContextKind,
+  record: ComposerContextRecord | undefined,
   label: string,
   contextId: ComposerContextId,
 ): string {
-  const cleanLabel = label
-    .replace(/[\r\n;\]]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return `[${kindDisplayName(kind)}: ${escapeComposerContextPayloadText(cleanLabel)}; ref=${contextId}]`;
+  const name =
+    record?.kind === "plugin-reference" && "pluginName" in record
+      ? `Plugin ${cleanMarkerText(record.pluginName)}`
+      : kindDisplayName(record?.kind ?? kind);
+  return `[${name}: ${cleanMarkerText(label)}; ref=${contextId}]`;
 }
 
 // Escape envelope tags so payload text cannot close the envelope and forge records.
@@ -310,6 +320,13 @@ function formatComposerContextProviderPayload(record: KnownComposerContextRecord
         `environmentId: ${record.environmentId}`,
         "The user means this machine. Not linked here yet: call t3_environment_link with this environmentId. Linked: pass it as environmentId, or target.environmentId for delegate_task.",
       ].join("\n");
+    case "plugin-reference":
+      return [
+        `locator: ${JSON.stringify(record.locator)}`,
+        record.snapshotTruncated ? "snapshot (truncated):" : "snapshot:",
+        indent(record.snapshot),
+        "Fetch more with the plugin's tools if needed; this is a snapshot.",
+      ].join("\n");
   }
 }
 
@@ -320,11 +337,15 @@ function formatEnvelopeEntry(
 ): string {
   const open = `<${CONTEXT_ENTRY_TAG} kind="${escapeAttribute(kind)}" id="${escapeAttribute(contextId)}"`;
   if (!record) return `${open} unavailable="true"/>`;
+  const attributes =
+    record.kind === "plugin-reference" && "pluginId" in record
+      ? ` environment="${escapeAttribute(record.environmentId)}" plugin="${escapeAttribute(record.pluginId)}"`
+      : "";
   const body =
     "payload" in record
       ? JSON.stringify(record.payload)
       : formatComposerContextProviderPayload(record);
-  return `${open}>\n${escapeComposerContextPayloadText(body)}\n</${CONTEXT_ENTRY_TAG}>`;
+  return `${open}${attributes}>\n${escapeComposerContextPayloadText(body)}\n</${CONTEXT_ENTRY_TAG}>`;
 }
 
 export function projectComposerContextForProvider(input: {
@@ -339,7 +360,8 @@ export function projectComposerContextForProvider(input: {
   }
   const body = replaceComposerContextReferences(input.text, (occurrence) =>
     formatComposerContextProviderMarker(
-      recordsById.get(occurrence.contextId)?.kind ?? occurrence.kind,
+      occurrence.kind,
+      recordsById.get(occurrence.contextId),
       occurrence.label,
       occurrence.contextId,
     ),

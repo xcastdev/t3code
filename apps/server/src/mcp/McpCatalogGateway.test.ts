@@ -5,8 +5,13 @@ import {
   McpCatalogSessionId,
   McpDefinitionId,
   McpServerId,
+  PLUGIN_LIMITS,
+  PluginId,
+  PluginRequestError,
   ProviderInstanceId,
   ThreadId,
+  type OrchestrationV2ThreadShell,
+  type PluginInstallRecord,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
@@ -22,7 +27,14 @@ import {
   ListResourceTemplatesRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { __testing, namespaceName, type RegisterCatalogSessionInput } from "./McpCatalogGateway.ts";
+import {
+  __testing,
+  namespaceName,
+  PLUGIN_MUTATION_REFUSED_MESSAGE,
+  type RegisterCatalogSessionInput,
+} from "./McpCatalogGateway.ts";
+import { ProjectionStoreV2 } from "../orchestration-v2/ProjectionStore.ts";
+import { PluginService, type PluginAgentCatalogEntry } from "../plugins/PluginService.ts";
 import { McpSessionRegistry, type McpNativeRuntimeBinding } from "./McpSessionRegistry.ts";
 import { ProjectMcpProxyRegistry, ProjectMcpConnectionError } from "./ProjectMcpProxyRegistry.ts";
 
@@ -66,10 +78,58 @@ const setup = Effect.gen(function* () {
     connect: (entry) => Effect.suspend(() => connect(entry)),
   });
   let allowedTools: ReadonlyArray<string> | undefined;
+  // Absent by default so catalog-only cases keep their exact tool lists.
+  const plugins = {
+    echo: "absent" as "absent" | "enabled" | "disabled",
+    // Disabled after the catalog read: agentCatalog still lists it, callOperation refuses.
+    disabledMidCall: false,
+    calls: [] as Array<{ operation: string; input: unknown }>,
+    result: undefined as unknown,
+    call: undefined as undefined | Effect.Effect<unknown>,
+    threadShell: "present" as "present" | "missing",
+  };
+  let threadModes: Pick<OrchestrationV2ThreadShell, "runtimeMode" | "interactionMode"> = {
+    runtimeMode: "full-access",
+    interactionMode: "default",
+  };
+  const pluginService = {
+    agentCatalog: Effect.sync(() => (plugins.echo === "enabled" ? [echoCatalogEntry] : [])),
+    list: Effect.sync(() => ({
+      installed: (plugins.echo === "absent"
+        ? []
+        : [
+            {
+              pluginId: echoCatalogEntry.pluginId,
+              name: "Echo",
+              enabled: plugins.echo === "enabled" && !plugins.disabledMidCall,
+            },
+          ]) as unknown as ReadonlyArray<PluginInstallRecord>,
+      retainedData: [],
+    })),
+    callOperation: (request: { operation: string; input: unknown }) =>
+      plugins.echo === "enabled" && !plugins.disabledMidCall
+        ? (plugins.call ??
+          Effect.sync(() => {
+            plugins.calls.push({ operation: request.operation, input: request.input });
+            return plugins.result ?? { echoed: request.operation };
+          }))
+        : Effect.fail(new PluginRequestError({ reason: "disabled" })),
+  } as unknown as PluginService["Service"];
+  const projections = {
+    getThreadShell: (threadId: ThreadId) =>
+      Effect.sync(() => {
+        expect(threadId).toBe(binding.threadId);
+        return plugins.threadShell === "missing"
+          ? null
+          : ({ ...threadModes, deletedAt: null } as OrchestrationV2ThreadShell);
+      }),
+  } as unknown as ProjectionStoreV2["Service"];
   const gateway = yield* __testing.make.pipe(
     Effect.provideService(AssistantNativeResources, {
       tools: () => Effect.sync(() => allowedTools),
     }),
+    Effect.provideService(PluginService, pluginService),
+    Effect.provideService(ProjectionStoreV2, projections),
     Effect.provideService(McpSessionRegistry, registry),
     Effect.provideService(ProjectMcpProxyRegistry, proxy),
   );
@@ -89,7 +149,65 @@ const setup = Effect.gen(function* () {
     setConnect: (value: typeof connect) => {
       connect = value;
     },
+    plugins,
+    setThreadModes: (value: typeof threadModes) => {
+      threadModes = value;
+    },
   };
+});
+
+const echoCatalogEntry: PluginAgentCatalogEntry = {
+  pluginId: PluginId.make("echo"),
+  name: "Echo",
+  operations: [
+    {
+      name: "ping",
+      title: "Ping",
+      description: "Answers without changing state.",
+      inputSchema: { type: "object" },
+      mutates: false,
+      agent: true,
+    },
+    {
+      name: "pong",
+      title: "Pong",
+      description: "Changes state.",
+      inputSchema: { type: "object" },
+      mutates: true,
+      agent: true,
+    },
+    {
+      name: "log",
+      title: "Log",
+      description: "Panel only.",
+      inputSchema: { type: "object" },
+      mutates: false,
+      agent: false,
+    },
+  ],
+  resources: [{ name: "status", title: "Echo status", operation: "ping" }],
+};
+
+const encodePacket = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const rpc = Effect.fn("testMcpCatalogGateway.rpc")(function* (
+  gateway: Effect.Success<typeof setup>["gateway"],
+  input: RegisterCatalogSessionInput,
+  method: string,
+  params: unknown,
+) {
+  const response = yield* gateway.handle(
+    input.providerSessionId,
+    input.providerSessionId,
+    new Request(`http://localhost/mcp/catalog/${input.providerSessionId}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: encodePacket({ jsonrpc: "2.0", id: 1, method, params }),
+    }),
+  );
+  return yield* Effect.promise(() => response.json());
 });
 
 it.effect("failed complete staging retains the previous applied catalog", () =>
@@ -501,4 +619,229 @@ it.effect(
       yield* request("tools/call", { name: namespaceName(logicalServerId, "read"), arguments: {} });
       expect(calls).toBe(1);
     }),
+);
+
+it.effect("lists plugin agent tools with read-only and destructive hints", () =>
+  Effect.gen(function* () {
+    const { gateway, input, plugins } = yield* setup;
+    yield* gateway.applyCatalogRevision(input);
+    plugins.echo = "enabled";
+    expect(yield* rpc(gateway, input, "tools/list", {})).toMatchObject({
+      result: {
+        tools: [
+          {
+            name: "plugin_echo__ping",
+            annotations: { readOnlyHint: true, destructiveHint: false },
+          },
+          {
+            name: "plugin_echo__pong",
+            annotations: { readOnlyHint: false, destructiveHint: true },
+          },
+        ],
+      },
+    });
+  }),
+);
+
+it.effect("omits non-agent operations and refuses calling them by name", () =>
+  Effect.gen(function* () {
+    const { gateway, input, plugins } = yield* setup;
+    yield* gateway.applyCatalogRevision(input);
+    plugins.echo = "enabled";
+    const listed = (yield* rpc(gateway, input, "tools/list", {})) as {
+      result: { tools: ReadonlyArray<{ name: string }> };
+    };
+    expect(listed.result.tools.map((tool) => tool.name)).not.toContain("plugin_echo__log");
+    expect(
+      yield* rpc(gateway, input, "tools/call", { name: "plugin_echo__log", arguments: {} }),
+    ).toMatchObject({ error: { message: "This plugin has no such operation." } });
+    expect(plugins.calls).toEqual([]);
+    expect(
+      yield* rpc(gateway, input, "tools/call", { name: "plugin_echo__ping", arguments: { a: 1 } }),
+    ).toMatchObject({ result: { content: [{ type: "text", text: '{"echoed":"ping"}' }] } });
+    expect(plugins.calls).toEqual([{ operation: "ping", input: { a: 1 } }]);
+    plugins.result = { text: "x".repeat(PLUGIN_LIMITS.maxPayloadBytes) };
+    expect(
+      yield* rpc(gateway, input, "tools/call", { name: "plugin_echo__ping", arguments: {} }),
+    ).toMatchObject({ error: { message: "The plugin request or response is too large." } });
+  }),
+);
+
+it.effect("an MCP cancel notification interrupts the plugin call it names", () =>
+  Effect.gen(function* () {
+    const { gateway, input, plugins } = yield* setup;
+    yield* gateway.applyCatalogRevision(input);
+    plugins.echo = "enabled";
+    const started = yield* Deferred.make<void>();
+    const interrupted = yield* Deferred.make<void>();
+    plugins.call = Deferred.succeed(started, undefined).pipe(
+      Effect.andThen(Effect.never),
+      Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
+    );
+    const call = yield* rpc(gateway, input, "tools/call", {
+      name: "plugin_echo__ping",
+      arguments: {},
+    }).pipe(Effect.forkChild);
+    yield* Deferred.await(started);
+    const cancelled = yield* gateway.handle(
+      input.providerSessionId,
+      input.providerSessionId,
+      new Request(`http://localhost/mcp/catalog/${input.providerSessionId}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: encodePacket({
+          jsonrpc: "2.0",
+          method: "notifications/cancelled",
+          params: { requestId: 1, reason: "user stopped" },
+        }),
+      }),
+    );
+    expect(cancelled.status).toBe(202);
+    yield* Deferred.await(interrupted);
+    expect(yield* Fiber.join(call)).toHaveProperty("error");
+  }),
+);
+
+it.effect(
+  "disabling a plugin removes its tools from the next list and fails in-flight names with plugin-disabled",
+  () =>
+    Effect.gen(function* () {
+      const { gateway, input, plugins } = yield* setup;
+      yield* gateway.applyCatalogRevision(input);
+      plugins.echo = "enabled";
+      expect(yield* rpc(gateway, input, "tools/list", {})).toMatchObject({
+        result: { tools: [{ name: "plugin_echo__ping" }, { name: "plugin_echo__pong" }] },
+      });
+      plugins.echo = "disabled";
+      expect(yield* rpc(gateway, input, "tools/list", {})).toMatchObject({
+        result: { tools: [] },
+      });
+      expect(
+        yield* rpc(gateway, input, "tools/call", { name: "plugin_echo__ping", arguments: {} }),
+      ).toMatchObject({ error: { message: 'Plugin "Echo" is disabled.' } });
+      plugins.echo = "enabled";
+      plugins.disabledMidCall = true;
+      expect(
+        yield* rpc(gateway, input, "tools/call", { name: "plugin_echo__ping", arguments: {} }),
+      ).toMatchObject({ error: { message: 'Plugin "Echo" is disabled.' } });
+      expect(plugins.calls).toEqual([]);
+    }),
+);
+
+it.effect("mutating plugin tool is refused for a non-full-access thread", () =>
+  Effect.gen(function* () {
+    const { gateway, input, plugins, setThreadModes } = yield* setup;
+    yield* gateway.applyCatalogRevision(input);
+    plugins.echo = "enabled";
+    setThreadModes({ runtimeMode: "approval-required", interactionMode: "default" });
+    expect(
+      yield* rpc(gateway, input, "tools/call", { name: "plugin_echo__pong", arguments: {} }),
+    ).toMatchObject({ error: { message: PLUGIN_MUTATION_REFUSED_MESSAGE } });
+    setThreadModes({ runtimeMode: "full-access", interactionMode: "plan" });
+    expect(
+      yield* rpc(gateway, input, "tools/call", { name: "plugin_echo__pong", arguments: {} }),
+    ).toMatchObject({ error: { message: PLUGIN_MUTATION_REFUSED_MESSAGE } });
+    expect(
+      yield* rpc(gateway, input, "tools/call", { name: "plugin_echo__ping", arguments: {} }),
+    ).toHaveProperty("result");
+    expect(plugins.calls.map((call) => call.operation)).toEqual(["ping"]);
+    setThreadModes({ runtimeMode: "full-access", interactionMode: "default" });
+    plugins.threadShell = "missing";
+    expect(
+      yield* rpc(gateway, input, "tools/call", { name: "plugin_echo__pong", arguments: {} }),
+    ).toMatchObject({ error: { message: PLUGIN_MUTATION_REFUSED_MESSAGE } });
+    plugins.threadShell = "present";
+    expect(
+      yield* rpc(gateway, input, "tools/call", { name: "plugin_echo__pong", arguments: {} }),
+    ).toHaveProperty("result");
+  }),
+);
+
+it.effect("assistant policy lists and calls only selected plugin operations", () =>
+  Effect.gen(function* () {
+    const { gateway, input, plugins, setAllowedTools } = yield* setup;
+    yield* gateway.applyCatalogRevision(input);
+    plugins.echo = "enabled";
+    setAllowedTools(["plugin:echo:ping"]);
+    const listed = (yield* rpc(gateway, input, "tools/list", {})) as {
+      result: { tools: ReadonlyArray<{ name: string }> };
+    };
+    expect(listed.result.tools.map((tool) => tool.name)).toEqual(["plugin_echo__ping"]);
+    expect(
+      yield* rpc(gateway, input, "tools/call", { name: "plugin_echo__ping", arguments: {} }),
+    ).toHaveProperty("result");
+    expect(
+      yield* rpc(gateway, input, "tools/call", { name: "plugin_echo__pong", arguments: {} }),
+    ).toMatchObject({
+      error: { message: "This tool is not selected in the assistant configuration." },
+    });
+    expect(plugins.calls.map((call) => call.operation)).toEqual(["ping"]);
+  }),
+);
+
+it.effect("assistant policy hides plugin resources and refuses reading them", () =>
+  Effect.gen(function* () {
+    const { gateway, input, plugins, setAllowedTools } = yield* setup;
+    yield* gateway.applyCatalogRevision(input);
+    plugins.echo = "enabled";
+    setAllowedTools(["plugin:echo:ping"]);
+    expect(yield* rpc(gateway, input, "resources/list", {})).toMatchObject({
+      result: { resources: [] },
+    });
+    expect(
+      yield* rpc(gateway, input, "resources/read", { uri: "t3-plugin://echo/status" }),
+    ).toMatchObject({
+      error: { message: "Assistant resource access requires a configured selection." },
+    });
+    expect(plugins.calls).toEqual([]);
+  }),
+);
+
+it.effect("reads a plugin resource through its declared operation", () =>
+  Effect.gen(function* () {
+    const { gateway, input, plugins } = yield* setup;
+    yield* gateway.applyCatalogRevision(input);
+    plugins.echo = "enabled";
+    expect(yield* rpc(gateway, input, "resources/list", {})).toMatchObject({
+      result: {
+        resources: [{ uri: "t3-plugin://echo/status", name: "status", title: "Echo status" }],
+      },
+    });
+    expect(
+      yield* rpc(gateway, input, "resources/read", { uri: "t3-plugin://echo/status" }),
+    ).toMatchObject({
+      result: {
+        contents: [
+          {
+            uri: "t3-plugin://echo/status",
+            mimeType: "application/json",
+            text: '{"echoed":"ping"}',
+          },
+        ],
+      },
+    });
+    expect(plugins.calls).toEqual([{ operation: "ping", input: {} }]);
+  }),
+);
+
+it.effect("plugin tools work with zero catalog entries", () =>
+  Effect.gen(function* () {
+    const { gateway, input, plugins } = yield* setup;
+    plugins.echo = "enabled";
+    expect(yield* gateway.resolveCatalogSession(input.catalogSessionId)).toBeUndefined();
+    const listed = (yield* rpc(gateway, input, "tools/list", {})) as {
+      result: { tools: ReadonlyArray<{ name: string }> };
+    };
+    expect(listed.result.tools.map((tool) => tool.name)).toEqual([
+      "plugin_echo__ping",
+      "plugin_echo__pong",
+    ]);
+    expect(
+      yield* rpc(gateway, input, "tools/call", { name: "plugin_echo__ping", arguments: {} }),
+    ).toHaveProperty("result");
+    expect(plugins.calls).toHaveLength(1);
+  }),
 );

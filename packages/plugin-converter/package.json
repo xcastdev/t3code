@@ -1,0 +1,13 @@
+{
+  "name": "@t3tools/plugin-converter",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "pack": "node scripts/pack.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@t3tools/plugin-sdk": "workspace:*",
+    "@types/node": "catalog:"
+  }
+}

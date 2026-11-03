@@ -511,9 +511,25 @@
       "types": "./src/mcpApps/host.ts",
       "default": "./src/mcpApps/host.ts"
     },
+    "./plugins/bridge": {
+      "types": "./src/plugins/bridge.ts",
+      "default": "./src/plugins/bridge.ts"
+    },
+    "./plugins/client-packages": {
+      "types": "./src/plugins/clientPackages.ts",
+      "default": "./src/plugins/clientPackages.ts"
+    },
+    "./plugins/commands": {
+      "types": "./src/plugins/commands.ts",
+      "default": "./src/plugins/commands.ts"
+    },
     "./state/mcp-apps": {
       "types": "./src/state/mcpApps.ts",
       "default": "./src/state/mcpApps.ts"
+    },
+    "./state/plugins": {
+      "types": "./src/state/plugins.ts",
+      "default": "./src/state/plugins.ts"
     },
     "./source-control-clients": {
       "types": "./src/sourceControlClients.ts",

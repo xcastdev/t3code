@@ -3,6 +3,7 @@ import {
   sourceControlClients,
 } from "@t3tools/client-runtime/source-control-clients";
 import {
+  COMPOSER_CONTEXT_PLUGIN_SNAPSHOT_MAX_CHARS,
   COMPOSER_CONTEXT_REVIEW_DIFF_MAX_CHARS,
   COMPOSER_CONTEXT_REVIEW_TEXT_MAX_CHARS,
 } from "@t3tools/contracts";
@@ -16,6 +17,8 @@ import type {
   KnownComposerContextRecord,
   MessageId,
   OrchestrationMessageContext,
+  PluginId,
+  PluginReferenceContextRecord,
   PreviewAnnotationContextRecord,
   PreviewAnnotationPayload,
   ReviewCommentContextRecord,
@@ -177,6 +180,45 @@ export function environmentContextRecord(
   };
 }
 
+export function pluginReferenceContextReference(
+  record: PluginReferenceContextRecord,
+): ComposerContextReference {
+  return { kind: "plugin-reference", contextId: record.contextId, label: record.label };
+}
+
+/** One record per plugin locator, so attaching the same capture again reuses its chip. */
+export function pluginReferenceContextRecord(input: {
+  readonly environmentId: EnvironmentId;
+  readonly pluginId: PluginId;
+  readonly pluginName: string;
+  readonly label: string;
+  readonly locator: Readonly<Record<string, string>>;
+  readonly snapshot: string;
+}): PluginReferenceContextRecord {
+  const locator = Object.fromEntries(
+    Object.entries(input.locator).toSorted(([a], [b]) => a.localeCompare(b)),
+  );
+  const snapshotTruncated = input.snapshot.length > COMPOSER_CONTEXT_PLUGIN_SNAPSHOT_MAX_CHARS;
+  return {
+    version: 1,
+    kind: "plugin-reference",
+    contextId: toKindScopedComposerContextId(
+      "plugin-reference",
+      `${input.environmentId}:${input.pluginId}:${JSON.stringify(locator)}`,
+    ),
+    label: sanitizeComposerContextLabel(input.label, "plugin-reference"),
+    referenceVersion: 1,
+    environmentId: input.environmentId,
+    pluginId: input.pluginId,
+    pluginName: input.pluginName.trim().slice(0, 64),
+    locator,
+    snapshot: snapshotTruncated
+      ? input.snapshot.slice(0, COMPOSER_CONTEXT_PLUGIN_SNAPSHOT_MAX_CHARS)
+      : input.snapshot,
+    snapshotTruncated,
+  };
+}
+
 export function terminalContextRecord(context: TerminalContextDraft): TerminalContextRecord {
   return {
     version: 1,
@@ -318,6 +360,7 @@ export function buildMessageContext(input: {
   previewAnnotations: ReadonlyArray<PreviewAnnotationPayload>;
   threadContexts?: ReadonlyArray<ThreadContextRecord>;
   environmentContexts?: ReadonlyArray<EnvironmentContextRecord>;
+  pluginReferences?: ReadonlyArray<PluginReferenceContextRecord>;
   attachments?: ReadonlyArray<BoundComposerAttachment>;
 }): OrchestrationMessageContext | undefined {
   const screenshotAttachmentIds = new Set(
@@ -330,6 +373,7 @@ export function buildMessageContext(input: {
     ...input.reviewComments.map(reviewCommentContextRecord),
     ...(input.threadContexts ?? []),
     ...(input.environmentContexts ?? []),
+    ...(input.pluginReferences ?? []),
     ...input.previewAnnotations.map((annotation) =>
       previewAnnotationContextRecord(annotation, {
         screenshotContextId: screenshotAttachmentIds.has(annotation.id) ? annotation.id : undefined,
