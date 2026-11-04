@@ -38,9 +38,11 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
+import * as AliasStore from "./McpCatalogAliasStore.ts";
 import * as Registry from "./McpSessionRegistry.ts";
 import * as Proxy from "./ProjectMcpProxyRegistry.ts";
 import {
+  type CatalogAliases,
   catalogAliases,
   namespaceName,
   namespaceResourceUri,
@@ -103,6 +105,7 @@ interface Generation {
   readonly session: McpCatalogGatewaySession;
   readonly scope: Scope.Closeable;
   readonly connections: ReadonlyArray<Proxy.ProjectMcpConnection>;
+  readonly aliases: CatalogAliases;
   active: number;
   retired: boolean;
   drained?: () => void;
@@ -190,8 +193,8 @@ const makeServer = (
       if (inflight.get(extra.requestId) === controller) inflight.delete(extra.requestId);
     }
   };
-  const aliases = catalogAliases(generation.connections.map((connection) => connection.entry));
-  const alias = (entry: ResolvedMcpCatalogEntry) => aliases.get(entry.logicalServerId)!;
+  const alias = (entry: ResolvedMcpCatalogEntry) =>
+    generation.aliases.byServer.get(entry.logicalServerId)!.alias;
   const byAlias = new Map(
     generation.connections.map((connection) => [alias(connection.entry), connection]),
   );
@@ -398,6 +401,7 @@ const make = Effect.gen(function* () {
   const registry = yield* Registry.McpSessionRegistry;
   const plugins = yield* PluginService.PluginService;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
+  const aliasStore = yield* AliasStore.McpCatalogAliasStore;
   const unavailablePlugin = (pluginId: PluginId, missing: string) =>
     Effect.flatMap(plugins.list, (snapshot) => {
       const record = snapshot.installed.find((candidate) => candidate.pluginId === pluginId);
@@ -526,6 +530,8 @@ const make = Effect.gen(function* () {
           )
         )
           return yield* Effect.fail(new McpCatalogGatewayError());
+        // Provider history outlives generations and restarts, so issued aliases are durable.
+        const issued = yield* aliasStore.read(input.catalogSessionId);
         const scope = yield* Scope.make("parallel");
         const connections = yield* Effect.forEach(
           input.entries,
@@ -543,10 +549,15 @@ const make = Effect.gen(function* () {
           return yield* Effect.fail(new McpCatalogGatewayError());
         }
         const previous = sessions.get(input.catalogSessionId);
+        const aliases = catalogAliases(input.entries, issued);
+        yield* aliasStore
+          .write(input.catalogSessionId, aliases)
+          .pipe(Effect.onError(() => Scope.close(scope, Exit.void)));
         const generation: Generation = {
           session: { ...input, entries: [...input.entries] },
           scope,
           connections,
+          aliases,
           active: 0,
           retired: false,
         };
@@ -617,6 +628,7 @@ const make = Effect.gen(function* () {
         },
         scope: emptyScope!,
         connections: [],
+        aliases: catalogAliases([]),
         active: 0,
         retired: false,
       };
@@ -662,6 +674,6 @@ const make = Effect.gen(function* () {
 });
 /** Needs `PluginService` from the host, which owns the one set of plugin workers. */
 export const layer = Layer.effect(McpCatalogGateway, make).pipe(
-  Layer.provide(Layer.merge(AssistantResources.layer, ProjectionStore.layer)),
+  Layer.provide(Layer.mergeAll(AssistantResources.layer, ProjectionStore.layer, AliasStore.layer)),
 );
 export const __testing = { make };

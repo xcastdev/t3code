@@ -152,7 +152,7 @@ describe("PluginPanelFrame", () => {
     expect(getState).not.toHaveBeenCalled();
   });
 
-  it("credits a click in the panel right after a click elsewhere in T3", async () => {
+  it("refuses a hovered panel that focuses itself right after a click elsewhere in T3", async () => {
     const writeClipboard = vi.fn(async (_text: string) => {});
     await using screen = await render(
       <div style={{ width: 400, height: 300 }}>
@@ -162,9 +162,15 @@ describe("PluginPanelFrame", () => {
           document={{
             kind: "srcdoc",
             html: pluginPanelTestHtml(
-              `document.getElementById("copy").onclick = async () =>
-                probe("copied", await call("t3/clipboard.write", { text: "hi" }));`,
-              `<button id="copy">Copy</button>`,
+              `let tried = false;
+              addEventListener("pointermove", async () => {
+                if (tried) return;
+                tried = true;
+                window.focus();
+                probe("focused", document.hasFocus());
+                probe("copied", await call("t3/clipboard.write", { text: "hi" }));
+              });`,
+              `<div style="height:200px"></div>`,
             ),
           }}
           bridge={{
@@ -187,8 +193,56 @@ describe("PluginPanelFrame", () => {
     await probes.probe("initialized");
 
     await page.getByRole("button", { name: "Open panel" }).click();
-    await page.frameLocator(page.getByTitle("Echo")).getByRole("button", { name: "Copy" }).click();
-    expect(await probes.probe("copied")).toEqual({ jsonrpc: "2.0", id: 2, result: {} });
+    await page.getByTitle("Echo").hover();
+    // Without this the test would pass on a browser that blocks the panel's self-focus.
+    expect(await probes.probe("focused")).toBe(true);
+    expect(document.activeElement).toBe(screen.container.querySelector("iframe"));
+    expect(await probes.probe("copied")).toMatchObject({
+      error: {
+        message: "Copying was blocked. Wait a few seconds, then click or tap in the panel again.",
+      },
+    });
+    expect(writeClipboard).not.toHaveBeenCalled();
+  });
+
+  it("copies when the user clicks inside the panel", async () => {
+    const writeClipboard = vi.fn(async (_text: string) => {});
+    await using screen = await render(
+      <div style={{ width: 400, height: 300 }}>
+        <PluginPanelFrame
+          title="Echo"
+          document={{
+            kind: "srcdoc",
+            html: pluginPanelTestHtml(
+              `addEventListener("click", async () => {
+                probe("copied", await call("t3/clipboard.write", { text: "hi" }));
+              }, { once: true });`,
+              `<div style="height:200px"></div>`,
+            ),
+          }}
+          bridge={{
+            manifest: { ...manifest("1.0.0"), capabilities: ["clipboard.write"] },
+            panelId: "main",
+            pluginVersion: "1",
+            state: { get: async () => null, set: async () => {} },
+            openSurface: async () => {},
+            attach: async () => "inserted",
+            saveFile: async () => "saved",
+            writeClipboard,
+            chatTargets: () => ({ threads: [], projects: [] }),
+          }}
+          destination={{ kind: "client" }}
+          chatTarget={null}
+        />
+      </div>,
+    );
+    using probes = collectPanelProbes(screen.container);
+    await probes.probe("initialized");
+    // Far past any page-input timestamp earlier tests' clicks on the T3 page recorded.
+    using _now = vi.spyOn(performance, "now").mockReturnValue(Number.MAX_SAFE_INTEGER);
+
+    await page.getByTitle("Echo").click();
+    expect(await probes.probe("copied")).toMatchObject({ result: {} });
     expect(writeClipboard).toHaveBeenCalledWith("hi");
   });
 

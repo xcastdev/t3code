@@ -919,7 +919,11 @@ function McpOAuthControls({
 }
 
 interface ProviderSelection {
-  /** Every provider, including ones added later; `ids` is kept for when it is turned off. */
+  /**
+   * Every provider, including ones added later. Turning it on also selects every current
+   * provider in `ids`, so a client or server that predates `all` delivers to those instead of none.
+   * The checklist restores the earlier subset if it is turned off in the same dialog.
+   */
   readonly all: boolean;
   readonly ids: ReadonlyArray<ProviderInstanceId>;
 }
@@ -934,6 +938,10 @@ function ProviderChecklist({
   onChange: (next: ProviderSelection) => void;
 }) {
   const { all, ids: selected } = selection;
+  // Turning "All providers" on checks every row; this brings back the subset it replaced.
+  const [subsetBeforeAll, setSubsetBeforeAll] = useState<ReadonlyArray<ProviderInstanceId> | null>(
+    null,
+  );
   const known = new Set(providers.map((provider) => provider.id));
   const unknown = selected.filter((id) => !known.has(id));
   const allSelected = all || providers.every((provider) => selected.includes(provider.id));
@@ -962,7 +970,14 @@ function ProviderChecklist({
         <label className="flex cursor-pointer items-center gap-3 px-3 py-2">
           <Checkbox
             checked={all}
-            onCheckedChange={(checked) => onChange({ all: checked === true, ids: selected })}
+            onCheckedChange={(checked) => {
+              if (checked === true) {
+                setSubsetBeforeAll(selected);
+                onChange({ all: true, ids: providers.map((provider) => provider.id) });
+              } else {
+                onChange({ all: false, ids: subsetBeforeAll ?? selected });
+              }
+            }}
           />
           <span className="min-w-0 flex-1 truncate text-xs">All providers</span>
           <span className="text-xs text-muted-foreground">Includes providers added later</span>
@@ -1580,7 +1595,9 @@ function McpServerEditor({
 
 function McpTestResult({ result }: { result: McpCatalogTestConnectionResult }) {
   const server = result.serverInfo;
-  const count = `${result.tools.length} ${result.tools.length === 1 ? "tool" : "tools"}`;
+  const total = result.tools.length + (result.omittedToolCount ?? 0);
+  const plus = result.truncated ? "+" : "";
+  const count = `${total}${plus} ${total === 1 && !plus ? "tool" : "tools"}`;
   return (
     <div role="status" className="space-y-1.5 rounded-md border p-2.5 text-sm">
       <p>
@@ -1598,6 +1615,13 @@ function McpTestResult({ result }: { result: McpCatalogTestConnectionResult }) {
               ) : null}
             </li>
           ))}
+          {result.omittedToolCount === undefined && !result.truncated ? null : (
+            <li className="text-muted-foreground">
+              and{" "}
+              {result.omittedToolCount === undefined ? "" : `${result.omittedToolCount}${plus} `}
+              more
+            </li>
+          )}
         </ul>
       ) : null}
     </div>

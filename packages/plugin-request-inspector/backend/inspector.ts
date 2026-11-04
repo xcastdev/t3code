@@ -16,6 +16,7 @@ import {
 import { type ExportEntry, type ExportFormat, exportRequests } from "../shared/exportFormats.ts";
 import { formatHeaders, type HeaderFormat } from "../shared/headerFormats.ts";
 import type { BodyInput as ExportBody, HeaderList } from "../shared/httpText.ts";
+import { isSensitiveHeader, redactHeaderValue } from "../shared/sensitiveHeaders.ts";
 import {
   type CallerContext,
   callerLink,
@@ -56,6 +57,7 @@ import {
   NSS_DETAILS,
   PROXY_DETAILS,
   REPLAY_INPUT_DETAILS,
+  sensitiveHeaderDetail,
 } from "./refusals.ts";
 import {
   type InspectorTimer,
@@ -317,11 +319,12 @@ const parseEdits = (value: unknown): ReplayEdits | undefined => {
   };
 };
 
-const replayInput = (input: Input) => {
+const replayInput = (input: Input, ctx: OperationContext) => {
   const edits = parseEdits(input.edits);
   return {
     requestId: parseId(input.requestId, "request"),
     ...(edits === undefined ? {} : { edits }),
+    ...(redactsFor(input, ctx) ? { credentials: "recorded-origin" as const } : {}),
   };
 };
 
@@ -440,6 +443,19 @@ function parseProxyOptions(value: unknown, base: ProxyOptions): ParsedProxyOptio
   return { options, auth: parsedMode?.auth };
 }
 
+const LOOPBACK_HOST = /^(?:localhost|127(?:\.\d{1,3}){3}|::1|\[::1\])$/i;
+
+/** Agents may listen on loopback or on a host the user already chose, never open a new one. */
+const checkAgentListenHost = (
+  ctx: OperationContext,
+  host: string,
+  userHosts: ReadonlyArray<string>,
+) => {
+  if (ctx.caller === "agent" && !LOOPBACK_HOST.test(host) && !userHosts.includes(host)) {
+    throw invalid(PROXY_DETAILS.agentListenHost);
+  }
+};
+
 function compiledHosts(options: ProxyOptions): ProxyHosts {
   const compiled = compileProxyHosts(options.passthroughHosts, options.ignoredHosts);
   if (!compiled.ok) throw invalid(invalidHostPatternDetail(compiled.pattern, compiled.reason));
@@ -481,18 +497,27 @@ export const recordingView = (recording: RecordingRecord) => ({
   proxyId: String(recording.proxyId),
 });
 
-const headerText = (pairs: ReadonlyArray<HeaderPair>): HeaderList =>
-  pairs.map(
-    ([name, value]) =>
-      [Buffer.from(name).toString("latin1"), Buffer.from(value).toString("latin1")] as const,
-  );
+/** Agents see credential header values only when they ask; the user's panel always sees them. */
+const redactsFor = (raw: Input, ctx: OperationContext) =>
+  ctx.caller === "agent" && raw.includeSensitiveHeaders !== true;
+
+const headerText = (pairs: ReadonlyArray<HeaderPair>, redact = false): HeaderList =>
+  pairs.map(([nameBytes, value]) => {
+    const name = Buffer.from(nameBytes).toString("latin1");
+    const text = Buffer.from(value).toString("latin1");
+    return [name, redact ? redactHeaderValue(name, text) : text] as const;
+  });
 
 /** Ordered headers with each value cut at 8 KiB and the side cut at 32 KiB. */
-export function shapeHeaders(pairs: ReadonlyArray<HeaderPair>, sideChars = HEADER_SIDE_CHARS) {
+export function shapeHeaders(
+  pairs: ReadonlyArray<HeaderPair>,
+  redact: boolean,
+  sideChars = HEADER_SIDE_CHARS,
+) {
   const headers: Array<[string, string]> = [];
   let truncated = false;
   let used = 0;
-  for (const [name, value] of headerText(pairs)) {
+  for (const [name, value] of headerText(pairs, redact)) {
     let text = value;
     if (text.length > HEADER_VALUE_CHARS) {
       text = text.slice(0, HEADER_VALUE_CHARS);
@@ -605,6 +630,7 @@ export function requestDetail(
   options: {
     readonly previewBytes: number;
     readonly bodies: "none" | "request" | "response" | "both";
+    readonly redact?: boolean;
   },
   budgetBytes = PAYLOAD_BYTES,
 ) {
@@ -641,7 +667,7 @@ export function requestDetail(
       ...(summary.error === undefined ? {} : { error: summary.error }),
       ...tunnelFields(summary),
       request: {
-        ...shapeHeaders(record.requestHeaders, headerChars),
+        ...shapeHeaders(record.requestHeaders, options.redact === true, headerChars),
         ...(requestBody === undefined ? {} : { body: renderBodyView(requestBody, previewBytes) }),
       },
       ...(record.response === undefined
@@ -651,7 +677,7 @@ export function requestDetail(
               status: record.response.status,
               ...(record.response.reason === undefined ? {} : { reason: record.response.reason }),
               httpVersion: record.response.httpVersion,
-              ...shapeHeaders(record.response.headers, headerChars),
+              ...shapeHeaders(record.response.headers, options.redact === true, headerChars),
               ...(responseBody === undefined
                 ? {}
                 : { body: renderBodyView(responseBody, previewBytes) }),
@@ -1282,6 +1308,7 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
     format: ExportFormat,
     withBodies: boolean,
     budget: { left: number },
+    redact: boolean,
   ): ExportEntry => {
     const { summary } = record;
     const response = record.response;
@@ -1304,7 +1331,7 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
         authority: record.authority,
         path: record.path,
         httpVersion: record.httpVersion,
-        headers: headerText(record.requestHeaders),
+        headers: headerText(record.requestHeaders, redact),
         body: withBodies ? exportBody("request", record.requestBody) : undefined,
       },
       response:
@@ -1314,7 +1341,7 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
               status: response.status,
               reason: response.reason,
               httpVersion: response.httpVersion,
-              headers: headerText(response.headers),
+              headers: headerText(response.headers, redact),
               body: withBodies ? exportBody("response", response.body) : undefined,
             },
       error: summary.error,
@@ -1470,6 +1497,7 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
         passthroughHosts: [],
         ignoredHosts: [],
       });
+      checkAgentListenHost(ctx, options.listenHost, [config.listenHost]);
       const link = raw.link ?? defaultLink(ctx);
       if (link !== "thread" && link !== "project" && link !== "none") {
         throw invalid('link must be "thread", "project" or "none".');
@@ -1493,13 +1521,17 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
     },
     update_proxy: async (input, ctx) =>
       serialized(async () => {
-        const { store } = current();
+        const { store, config } = current();
         const raw = objectInput(input);
         const proxyId = parseId(raw.proxyId, "proxy");
         const proxy = liveProxy(proxyId);
         const name = optionalName(raw, "name");
         const restart = optionalBoolean(raw, "restart") ?? false;
         const { options, auth } = parseProxyOptions(raw.options ?? {}, proxy.options);
+        checkAgentListenHost(ctx, options.listenHost, [
+          config.listenHost,
+          proxy.options.listenHost,
+        ]);
         // Credentials belong to one upstream: a new url drops them unless auth comes with it.
         const sameUpstream =
           options.mode.kind === "upstream" &&
@@ -1514,14 +1546,8 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
             : requested === null && !proxy.hasUpstreamAuth
               ? undefined
               : requested;
-        await store.exclusive((lane) =>
-          lane.updateProxy(proxyId, {
-            options,
-            ...(name === undefined ? {} : { name }),
-            ...(upstreamAuth === undefined ? {} : { upstreamAuth }),
-          }),
-        );
         let entry = running.get(proxyId);
+        // Applied before the store write, so a refused change stays unsaved and a retry resends it.
         if (
           entry !== undefined &&
           (!sameList(options.passthroughHosts, proxy.options.passthroughHosts) ||
@@ -1529,6 +1555,13 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
         ) {
           await entry.process.setHosts(compiledHosts(options));
         }
+        await store.exclusive((lane) =>
+          lane.updateProxy(proxyId, {
+            options,
+            ...(name === undefined ? {} : { name }),
+            ...(upstreamAuth === undefined ? {} : { upstreamAuth }),
+          }),
+        );
         if (entry !== undefined && restart) entry = await restartLocked(entry);
         const view = viewOf(proxyId, callerOf(ctx));
         return { proxy: view, restartRequired: view.restartRequired };
@@ -1666,7 +1699,7 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
         proxyId,
       };
     },
-    get_request: async (input) => {
+    get_request: async (input, ctx) => {
       const { store } = current();
       const raw = objectInput(input);
       const id = parseId(raw.requestId, "request");
@@ -1680,7 +1713,7 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
       if (bodies !== "none" && bodies !== "request" && bodies !== "response" && bodies !== "both") {
         throw invalid('bodies must be "none", "request", "response" or "both".');
       }
-      return requestDetail(store, record, { previewBytes, bodies });
+      return requestDetail(store, record, { previewBytes, bodies, redact: redactsFor(raw, ctx) });
     },
     read_body: async (input) => {
       const { readBody } = current();
@@ -1708,6 +1741,7 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
       const ids = parseStringList(raw.requestIds, "requestIds", MAX_EXPORT_REQUESTS, 32);
       if (ids !== undefined && raw.filter !== undefined) throw invalid(EXPORT_DETAILS.needsScope);
       const withBodies = optionalBoolean(raw, "includeBodies") ?? true;
+      const redact = redactsFor(raw, ctx);
       const budget = { left: MAX_EXPORT_BYTES };
       const entries: Array<ExportEntry> = [];
       const missing: Array<string> = [];
@@ -1716,7 +1750,7 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
         for (const id of ids) {
           const record = ID_PATTERN.test(id) ? store.getRequest(Number(id)) : undefined;
           if (record === undefined) missing.push(id);
-          else entries.push(exportEntry(store, record, exportFormat, withBodies, budget));
+          else entries.push(exportEntry(store, record, exportFormat, withBodies, budget, redact));
         }
       } else {
         const { filter } = scopedFilter(objectInput(raw.filter), ctx);
@@ -1738,7 +1772,7 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
         } while (cursor !== undefined);
         // Search is newest first; an export reads oldest first.
         for (const record of records.toReversed()) {
-          entries.push(exportEntry(store, record, exportFormat, withBodies, budget));
+          entries.push(exportEntry(store, record, exportFormat, withBodies, budget, redact));
         }
       }
       const { text, count } = exportRequests(entries, {
@@ -1811,7 +1845,7 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
         NodeFS.closeSync(fd);
       }
     },
-    format_headers: async (input) => {
+    format_headers: async (input, ctx) => {
       const { store } = current();
       const raw = objectInput(input);
       const record = store.getRequest(parseId(raw.requestId, "request"));
@@ -1830,7 +1864,7 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
           : parseStringList(raw.cookies, "cookies", 256, 256);
       const pairs = side === "request" ? record.requestHeaders : (record.response?.headers ?? []);
       const text = formatHeaders({
-        headers: headerText(pairs),
+        headers: headerText(pairs, redactsFor(raw, ctx)),
         side,
         request: { host: record.summary.host, path: record.path },
         capturedAt: record.summary.startedAt,
@@ -1840,7 +1874,7 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
       });
       return fitFormattedHeaders(text);
     },
-    decode_value: async (input) => {
+    decode_value: async (input, ctx) => {
       const { store } = current();
       const raw = objectInput(input);
       const source = objectInput(raw.source);
@@ -1858,6 +1892,9 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
         if (header !== undefined) {
           const pairs = side === "request" ? record.requestHeaders : record.response?.headers;
           const wanted = header.toLowerCase();
+          if (isSensitiveHeader(wanted) && redactsFor(raw, ctx)) {
+            throw invalid(sensitiveHeaderDetail(header));
+          }
           const found = pairs?.find(
             ([name]) => Buffer.from(name).toString("latin1").toLowerCase() === wanted,
           );
@@ -1914,14 +1951,15 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
       const dbs = parseStringList(objectInput(input).dbs, "dbs", MAX_NSS_DBS, 4096);
       return { results: await nssUninstall(nssDeps(), dbs).catch(nssFailure) };
     },
-    preview_replay: async (input) => current().replay.preview(replayInput(objectInput(input))),
+    preview_replay: async (input, ctx: OperationContext) =>
+      current().replay.preview(replayInput(objectInput(input), ctx)),
     replay_request: async (input, ctx: OperationContext) => {
       const raw = objectInput(input);
       const idempotencyKey = optionalString(raw, "idempotencyKey");
       if (idempotencyKey === undefined || idempotencyKey === "") {
         throw invalid(REPLAY_INPUT_DETAILS.keyRequired);
       }
-      return current().replay.accept({ ...replayInput(raw), idempotencyKey }, ctx.signal);
+      return current().replay.accept({ ...replayInput(raw, ctx), idempotencyKey }, ctx.signal);
     },
     get_replay: async (input, ctx: OperationContext) => {
       const raw = objectInput(input);
@@ -1964,13 +2002,15 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
       const { summary } = record;
       const lines = [
         `${summary.method} ${summary.scheme}://${requestOrigin({ ...summary, authority: record.authority })}${record.path}`,
-        ...shapeHeaders(record.requestHeaders).headers.map(([name, value]) => `${name}: ${value}`),
+        ...shapeHeaders(record.requestHeaders, true).headers.map(
+          ([name, value]) => `${name}: ${value}`,
+        ),
       ];
       if (record.response !== undefined) {
         lines.push(
           "",
           `${record.response.status}${record.response.reason ? ` ${record.response.reason}` : ""}`,
-          ...shapeHeaders(record.response.headers).headers.map(
+          ...shapeHeaders(record.response.headers, true).headers.map(
             ([name, value]) => `${name}: ${value}`,
           ),
         );

@@ -2,6 +2,7 @@ import {
   PLUGIN_HOST_API,
   PluginId,
   PluginManifest,
+  PluginCapability,
   PluginOperationName,
   type PluginOperationDecl,
   type PluginSettingField,
@@ -12,6 +13,7 @@ import * as Schema from "effect/Schema";
 const decodeManifestResult = Schema.decodeUnknownResult(PluginManifest);
 const isPluginId = Schema.is(PluginId);
 const isPluginOperationName = Schema.is(PluginOperationName);
+const isPluginCapability = Schema.is(PluginCapability);
 
 const PLUGIN_TOOL_PREFIX = "plugin_";
 const PLUGIN_RESOURCE_SCHEME = "t3-plugin://";
@@ -161,6 +163,11 @@ const manifestProblem = (manifest: PluginManifest): string | undefined => {
     if (operation === undefined || operation.mutates) {
       return `resource "${resource.name}" must name a declared non-mutating operation`;
     }
+  }
+
+  if (isHostApiCompatible(manifest.hostApi)) {
+    const unknown = manifest.capabilities.find((capability) => !isPluginCapability(capability));
+    if (unknown !== undefined) return `unknown capability "${unknown}"`;
   }
 
   for (const field of [

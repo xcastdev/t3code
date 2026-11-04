@@ -159,7 +159,11 @@ export const PluginManifest = Schema.Struct({
       environment: Schema.Array(PluginSettingField).check(Schema.isMaxLength(64)),
     }),
   ),
-  capabilities: Schema.Array(PluginCapability).check(Schema.isMaxLength(8)),
+  // Open on the wire so a client can decode a newer manifest and ask for an update;
+  // decodePluginManifest rejects unknown ones for a hostApi the host claims.
+  capabilities: Schema.Array(Schema.String.check(Schema.isMaxLength(64))).check(
+    Schema.isMaxLength(8),
+  ),
 });
 export type PluginManifest = typeof PluginManifest.Type;
 

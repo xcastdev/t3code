@@ -40,6 +40,7 @@ const CA_SHA1 = "0EA942CDBED796D33378F806E70FF4A5E3C17E47";
 
 function fakeFs(initial: Record<string, string>) {
   const files = new Map(Object.entries(initial));
+  const writes: Array<string> = [];
   const fs: CertFs = {
     existsSync: (path) => files.has(path),
     readFileSync: (path) => {
@@ -48,7 +49,17 @@ function fakeFs(initial: Record<string, string>) {
       return value;
     },
     writeFileSync: (path, data) => {
+      writes.push(path);
       files.set(path, data);
+    },
+    renameSync: (from, to) => {
+      const value = files.get(from);
+      if (value === undefined) throw new Error(`ENOENT ${from}`);
+      files.delete(from);
+      files.set(to, value);
+    },
+    unlinkSync: (path) => {
+      files.delete(path);
     },
     mkdirSync: () => {},
     readdirSync: (dir) => {
@@ -60,7 +71,7 @@ function fakeFs(initial: Record<string, string>) {
       return [...names];
     },
   };
-  return { fs, files };
+  return { fs, files, writes };
 }
 
 const mitmConfdir = {
@@ -135,6 +146,37 @@ describe("combinedBundle", () => {
     const { fs, files } = fakeFs({ ...mitmConfdir, [systemPath]: "SYSTEM\n" });
     expect(combinedBundle("/data", CA_PEM, fs)).toBe("/data/exports/ca-bundle.pem");
     expect(files.get("/data/exports/ca-bundle.pem")).toBe("SYSTEM\nCA PEM\n");
+  });
+
+  it("replaces the bundle through a temp file, and only when its content changed", () => {
+    const { fs, files, writes } = fakeFs({
+      ...mitmConfdir,
+      "/etc/ssl/cert.pem": "SYSTEM",
+    });
+    combinedBundle("/data", CA_PEM, fs);
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).not.toBe("/data/exports/ca-bundle.pem");
+    expect([...files.keys()].filter((path) => path.startsWith("/data/exports/"))).toEqual([
+      "/data/exports/ca-bundle.pem",
+    ]);
+    combinedBundle("/data", CA_PEM, fs);
+    expect(writes).toHaveLength(1);
+    files.set("/etc/ssl/cert.pem", "UPDATED");
+    combinedBundle("/data", CA_PEM, fs);
+    expect(writes).toHaveLength(2);
+    expect(files.get("/data/exports/ca-bundle.pem")).toBe("UPDATED\nCA PEM\n");
+
+    files.set("/etc/ssl/cert.pem", "FAILS");
+    const failing: CertFs = {
+      ...fs,
+      renameSync: () => {
+        throw new Error("EPERM");
+      },
+    };
+    expect(() => combinedBundle("/data", CA_PEM, failing)).toThrow("EPERM");
+    expect([...files.keys()].filter((path) => path.startsWith("/data/exports/"))).toEqual([
+      "/data/exports/ca-bundle.pem",
+    ]);
   });
 
   it("prefers the first bundle and writes nothing without one", () => {

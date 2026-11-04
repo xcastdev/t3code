@@ -79,5 +79,17 @@ describe("openCodeToolTurnItem", () => {
       expect(project("execute", { code }).type, code).toBe("dynamic_tool");
     }
     expect(project("t3-code-other_thread_t3_web_search", { query: "x" }).type).toBe("dynamic_tool");
+    expect(
+      openCodeToolTurnItem(
+        { ...base, status: "running" },
+        {
+          name: `${server}_t3_web_search`,
+          input: { query: "x" },
+          output: undefined,
+          completedMetadata: undefined,
+          t3McpServer: server,
+        },
+      ).type,
+    ).toBe("dynamic_tool");
   });
 });

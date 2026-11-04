@@ -191,13 +191,28 @@ describe("mcpCatalogRows", () => {
     ]);
   });
 
-  it("lists a session's own copy of an inherited server once, in place of the inherited one", () => {
-    const rows = mcpCatalogRows({
-      inherited: [definition()],
-      own: [definition({ scope: "session", name: "Docs (thread)" })],
-      overrides: [],
-    });
-    expect(rows.map((row) => [row.name, row.inherited])).toEqual([["Docs (thread)", false]]);
+  it("lists a session's own copy of an inherited server once, with the session's override", () => {
+    const own = [definition({ scope: "session", name: "Docs (thread)" })];
+    const disabled = {
+      id: McpCatalogOverrideId.make("override-1"),
+      scope: "session" as const,
+      scopeId: "session-1",
+      targetId: McpServerId.make("server-1"),
+      enabled: false,
+    };
+    expect(
+      [[], [disabled]].map((overrides) =>
+        mcpCatalogRows({ inherited: [definition()], own, overrides }).map((row) => [
+          row.name,
+          row.inherited,
+          row.enabled,
+          row.override?.id ?? null,
+        ]),
+      ),
+    ).toEqual([
+      [["Docs (thread)", true, true, null]],
+      [["Docs (thread)", true, false, "override-1"]],
+    ]);
   });
 
   it("keeps an inherited all-providers selection until an override names providers", () => {

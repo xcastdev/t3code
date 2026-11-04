@@ -76,6 +76,7 @@ import {
   compactDynamicToolOutput,
   htmlRenderFromToolItem,
   mcpAppFromToolItem,
+  t3WebSearchDisplayItem,
 } from "@t3tools/shared/toolOutput";
 import * as DateTime from "effect/DateTime";
 import {
@@ -797,7 +798,7 @@ function toFeedActivity(
   row: OrchestrationV2ProjectedTurnItem,
   attemptId: RunAttemptId | null,
 ): ThreadFeedActivity {
-  const item = row.item;
+  const item = t3WebSearchDisplayItem(row.item);
   const toolPresentation = itemToolPresentation(item);
   const summary = itemSummary(item, toolPresentation);
   const detail = item.type === "notification" ? null : itemPreview(item);

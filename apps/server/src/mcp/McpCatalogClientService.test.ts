@@ -575,9 +575,9 @@ it.effect("preserves the recovery journal if secret finalization fails after pub
   }),
 );
 
-const stdioFixture = `import {Server} from ${JSON.stringify(import.meta.resolve("@modelcontextprotocol/sdk/server/index.js"))}; import {StdioServerTransport} from ${JSON.stringify(import.meta.resolve("@modelcontextprotocol/sdk/server/stdio.js"))}; import {ListToolsRequestSchema} from ${JSON.stringify(import.meta.resolve("@modelcontextprotocol/sdk/types.js"))}; const server=new Server({name:'fixture',version:'2.1'},{capabilities:{tools:{}}});server.setRequestHandler(ListToolsRequestSchema,(request)=>request.params?.cursor==='next'?{tools:[{name:'second',inputSchema:{type:'object'}}]}:{tools:[{name:process.env.FIXTURE_KEY==='secret-value'&&process.env.FIXTURE_STORED==='stored-value'?'saw_secret':'no_secret',description:'First page',inputSchema:{type:'object'}}],nextCursor:'next'});await server.connect(new StdioServerTransport());`;
+const stdioFixture = `import {Server} from ${JSON.stringify(import.meta.resolve("@modelcontextprotocol/sdk/server/index.js"))}; import {StdioServerTransport} from ${JSON.stringify(import.meta.resolve("@modelcontextprotocol/sdk/server/stdio.js"))}; import {ListToolsRequestSchema} from ${JSON.stringify(import.meta.resolve("@modelcontextprotocol/sdk/types.js"))}; const server=new Server({name:'fixture',version:'2.1'},{capabilities:{tools:{}}});server.setRequestHandler(ListToolsRequestSchema,(request)=>request.params?.cursor==='next'?{tools:Array.from({length:202},(_,i)=>({name:'tool_'+(i%201),inputSchema:{type:'object'}})),nextCursor:'next'}:{tools:[{name:process.env.FIXTURE_KEY==='secret-value'&&process.env.FIXTURE_STORED==='stored-value'?'saw_secret':'no_secret',description:'First page'.padEnd(600,'.'),inputSchema:{type:'object'}},{name:'x'.repeat(600)+'a',inputSchema:{type:'object'}},{name:'x'.repeat(600)+'b',inputSchema:{type:'object'}}],nextCursor:'next'});await server.connect(new StdioServerTransport());`;
 
-it.live("test connection resolves typed and stored secrets and lists every tool page", () =>
+it.live("test connection resolves typed and stored secrets and lists tool pages up to a cap", () =>
   Effect.gen(function* () {
     const test = fixture({ stored: true });
     const result = yield* Effect.gen(function* () {
@@ -610,7 +610,13 @@ it.live("test connection resolves typed and stored secrets and lists every tool 
     }).pipe(Effect.provide(test.layer));
     expect(result).toEqual({
       serverInfo: { name: "fixture", version: "2.1" },
-      tools: [{ name: "saw_secret", description: "First page" }, { name: "second" }],
+      tools: [
+        { name: "saw_secret", description: `${"First page".padEnd(499, ".")}…` },
+        { name: `${"x".repeat(499)}…` },
+        ...Array.from({ length: 198 }, (_, index) => ({ name: `tool_${index}` })),
+      ],
+      omittedToolCount: 4,
+      truncated: true,
     });
     expect(test.calls).toEqual(["resolve"]);
   }),

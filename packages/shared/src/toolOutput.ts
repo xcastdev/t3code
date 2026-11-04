@@ -1,4 +1,5 @@
 import {
+  isOrchestrationV2WorkActive,
   isProviderSendTurnSupportedImageMimeType,
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
   type OrchestrationV2TurnItem,
@@ -327,10 +328,10 @@ export function t3WebSearchTurnItem(
   };
 }
 
-export function asT3WebSearchTurnItem(item: OrchestrationV2TurnItem): OrchestrationV2TurnItem {
-  if (item.type !== "dynamic_tool" || !T3_WEB_SEARCH_TOOL_NAMES.has(item.toolName ?? "")) {
-    return item;
-  }
+function convertT3WebSearchTurnItem(
+  item: DynamicToolTurnItem,
+  trustOutput: boolean,
+): WebSearchTurnItem {
   const {
     type: _type,
     toolName: _toolName,
@@ -341,7 +342,35 @@ export function asT3WebSearchTurnItem(item: OrchestrationV2TurnItem): Orchestrat
     ...base
   } = item;
   const query = Predicate.isObject(input) ? input.query : undefined;
-  return t3WebSearchTurnItem(base, typeof query === "string" ? query : undefined, output);
+  return t3WebSearchTurnItem(
+    base,
+    typeof query === "string" ? query : undefined,
+    trustOutput ? output : undefined,
+  );
+}
+
+/** Converts only ended calls: a running one stays dynamic_tool, which Stop and settlement end. */
+export function asT3WebSearchTurnItem(item: OrchestrationV2TurnItem): OrchestrationV2TurnItem {
+  if (
+    item.type !== "dynamic_tool" ||
+    isOrchestrationV2WorkActive(item.status) ||
+    !T3_WEB_SEARCH_TOOL_NAMES.has(item.toolName ?? "")
+  ) {
+    return item;
+  }
+  return convertT3WebSearchTurnItem(item, true);
+}
+
+/**
+ * Clients show a T3 web search call as a web search in every state, so the row does not change
+ * look when it ends; Stop and recovery end calls without converting them. Output from a name
+ * other than our own server's (OpenCode 2 names one per thread) is not shown as sources.
+ */
+export function t3WebSearchDisplayItem(item: OrchestrationV2TurnItem): OrchestrationV2TurnItem {
+  if (item.type !== "dynamic_tool" || resolveT3McpToolId(item.toolName) !== "t3_web_search") {
+    return item;
+  }
+  return convertT3WebSearchTurnItem(item, T3_WEB_SEARCH_TOOL_NAMES.has(item.toolName ?? ""));
 }
 
 /** Some providers report completion even when command output describes a failure. */

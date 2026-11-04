@@ -17,28 +17,44 @@ export const catalogAlias = (name: string): string => {
 
 const idHash = (id: McpServerId) => NodeCrypto.createHash("sha256").update(id).digest("hex");
 
+export interface CatalogAliases {
+  readonly byServer: ReadonlyMap<McpServerId, { readonly base: string; readonly alias: string }>;
+  /** Every alias issued in this catalog session, mapped to the one server it may ever reach. */
+  readonly issued: ReadonlyMap<string, McpServerId>;
+}
+
 /**
- * Readable aliases for one catalog. Servers whose names fold to the same alias all carry an id
- * hash instead of an ordinal, so a name cached from an older revision can only fail, never reach
- * another server. An alias never contains `__` or ends in `_`, so the first `__` ends it.
+ * Readable aliases for one catalog revision, given the session's previous one. A server keeps its
+ * alias while its name folds the same, and no alias is reissued to another server in the session,
+ * so a cached name can only fail or reach its original server. `__` never appears in an alias.
  */
 export const catalogAliases = (
   entries: ReadonlyArray<{ readonly logicalServerId: McpServerId; readonly name: string }>,
-): ReadonlyMap<McpServerId, string> => {
+  previous?: CatalogAliases,
+): CatalogAliases => {
+  const issued = new Map(previous?.issued);
+  const byServer = new Map<McpServerId, { readonly base: string; readonly alias: string }>();
+  const used = new Set<string>();
+  const free = (alias: string, id: McpServerId) =>
+    !used.has(alias) && (issued.get(alias) ?? id) === id;
+  const assign = (id: McpServerId, base: string, alias: string) => {
+    byServer.set(id, { base, alias });
+    issued.set(alias, id);
+    used.add(alias);
+  };
   const groups = new Map<string, McpServerId[]>();
   for (const entry of entries) {
     const base = catalogAlias(entry.name);
-    groups.set(base, [...(groups.get(base) ?? []), entry.logicalServerId]);
+    const kept = previous?.byServer.get(entry.logicalServerId);
+    if (kept?.base === base) assign(entry.logicalServerId, base, kept.alias);
+    else groups.set(base, [...(groups.get(base) ?? []), entry.logicalServerId]);
   }
-  const aliases = new Map<McpServerId, string>();
-  const used = new Set<string>();
-  for (const [base, ids] of groups)
-    if (base !== "" && ids.length === 1) {
-      aliases.set(ids[0]!, base);
-      used.add(base);
-    }
-  for (const [base, ids] of [...groups].toSorted(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
-    if (base !== "" && ids.length === 1) continue;
+  const sorted = [...groups].toSorted(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const hashed: Array<readonly [string, McpServerId[]]> = [];
+  for (const [base, ids] of sorted)
+    if (base !== "" && ids.length === 1 && free(base, ids[0]!)) assign(ids[0]!, base, base);
+    else hashed.push([base, ids]);
+  for (const [base, ids] of hashed) {
     const hashes = ids.map(idHash);
     const named = (length: number) =>
       hashes.map((hash) => `${base === "" ? "mcp" : base}_${hash.slice(0, length)}`);
@@ -46,15 +62,12 @@ export const catalogAliases = (
     let names = named(length);
     while (
       length < 64 &&
-      (new Set(names).size !== names.length || names.some((name) => used.has(name)))
+      (new Set(names).size !== names.length || names.some((name, i) => !free(name, ids[i]!)))
     )
       names = named(++length);
-    ids.forEach((id, index) => {
-      aliases.set(id, names[index]!);
-      used.add(names[index]!);
-    });
+    ids.forEach((id, index) => assign(id, base, names[index]!));
   }
-  return aliases;
+  return { byServer, issued };
 };
 export const namespaceName = (alias: string, name: string): string => `${alias}__${name}`;
 export const splitNamespacedName = (

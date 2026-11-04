@@ -17,6 +17,8 @@ export interface CertFs {
   readonly existsSync: (path: string) => boolean;
   readonly readFileSync: (path: string, encoding: "utf8") => string;
   readonly writeFileSync: (path: string, data: string) => void;
+  readonly renameSync: (from: string, to: string) => void;
+  readonly unlinkSync: (path: string) => void;
   readonly mkdirSync: (path: string, options: { recursive: true }) => void;
   readonly readdirSync: (path: string) => ReadonlyArray<string>;
 }
@@ -25,6 +27,8 @@ export const nodeCertFs: CertFs = {
   existsSync: (path) => NodeFS.existsSync(path),
   readFileSync: (path, encoding) => NodeFS.readFileSync(path, encoding),
   writeFileSync: (path, data) => NodeFS.writeFileSync(path, data),
+  renameSync: (from, to) => NodeFS.renameSync(from, to),
+  unlinkSync: (path) => NodeFS.rmSync(path, { force: true }),
   mkdirSync: (path, options) => {
     NodeFS.mkdirSync(path, options);
   },
@@ -93,8 +97,18 @@ export function combinedBundle(
   const caPem = fs.readFileSync(caPemPath, "utf8");
   const exportsDir = NodePath.join(dataDir, "exports");
   const target = NodePath.join(exportsDir, "ca-bundle.pem");
+  const bundle = `${systemPem.trimEnd()}\n${caPem.trimEnd()}\n`;
+  if (fs.existsSync(target) && fs.readFileSync(target, "utf8") === bundle) return target;
   fs.mkdirSync(exportsDir, { recursive: true });
-  fs.writeFileSync(target, `${systemPem.trimEnd()}\n${caPem.trimEnd()}\n`);
+  // A shell may be reading the bundle through SSL_CERT_FILE; a rename swaps it whole.
+  const temp = `${target}.${process.pid}.${NodeCrypto.randomBytes(4).toString("hex")}.tmp`;
+  fs.writeFileSync(temp, bundle);
+  try {
+    fs.renameSync(temp, target);
+  } catch (error) {
+    fs.unlinkSync(temp);
+    throw error;
+  }
   return target;
 }
 

@@ -92,6 +92,8 @@ export interface FakeSpawn {
   readonly exited: Promise<void>;
   readonly send: (message: unknown) => void;
   readonly sendLine: (line: string) => void;
+  /** Makes the addon refuse the next record or hosts control with `error`. */
+  readonly refuseNextControl: (error: string) => void;
 }
 
 /** The listen port a fake capture spawn was given, from its argv. */
@@ -115,6 +117,7 @@ export function makeFakeMitmdump(
     socket.on("error", () => undefined);
     socket.on("close", () => exited.resolve());
     const send = (message: unknown) => socket.write(`${JSON.stringify(message)}\n`);
+    let refusal: string | undefined;
     const spawn: FakeSpawn = {
       command,
       args,
@@ -126,6 +129,9 @@ export function makeFakeMitmdump(
       exited: exited.promise,
       send,
       sendLine: (line) => socket.write(`${line}\n`),
+      refuseNextControl: (error) => {
+        refusal = error;
+      },
     };
     send({ type: "hello", token: env[CONTROL_ENV.token] });
     let buffered = "";
@@ -136,6 +142,11 @@ export function makeFakeMitmdump(
         const parsed = JSON.parse(buffered.slice(0, newline)) as Readonly<Record<string, unknown>>;
         buffered = buffered.slice(newline + 1);
         if (parsed.type === "record" || parsed.type === "hosts") {
+          if (refusal !== undefined) {
+            send({ type: "applied", id: parsed.id, error: refusal });
+            refusal = undefined;
+            continue;
+          }
           spawn.controls.push(parsed);
           send({ type: "applied", id: parsed.id });
           continue;

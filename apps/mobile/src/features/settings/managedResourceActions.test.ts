@@ -385,9 +385,17 @@ describe("effectiveMcpCatalogDefinitions", () => {
       effectiveMcpCatalogDefinitions({
         inherited: [definition],
         own: [{ ...(definition as object), scope: "session", name: "Docs (thread)" } as never],
-        overrides: [],
-      }).map((entry) => entry.name),
-    ).toEqual(["Docs (thread)"]);
+        overrides: [
+          {
+            id: "override-2",
+            scope: "session",
+            scopeId: "session-1",
+            targetId: "server-1",
+            enabled: false,
+          } as never,
+        ],
+      }).map((entry) => [entry.name, entry.enabled]),
+    ).toEqual([["Docs (thread)", false]]);
   });
 });
 

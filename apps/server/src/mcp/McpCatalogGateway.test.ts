@@ -17,6 +17,8 @@ import {
   type PluginInstallRecord,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
@@ -39,8 +41,22 @@ import { ProjectionStoreV2 } from "../orchestration-v2/ProjectionStore.ts";
 import { PluginService, type PluginAgentCatalogEntry } from "../plugins/PluginService.ts";
 import { McpSessionRegistry, type McpNativeRuntimeBinding } from "./McpSessionRegistry.ts";
 import { ProjectMcpProxyRegistry, ProjectMcpConnectionError } from "./ProjectMcpProxyRegistry.ts";
+import * as McpCatalogAliasStoreModule from "./McpCatalogAliasStore.ts";
+import { McpCatalogAliasStore, McpCatalogAliasStoreError } from "./McpCatalogAliasStore.ts";
+import type { CatalogAliases } from "./ProjectMcpBroker.ts";
+import * as Sqlite from "../persistence/Sqlite.ts";
 
-const setup = Effect.gen(function* () {
+const memoryAliasStore = () => {
+  const rows = new Map<McpCatalogSessionId, CatalogAliases>();
+  return McpCatalogAliasStore.of({
+    read: (id) => Effect.succeed(rows.get(id)),
+    write: (id, aliases) => Effect.sync(() => void rows.set(id, aliases)),
+  });
+};
+
+const setupWith = Effect.fn("testMcpCatalogGateway.setup")(function* (
+  aliasStore: McpCatalogAliasStore["Service"],
+) {
   const binding: McpNativeRuntimeBinding = {
     providerSessionId: "issued-mcp-identity",
     threadId: ThreadId.make("thread"),
@@ -140,7 +156,7 @@ const setup = Effect.gen(function* () {
             } as OrchestrationV2ThreadShell);
       }),
   } as unknown as ProjectionStoreV2["Service"];
-  const gateway = yield* __testing.make.pipe(
+  const makeGateway = __testing.make.pipe(
     Effect.provideService(AssistantNativeResources, {
       tools: () => Effect.sync(() => allowedTools),
     }),
@@ -148,7 +164,9 @@ const setup = Effect.gen(function* () {
     Effect.provideService(ProjectionStoreV2, projections),
     Effect.provideService(McpSessionRegistry, registry),
     Effect.provideService(ProjectMcpProxyRegistry, proxy),
+    Effect.provideService(McpCatalogAliasStore, aliasStore),
   );
+  const gateway = yield* makeGateway;
   const input: RegisterCatalogSessionInput = {
     ...binding,
     catalogSessionId: McpCatalogSessionId.make("catalog"),
@@ -157,6 +175,7 @@ const setup = Effect.gen(function* () {
   };
   return {
     gateway,
+    makeGateway,
     input,
     setAllowedTools: (value: ReadonlyArray<string> | undefined) => {
       allowedTools = value;
@@ -171,6 +190,7 @@ const setup = Effect.gen(function* () {
     },
   };
 });
+const setup = Effect.suspend(() => setupWith(memoryAliasStore()));
 
 const echoCatalogEntry: PluginAgentCatalogEntry = {
   pluginId: PluginId.make("echo"),
@@ -228,26 +248,47 @@ const rpc = Effect.fn("testMcpCatalogGateway.rpc")(function* (
 
 it.effect("failed complete staging retains the previous applied catalog", () =>
   Effect.gen(function* () {
-    const { gateway, input } = yield* setup;
+    const memory = memoryAliasStore();
+    let aliasWriteFails = false;
+    const { gateway, input, setConnect } = yield* setupWith({
+      ...memory,
+      write: (id, aliases) =>
+        aliasWriteFails
+          ? Effect.fail(new McpCatalogAliasStoreError({ cause: "disk full" }))
+          : memory.write(id, aliases),
+    });
     yield* gateway.applyCatalogRevision(input);
-    const failure = yield* gateway
-      .applyCatalogRevision({
-        ...input,
-        revision: 2,
-        entries: [
-          {
-            logicalServerId: McpServerId.make("weather"),
-            transportDefinitionId: McpDefinitionId.make("definition"),
-            name: "Weather",
-            providerInstanceId: input.providerInstanceId,
-            scope: "project",
-            scopeId: "project",
-            transport: { type: "stdio", command: "unused", args: [], env: [] },
-          },
-        ],
-      })
-      .pipe(Effect.flip);
+    const weather = {
+      ...input,
+      revision: 2,
+      entries: [
+        {
+          logicalServerId: McpServerId.make("weather"),
+          transportDefinitionId: McpDefinitionId.make("definition"),
+          name: "Weather",
+          providerInstanceId: input.providerInstanceId,
+          scope: "project" as const,
+          scopeId: "project",
+          transport: { type: "stdio" as const, command: "unused", args: [], env: [] },
+        },
+      ],
+    };
+    const failure = yield* gateway.applyCatalogRevision(weather).pipe(Effect.flip);
     expect(failure.message).toBe("MCP catalog apply failed.");
+    expect((yield* gateway.resolveCatalogSession(input.catalogSessionId))?.revision).toBe(1);
+
+    // A connected revision whose aliases cannot be stored must not install or leak its upstreams.
+    aliasWriteFails = true;
+    const closed = yield* Deferred.make<void>();
+    setConnect((entry) =>
+      Effect.acquireRelease(
+        Effect.succeed({ entry, client: new Client({ name: "fixture", version: "1" }) }),
+        () => Deferred.succeed(closed, undefined),
+      ),
+    );
+    const writeFailure = yield* gateway.applyCatalogRevision(weather).pipe(Effect.flip);
+    expect(writeFailure.message).toBe("MCP catalog apply failed.");
+    yield* Deferred.await(closed);
     expect((yield* gateway.resolveCatalogSession(input.catalogSessionId))?.revision).toBe(1);
   }),
 );
@@ -550,7 +591,9 @@ it.effect.each(["tools/list", "resources/list", "resources/templates/list", "pro
 
 it.effect("exposes readable server aliases and routes each call back to its server", () =>
   Effect.gen(function* () {
-    const { gateway, input, setConnect } = yield* setup;
+    const { gateway, makeGateway, input, setConnect } = yield* setupWith(
+      yield* McpCatalogAliasStore,
+    );
     setConnect((entry) =>
       Effect.gen(function* () {
         const [left, right] = InMemoryTransport.createLinkedPair();
@@ -626,7 +669,36 @@ it.effect("exposes readable server aliases and routes each call back to its serv
         arguments: {},
       }),
     ).toMatchObject({ error: { message: "Unknown MCP catalog item." } });
-  }),
+
+    // After a restart the provider may still replay `docs__…`, so it must not reach a new server.
+    const restarted = yield* makeGateway;
+    yield* restarted.applyCatalogRevision({
+      ...input,
+      revision: 2,
+      entries: [entry("c", "Old docs"), entry("d", "Docs")],
+    });
+    for (const [name, routed] of [
+      ["old_docs__a__b", "c:a__b"],
+      [`${hashed("docs", "d")}__a__b`, "d:a__b"],
+    ])
+      expect(yield* rpc(restarted, input, "tools/call", { name, arguments: {} })).toMatchObject({
+        result: { content: [{ text: routed }] },
+      });
+    expect(
+      yield* rpc(restarted, input, "tools/call", { name: "docs__a__b", arguments: {} }),
+    ).toMatchObject({ error: { message: "Unknown MCP catalog item." } });
+
+    // An unreadable stored row is treated as missing instead of failing every later apply.
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`UPDATE t3_workflow_v2_mcp_catalog_aliases SET aliases_json='{"byServer":1}'`;
+    const recovered = yield* makeGateway;
+    yield* recovered.applyCatalogRevision({ ...input, revision: 3, entries: [entry("d", "Docs")] });
+    expect(
+      yield* rpc(recovered, input, "tools/call", { name: "docs__a__b", arguments: {} }),
+    ).toMatchObject({ result: { content: [{ text: "d:a__b" }] } });
+  }).pipe(
+    Effect.provide(McpCatalogAliasStoreModule.layer.pipe(Layer.provideMerge(Sqlite.layerMemory))),
+  ),
 );
 
 const encodeAssistantMcpPacket = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));

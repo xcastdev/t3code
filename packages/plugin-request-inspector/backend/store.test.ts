@@ -318,6 +318,29 @@ describe("records", () => {
     });
   });
 
+  it("the data directory is private to the user, including one that already existed", async () => {
+    const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "request-inspector-"));
+    try {
+      const dataDir = NodePath.join(root, "data");
+      // Windows has no POSIX mode bits; there the stores still open over an existing directory.
+      const expectPrivate = () => {
+        // oxlint-disable-next-line t3code/no-global-process-runtime -- The store under test reads the real host platform.
+        if (process.platform === "win32") return;
+        expect(NodeFS.statSync(dataDir).mode & 0o777).toBe(0o700);
+      };
+      {
+        await using _temp = await openTempStore({ maxDiskBytes: 64 * MiB }, dataDir);
+        expectPrivate();
+      }
+      NodeFS.mkdirSync(dataDir, { mode: 0o755 });
+      NodeFS.chmodSync(dataDir, 0o755);
+      await using _temp = await openTempStore({ maxDiskBytes: 64 * MiB }, dataDir);
+      expectPrivate();
+    } finally {
+      await NodeFSP.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("headers keep duplicates and order through store round-trip", async () => {
     await using temp = await openTempStore({ maxDiskBytes: 64 * MiB });
     const { store } = temp;
@@ -680,6 +703,40 @@ describe("proxies", () => {
       { type: "link-removed", ...target, proxyId: DEFAULT_PROXY_ID },
       { type: "link-removed", ...target, proxyId: second.id },
     ]);
+  });
+
+  it("deleting a proxy clears its stored upstream credentials", async () => {
+    await using temp = await openTempStore({ maxDiskBytes: 64 * MiB });
+    const { store, dataDir } = temp;
+    const proxy = await store.exclusive((lane) =>
+      lane.createProxy({
+        name: "Upstream",
+        createdAt: 1,
+        options: {
+          ...DEFAULT_PROXY_OPTIONS,
+          mode: { kind: "upstream", url: "http://u.test:3128" },
+        },
+        upstreamAuth: { username: "user", password: "s3cret" },
+      }),
+    );
+    await store.exclusive((lane) => lane.deleteProxy(proxy.id, 2));
+
+    expect(store.upstreamAuth(proxy.id)).toBeUndefined();
+    const row = readDatabase(dataDir, (db) =>
+      db.prepare("SELECT upstream_auth FROM proxies WHERE id = ?").get(proxy.id),
+    );
+    expect(row?.upstream_auth).toBeNull();
+
+    // A proxy deleted by an older build kept its credentials; opening the store clears them.
+    store.close();
+    readDatabase(dataDir, (db) =>
+      db.prepare("UPDATE proxies SET upstream_auth = ? WHERE id = ?").run('"s3cret"', proxy.id),
+    );
+    await using _reopened = await openTempStore({ maxDiskBytes: 64 * MiB }, dataDir);
+    const cleared = readDatabase(dataDir, (db) =>
+      db.prepare("SELECT upstream_auth FROM proxies WHERE id = ?").get(proxy.id),
+    );
+    expect(cleared?.upstream_auth).toBeNull();
   });
 
   it("search by proxyId excludes flows recorded by other proxies", async () => {

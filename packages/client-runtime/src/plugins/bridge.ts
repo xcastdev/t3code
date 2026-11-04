@@ -276,6 +276,7 @@ type ChatTargetSource = {
     readonly title: string;
     readonly updatedAt: string;
     readonly deletedAt: string | null;
+    readonly archivedAt: string | null;
   }>;
   readonly projects: ReadonlyArray<{
     readonly environmentId: string;
@@ -295,14 +296,24 @@ export function selectPluginChatTargets(
   const needle = query.trim().toLowerCase();
   const matches = (...texts: ReadonlyArray<string>) =>
     needle === "" || texts.some((text) => text.toLowerCase().includes(needle));
+  // ISO timestamps order as plain strings; localeCompare is far slower over every thread.
   const newestFirst = (a: { readonly updatedAt: string }, b: { readonly updatedAt: string }) =>
-    b.updatedAt.localeCompare(a.updatedAt);
+    a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0;
   const projectNames = new Map<string, string>();
+  const archivedProjects = new Set<string>();
   for (const project of source.projects) {
-    if (project.environmentId === environmentId) projectNames.set(project.id, project.title);
+    if (project.environmentId !== environmentId) continue;
+    projectNames.set(project.id, project.title);
+    if ((project.archivedAt ?? null) !== null) archivedProjects.add(project.id);
   }
   const threads = source.threads
-    .filter((thread) => thread.environmentId === environmentId && thread.deletedAt === null)
+    .filter(
+      (thread) =>
+        thread.environmentId === environmentId &&
+        thread.deletedAt === null &&
+        thread.archivedAt === null &&
+        !archivedProjects.has(thread.projectId),
+    )
     .map((thread) => ({ thread, projectName: projectNames.get(thread.projectId) ?? "" }))
     .filter(({ thread, projectName }) => matches(thread.title, projectName))
     .sort((a, b) => newestFirst(a.thread, b.thread))
@@ -440,11 +451,12 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
     else dispose();
   };
 
-  const requireActivation = (activated: boolean, action: string) => {
+  // Web also refuses panel clicks within seconds of input elsewhere in T3, so a retry must wait.
+  const requireActivation = (activated: boolean, action: "Attaching" | "Copying" | "Saving") => {
     if (!activated) {
       throw new BridgeFailure(
         REQUEST_FAILED,
-        `${action} must follow a click or key press in the panel.`,
+        `${action} was blocked. Wait a few seconds, then click or tap in the panel again.`,
       );
     }
   };
@@ -531,18 +543,16 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
         const request = params(AttachParams, rawParams, method);
         const capability = request.kind === "text" ? "chat.attach" : "chat.reference";
         if (!manifest.capabilities.includes(capability)) throw refusal("capability-denied");
-        requireActivation(activated, "Attaching to chat");
+        requireActivation(activated, "Attaching");
         answer(id, () => options.attach(request, activated).then((outcome) => ({ outcome })));
         return;
       }
       case "t3/file.save.begin": {
         const { name, mimeType, size } = params(FileSaveBeginParams, rawParams, method);
         if (!manifest.capabilities.includes("file.save")) throw refusal("capability-denied");
-        requireActivation(activated, "Saving a file");
+        requireActivation(activated, "Saving");
         if (size !== undefined && size > PLUGIN_LIMITS.maxSaveBytes) throw refusal("too-large");
-        if (save !== null) {
-          throw new BridgeFailure(REQUEST_FAILED, "Another save is still in progress.");
-        }
+        // A begin follows fresh activation, so it supersedes a save the panel abandoned.
         const saveId = `save-${nextSaveId++}`;
         save = { saveId, name: saveFileName(name), mimeType, size, parts: [], received: 0 };
         respond(id, { saveId });
@@ -604,6 +614,12 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
       }
       case "t3/chat.targets.list": {
         const { query } = params(PluginChatTargetsListParams, rawParams, method);
+        if (
+          !manifest.capabilities.includes("chat.attach") &&
+          !manifest.capabilities.includes("chat.reference")
+        ) {
+          throw refusal("capability-denied");
+        }
         answer(id, async () => {
           const targets = await options.chatTargets(query ?? "");
           return {

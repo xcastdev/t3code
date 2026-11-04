@@ -1,6 +1,6 @@
 {
   "name": "@t3tools/plugin-request-inspector",
-  "version": "0.2.5",
+  "version": "0.2.11",
   "private": true,
   "type": "module",
   "scripts": {

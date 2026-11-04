@@ -22,6 +22,8 @@ export const PROXY_DETAILS = {
   noCallerThread: 'This call has no caller thread. Pass target: { "threadId": ... } instead.',
   noCallerProject: 'This call has no caller project. Pass target: { "projectId": ... } instead.',
   linkTarget: "A link needs a thread or project id.",
+  agentListenHost:
+    "Agents can only listen on loopback (127.0.0.1, ::1, localhost) or the listen host set in the Request Inspector settings. Ask the user to choose another listen host in the panel.",
 } as const;
 
 export const RECORDING_DETAILS = {
@@ -42,6 +44,10 @@ export const EXPORT_DETAILS = {
   storageFull:
     "The inspector's storage budget is full. Delete recordings with delete_recording or raise maxDiskBytes in the inspector's settings, then export again.",
 } as const;
+
+/** decode_value refuses a credential header source for an agent that did not opt in. */
+export const sensitiveHeaderDetail = (header: string) =>
+  `${header} is a credential header; pass includeSensitiveHeaders: true only when the user needs its value.`;
 
 const NO_DEFAULT_PROXY_PREFIX = "No proxy is linked to this thread or its project.";
 

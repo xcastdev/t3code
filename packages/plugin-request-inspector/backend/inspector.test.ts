@@ -168,6 +168,21 @@ describe("inspector proxies", () => {
       ),
     ).toMatch(/^Invalid host pattern "a b": /);
 
+    const spawn = fake.spawns[0]!;
+    const ignore = () =>
+      harness.call("update_proxy", { proxyId: "1", options: { ignoredHosts: ["noise.test"] } });
+    spawn.refuseNextControl("busy");
+    expect(await detailOf(ignore())).toBeDefined();
+    const unchanged = (await harness.call("list_proxies")) as {
+      readonly proxies: ReadonlyArray<{ readonly ignoredHosts: ReadonlyArray<string> }>;
+    };
+    expect(unchanged.proxies[0]?.ignoredHosts).toEqual([]);
+    await ignore();
+    expect(spawn.controls.at(-1)).toMatchObject({
+      type: "hosts",
+      ignored: [expect.stringContaining("noise")],
+    });
+
     const pending = (await harness.call("update_proxy", {
       proxyId: "1",
       options: { listenPort: 9090 },
@@ -188,6 +203,34 @@ describe("inspector proxies", () => {
     expect(listenPortOf(second)).toBe(9090);
     expect(second.env[CONTROL_ENV.record]).toBe("1");
     expect(await recordFlow(harness, fake, 1, "/after-restart")).toMatchObject({ recordingId });
+  });
+
+  it("an agent can only listen on loopback or the listen host the user set", async () => {
+    const { harness } = await setup({ config: { listenHost: "192.168.1.5" } });
+    await using _harness = harness;
+    const asAgent = { caller: "agent" as const };
+    const create = (listenHost: string) =>
+      harness.call("create_proxy", { link: "none", options: { listenHost } }, asAgent);
+
+    expect(await detailOf(create("0.0.0.0"))).toBe(PROXY_DETAILS.agentListenHost);
+    expect(
+      await detailOf(
+        harness.call("update_proxy", { proxyId: "1", options: { listenHost: "::" } }, asAgent),
+      ),
+    ).toBe(PROXY_DETAILS.agentListenHost);
+    for (const host of ["127.0.0.1", "127.0.0.2", "localhost", "::1", "[::1]", "192.168.1.5"]) {
+      expect(await detailOf(create(host))).toBeUndefined();
+    }
+    const panel = await createProxy(harness, { link: "none", options: { listenHost: "0.0.0.0" } });
+    expect(
+      await detailOf(
+        harness.call(
+          "update_proxy",
+          { proxyId: panel.id, options: { listenHost: "0.0.0.0", passthroughHosts: ["a.test"] } },
+          asAgent,
+        ),
+      ),
+    ).toBeUndefined();
   });
 
   it("update_proxy keeps upstream credentials for the same upstream url and clears them when the url changes without auth", async () => {
@@ -444,6 +487,89 @@ describe("inspector exports and replay carriers", () => {
     expect(await decode({ header: "x-trace" })).toMatchObject({
       steps: [{ text: Buffer.from("abc").toString("base64") }],
     });
+  });
+
+  it("agent calls and references hide credential headers unless includeSensitiveHeaders; the panel sees them", async () => {
+    const { harness, fake } = await setup();
+    await using _harness = harness;
+    await harness.call("start_proxy", { proxyId: "1" });
+    const { recordingId } = (await harness.call("start_recording", { proxyId: "1" })) as {
+      readonly recordingId: string;
+    };
+    const stored = harness.nextBatch("requests", {}, (items) => items.length > 0);
+    (await fake.nextSpawn(0)).send(
+      flowRecord({
+        headers: [
+          ["Authorization", "Bearer s3cret"],
+          ["Cookie", "sid=c00kie"],
+          ["Proxy-Authorization", "Basic pr0xy"],
+          ["X-Api-Key", "k3yval"],
+          ["X-Trace", "abc"],
+        ],
+        responseHeaders: [["Set-Cookie", "sid=n3w; Path=/"]],
+      }),
+    );
+    const { items, stop } = await stored;
+    await stop();
+    const requestId = (items[0] as { readonly id: string }).id;
+    const secrets = /s3cret|c00kie|pr0xy|k3yval|n3w/;
+    const agent = (operation: string, input: Record<string, unknown>) =>
+      harness.call(operation, input, { caller: "agent" }).then((result) => JSON.stringify(result));
+
+    const hidden = await agent("get_request", { requestId });
+    expect(hidden).not.toMatch(secrets);
+    expect(hidden).toContain('["X-Trace","abc"]');
+    expect(hidden).toContain('["Authorization","[redacted]"]');
+    expect(hidden).toContain('["Cookie","sid=[redacted]"]');
+    expect(await agent("format_headers", { requestId, side: "response", format: "raw" })).toBe(
+      JSON.stringify({ text: "Set-Cookie: sid=[redacted]; Path=/" }),
+    );
+    expect(await agent("export_requests", { requestIds: [requestId], format: "curl" })).not.toMatch(
+      secrets,
+    );
+    const decodeAuth = (extra: Record<string, unknown>) =>
+      harness.call(
+        "decode_value",
+        {
+          source: { requestId, side: "request", header: "authorization" },
+          steps: [{ op: "url", direction: "decode" }],
+          ...extra,
+        },
+        { caller: "agent" },
+      );
+    expect(await detailOf(decodeAuth({}))).toMatch(/includeSensitiveHeaders/);
+    expect(JSON.stringify(await decodeAuth({ includeSensitiveHeaders: true }))).toMatch(/s3cret/);
+    const reference = await harness.client.resolveReference({ requestId, recordingId });
+    expect(reference.detail).not.toMatch(secrets);
+    expect(reference.detail).toContain("X-Trace: abc");
+
+    expect(await agent("get_request", { requestId, includeSensitiveHeaders: true })).toMatch(
+      /s3cret.*c00kie.*pr0xy.*n3w/,
+    );
+    expect(
+      await agent("export_requests", {
+        requestIds: [requestId],
+        format: "raw",
+        includeSensitiveHeaders: true,
+      }),
+    ).toMatch(/s3cret/);
+    expect(JSON.stringify(await harness.call("get_request", { requestId }))).toMatch(secrets);
+
+    const elsewhere = { requestId, edits: { url: "https://elsewhere.example/" } };
+    const withheld = (input: Record<string, unknown>, caller?: "agent") =>
+      harness
+        .call("preview_replay", input, caller === undefined ? {} : { caller })
+        .then((preview) => (preview as { readonly withheldHeaders?: unknown }).withheldHeaders);
+    expect(await withheld(elsewhere, "agent")).toEqual([
+      "Authorization",
+      "Cookie",
+      "Proxy-Authorization",
+      "X-Api-Key",
+    ]);
+    expect(
+      await withheld({ ...elsewhere, includeSensitiveHeaders: true }, "agent"),
+    ).toBeUndefined();
+    expect(await withheld(elsewhere)).toBeUndefined();
   });
 
   it("an export charges decoded bodies to its budget and decodes only the bodies its format shows decoded", () => {

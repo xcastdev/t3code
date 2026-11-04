@@ -2,7 +2,7 @@
   "manifestVersion": 1,
   "id": "request-inspector",
   "name": "Request Inspector",
-  "version": "0.2.5",
+  "version": "0.2.11",
   "hostApi": "1.1",
   "author": "T3 Tools",
   "description": "Runs local mitmproxy proxies, records the HTTP traffic you route through them, and lets you search, export, decode, and replay it.",
@@ -580,7 +580,7 @@
       {
         "name": "get_request",
         "title": "Get request",
-        "description": "Returns one recorded request and its response: ordered headers (long values are cut and flagged headersTruncated) and per-body metadata. Bodies are omitted unless bodies names a side; then a decoded preview of at most previewBytes is included. Use read_body to page through a larger body. Tunnel rows have sni, clientAddr, endedAt, bytesUp, and bytesDown instead of bodies.",
+        "description": "Returns one recorded request and its response: ordered headers (long values are cut and flagged headersTruncated) and per-body metadata. Bodies are omitted unless bodies names a side; then a decoded preview of at most previewBytes is included. Use read_body to page through a larger body. Tunnel rows have sni, clientAddr, endedAt, bytesUp, and bytesDown instead of bodies. Credential header values (Authorization, Proxy-Authorization, X-Api-Key, X-Auth-Token, and similar) read [redacted], and Cookie and Set-Cookie keep cookie names with [redacted] values, unless includeSensitiveHeaders is true; ask for them only when the user needs them.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -599,6 +599,10 @@
               "type": "string",
               "enum": ["none", "request", "response", "both"],
               "default": "none"
+            },
+            "includeSensitiveHeaders": {
+              "type": "boolean",
+              "default": false
             }
           },
           "required": ["requestId"],
@@ -646,7 +650,7 @@
       {
         "name": "export_requests",
         "title": "Export requests",
-        "description": "Exports requests as HAR, cURL commands, raw HTTP, JSON (the only format that includes pass-through tunnels), fetch, or Python requests snippets. Pass requestIds, or a filter (scoped like search_requests). A filter exports at most the newest 500 matches; when more match, the result has truncated: true and matched, the total. An export of at most 64 KiB whose result fits one response is returned inline unless output is \"file\". Larger ones, and output \"file\", are written to the inspector's exports folder (file.path, the newest 64 are kept), because the inspector may write only there; copy the file elsewhere yourself if the user wants it.",
+        "description": "Exports requests as HAR, cURL commands, raw HTTP, JSON (the only format that includes pass-through tunnels), fetch, or Python requests snippets. Pass requestIds, or a filter (scoped like search_requests). A filter exports at most the newest 500 matches; when more match, the result has truncated: true and matched, the total. An export of at most 64 KiB whose result fits one response is returned inline unless output is \"file\". Larger ones, and output \"file\", are written to the inspector's exports folder (file.path, the newest 64 are kept), because the inspector may write only there; copy the file elsewhere yourself if the user wants it. Credential header values (Authorization, Proxy-Authorization, X-Api-Key, X-Auth-Token, and similar) read [redacted], and Cookie and Set-Cookie keep cookie names with [redacted] values, unless includeSensitiveHeaders is true; ask for them only when the user needs them.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -709,6 +713,10 @@
               "type": "string",
               "enum": ["auto", "inline", "file"],
               "default": "auto"
+            },
+            "includeSensitiveHeaders": {
+              "type": "boolean",
+              "default": false
             }
           },
           "additionalProperties": false,
@@ -748,7 +756,7 @@
       {
         "name": "format_headers",
         "title": "Format headers",
-        "description": "Formats one side's headers or cookies of a recorded request as raw lines, JSON, cURL -H flags, a Cookie header, a Netscape cookie jar, a JavaScript Headers object, or a Python dict. names keeps only those headers; cookies false drops cookie headers, a list keeps only those cookie names.",
+        "description": "Formats one side's headers or cookies of a recorded request as raw lines, JSON, cURL -H flags, a Cookie header, a Netscape cookie jar, a JavaScript Headers object, or a Python dict. names keeps only those headers; cookies false drops cookie headers, a list keeps only those cookie names. Credential header values (Authorization, Proxy-Authorization, X-Api-Key, X-Auth-Token, and similar) read [redacted], and Cookie and Set-Cookie keep cookie names with [redacted] values, unless includeSensitiveHeaders is true; ask for them only when the user needs them.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -787,6 +795,10 @@
             "format": {
               "type": "string",
               "enum": ["raw", "json", "curl", "cookie-header", "netscape", "js", "python"]
+            },
+            "includeSensitiveHeaders": {
+              "type": "boolean",
+              "default": false
             }
           },
           "additionalProperties": false,
@@ -798,7 +810,7 @@
       {
         "name": "decode_value",
         "title": "Decode value",
-        "description": "Runs a chain of up to 16 decode or encode steps over text, base64 bytes, or a recorded header or body ({ requestId, side, header? }; a body has its content-encoding removed first). Returns every step's output. Steps: base64, base64url, url, hex, html, unicode, gzip, deflate, brotli (direction decode or encode), jwt and json (decode), hash (algorithm md5, sha1, sha256, sha512), aes (mode cbc, gcm with tag, or ctr; key, iv, encoding hex, base64, or utf8), xor (key, encoding). A failing step reports its error and stops the chain; earlier steps are kept. Input is at most 1 MiB.",
+        "description": "Runs a chain of up to 16 decode or encode steps over text, base64 bytes, or a recorded header or body ({ requestId, side, header? }; a body has its content-encoding removed first). Returns every step's output. Steps: base64, base64url, url, hex, html, unicode, gzip, deflate, brotli (direction decode or encode), jwt and json (decode), hash (algorithm md5, sha1, sha256, sha512), aes (mode cbc, gcm with tag, or ctr; key, iv, encoding hex, base64, or utf8), xor (key, encoding). A failing step reports its error and stops the chain; earlier steps are kept. Input is at most 1 MiB. A credential header source (Authorization, Cookie, X-Api-Key, and similar) is refused unless includeSensitiveHeaders is true; ask for them only when the user needs them.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -928,6 +940,10 @@
                 "required": ["op"],
                 "additionalProperties": false
               }
+            },
+            "includeSensitiveHeaders": {
+              "type": "boolean",
+              "default": false
             }
           },
           "additionalProperties": false,
@@ -1002,7 +1018,7 @@
       {
         "name": "preview_replay",
         "title": "Preview replay",
-        "description": "Shows where a replay of a recorded request would go (scheme, host, port, method, path, body size) and whether it would be refused, without sending anything. Takes the same input as replay_request without idempotencyKey. Each call returns a fresh idempotencyKey. A key is for one replay only: pass it to replay_request, and if you retry that replay, pass the same key unchanged.",
+        "description": "Shows where a replay of a recorded request would go (scheme, host, port, method, path, body size) and whether it would be refused, without sending anything. Takes the same input as replay_request without idempotencyKey. Each call returns a fresh idempotencyKey. A key is for one replay only: pass it to replay_request, and if you retry that replay, pass the same key unchanged. When the replay goes to a different scheme, host, or port than the recorded request, recorded credential headers (Authorization, Cookie, X-Api-Key, and similar) are left out, unless includeSensitiveHeaders is true; pass it only when the user wants those credentials sent to the new destination. withheldHeaders lists the headers that would be left out.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -1013,6 +1029,10 @@
             },
             "edits": {
               "$ref": "#/$defs/edits"
+            },
+            "includeSensitiveHeaders": {
+              "type": "boolean",
+              "default": false
             }
           },
           "required": ["requestId"],
@@ -1033,6 +1053,7 @@
                 },
                 "headers": {
                   "type": "array",
+                  "description": "Replaces the whole header list. A credential header whose value is still [redacted], or a cookie whose value is [redacted], is sent with the recorded value while the replay keeps the recorded scheme, host, and port, so you can edit other headers without asking for credentials.",
                   "maxItems": 256,
                   "items": {
                     "type": "array",
@@ -1091,7 +1112,7 @@
       {
         "name": "replay_request",
         "title": "Replay request",
-        "description": "Sends a recorded request again, as stored or with edits, through mitmproxy. Call preview_replay first and pass its idempotencyKey; get a new key from preview_replay for each distinct replay. Returns replayId and state as soon as the replay is accepted, usually pending; then call get_replay with waitMs for the outcome. After a timed-out or unclear result, retry with the exact same key or call get_replay, never a new key. A key protects only exact retries: a request with a new key is a new replay. If a retry is refused as expired or not issued, tell the user the earlier replay may have been sent and ask before requesting a new key. Only failed with dispatched false means the request was definitely not sent; unknown, or failed with dispatched true, means it may have been. The replay leaves through the source request's proxy when it runs, else through that proxy's upstream.",
+        "description": "Sends a recorded request again, as stored or with edits, through mitmproxy. Call preview_replay first and pass its idempotencyKey; get a new key from preview_replay for each distinct replay. Returns replayId and state as soon as the replay is accepted, usually pending; then call get_replay with waitMs for the outcome. After a timed-out or unclear result, retry with the exact same key or call get_replay, never a new key. A key protects only exact retries: a request with a new key is a new replay. If a retry is refused as expired or not issued, tell the user the earlier replay may have been sent and ask before requesting a new key. Only failed with dispatched false means the request was definitely not sent; unknown, or failed with dispatched true, means it may have been. The replay leaves through the source request's proxy when it runs, else through that proxy's upstream. Recorded credential headers go to a different scheme, host, or port only with includeSensitiveHeaders true; see preview_replay.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -1107,6 +1128,10 @@
             },
             "edits": {
               "$ref": "#/$defs/edits"
+            },
+            "includeSensitiveHeaders": {
+              "type": "boolean",
+              "default": false
             }
           },
           "required": ["requestId", "idempotencyKey"],
@@ -1127,6 +1152,7 @@
                 },
                 "headers": {
                   "type": "array",
+                  "description": "Replaces the whole header list. A credential header whose value is still [redacted], or a cookie whose value is [redacted], is sent with the recorded value while the replay keeps the recorded scheme, host, and port, so you can edit other headers without asking for credentials.",
                   "maxItems": 256,
                   "items": {
                     "type": "array",

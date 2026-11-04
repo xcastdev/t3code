@@ -808,4 +808,133 @@ describe("replay refusals", () => {
     );
     expect(decode(await fake.nextMessage())).toEqual([["content-type", "text/plain"]]);
   });
+
+  const sentHeaders = (message: ReplayMessage) =>
+    message.request.headers.map(([name, value]) => [
+      Buffer.from(name, "base64").toString("latin1"),
+      Buffer.from(value, "base64").toString("latin1"),
+    ]);
+
+  const credentialSource = async (harness: ReplayHarness, recorded: Array<[string, string]>) => {
+    const { fake, requestId } = await withCapture(harness);
+    const capture = harness.store.getRequest(requestId)?.summary.recordingId as number;
+    const source = await harness.store.insertFlow(
+      makeFlow(capture, 60, 0, {
+        headers: recorded.map(([name, value]) => header(name, value)),
+      }),
+    );
+    if (!source.ok) throw new Error("insert failed");
+    return { fake, requestId: source.id };
+  };
+
+  it("edited headers that still carry a [redacted] credential send the recorded value instead", async () => {
+    await using harness = await openReplayHarness();
+    const { fake, requestId } = await credentialSource(harness, [
+      ["authorization", "Bearer s3cret"],
+      ["authorization", "Bearer s3cond"],
+      ["cookie", "n4meless; sid=c00kie; theme=dark; sid=l4ter"],
+      ["x-api-key", "k3y"],
+      ["private-token", "glpat-1"],
+      ["private-token", "glpat-2"],
+    ]);
+    const edits = {
+      headers: [
+        ["Authorization", "[redacted]"],
+        ["Authorization", "[redacted]"],
+        ["Cookie", "[redacted]; sid=[redacted]; theme=light; sid=[redacted]; gone=[redacted]"],
+        ["X-Api-Key", "n3w"],
+        ["X-Note", "[redacted]"],
+        ["Private-Token", "[redacted]"],
+        ["Private-Token", "[redacted]"],
+      ] as Array<[string, string]>,
+    };
+    const { idempotencyKey } = harness.replay.preview({ requestId, edits });
+    await harness.replay.accept({ requestId, idempotencyKey, edits }, new AbortController().signal);
+    expect(sentHeaders(await fake.nextMessage())).toEqual([
+      ["Authorization", "Bearer s3cret"],
+      ["Authorization", "Bearer s3cond"],
+      ["Cookie", "n4meless; sid=c00kie; theme=light; sid=l4ter; gone=[redacted]"],
+      ["X-Api-Key", "n3w"],
+      ["X-Note", "[redacted]"],
+      ["Private-Token", "glpat-1"],
+      ["Private-Token", "glpat-2"],
+    ]);
+  });
+
+  it("recorded-origin credentials are left out of a replay to another origin and kept otherwise", async () => {
+    const recorded: Array<[string, string]> = [
+      ["authorization", "Bearer s3cret"],
+      ["cookie", "sid=c00kie; theme=dark"],
+      ["x-trace", "abc"],
+    ];
+    const edited: Array<[string, string]> = [
+      ["Authorization", "[redacted]"],
+      ["Cookie", "sid=[redacted]; theme=light"],
+      ["X-Api-Key", "typed"],
+      ["X-Trace", "abc"],
+    ];
+    const cases = [
+      {
+        input: { url: "https://evil.example/steal", credentials: "recorded-origin" as const },
+        withheld: ["authorization", "cookie"],
+        sent: [["x-trace", "abc"]],
+      },
+      {
+        input: { url: "http://api.example.test:443/x", credentials: "recorded-origin" as const },
+        withheld: ["authorization", "cookie"],
+        sent: [["x-trace", "abc"]],
+      },
+      {
+        input: { url: "https://api.example.test:8443/x", credentials: "recorded-origin" as const },
+        withheld: ["authorization", "cookie"],
+        sent: [["x-trace", "abc"]],
+      },
+      {
+        input: {
+          headers: edited,
+          url: "https://evil.example/",
+          credentials: "recorded-origin" as const,
+        },
+        withheld: ["Authorization", "Cookie"],
+        sent: [
+          ["Cookie", "theme=light"],
+          ["X-Api-Key", "typed"],
+          ["X-Trace", "abc"],
+        ],
+      },
+      {
+        input: { url: "https://evil.example/steal" },
+        withheld: undefined,
+        sent: recorded,
+      },
+      {
+        input: { url: "https://API.example.test/other", credentials: "recorded-origin" as const },
+        withheld: undefined,
+        sent: recorded,
+      },
+      {
+        input: { headers: edited, credentials: "recorded-origin" as const },
+        withheld: undefined,
+        sent: [
+          ["Authorization", "Bearer s3cret"],
+          ["Cookie", "sid=c00kie; theme=light"],
+          ["X-Api-Key", "typed"],
+          ["X-Trace", "abc"],
+        ],
+      },
+    ];
+    for (const { input, withheld, sent } of cases) {
+      await using harness = await openReplayHarness();
+      const { fake, requestId } = await credentialSource(harness, recorded);
+      const { credentials, ...edits } = input;
+      const replay = { requestId, edits, ...(credentials === undefined ? {} : { credentials }) };
+      const preview = harness.replay.preview(replay);
+      expect(preview.withheldHeaders).toEqual(withheld);
+      await harness.replay.accept(
+        { ...replay, idempotencyKey: preview.idempotencyKey },
+        new AbortController().signal,
+      );
+      expect(sentHeaders(await fake.nextMessage())).toEqual(sent);
+    }
+  });
 });

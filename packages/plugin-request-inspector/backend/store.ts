@@ -773,7 +773,9 @@ export function openInspectorStore(options: InspectorStoreOptions): InspectorSto
   const log = options.log ?? (() => undefined);
   const step = (value: StorageStep) => options.onStorageStep?.(value);
 
-  NodeFS.mkdirSync(dataDir, { recursive: true });
+  // Recorded cookies and upstream credentials live here: keep the directory owner-only.
+  NodeFS.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  if ((NodeFS.statSync(dataDir).mode & 0o077) !== 0) NodeFS.chmodSync(dataDir, 0o700);
   const db = new NodeSqlite.DatabaseSync(databasePath);
   db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
   const readVersion = () => num(db.prepare("PRAGMA user_version").get()?.user_version);
@@ -831,6 +833,8 @@ export function openInspectorStore(options: InspectorStoreOptions): InspectorSto
       throw error;
     }
   }
+  // Scrubbed on every open so no deleted proxy keeps upstream credentials.
+  db.exec("UPDATE proxies SET upstream_auth = NULL WHERE deleted_at IS NOT NULL");
   db.exec("PRAGMA wal_autocheckpoint = 0");
   db.exec("PRAGMA synchronous = NORMAL");
 
@@ -901,7 +905,7 @@ export function openInspectorStore(options: InspectorStoreOptions): InspectorSto
       INSERT INTO proxies (seq, name, created_at, options, upstream_auth)
       VALUES (?, ?, ?, ?, ?) RETURNING id`),
     deleteProxy: db.prepare(
-      "UPDATE proxies SET seq = ?, deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+      "UPDATE proxies SET seq = ?, deleted_at = ?, upstream_auth = NULL WHERE id = ? AND deleted_at IS NULL",
     ),
     links: db.prepare("SELECT * FROM proxy_links ORDER BY kind, target_id, linked_at, rowid"),
     linksOf: db.prepare("SELECT * FROM proxy_links WHERE proxy_id = ? ORDER BY kind, target_id"),

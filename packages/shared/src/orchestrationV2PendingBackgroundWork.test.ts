@@ -3,6 +3,7 @@ import { ProviderInstanceId, ProviderThreadId } from "@t3tools/contracts";
 import {
   backgroundWorkHoldsCompletion,
   derivePendingBackgroundWork,
+  turnItemUpdateCanEndBackgroundWork,
 } from "./orchestrationV2PendingBackgroundWork.ts";
 
 describe("backgroundWorkHoldsCompletion", () => {
@@ -13,6 +14,18 @@ describe("backgroundWorkHoldsCompletion", () => {
     ["a subagent", true, [{ taskId: "review", kind: "subagent" }]],
   ] as const)("with %s pending, holds completion: %s", (_case, holds, tasks) => {
     expect(backgroundWorkHoldsCompletion(tasks)).toBe(holds);
+  });
+});
+
+describe("turnItemUpdateCanEndBackgroundWork", () => {
+  it.each([
+    ["a finished command", { type: "command_execution", status: "completed" }, true],
+    ["a running command", { type: "command_execution", status: "running" }, false],
+    // A T3 web search runs as dynamic_tool and is stored as web_search once it ends.
+    ["a finished web search", { type: "web_search", status: "failed" }, true],
+    ["a finished file edit", { type: "file_change", status: "completed" }, false],
+  ] as const)("%s", (_case, item, ends) => {
+    expect(turnItemUpdateCanEndBackgroundWork(item)).toBe(ends);
   });
 });
 

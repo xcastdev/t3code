@@ -54,6 +54,10 @@ const failure = () =>
 const testFailure = (message: string) => new McpCatalogOperationError({ message });
 const decodeTestTransport = Schema.decodeUnknownEffect(ProjectMcpTransportSchema);
 const TEST_TOOL_PAGE_LIMIT = 20;
+const TEST_TOOL_LIMIT = 200;
+const TEST_TEXT_LIMIT = 500;
+const clip = (text: string) =>
+  text.length > TEST_TEXT_LIMIT ? `${text.slice(0, TEST_TEXT_LIMIT - 1)}…` : text;
 
 const mapTransport = Effect.fn("McpCatalogClientService.mapTransport")(function* (
   transport: McpCatalogTransportInput | McpCatalogTestTransportInput | ProjectMcpTransportDraft,
@@ -260,6 +264,9 @@ const make = Effect.gen(function* () {
           ),
       );
       const tools: Array<{ name: string; title?: string; description?: string }> = [];
+      const seen = new Set<string>();
+      const listed = new Set<string>();
+      let omittedToolCount = 0;
       let cursor: string | undefined;
       for (let page = 0; page < TEST_TOOL_PAGE_LIMIT; page++) {
         const result = yield* Effect.tryPromise({
@@ -269,12 +276,21 @@ const make = Effect.gen(function* () {
             }),
           catch: describe,
         });
-        for (const tool of result.tools)
-          tools.push({
-            name: tool.name,
-            ...(tool.title === undefined ? {} : { title: tool.title }),
-            ...(tool.description === undefined ? {} : { description: tool.description }),
-          });
+        for (const tool of result.tools) {
+          if (seen.has(tool.name)) continue;
+          seen.add(tool.name);
+          // Clipped names key the result list, so a distinct tool that clips to a listed name is omitted.
+          const name = clip(tool.name);
+          if (tools.length === TEST_TOOL_LIMIT || listed.has(name)) omittedToolCount += 1;
+          else {
+            listed.add(name);
+            tools.push({
+              name,
+              ...(tool.title === undefined ? {} : { title: clip(tool.title) }),
+              ...(tool.description === undefined ? {} : { description: clip(tool.description) }),
+            });
+          }
+        }
         cursor = result.nextCursor;
         if (cursor === undefined) break;
       }
@@ -290,6 +306,8 @@ const make = Effect.gen(function* () {
               },
             }),
         tools,
+        ...(omittedToolCount === 0 ? {} : { omittedToolCount }),
+        ...(cursor === undefined ? {} : { truncated: true as const }),
       };
     },
     Effect.scoped,

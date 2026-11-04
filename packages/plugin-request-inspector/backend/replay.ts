@@ -3,6 +3,7 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 
+import { isSensitiveHeader, restoreRedactedHeaders } from "../shared/sensitiveHeaders.ts";
 import { decodeBase64Chunk, type DraftStore } from "./bodies.ts";
 import {
   DRAFT_MISSING_DETAIL,
@@ -61,6 +62,11 @@ export interface ReplayEdits {
 export interface ReplayInput {
   readonly requestId: number;
   readonly edits?: ReplayEdits;
+  /**
+   * `recorded-origin` sends recorded credential headers only when the replay keeps the
+   * recorded scheme, host, and port. Agents get it unless they pass includeSensitiveHeaders.
+   */
+  readonly credentials?: "recorded-origin";
 }
 
 /** The request the addon builds with `http.Request(...)`. Header pairs and names are base64. */
@@ -124,6 +130,8 @@ export interface ReplayPreview {
   readonly path: string;
   readonly pathTruncated?: true;
   readonly bodyBytes: number;
+  /** Recorded credential headers left out because the replay goes to another origin. */
+  readonly withheldHeaders?: ReadonlyArray<string>;
   readonly refusal?: string;
   readonly idempotencyKey: string;
 }
@@ -221,9 +229,16 @@ const canonical = (value: unknown): string => {
 
 export const replayInputHash = (input: ReplayInput) =>
   NodeCrypto.createHash("sha256")
-    .update(canonical({ requestId: input.requestId, edits: input.edits ?? null }))
+    .update(
+      canonical({
+        requestId: input.requestId,
+        edits: input.edits ?? null,
+        credentials: input.credentials,
+      }),
+    )
     .digest("hex");
 
+const latin1 = (bytes: Uint8Array) => Buffer.from(bytes).toString("latin1");
 /** Header text as wire bytes: latin1 when every char fits, otherwise UTF-8. */
 const textBytes = (text: string) => Buffer.from(text, /[^\u0000-ÿ]/.test(text) ? "utf8" : "latin1");
 
@@ -252,6 +267,7 @@ interface BuiltReplay {
   readonly headers: ReadonlyArray<HeaderPair>;
   readonly body: BuiltBody;
   readonly bodyBytes: number;
+  readonly withheldHeaders: ReadonlyArray<string>;
   readonly refusal?: string;
 }
 
@@ -295,10 +311,31 @@ function buildReplay(store: InspectorStore, drafts: DraftStore, input: ReplayInp
   const method = edits.method ?? record.summary.method;
   if (!TOKEN_PATTERN.test(method)) refusals.push(REPLAY_INPUT_DETAILS.method);
 
-  let headers: Array<HeaderPair> =
-    edits.headers === undefined
-      ? record.requestHeaders.map(([name, value]) => [name, value] as const)
-      : edits.headers.map(([name, value]) => [textBytes(name), textBytes(value)] as const);
+  const sameOrigin =
+    destination.scheme === record.summary.scheme &&
+    destination.host.toLowerCase() === record.summary.host.toLowerCase() &&
+    destination.port === record.summary.port;
+  const sendRecordedCredentials = sameOrigin || input.credentials === undefined;
+  let headers: Array<HeaderPair>;
+  let withheldHeaders: Array<string> = [];
+  if (edits.headers === undefined) {
+    headers = [];
+    for (const pair of record.requestHeaders) {
+      const name = latin1(pair[0]);
+      if (sendRecordedCredentials || !isSensitiveHeader(name)) headers.push(pair);
+      else if (!withheldHeaders.some((seen) => seen.toLowerCase() === name.toLowerCase())) {
+        withheldHeaders.push(name);
+      }
+    }
+  } else {
+    const restored = restoreRedactedHeaders(
+      edits.headers,
+      record.requestHeaders.map(([name, value]) => [latin1(name), latin1(value)] as const),
+      sendRecordedCredentials,
+    );
+    withheldHeaders = restored.withheld;
+    headers = restored.headers.map(([name, value]) => [textBytes(name), textBytes(value)] as const);
+  }
   if (hostHeader !== undefined) {
     headers = headers.map((pair) =>
       isHeader(pair, "host") ? ([pair[0], textBytes(hostHeader)] as const) : pair,
@@ -352,6 +389,7 @@ function buildReplay(store: InspectorStore, drafts: DraftStore, input: ReplayInp
     headers,
     body,
     bodyBytes,
+    withheldHeaders,
     ...(refusal === undefined ? {} : { refusal }),
   };
 }
@@ -714,6 +752,7 @@ export function makeReplayService(options: ReplayServiceOptions): ReplayService 
       path: pathCut ? built.path.slice(0, STORE_LIMITS.summaryPathChars) : built.path,
       ...(pathCut ? { pathTruncated: true as const } : {}),
       bodyBytes: built.bodyBytes,
+      ...(built.withheldHeaders.length === 0 ? {} : { withheldHeaders: built.withheldHeaders }),
       ...(built.refusal === undefined ? {} : { refusal: built.refusal }),
       idempotencyKey: mintReplayKey(store),
     };

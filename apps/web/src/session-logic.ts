@@ -27,7 +27,11 @@ import {
 import type { HtmlRenderReference } from "@t3tools/shared/htmlRender";
 import { turnItemDetailRevision } from "@t3tools/client-runtime/work-log/item-detail";
 import type { McpAppReference } from "@t3tools/shared/mcpApp";
-import { htmlRenderFromToolItem, mcpAppFromToolItem } from "@t3tools/shared/toolOutput";
+import {
+  htmlRenderFromToolItem,
+  mcpAppFromToolItem,
+  t3WebSearchDisplayItem,
+} from "@t3tools/shared/toolOutput";
 import {
   contextCompactionLabel,
   workEntryIndicatesToolFailure,
@@ -399,7 +403,7 @@ export function providerErrorPresentation(
 }
 
 function projectedWorkEntry(row: OrchestrationV2ProjectedTurnItem): WorkLogEntry {
-  const { item } = row;
+  const item = t3WebSearchDisplayItem(row.item);
   const title = item.title?.trim() || null;
   const common = {
     id: item.id,

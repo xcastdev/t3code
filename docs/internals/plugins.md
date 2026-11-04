@@ -45,11 +45,12 @@ and the plugin is installed and enabled; otherwise it is hidden, not deleted, so
 the plugin or the chat. Mobile has no rail and no pins.
 
 Host API skew is decided in the client, not the server: a remote environment can install a
-plugin that this client cannot host, so the server's version cannot decide it. Clients that know
-host API 1.1 render an "update the app" state for a panel whose manifest `hostApi` is newer
-(`isHostApiCompatible`). Older clients predate that check and mount the panel anyway, so a panel
-needing 1.1 reads `client.hostApi` and degrades; the inspector hides copy, download, and chat
-linking there.
+plugin that this client cannot host, so the server's version cannot decide it. Clients render an
+"update the app" state for a panel whose manifest `hostApi` is newer (`isHostApiCompatible`).
+That needs the record to decode, so manifest `capabilities` are open strings on the wire and
+`decodePluginManifest` rejects an unknown one only when the host claims the manifest's `hostApi`.
+Host API 1.0 clients decoded capabilities as a closed list: they cannot read a registry holding a
+manifest that declares `file.save` or `clipboard.write`, and must update.
 
 ## Backend packaging
 
@@ -86,8 +87,10 @@ messages are capped well below a large export, so saving is chunked: `begin`, `a
 `commit` or `abort`, bounded by `PLUGIN_LIMITS.maxSaveBytes`. Both need user activation, and
 activation expires. `begin` therefore checks it and its `size` is optional: a streaming export
 does not know its size until it has read everything, and waiting would let the activation lapse.
-When a size is declared it is enforced on `append` and `commit`. Mobile cannot see whether the
-share sheet was dismissed, so its commit always reports `saved`.
+When a size is declared it is enforced on `append` and `commit`. A new `begin` drops a save the
+panel abandoned. Mobile cannot see whether the share sheet was dismissed, so its commit always
+reports `saved`. `chat.targets.list` needs `chat.attach` or `chat.reference` but no activation,
+so a target picker can fill as it opens.
 
 ## Long-running mutations and replay
 

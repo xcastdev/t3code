@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   asT3WebSearchTurnItem,
+  t3WebSearchDisplayItem,
   compactDynamicToolOutput,
   MAX_TOOL_OUTPUT_IMAGES,
   toolOutputImages,
@@ -293,6 +294,30 @@ describe("asT3WebSearchTurnItem", () => {
       const other = toolCall(toolName, result);
       expect(asT3WebSearchTurnItem(other), toolName).toBe(other);
     }
+    const running = { ...toolCall("t3-code.t3_web_search", undefined), status: "running" as const };
+    expect(asT3WebSearchTurnItem(running)).toBe(running);
+  });
+
+  it("shows running, stopped, and per-thread calls as web searches", () => {
+    const answer = [{ title: "Answer", snippet: "Node.js 26.1.0" }];
+    for (const [toolName, status, output, results] of [
+      ["t3-code.t3_web_search", "running", undefined, undefined],
+      ["mcp__t3-code__t3_web_search", "cancelled", result, answer],
+      ["t3-code-thread_1_t3_web_search", "running", undefined, undefined],
+      ["t3-code-thread_1_t3_web_search", "interrupted", result, undefined],
+    ] as const) {
+      const item = t3WebSearchDisplayItem({ ...toolCall(toolName, output), status });
+      expect(item, toolName).toMatchObject({
+        type: "web_search",
+        status,
+        patterns: ["latest Node.js"],
+      });
+      expect(item.type === "web_search" ? item.results?.slice(0, 1) : null, toolName).toEqual(
+        results,
+      );
+    }
+    const other = toolCall("mcp__other__t3_web_search", result);
+    expect(t3WebSearchDisplayItem(other)).toBe(other);
   });
 
   it("keeps unparsed output and non-execution, bounded for the timeline", () => {

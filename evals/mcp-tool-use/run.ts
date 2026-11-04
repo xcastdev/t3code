@@ -59,6 +59,7 @@ import {
   noDefaultProxyDetail,
   PROXY_DETAILS,
   REPLAY_DETAILS,
+  sensitiveHeaderDetail,
 } from "../../packages/plugin-request-inspector/backend/refusals.ts";
 import { buildCodexAdditionalContext } from "../../apps/server/src/provider/CodexDeveloperInstructions.ts";
 import { makeSideChatContext } from "../../apps/server/src/orchestration-v2/ContextHandoffService.ts";
@@ -158,7 +159,7 @@ const PLUGINS = {
   "request-inspector": {
     dir: "plugin-request-inspector",
     details: { ...REPLAY_DETAILS, ...PROXY_DETAILS },
-    detailFns: { noDefaultProxy: noDefaultProxyDetail },
+    detailFns: { noDefaultProxy: noDefaultProxyDetail, sensitiveHeader: sensitiveHeaderDetail },
   },
 } as const;
 type PluginName = keyof typeof PLUGINS;

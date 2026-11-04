@@ -38,22 +38,32 @@ const CODEX_NO_PLUGIN_ARGS = [
   "features.apps=false",
 ] as const;
 // `web_search="live"` is what top-level `codex --search` sets; `codex exec` has no such flag.
-// Fetched pages may carry instructions, so the search also loses the shell, image viewing and
-// the checkout's AGENTS.md. apply_patch stays, but the read-only sandbox refuses its writes.
+// Fetched pages may carry instructions, so the search loses default-on tools, user hooks, skill
+// text and the checkout's AGENTS.md (checked against codex 0.166 requests). apply_patch and
+// request_user_input have no switch; the read-only sandbox refuses writes and exec has no user.
 const CODEX_WEB_SEARCH_ARGS = [
   "--config",
   'web_search="live"',
+  ...[
+    "shell_tool",
+    "unified_exec",
+    "view_image",
+    "image_generation",
+    "goals",
+    "multi_agent",
+    "code_mode_host",
+    "browser_use",
+    "in_app_browser",
+    "computer_use",
+    "browser_use_external",
+    "tool_suggest",
+    "hooks",
+  ].flatMap((feature) => ["--config", `features.${feature}=false`]),
   "--config",
-  "features.shell_tool=false",
-  "--config",
-  "features.unified_exec=false",
-  "--config",
-  "features.view_image=false",
-  "--config",
-  "features.image_generation=false",
+  "skills.include_instructions=false",
   "--config",
   "project_doc_max_bytes=0",
-] as const;
+];
 const CodexMcpServers = Schema.fromJsonString(
   Schema.Array(Schema.Struct({ name: Schema.String, enabled: Schema.Boolean })),
 );

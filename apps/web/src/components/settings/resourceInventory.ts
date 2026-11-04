@@ -390,41 +390,36 @@ export function mcpCatalogRows(input: {
   readonly own: ReadonlyArray<McpCatalogDefinition>;
   readonly overrides: ReadonlyArray<McpCatalogOverride>;
 }): ReadonlyArray<McpCatalogRow> {
-  const overrideFor = (definition: McpCatalogDefinition) =>
-    input.overrides.find((override) => override.targetId === definition.logicalServerId) ?? null;
-  // A session edit copies the inherited server into its own scope under the same id and replaces it.
-  const owned = new Set(input.own.map((definition) => definition.logicalServerId));
-  return [
-    ...input.inherited
-      .filter((definition) => !owned.has(definition.logicalServerId))
-      .map((definition) => {
-        const override = overrideFor(definition);
-        return {
-          definition,
-          override,
-          inherited: true,
-          enabled: override?.enabled ?? definition.enabled,
-          name: override?.name ?? definition.name,
-          providerInstanceIds: override?.providerInstanceIds ?? definition.providerInstanceIds,
-          allProviders:
-            override?.providerInstanceIds !== undefined || override?.allProviders !== undefined
-              ? override.allProviders === true
-              : definition.allProviders === true,
-          transport: override?.transport ?? definition.transport,
-          transportDefinitionId: override?.transportDefinitionId ?? definition.definitionId,
-        };
-      }),
-    ...input.own.map((definition) => ({
+  const row = (definition: McpCatalogDefinition, inherited: boolean): McpCatalogRow => {
+    const override =
+      input.overrides.find((candidate) => candidate.targetId === definition.logicalServerId) ??
+      null;
+    return {
       definition,
-      override: null,
-      inherited: false,
-      enabled: definition.enabled,
-      name: definition.name,
-      providerInstanceIds: definition.providerInstanceIds,
-      allProviders: definition.allProviders === true,
-      transport: definition.transport,
-      transportDefinitionId: definition.definitionId,
-    })),
+      override,
+      inherited,
+      enabled: override?.enabled ?? definition.enabled,
+      name: override?.name ?? definition.name,
+      providerInstanceIds: override?.providerInstanceIds ?? definition.providerInstanceIds,
+      allProviders:
+        override?.providerInstanceIds !== undefined || override?.allProviders !== undefined
+          ? override.allProviders === true
+          : definition.allProviders === true,
+      transport: override?.transport ?? definition.transport,
+      transportDefinitionId: override?.transportDefinitionId ?? definition.definitionId,
+    };
+  };
+  // A session holds its own copy of each inherited server under the same id, and its overrides
+  // target that copy, so the copy stands in for the inherited row.
+  const own = new Map(input.own.map((definition) => [definition.logicalServerId, definition]));
+  const inheritedIds = new Set(input.inherited.map((definition) => definition.logicalServerId));
+  return [
+    ...input.inherited.map((definition) =>
+      row(own.get(definition.logicalServerId) ?? definition, true),
+    ),
+    ...input.own
+      .filter((definition) => !inheritedIds.has(definition.logicalServerId))
+      .map((definition) => row(definition, false)),
   ];
 }
 

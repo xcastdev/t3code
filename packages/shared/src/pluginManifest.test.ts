@@ -125,6 +125,19 @@ describe("decodePluginManifest", () => {
     );
   });
 
+  it("rejects an unknown capability only when this host claims the manifest's hostApi", () => {
+    expectRejected(
+      { ...clientOnly, capabilities: ["file.open"] },
+      'unknown capability "file.open"',
+    );
+    const newer = decodePluginManifest({
+      ...clientOnly,
+      hostApi: "1.2",
+      capabilities: ["file.open"],
+    });
+    expect(Result.isSuccess(newer)).toBe(true);
+  });
+
   it("rejects a command whose opens.panel names no declared panel", () => {
     expectRejected(
       {

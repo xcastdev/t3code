@@ -123,22 +123,11 @@ export function PluginPanelFrame(props: {
       chatTargets: (query) => options().chatTargets(query),
     });
     bridgeRef.current = bridge;
-    // Pointer moves are not activation and the panel cannot fake them: while the pointer has
-    // stayed on the frame since the last page input, the page's activation came from the frame.
-    let pointerEnteredAt: number | null = null;
-    const onPointerEnter = () => {
-      pointerEnteredAt = performance.now();
-    };
-    const onPointerLeave = () => {
-      pointerEnteredAt = null;
-    };
-    frame.addEventListener("pointerenter", onPointerEnter);
-    frame.addEventListener("pointerleave", onPointerLeave);
+    // Real input in the frame focuses it and activates this page; recent page input does not count.
     const activated = () =>
       document.activeElement === frameRef.current &&
       navigator.userActivation?.isActive === true &&
-      ((pointerEnteredAt !== null && pointerEnteredAt > lastPageInputAt) ||
-        performance.now() - lastPageInputAt >= PAGE_ACTIVATION_MS);
+      performance.now() - lastPageInputAt >= PAGE_ACTIVATION_MS;
     const receive = (event: MessageEvent) => {
       if (event.source !== null && event.source === target()) {
         bridge.receive(event.data, activated());
@@ -147,8 +136,6 @@ export function PluginPanelFrame(props: {
     window.addEventListener("message", receive);
     return () => {
       window.removeEventListener("message", receive);
-      frame.removeEventListener("pointerenter", onPointerEnter);
-      frame.removeEventListener("pointerleave", onPointerLeave);
       bridge.dispose();
       bridgeRef.current = null;
       frameRef.current = null;

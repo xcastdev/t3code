@@ -89,14 +89,8 @@ function nonterminalRuns(projection: ProjectionStore.ProjectionRuntimeRecoverySt
   });
 }
 
-// web_search can be an MCP tool call (T3's web search) that outlived its run.
 function isBackgroundCapableTurnItemType(type: string): boolean {
-  return (
-    type === "command_execution" ||
-    type === "dynamic_tool" ||
-    type === "web_search" ||
-    type === "subagent"
-  );
+  return type === "command_execution" || type === "dynamic_tool" || type === "subagent";
 }
 
 function isNonterminalTurnItemStatus(status: string): boolean {

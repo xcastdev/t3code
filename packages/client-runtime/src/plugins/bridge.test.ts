@@ -361,7 +361,10 @@ describe("makePluginBridge", () => {
     const attachment = { kind: "text", text: "hello", expectedChatTargetKey: "thread-1" };
 
     const refused = await request("t3/chat.attach", attachment, false);
-    expect(errorOf(refused).code).toBe(-32000);
+    expect(errorOf(refused)).toMatchObject({
+      code: -32000,
+      message: "Attaching was blocked. Wait a few seconds, then click or tap in the panel again.",
+    });
     expect(attach).not.toHaveBeenCalled();
 
     const accepted = await request("t3/chat.attach", attachment, true);
@@ -464,7 +467,7 @@ describe("makePluginBridge", () => {
       method: "t3/file.save.begin",
       params: { name: "a.har", mimeType: "application/json", size: 2 },
       activated: false,
-      message: "Saving a file must follow a click or key press in the panel.",
+      message: "Saving was blocked. Wait a few seconds, then click or tap in the panel again.",
     },
     {
       name: "file.save.begin over maxSaveBytes",
@@ -488,7 +491,7 @@ describe("makePluginBridge", () => {
       method: "t3/clipboard.write",
       params: { text: "hi" },
       activated: false,
-      message: "Copying must follow a click or key press in the panel.",
+      message: "Copying was blocked. Wait a few seconds, then click or tap in the panel again.",
     },
     {
       name: "clipboard.write over maxPayloadBytes",
@@ -510,7 +513,7 @@ describe("makePluginBridge", () => {
     expect(writeClipboard).not.toHaveBeenCalled();
   });
 
-  it("file.save joins appended chunks, refuses overruns and short commits, and frees on abort", async () => {
+  it("file.save joins appended chunks, refuses overruns and short commits, frees on abort, and lets a new begin replace an abandoned save", async () => {
     const { request, initialize, saveFile } = setup({
       manifest: { ...baseManifest, capabilities: ["file.save"] },
     });
@@ -526,11 +529,10 @@ describe("makePluginBridge", () => {
     const append = (saveId: string, text: string) =>
       request("t3/file.save.append", { saveId, base64: btoa(text) });
 
+    const abandoned = await begin(3);
+    await append(abandoned, "ab");
     const overrun = await begin(3);
-    expect(
-      errorOf(await request("t3/file.save.begin", { name: "b", mimeType: "", size: 1 }, true))
-        .message,
-    ).toBe("Another save is still in progress.");
+    expect(errorOf(await append(abandoned, "c")).code).toBe(-32602);
     expect((await append(overrun, "ab")).result).toEqual({});
     expect(errorOf(await append(overrun, "cd")).code).toBe(-32602);
     expect(errorOf(await request("t3/file.save.commit", { saveId: overrun })).code).toBe(-32602);
@@ -614,6 +616,7 @@ describe("makePluginBridge", () => {
     const queries: Array<string> = [];
     const many = PLUGIN_LIMITS.maxChatTargets + 10;
     const { request, initialize } = setup({
+      manifest: { ...baseManifest, capabilities: ["chat.reference"] },
       overrides: {
         chatTargets: async (query) => {
           queries.push(query);
@@ -646,10 +649,21 @@ describe("makePluginBridge", () => {
     const tooLong = await request("t3/chat.targets.list", { query: "x".repeat(257) });
     expect(errorOf(tooLong).code).toBe(-32602);
   });
+
+  it("chat.targets.list is refused without chat.attach or chat.reference", async () => {
+    const chatTargets = vi.fn(() => ({ threads: [], projects: [] }));
+    const { request, initialize } = setup({
+      manifest: { ...baseManifest, capabilities: ["file.save", "clipboard.write"] },
+      overrides: { chatTargets },
+    });
+    await initialize();
+    expect(errorOf(await request("t3/chat.targets.list")).data?.reason).toBe("capability-denied");
+    expect(chatTargets).not.toHaveBeenCalled();
+  });
 });
 
 describe("selectPluginChatTargets", () => {
-  it("keeps one environment's live threads and unarchived projects, newest first, matching the query", () => {
+  it("keeps one environment's live, unarchived threads and projects, newest first, matching the query", () => {
     const thread = (id: string, title: string, updatedAt: string, extra: object = {}) => ({
       environmentId: "env-1",
       id: ThreadId.make(id),
@@ -657,6 +671,7 @@ describe("selectPluginChatTargets", () => {
       title,
       updatedAt,
       deletedAt: null,
+      archivedAt: null,
       ...extra,
     });
     const project = (id: string, title: string, updatedAt: string, extra: object = {}) => ({
@@ -672,6 +687,8 @@ describe("selectPluginChatTargets", () => {
         thread("t2", "Proxy setup", "2026-01-03"),
         thread("t3", "Deleted", "2026-01-04", { deletedAt: "2026-01-05" }),
         thread("t4", "Other env", "2026-01-04", { environmentId: "env-2" }),
+        thread("t5", "Archived thread", "2026-01-04", { archivedAt: "2026-01-05" }),
+        thread("t6", "In archived project", "2026-01-04", { projectId: ProjectId.make("p2") }),
       ],
       projects: [
         project("p1", "Web App", "2026-01-01"),

@@ -608,5 +608,9 @@ export const McpCatalogTestConnectionResult = Schema.Struct({
       description: Schema.optional(Schema.String),
     }),
   ),
+  /** Tools the server listed beyond the ones returned. */
+  omittedToolCount: Schema.optional(Schema.Int.check(Schema.isGreaterThan(0))),
+  /** The server had more tool pages than the test reads, so the count is a lower bound. */
+  truncated: Schema.optional(Schema.Literal(true)),
 });
 export type McpCatalogTestConnectionResult = typeof McpCatalogTestConnectionResult.Type;

@@ -1,4 +1,4 @@
-import type { OrchestrationV2TurnItem } from "@t3tools/contracts";
+import { isOrchestrationV2WorkActive, type OrchestrationV2TurnItem } from "@t3tools/contracts";
 import { resolveT3McpToolId } from "@t3tools/shared/t3McpToolPresentation";
 import { formatReadToolLabel, formatSearchToolLabel } from "@t3tools/shared/toolActivity";
 import { t3WebSearchTurnItem } from "@t3tools/shared/toolOutput";
@@ -138,7 +138,10 @@ export function openCodeToolTurnItem(
   },
 ): OrchestrationV2TurnItem {
   const { input, output } = tool;
-  const webSearchQuery = t3WebSearchQuery(tool.name, input, tool.t3McpServer);
+  // Like asT3WebSearchTurnItem: a running search stays dynamic_tool so Stop and settlement end it.
+  const webSearchQuery = isOrchestrationV2WorkActive(base.status)
+    ? undefined
+    : t3WebSearchQuery(tool.name, input, tool.t3McpServer);
   if (webSearchQuery !== undefined) return t3WebSearchTurnItem(base, webSearchQuery, output);
   switch (openCodeToolProjectionKind(tool.name)) {
     case "command_execution": {

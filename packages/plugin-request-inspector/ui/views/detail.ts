@@ -14,6 +14,7 @@ import {
   rawRequest,
   rawResponse,
 } from "../../shared/httpText.ts";
+import { redactHeaders } from "../../shared/sensitiveHeaders.ts";
 import {
   type App,
   type BodyInfo,
@@ -252,10 +253,14 @@ const recordingIdOf = (value: Detail) => {
 const statusLine = (response: NonNullable<Detail["response"]>) =>
   `${response.httpVersion} ${response.status}${response.reason ? ` ${response.reason}` : ""}`;
 
-const snapshotText = (value: Detail) => {
-  const lines = [`${requestLine(value)} ${value.httpVersion}`, headersText(value.request.headers)];
+/** What the panel sends to chat. The panel shows credentials; the model gets them redacted. */
+export const snapshotText = (value: Detail) => {
+  const lines = [
+    `${requestLine(value)} ${value.httpVersion}`,
+    headersText(redactHeaders(value.request.headers)),
+  ];
   if (value.response !== undefined) {
-    lines.push("", statusLine(value.response), headersText(value.response.headers));
+    lines.push("", statusLine(value.response), headersText(redactHeaders(value.response.headers)));
   } else if (value.error !== undefined) {
     lines.push("", `Error: ${value.error}`);
   }

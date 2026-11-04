@@ -69,6 +69,21 @@ export downloads to your device.
 When an agent exports, large results are written to the inspector's exports folder on the
 environment, and the agent copies the file where it needs it.
 
+**What agents see.** The panel shows every header as recorded. When an agent reads, exports,
+formats, or decodes requests, and in requests you attach to a chat (as a reference or as text),
+credential headers such as `Authorization`, `Proxy-Authorization`, and `X-Api-Key` show as
+`[redacted]`, as do headers named like tokens, secrets, keys, sessions, JWTs, or signatures (such
+as `Private-Token`). `Cookie` and `Set-Cookie` keep cookie names with `[redacted]` values.
+Credentials in URLs, query strings, and bodies are not redacted. Redaction keeps credentials out of
+the model's context by accident; it does not stop a determined agent with shell access, which can
+read the inspector's data on the environment's machine. An agent gets the values only by asking
+for them explicitly, so tell it when it needs a token. An agent can still replay a request that
+carries them: a header it leaves as `[redacted]` is sent with the recorded value, but only to the
+request's recorded scheme, host, and port. When an agent replays to another destination, recorded
+credentials are left out unless it asks to send them. Agents can create proxies that listen on
+loopback or on the default listen host from the plugin's settings; choose any other listen host in
+the panel yourself.
+
 **HTTPS.** To capture HTTPS, trust the inspector's certificate in the client you are testing. The
 certificate helper shows the file paths and the system trust commands for your OS; run those
 yourself, since they need `sudo`. On Linux it can also install the certificate into Chrome and
