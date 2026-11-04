@@ -296,7 +296,11 @@ export default function ProjectScriptsControl({
               render={
                 <button
                   type="button"
-                  className={cn(TITLEBAR_SPLIT_PART_CLASS, "gap-1.5 pr-2 pl-2.5")}
+                  className={cn(
+                    TITLEBAR_SPLIT_PART_CLASS,
+                    "gap-1.5 pr-2 pl-2.5",
+                    primaryScript ? "max-[380px]:px-2" : "max-sm:px-2",
+                  )}
                   aria-label={primaryScript ? `Run ${primaryScript.name}` : "New project script"}
                   aria-disabled={(primaryScript !== undefined && !onRunScript) || undefined}
                   onClick={() => (primaryScript ? onRunScript?.(primaryScript) : openAddDialog())}
@@ -308,7 +312,15 @@ export default function ProjectScriptsControl({
               ) : (
                 <PlusIcon className="size-4 shrink-0" />
               )}
-              <span className="max-w-40 truncate font-medium">{primaryScript?.name ?? "New"}</span>
+              {/* Phones drop the generic "New" label; script names shorten, then drop below 380px. */}
+              <span
+                className={cn(
+                  "max-w-40 truncate font-medium max-sm:max-w-16",
+                  primaryScript ? "max-[380px]:hidden" : "max-sm:hidden",
+                )}
+              >
+                {primaryScript?.name ?? "New"}
+              </span>
             </TooltipTrigger>
             <TooltipPopup side="bottom">
               {!primaryScript

@@ -501,6 +501,12 @@ describe("rightPanelStore", () => {
     expect(selectThreadRightPanelState(byThreadKey, refA).maximized).toBe(true);
     expect(selectThreadRightPanelState(byThreadKey, refB).maximized).toBeUndefined();
     expect(store.getUserActionRevision(refA)).toBe(revision);
+
+    // An emptied panel is the launcher rail, which cannot be maximized.
+    store.closeAllSurfaces(refA);
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).maximized,
+    ).toBeUndefined();
   });
 
   it("restores a saved maximized panel during migration", () => {

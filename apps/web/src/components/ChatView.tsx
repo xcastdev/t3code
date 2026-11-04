@@ -1066,7 +1066,7 @@ export default function ChatView(props: ChatViewProps) {
   const rightPanelState = useRightPanelStore((state) =>
     selectThreadRightPanelState(state.byThreadKey, activeThreadRef),
   );
-  const shouldUsePlanSidebarSheet = prefersPlanSidebarSheet && rightPanelState.maximized !== true;
+  const rightPanelCompact = prefersPlanSidebarSheet && rightPanelState.maximized !== true;
   const activeRightPanelSurface = useRightPanelStore((state) =>
     selectActiveRightPanelSurface(state.byThreadKey, activeThreadRef),
   );
@@ -1122,6 +1122,7 @@ export default function ChatView(props: ChatViewProps) {
   const canReuseTerminal = activeThreadKnownSessionsRaw !== null;
   const previewPanelOpen = displayedRightPanelSurface?.kind === "preview" && browserAvailable;
   const rightPanelOpen = rightPanelState.isOpen || dockedPluginSurface !== null;
+  // Narrow layouts keep the inline launcher rail and show only an opened surface as a sheet.
   const { active: panelAnimationsActive, durationMs: panelAnimationDurationMs } =
     usePanelAnimationSettings();
   const rightPanelPresenceValue = {
@@ -1136,24 +1137,23 @@ export default function ChatView(props: ChatViewProps) {
     panelAnimationDurationMs,
   );
   const rightPanelPresent = rightPanelPresence.present;
-  const rightPanelControlsInPanel =
-    shouldUsePlanSidebarSheet && rightPanelPresent && rightPanelOpen;
-  const rightPanelControlsAtRoot = rightPanelPresent && !shouldUsePlanSidebarSheet;
   const renderedRightPanelSurface = rightPanelPresence.value?.activeSurface ?? null;
   const renderedRightPanelSurfaces = rightPanelPresence.value?.surfaces ?? [];
+  // Uses the presence value so a closing sheet keeps its surface through the exit animation.
+  const rightPanelSheet = rightPanelCompact && renderedRightPanelSurface !== null;
+  const rightPanelControlsInPanel = rightPanelSheet && rightPanelPresent && rightPanelOpen;
+  const rightPanelControlsAtRoot = rightPanelPresent && !rightPanelSheet;
   const previewMiniPlayerVisible = shouldRenderPreviewMiniPlayer(
     activePreviewMiniPlayer?.source ?? null,
     renderedRightPanelSurface,
   );
   // With no tabs the inline panel is a narrow launcher rail, too thin to hold the titlebar controls.
-  const rightPanelRail =
-    rightPanelOpen && !shouldUsePlanSidebarSheet && displayedRightPanelSurface === null;
+  const rightPanelRail = rightPanelOpen && !rightPanelSheet && displayedRightPanelSurface === null;
   const canMaximizeRightPanel = rightPanelOpen && !rightPanelRail;
   // An embedded side chat has no panel; a stale maximized flag would hide its own column.
   const rightPanelMaximized =
     !embedded && canMaximizeRightPanel && rightPanelState.maximized === true;
-  const inlineRightPanelOwnsTitleBar =
-    rightPanelOpen && !shouldUsePlanSidebarSheet && !rightPanelRail;
+  const inlineRightPanelOwnsTitleBar = rightPanelOpen && !rightPanelSheet && !rightPanelRail;
   const [threadPanelPopoverHandle] = useState(PopoverCreateHandle);
   const [chatCanvasStore] = useState(createChatCanvasStore);
 
@@ -2087,7 +2087,7 @@ export default function ChatView(props: ChatViewProps) {
   const activeRunningTurnId = activeRuntime?.activeRunId ?? null;
   useProactivePanels({
     threadRef: isServerThread && !embedded ? activeThreadRef : null,
-    enabled: settings.proactivePanelsEnabled && !shouldUsePlanSidebarSheet && !embedded,
+    enabled: settings.proactivePanelsEnabled && !rightPanelCompact && !embedded,
     settingsHydrated: clientSettingsHydrated,
     threadDetailLoading,
     runningTurnId: activeRunningTurnId,
@@ -3471,7 +3471,7 @@ export default function ChatView(props: ChatViewProps) {
   ) : null;
   const panelLayoutControls = (
     <WorkspaceTitlebarControls
-      showMaximizeControl={!shouldUsePlanSidebarSheet}
+      showMaximizeControl={!rightPanelCompact}
       rightPanelOpen={canMaximizeRightPanel}
       animationsActive={panelAnimationsActive}
       maximized={rightPanelMaximized}
@@ -4141,7 +4141,7 @@ export default function ChatView(props: ChatViewProps) {
 
       {rightPanelPresent && activeThreadRef && !embedded ? (
         <ChatRightPanel
-          sheet={shouldUsePlanSidebarSheet}
+          sheet={rightPanelSheet}
           workspaceLayoutElement={workspaceLayoutElement}
           widthStorageKey={`t3code:preview-panel-width:${activeThreadKey}`}
           sheetAnimationDurationMs={panelAnimationsActive ? panelAnimationDurationMs : 0}
@@ -4157,7 +4157,16 @@ export default function ChatView(props: ChatViewProps) {
                   maximized={rightPanelMaximized}
                   onToggle={toggleRightPanelMaximizedStable}
                 />
-                {panelToggleControls}
+                {isMobileViewport ? (
+                  // A phone-width sheet has no room for its tabs beside every toggle.
+                  <PanelLayoutControls
+                    {...panelToggleControlProps}
+                    showThreadPanelControl={false}
+                    showTerminalControl={false}
+                  />
+                ) : (
+                  panelToggleControls
+                )}
               </div>
             ) : null
           }

@@ -500,7 +500,19 @@ const closeAction = (
   state: RightPanelStoreState,
   threadKey: string,
   updater: (current: ThreadRightPanelState) => ThreadRightPanelState,
-): Partial<RightPanelStoreState> => userAction(state, threadKey, updater, true);
+): Partial<RightPanelStoreState> =>
+  userAction(
+    state,
+    threadKey,
+    (current) => {
+      const next = updater(current);
+      // An emptied panel is the launcher rail, which cannot stay maximized.
+      if (next.surfaces.length > 0 || next.maximized !== true) return next;
+      const { maximized: _maximized, ...rest } = next;
+      return rest;
+    },
+    true,
+  );
 
 function normalizeRevealLine(line: number | undefined): number | null {
   if (line === undefined || !Number.isFinite(line)) return null;

@@ -38,7 +38,6 @@ import { horizontalListSortingStrategy, SortableContext, useSortable } from "@dn
 import { CSS } from "@dnd-kit/utilities";
 import {
   Smartphone,
-  ChevronDown,
   ChevronLeft,
   ChevronRight,
   BookOpen,
@@ -345,7 +344,6 @@ function SurfaceMenuItem(props: {
 const BROWSER_ACTION_ID = "browser";
 
 function RightPanelEmptyState(props: {
-  layout: "rail" | "list";
   onAddBrowser: () => void;
   onAddBrowserInProfile: (profileId: string) => void;
   browserProfiles: ReadonlyArray<{ readonly id: string; readonly name: string }>;
@@ -369,8 +367,6 @@ function RightPanelEmptyState(props: {
   workAttention?: WorkAttentionKeys | undefined;
   pluginActions: ReadonlyArray<PluginSurfaceAction>;
 }) {
-  const [highlight, setHighlight] = useState(-1);
-
   const builtInActions = [
     ...(props.onAddSideChat
       ? [
@@ -492,8 +488,6 @@ function RightPanelEmptyState(props: {
   ];
 
   const availableActions = actions.filter((action) => action.available);
-  const highlightIndex =
-    availableActions.length === 0 ? -1 : Math.min(highlight, availableActions.length - 1);
 
   const handleShortcut = useEffectEvent((event: KeyboardEvent) => {
     const action = surfaceShortcutActionForKey(availableActions, event);
@@ -512,150 +506,13 @@ function RightPanelEmptyState(props: {
     return () => window.removeEventListener("keydown", handler, true);
   }, []);
 
-  const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
-    if (availableActions.length === 0) return;
-    if (event.key === "ArrowDown" || event.key === "ArrowRight") {
-      event.preventDefault();
-      setHighlight((highlightIndex + 1) % availableActions.length);
-      return;
-    }
-    if (event.key === "ArrowUp" || event.key === "ArrowLeft") {
-      event.preventDefault();
-      setHighlight(
-        highlightIndex === -1
-          ? availableActions.length - 1
-          : (highlightIndex - 1 + availableActions.length) % availableActions.length,
-      );
-      return;
-    }
-    if (event.key === "Enter") {
-      if (event.target !== event.currentTarget) return;
-      const action = availableActions[highlightIndex];
-      if (!action) return;
-      event.preventDefault();
-      action.onClick();
-    }
-  };
-
-  const isHighlighted = (action: RailSurfaceAction) =>
-    highlightIndex !== -1 && availableActions[highlightIndex] === action;
-
-  const actionIcon = (action: RailSurfaceAction, iconClassName = "size-4") => {
-    const Icon = action.icon;
-    return (
-      <AttentionIcon attention={action.attention ?? NO_ATTENTION}>
-        <Icon className={iconClassName} />
-      </AttentionIcon>
-    );
-  };
-
-  if (props.layout === "rail") {
-    return (
-      <RightPanelSurfaceRail
-        actions={actions}
-        launcherKeys={availableActions.map((action) => action.shortcut).join("")}
-        browserProfiles={props.browserProfiles}
-        onAddBrowserInProfile={props.onAddBrowserInProfile}
-      />
-    );
-  }
-
   return (
-    <div
-      data-workspace-focus-default
-      tabIndex={0}
-      onKeyDown={handleKeyDown}
-      aria-label="Open a surface"
-      data-surface-launcher-keys={availableActions.map((action) => action.shortcut).join("")}
-      className={cn(
-        "scrollbar-gutter-both flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-6 outline-none",
-        "pb-(--workspace-topbar-height)",
-      )}
-    >
-      <div className="w-full max-w-xs py-6">
-        <h3 className="mb-3 text-center font-medium text-foreground text-sm">Open a surface</h3>
-        <div className="flex flex-col gap-0.5">
-          {actions.map((action) =>
-            action.available ? (
-              <div
-                key={action.id ?? action.label}
-                className="group relative"
-                onMouseEnter={() => setHighlight(availableActions.indexOf(action))}
-                onMouseLeave={() =>
-                  setHighlight((current) =>
-                    current === availableActions.indexOf(action) ? -1 : current,
-                  )
-                }
-              >
-                <button
-                  type="button"
-                  onClick={action.onClick}
-                  onContextMenu={unpinOnContextMenu(action.onUnpin)}
-                  className={cn(
-                    "flex h-8 w-full cursor-pointer items-center gap-2.5 rounded-(--control-radius) px-2.5 text-left text-sm transition-colors group-hover:bg-accent/60",
-                    isHighlighted(action) && "bg-accent/60",
-                  )}
-                >
-                  {actionIcon(action, "size-4")}
-                  <span
-                    className={cn(
-                      "min-w-0 flex-1 truncate",
-                      action.id === BROWSER_ACTION_ID && props.browserProfiles.length > 1 && "pr-7",
-                    )}
-                  >
-                    {action.label}
-                  </span>
-                  {action.shortcut ? <Kbd>{action.shortcut}</Kbd> : null}
-                </button>
-                {action.id === BROWSER_ACTION_ID && props.browserProfiles.length > 1 ? (
-                  <Menu>
-                    <MenuTrigger
-                      render={
-                        <Button
-                          aria-label="Open browser in a profile"
-                          className="absolute top-1/2 right-8 -translate-y-1/2"
-                          size="icon-xs"
-                          variant="ghost-muted"
-                        />
-                      }
-                    >
-                      <ChevronDown className="size-3.5" />
-                    </MenuTrigger>
-                    <MenuPopup align="end" side="bottom" sideOffset={6} className="max-w-56">
-                      {props.browserProfiles.map((profile) => (
-                        <MenuItem
-                          key={profile.id}
-                          onClick={() => props.onAddBrowserInProfile(profile.id)}
-                        >
-                          <span className="min-w-0 truncate">{profile.name}</span>
-                        </MenuItem>
-                      ))}
-                    </MenuPopup>
-                  </Menu>
-                ) : null}
-              </div>
-            ) : (
-              <DisabledReasonTooltip
-                key={action.id ?? action.label}
-                reason={action.disabledReason}
-                trigger={
-                  <div
-                    tabIndex={0}
-                    aria-disabled="true"
-                    className="flex h-8 w-full cursor-default items-center gap-2.5 rounded-(--control-radius) px-2.5 text-left text-sm opacity-50"
-                  >
-                    {actionIcon(action, "size-4")}
-                    <span className="min-w-0 flex-1 truncate">{action.label}</span>
-                    <Kbd>{action.shortcut}</Kbd>
-                  </div>
-                }
-              />
-            ),
-          )}
-        </div>
-      </div>
-    </div>
+    <RightPanelSurfaceRail
+      actions={actions}
+      launcherKeys={availableActions.map((action) => action.shortcut).join("")}
+      browserProfiles={props.browserProfiles}
+      onAddBrowserInProfile={props.onAddBrowserInProfile}
+    />
   );
 }
 
@@ -1331,7 +1188,7 @@ function RightPanelTab(
 export function RightPanelTabs(props: RightPanelTabsProps) {
   const focusedSurface = props.surfaces.find((surface) => surface.id === props.activeSurfaceId);
   const ownsDesktopTitleBar = isElectron && props.mode === "inline";
-  const railLayout = props.mode === "inline" && !props.maximized && props.activeSurfaceId === null;
+  const railLayout = props.activeSurfaceId === null;
   const browserProfiles = useBrowserDefaults().profiles;
   const { resolvedTheme } = useTheme();
   const tabListRef = useRef<HTMLDivElement>(null);
@@ -1889,7 +1746,6 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       <div className="flex min-h-0 flex-1 flex-col" data-right-panel-surface-content>
         {props.activeSurfaceId === null ? (
           <RightPanelEmptyState
-            layout={railLayout ? "rail" : "list"}
             onAddBrowser={props.onAddBrowser}
             onAddBrowserInProfile={props.onAddBrowserInProfile}
             browserProfiles={browserProfiles}
