@@ -1515,6 +1515,11 @@ describe("collapsed thoughts", () => {
 
     await line.click();
     await expect.element(screen.getByText("The tests cover the default case.")).toBeVisible();
+    await screen.getByRole("button", { name: "Thought (×2)", exact: true }).click();
+    await expect.element(line).toBeVisible();
+    await expect
+      .element(screen.getByText("The tests cover the default case."))
+      .not.toBeInTheDocument();
   });
 });
 

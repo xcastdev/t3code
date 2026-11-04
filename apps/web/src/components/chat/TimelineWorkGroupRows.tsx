@@ -581,118 +581,70 @@ export function LiveWorkEntryTimelineRow({
   );
 }
 
-/**
- * A running turn's consecutive thoughts in one tinted block, set apart from tool calls. Each
- * thought shows in full; a rule marks where the next one starts.
- */
 const selectThoughtsCollapsed = (settings: ClientSettings) =>
   settings.timelineThoughts === "collapsed";
 
 export function ThoughtsTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "thoughts" }> }) {
   const ctx = use(TimelineRowCtx);
   const collapsedByDefault = useClientSettings(selectThoughtsCollapsed);
-  const [open, setOpen] = useState(false);
+  const [expanded, setExpanded] = useState<boolean | null>(null);
+  const open = expanded ?? !collapsedByDefault;
   const count = row.entries.length;
   const label = row.streaming ? "Thinking" : "Thought";
-  if (collapsedByDefault && !open) {
-    const preview = liveThoughtLine(row.entries[0]?.detail ?? "");
-    const heading = count > 1 ? `${label} (×${count})` : label;
-    return (
-      <WorkLogRow
-        role="button"
-        tabIndex={0}
-        aria-expanded={false}
-        aria-label={preview ? `${heading}: ${preview}` : heading}
-        onClick={() => setOpen(true)}
-        onKeyDown={(event) => {
-          if (
-            event.target === event.currentTarget &&
-            (event.key === "Enter" || event.key === " ")
-          ) {
-            event.preventDefault();
-            setOpen(true);
-          }
-        }}
-        icon={
-          <span className="flex size-4 items-center justify-center">
-            <ToolActivityIconView
-              icon={undefined}
-              fallbackName="brain"
-              className="block size-4 shrink-0 stroke-2"
-              muted
-            />
-          </span>
-        }
-        label={
-          <p className="flex min-w-0 flex-1 items-baseline gap-1.5 overflow-hidden text-sm leading-relaxed">
-            <span
-              ref={row.streaming ? observeVisibleAnimation : undefined}
-              className={cn("shrink-0 text-secondary-label", row.streaming && "live-tool-shine")}
-            >
-              {heading}
-            </span>
-            {preview ? (
-              <span className="min-w-0 truncate text-foreground/80">{preview}</span>
-            ) : null}
-          </p>
-        }
-        trailing={
-          <span className="flex size-4 shrink-0 items-center justify-center" aria-hidden>
-            <ChevronRightIcon className="size-3 shrink-0 text-icon-muted opacity-70" />
-          </span>
-        }
-      />
-    );
-  }
-  const header = (
-    <>
-      <ToolActivityIconView
-        icon={undefined}
-        fallbackName="brain"
-        className="block size-3.5 shrink-0 stroke-2"
-        muted
-      />
-      <span
-        ref={row.streaming ? observeVisibleAnimation : undefined}
-        className={cn("font-medium", row.streaming && "live-tool-shine")}
-      >
-        {label}
-      </span>
-      {count > 1 ? <span className="tabular-nums">· {count} thoughts</span> : null}
-    </>
-  );
+  const preview = liveThoughtLine(row.entries[0]?.detail ?? "");
+  const heading = count > 1 ? `${label} (×${count})` : label;
+  const contentId = `thought-content:${row.id}`;
   return (
     <section
       aria-label={row.streaming ? "Thinking" : "Thoughts"}
-      className="my-1 rounded-lg border border-border/70 border-s-2 border-s-muted-foreground/40 bg-secondary px-3 py-2"
+      className="my-2 rounded-lg border border-(--app-theme-accent,var(--primary))/25 bg-(--app-theme-accent,var(--primary))/5 px-4 py-3"
     >
-      {collapsedByDefault ? (
-        <button
-          type="button"
-          aria-expanded
-          className="flex w-full cursor-pointer items-center gap-1.5 rounded-sm text-left text-xs text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-          onClick={() => setOpen(false)}
-        >
-          {header}
-          <ChevronRightIcon aria-hidden className="ms-auto size-3 shrink-0 rotate-90 opacity-70" />
-        </button>
-      ) : (
-        <div className="flex items-center gap-1.5 text-xs text-muted-foreground">{header}</div>
-      )}
-      {row.entries.map((entry, index) => (
-        <ChatMarkdown
-          key={entry.id}
-          className={cn(
-            "mt-1.5 text-sm text-foreground/90",
-            index > 0 && "border-t border-border/50 pt-1.5",
-          )}
-          text={entry.detail?.trim() ?? ""}
-          cwd={ctx.markdownCwd}
-          parseRawHtml={false}
-          isStreaming={row.streaming && index === count - 1}
-          lineBreaks
+      <button
+        type="button"
+        aria-label={!open && preview ? `${heading}: ${preview}` : heading}
+        aria-expanded={open}
+        aria-controls={contentId}
+        className="flex w-full min-w-0 cursor-pointer items-center gap-2 rounded-sm text-left text-xs outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring text-foreground/75"
+        onClick={() => setExpanded(!open)}
+      >
+        <ToolActivityIconView
+          icon={undefined}
+          fallbackName="brain"
+          className="block size-3.5 shrink-0 stroke-2"
+          muted
         />
-      ))}
+        <span className="shrink-0 font-medium">{label}</span>
+        {count > 1 && (
+          <span className="shrink-0 tabular-nums text-muted-foreground">· {count} thoughts</span>
+        )}
+        {!open && (
+          <span className="min-w-0 flex-1 truncate text-left font-normal text-muted-foreground">
+            {preview}
+          </span>
+        )}
+        <ChevronRightIcon
+          aria-hidden
+          className={cn("ms-auto size-3 shrink-0 text-muted-foreground", open && "rotate-90")}
+        />
+      </button>
+      {open && (
+        <div id={contentId} className="mt-3 border-t border-(--app-theme-accent,var(--primary))/15">
+          {row.entries.map((entry, index) => (
+            <ChatMarkdown
+              key={entry.id}
+              className={cn(
+                "mt-3 text-sm leading-7 text-foreground/80",
+                index > 0 && "border-t border-border/50 pt-2",
+              )}
+              text={entry.detail?.trim() ?? ""}
+              cwd={ctx.markdownCwd}
+              parseRawHtml={false}
+              isStreaming={row.streaming && index === count - 1}
+              lineBreaks
+            />
+          ))}
+        </div>
+      )}
     </section>
   );
 }
