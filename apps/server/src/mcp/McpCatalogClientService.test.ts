@@ -1,4 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off - a plain local server stands in for an MCP upstream.
 import { expect, it } from "@effect/vitest";
+import * as NodeHttp from "node:http";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import {
   AuthOrchestrationReadScope,
@@ -11,6 +13,7 @@ import {
   ThreadId,
   ProjectId,
   ProjectMcpCredentialId,
+  ProjectMcpEnvironmentVariableName,
   ProjectMcpHeaderName,
   SecretRef,
   type McpCatalogWriteInput,
@@ -64,6 +67,28 @@ const input: McpCatalogWriteInput = {
   },
 };
 
+const storedDefinition: McpCatalogDefinition = {
+  definitionId: McpDefinitionId.make("stored-definition"),
+  logicalServerId: McpServerId.make("stored-server"),
+  scope: "project",
+  scopeId: projectId,
+  revision: 0,
+  name: "Stored",
+  enabled: true,
+  providerInstanceIds: [],
+  transport: {
+    type: "stdio",
+    command: "stored-command",
+    args: [],
+    env: [
+      {
+        name: ProjectMcpEnvironmentVariableName.make("FIXTURE_STORED"),
+        credential: { id: credentialId, name: "Stored" },
+      },
+    ],
+  },
+};
+
 function fixture(
   options: {
     revoked?: boolean;
@@ -77,6 +102,8 @@ function fixture(
     failAfterPublication?: boolean;
     failSecretCommit?: boolean;
     retainedReadFails?: boolean;
+    readOnly?: boolean;
+    stored?: boolean;
   } = {},
 ) {
   const calls: Array<string> = [];
@@ -84,29 +111,31 @@ function fixture(
   let expired = false;
   const state = {
     revision: 0,
-    definitions: options.oauth
-      ? [
-          {
-            definitionId: McpDefinitionId.make("definition"),
-            logicalServerId: McpServerId.make("server"),
-            scope: "project" as const,
-            scopeId: projectId,
-            revision: 0,
-            name: "OAuth",
-            enabled: true,
-            providerInstanceIds: [],
-            transport: {
-              type: "streamable-http" as const,
-              url: "https://example.test/mcp",
-              headers: [],
-              authorization: {
-                type: "oauth" as const,
-                registration: { type: "automatic" as const },
+    definitions: (options.stored
+      ? [storedDefinition]
+      : options.oauth
+        ? [
+            {
+              definitionId: McpDefinitionId.make("definition"),
+              logicalServerId: McpServerId.make("server"),
+              scope: "project" as const,
+              scopeId: projectId,
+              revision: 0,
+              name: "OAuth",
+              enabled: true,
+              providerInstanceIds: [],
+              transport: {
+                type: "streamable-http" as const,
+                url: "https://example.test/mcp",
+                headers: [],
+                authorization: {
+                  type: "oauth" as const,
+                  registration: { type: "automatic" as const },
+                },
               },
             },
-          },
-        ]
-      : [],
+          ]
+        : []) satisfies ReadonlyArray<McpCatalogDefinition>,
     overrides: [],
   };
   let published: Array<McpCatalogDefinition> = [];
@@ -220,7 +249,18 @@ function fixture(
     listServerIds: unused,
     removeAuxiliarySecret: unused,
     removeServer: unused,
-    resolve: unused,
+    resolve: (owner, id) =>
+      Effect.sync(() => {
+        calls.push("resolve");
+        expect(owner).toBe(
+          Secrets.credentialOwnerIdForDefinition(
+            storedDefinition.logicalServerId,
+            storedDefinition.definitionId,
+          ),
+        );
+        expect(id).toBe(credentialId);
+        return "stored-value";
+      }),
     acquireLease: unused,
     acquireOAuthStateLease: unused,
     revokeOAuthState: unused,
@@ -232,9 +272,11 @@ function fixture(
         Option.some({
           sessionId,
           subject: "human",
-          scopes: options.settingsOnly
-            ? [AuthSettingsWriteScope]
-            : [AuthOrchestrationReadScope, AuthSettingsWriteScope],
+          scopes: options.readOnly
+            ? [AuthOrchestrationReadScope]
+            : options.settingsOnly
+              ? [AuthSettingsWriteScope]
+              : [AuthOrchestrationReadScope, AuthSettingsWriteScope],
           method: "browser-session-cookie",
           client: {
             label: null,
@@ -530,5 +572,144 @@ it.effect("preserves the recovery journal if secret finalization fails after pub
     }).pipe(Effect.provide(test.layer), Effect.exit);
     expect(result._tag).toBe("Failure");
     expect(test.calls).toEqual(["authorize", "consume", "prepare", "write", "commit"]);
+  }),
+);
+
+const stdioFixture = `import {Server} from ${JSON.stringify(import.meta.resolve("@modelcontextprotocol/sdk/server/index.js"))}; import {StdioServerTransport} from ${JSON.stringify(import.meta.resolve("@modelcontextprotocol/sdk/server/stdio.js"))}; import {ListToolsRequestSchema} from ${JSON.stringify(import.meta.resolve("@modelcontextprotocol/sdk/types.js"))}; const server=new Server({name:'fixture',version:'2.1'},{capabilities:{tools:{}}});server.setRequestHandler(ListToolsRequestSchema,(request)=>request.params?.cursor==='next'?{tools:[{name:'second',inputSchema:{type:'object'}}]}:{tools:[{name:process.env.FIXTURE_KEY==='secret-value'&&process.env.FIXTURE_STORED==='stored-value'?'saw_secret':'no_secret',description:'First page',inputSchema:{type:'object'}}],nextCursor:'next'});await server.connect(new StdioServerTransport());`;
+
+it.live("test connection resolves typed and stored secrets and lists every tool page", () =>
+  Effect.gen(function* () {
+    const test = fixture({ stored: true });
+    const result = yield* Effect.gen(function* () {
+      return yield* (yield* McpCatalogClientService).testConnection(
+        {
+          scope: "project",
+          scopeId: projectId,
+          existing: {
+            logicalServerId: storedDefinition.logicalServerId,
+            definitionId: storedDefinition.definitionId,
+          },
+          transport: {
+            type: "stdio",
+            command: process.execPath,
+            args: ["--input-type=module", "-e", stdioFixture],
+            env: [
+              {
+                name: ProjectMcpEnvironmentVariableName.make("FIXTURE_KEY"),
+                credential: { name: "Key", secret: Redacted.make("secret-value") },
+              },
+              {
+                name: ProjectMcpEnvironmentVariableName.make("FIXTURE_STORED"),
+                credential: { name: "Stored", id: credentialId },
+              },
+            ],
+          },
+        },
+        sessionId,
+      );
+    }).pipe(Effect.provide(test.layer));
+    expect(result).toEqual({
+      serverInfo: { name: "fixture", version: "2.1" },
+      tools: [{ name: "saw_secret", description: "First page" }, { name: "second" }],
+    });
+    expect(test.calls).toEqual(["resolve"]);
+  }),
+);
+
+it.effect.each([
+  { kind: "a session without settings write", readOnly: true, expected: "Missing settings grant" },
+  {
+    kind: "a stored credential without its definition",
+    readOnly: false,
+    expected: "Enter the secret for Stored before testing.",
+  },
+  {
+    kind: "a definition that changed elsewhere",
+    readOnly: false,
+    existing: McpDefinitionId.make("replaced-definition"),
+    expected: "This server changed elsewhere. Reload it and test again.",
+  },
+])("test connection rejects $kind before connecting", ({ readOnly, existing, expected }) =>
+  Effect.gen(function* () {
+    const test = fixture({ readOnly, stored: true });
+    const error = yield* Effect.gen(function* () {
+      return yield* (yield* McpCatalogClientService).testConnection(
+        {
+          scope: "project",
+          scopeId: projectId,
+          ...(existing === undefined
+            ? {}
+            : {
+                existing: {
+                  logicalServerId: storedDefinition.logicalServerId,
+                  definitionId: existing,
+                },
+              }),
+          transport: {
+            type: "stdio",
+            command: "t3-must-not-spawn",
+            args: [],
+            env: [
+              {
+                name: ProjectMcpEnvironmentVariableName.make("FIXTURE_STORED"),
+                credential: { name: "Stored", id: credentialId },
+              },
+            ],
+          },
+        },
+        sessionId,
+      );
+    }).pipe(Effect.provide(test.layer), Effect.flip);
+    expect(error).toMatchObject({ message: expected });
+    expect(test.calls).toEqual([]);
+  }),
+);
+
+it.live.each([
+  { kind: "missing command", expected: "Command not found: t3-missing-mcp-command" },
+  {
+    kind: "SSE GET rejected",
+    expected: "HTTP 405 from upstream. The server may need the Streamable HTTP transport.",
+  },
+] as const)("test connection reports the upstream cause: $kind", ({ kind, expected }) =>
+  Effect.gen(function* () {
+    const test = fixture();
+    const server = yield* Effect.acquireRelease(
+      Effect.callback<NodeHttp.Server>((resume) => {
+        const value = NodeHttp.createServer((_request, response) => {
+          response.statusCode = 405;
+          response.end();
+        });
+        value.listen(0, "127.0.0.1", () => resume(Effect.succeed(value)));
+      }),
+      (value) => Effect.callback<void>((resume) => void value.close(() => resume(Effect.void))),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("Expected a port");
+    const error = yield* Effect.gen(function* () {
+      return yield* (yield* McpCatalogClientService).testConnection(
+        {
+          scope: "project",
+          scopeId: projectId,
+          transport:
+            kind === "missing command"
+              ? { type: "stdio", command: "t3-missing-mcp-command", args: [], env: [] }
+              : {
+                  type: "legacy-sse",
+                  url: `http://127.0.0.1:${address.port}/sse`,
+                  headers: [
+                    {
+                      name: ProjectMcpHeaderName.make("X-Key"),
+                      credential: { name: "Key", secret: Redacted.make("secret-value") },
+                    },
+                  ],
+                  authorization: { type: "none" },
+                },
+        },
+        sessionId,
+      );
+    }).pipe(Effect.provide(test.layer), Effect.flip);
+    expect(error).toMatchObject({ _tag: "McpCatalogOperationError", message: expected });
+    expect(error.message).not.toContain("secret-value");
   }),
 );

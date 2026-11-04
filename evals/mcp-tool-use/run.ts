@@ -55,7 +55,11 @@ import {
 } from "@t3tools/shared/pluginManifest";
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
 import { PLUGIN_MUTATION_REFUSED_MESSAGE } from "../../apps/server/src/mcp/McpCatalogGateway.ts";
-import { REPLAY_DETAILS } from "../../packages/plugin-request-inspector/backend/refusals.ts";
+import {
+  noDefaultProxyDetail,
+  PROXY_DETAILS,
+  REPLAY_DETAILS,
+} from "../../packages/plugin-request-inspector/backend/refusals.ts";
 import { buildCodexAdditionalContext } from "../../apps/server/src/provider/CodexDeveloperInstructions.ts";
 import { makeSideChatContext } from "../../apps/server/src/orchestration-v2/ContextHandoffService.ts";
 import { withInlineContext } from "../../apps/server/src/orchestration-v2/ContextHandoffDelivery.ts";
@@ -73,6 +77,7 @@ import {
 } from "../../apps/server/src/mcp/toolkits/pullRequests/tools.ts";
 import { ThreadToolkit } from "../../apps/server/src/mcp/toolkits/thread/tools.ts";
 import { ViewImageToolkit } from "../../apps/server/src/mcp/toolkits/viewImage/tools.ts";
+import { WebSearchToolkit } from "../../apps/server/src/mcp/toolkits/webSearch/tools.ts";
 import { WorktreeToolkit } from "../../apps/server/src/mcp/toolkits/worktree/tools.ts";
 import {
   CLAUDE_PROVIDER,
@@ -150,7 +155,11 @@ const Rest = [Schema.Record(Schema.String, Schema.Unknown)] as const;
 
 /** Plugins a case can install, by id: the package that holds the manifest, and its refusal texts. */
 const PLUGINS = {
-  "request-inspector": { dir: "plugin-request-inspector", details: REPLAY_DETAILS },
+  "request-inspector": {
+    dir: "plugin-request-inspector",
+    details: { ...REPLAY_DETAILS, ...PROXY_DETAILS },
+    detailFns: { noDefaultProxy: noDefaultProxyDetail },
+  },
 } as const;
 type PluginName = keyof typeof PLUGINS;
 const PLUGIN_NAMES = Object.keys(PLUGINS) as Array<PluginName>;
@@ -176,19 +185,29 @@ const pluginTools = (ids: ReadonlyArray<PluginName>): ReadonlyArray<ApiTool> =>
 
 /**
  * A plugin tool result that is T3's PluginRequestError. `detailKey` names one of the plugin's own
- * refusal texts, such as the inspector's `expired`, so cases never copy them.
+ * refusal texts, such as the inspector's `expired`, so cases never copy them. A key in the
+ * plugin's `detailFns`, such as `noDefaultProxy`, builds its text from `detailArg`.
  */
 const PluginErrorMock = Schema.TaggedStruct("PluginRequestError", {
   reason: PluginRequestErrorReason,
   detail: Schema.optional(Schema.String),
   detailKey: Schema.optional(Schema.String),
+  detailArg: Schema.optional(Schema.Unknown),
 });
 const isPluginErrorMock = Schema.is(PluginErrorMock);
 // The MCP SDK sends a thrown tool handler error as a JSON-RPC error; clients show its McpError.
 const mcpErrorText = (message: string) => `MCP error -32603: ${message}`;
 const pluginErrorText = (pluginId: PluginName, mock: typeof PluginErrorMock.Type) => {
   const details: Readonly<Record<string, string>> = PLUGINS[pluginId].details;
-  const detail = mock.detailKey === undefined ? mock.detail : details[mock.detailKey];
+  const detailFns: Readonly<Record<string, (arg: never) => string>> = PLUGINS[pluginId].detailFns;
+  const key = mock.detailKey;
+  const detailFn = key === undefined ? undefined : detailFns[key];
+  const detail =
+    key === undefined
+      ? mock.detail
+      : detailFn === undefined
+        ? details[key]
+        : detailFn(mock.detailArg as never);
   if (mock.detailKey !== undefined && detail === undefined) {
     throw new Error(`${pluginId} has no refusal text ${mock.detailKey}.`);
   }
@@ -333,6 +352,11 @@ export const McpToolUseCase = Schema.Struct({
     linkedEnvironments: Schema.optional(Schema.Boolean),
     /** The view image tool is on with a vision model, so T3 lists `t3_view_image`. */
     viewImage: Schema.optional(Schema.Boolean),
+    /**
+     * The web search tool is on with a model, so T3 lists `t3_web_search`. Claude's own web tools
+     * are gone, as on the harnesses T3 lists it for.
+     */
+    webSearch: Schema.optional(Schema.Boolean),
     /** Plugins installed and enabled in the environment, whose agent tools T3's catalog lists. */
     plugins: Schema.optional(Schema.Array(Schema.Literals(PLUGIN_NAMES))),
     /** The thread's runtime mode. Defaults to T3's default, full access. */
@@ -489,6 +513,7 @@ const t3SourceTools: ReadonlyArray<Tool.Any> = [
   DeviceToolkit,
   HtmlToolkit,
   ViewImageToolkit,
+  WebSearchToolkit,
 ].flatMap((toolkit): ReadonlyArray<Tool.Any> => Object.values(toolkit.tools));
 // McpHttpServer decodes arguments with each tool's JSON codec, which drops undeclared keys.
 const t3InputDecoders = new Map(
@@ -518,16 +543,21 @@ const hiddenFromSubagents = enabledWhen(McpInvocationContext.hiddenFromSubagents
 const hiddenWhileLinksOff = enabledWhen(McpInvocationContext.hiddenWhileLinksOff);
 // The view image tool starts off, and T3 lists it only while it is on with a vision model.
 const hiddenWhileViewImageOff = enabledWhen(McpInvocationContext.visibleWhileViewImageOn);
+// T3 lists web search only while it is on, to harnesses with no web search of their own.
+const hiddenWhileWebSearchOff = enabledWhen(McpInvocationContext.visibleWhileWebSearchOn);
+const NATIVE_WEB_TOOLS: ReadonlySet<string> = new Set(["WebSearch", "WebFetch"]);
 const visibleT3Tools = (options: {
   readonly subagent?: boolean;
   readonly links?: boolean;
   readonly viewImage?: boolean;
+  readonly webSearch?: boolean;
   readonly plugins?: ReadonlyArray<PluginName>;
 }) => [
   ...t3Tools.filter(
     (tool) =>
       (options.links === true || !hiddenWhileLinksOff.has(tool.name)) &&
       (options.viewImage === true || !hiddenWhileViewImageOff.has(tool.name)) &&
+      (options.webSearch === true || !hiddenWhileWebSearchOff.has(tool.name)) &&
       !(options.subagent === true && hiddenFromSubagents.has(tool.name)),
   ),
   ...pluginTools(options.plugins ?? []),
@@ -638,6 +668,7 @@ export const buildBase = (
     readonly subagent?: boolean;
     readonly links?: boolean;
     readonly viewImage?: boolean;
+    readonly webSearch?: boolean;
     readonly plugins?: ReadonlyArray<PluginName>;
     /** A native subagent starts from its task: T3 appends nothing to its system prompt. */
     readonly nativeSubagent?: boolean;
@@ -658,7 +689,12 @@ export const buildBase = (
   if (systemTexts.filter((value) => value.includes(RUNTIME_MARKER)).length !== 1 || !deferredList) {
     throw new Error(`The template needs one ${RUNTIME_MARKER} block and a deferred tool list.`);
   }
-  const nativeDeferred = deferredList.split("\n").filter((name) => name && !isT3Name(name));
+  const nativeDeferred = deferredList
+    .split("\n")
+    .filter(
+      (name) =>
+        name && !isT3Name(name) && !(options.webSearch === true && NATIVE_WEB_TOOLS.has(name)),
+    );
   const names = [...nativeDeferred, ...t3.map((tool) => tool.name)].toSorted().join("\n");
   const { model } = options;
   const append = options.nativeSubagent ? "" : t3SystemAppend(model, options.deviceAccess);
@@ -701,7 +737,10 @@ export const buildBase = (
       platform: /Platform: (\w+)/.exec(joined)?.[1] ?? "linux",
       date: /Today's date is ([\d-]+)/.exec(reminders.join("\n"))?.[1],
     },
-    nativeTools: template.tools.filter((tool) => !isT3Name(tool.name)),
+    nativeTools: template.tools.filter(
+      (tool) =>
+        !isT3Name(tool.name) && !(options.webSearch === true && NATIVE_WEB_TOOLS.has(tool.name)),
+    ),
     /** Tools ToolSearch loads: T3 tools from source, and native tools the template only names. */
     t3,
     deferred: [...t3, ...nativeDeferred.map((name) => ({ name, ...nativeSchema(name) }))],
@@ -724,6 +763,7 @@ const buildCodexBase = (
     readonly subagent?: boolean;
     readonly links?: boolean;
     readonly viewImage?: boolean;
+    readonly webSearch?: boolean;
     readonly plugins?: ReadonlyArray<PluginName>;
     /** false: the thread has no agent device access, so T3's text leaves devices out. */
     readonly deviceAccess?: boolean;
@@ -2200,6 +2240,7 @@ const main = Effect.gen(function* () {
     deviceAccess: boolean,
     links: boolean,
     viewImage: boolean,
+    webSearch: boolean,
     plugins: ReadonlyArray<PluginName>,
   ): Effect.Effect<Base, Schema.SchemaError> =>
     codex
@@ -2212,6 +2253,7 @@ const main = Effect.gen(function* () {
               subagent: role === "delegated-child",
               links,
               viewImage,
+              webSearch,
               plugins,
               deviceAccess,
             }),
@@ -2226,6 +2268,7 @@ const main = Effect.gen(function* () {
               nativeSubagent: role === "native-subagent",
               links,
               viewImage,
+              webSearch,
               plugins,
               deviceAccess,
             });
@@ -2238,14 +2281,15 @@ const main = Effect.gen(function* () {
         );
   // Codex has no native subagents; its cases with that role run as top-level threads.
   const baseKey = ({ setup }: McpToolUseCase) =>
-    `${codex && setup.role === "native-subagent" ? "top" : setup.role}:${setup.world?.deviceAgentAccess !== false}:${setup.linkedEnvironments === true}:${setup.viewImage === true}:${(setup.plugins ?? []).join(",")}`;
-  const base = yield* buildFor("top", true, false, false, []);
-  const bases = new Map<string, Base>([["top:true:false:false:", base]]);
+    `${codex && setup.role === "native-subagent" ? "top" : setup.role}:${setup.world?.deviceAgentAccess !== false}:${setup.linkedEnvironments === true}:${setup.viewImage === true}:${setup.webSearch === true}:${(setup.plugins ?? []).join(",")}`;
+  const base = yield* buildFor("top", true, false, false, false, []);
+  const bases = new Map<string, Base>([["top:true:false:false:false:", base]]);
   for (const testCase of selected) {
     const key = baseKey(testCase);
     if (bases.has(key)) continue;
-    const [role = "top", access, links, viewImage] = key.split(":") as [
+    const [role = "top", access, links, viewImage, webSearch] = key.split(":") as [
       McpToolUseCase["setup"]["role"],
+      string,
       string,
       string,
       string,
@@ -2257,6 +2301,7 @@ const main = Effect.gen(function* () {
         access === "true",
         links === "true",
         viewImage === "true",
+        webSearch === "true",
         testCase.setup.plugins ?? [],
       ),
     );

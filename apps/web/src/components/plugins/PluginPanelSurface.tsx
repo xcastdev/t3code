@@ -1,7 +1,9 @@
 import { RegistryContext, useAtomValue } from "@effect/atom-react";
-import type {
-  PluginAttachRequest,
-  PluginBridgeOptions,
+import {
+  selectPluginChatTargets,
+  type PluginAttachRequest,
+  type PluginBridgeOptions,
+  type PluginSaveFile,
 } from "@t3tools/client-runtime/plugins/bridge";
 import type { ClientPluginPanelState } from "@t3tools/client-runtime/plugins/client-packages";
 import {
@@ -13,16 +15,21 @@ import { runAtomCommand, squashAtomCommandFailure } from "@t3tools/client-runtim
 import {
   PluginRequestError,
   type EnvironmentId,
+  type PluginChatHint,
   type PluginId,
   type PluginManifest,
   type PluginSubscriptionEvent,
 } from "@t3tools/contracts";
+import { isHostApiCompatible } from "@t3tools/shared/pluginManifest";
 import * as Schema from "effect/Schema";
 import { Link, useRouter } from "@tanstack/react-router";
 import { PuzzleIcon } from "lucide-react";
 import { useContext, useState } from "react";
 
 import { useLongLivedAssetUrl } from "~/assets/longLivedAssetUrls";
+import { useComposerDraftStore } from "~/composerDraftStore";
+import { writeTextToClipboard } from "~/hooks/useCopyToClipboard";
+import { saveBlob } from "~/lib/saveBlob";
 import {
   attachPluginRequestToChat,
   type PluginAttachSource,
@@ -35,6 +42,7 @@ import {
   usePluginPanelInstall,
   type PluginPanelInstall,
 } from "~/plugins/pluginInstalls";
+import { readProjects, readThreadShells } from "~/state/entities";
 import { pluginEnvironment } from "~/state/plugins";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { Button } from "../ui/button";
@@ -72,6 +80,31 @@ export interface PluginPanelActions {
 }
 
 const isPluginRequestError = Schema.is(PluginRequestError);
+
+/** The chat beside a docked panel, named only when it runs in the plugin's environment (D7). */
+function dockedChatHint(
+  chatTarget: PluginChatTarget,
+  environmentId: EnvironmentId | null,
+): PluginChatHint | undefined {
+  if (chatTarget === null || environmentId === null) return undefined;
+  if (chatTarget.environmentId !== environmentId) return undefined;
+  const target = chatTarget.composerTarget;
+  if (typeof target !== "string") return { threadId: target.threadId };
+  const session = useComposerDraftStore.getState().getDraftSession(target);
+  return session?.environmentId === environmentId ? { projectId: session.projectId } : undefined;
+}
+
+const saveToDevice = async (file: PluginSaveFile) => {
+  saveBlob(
+    new Blob([...file.parts], { type: file.mimeType || "application/octet-stream" }),
+    file.name,
+  );
+  return "saved" as const;
+};
+
+const copyToClipboard = async (text: string) => {
+  await writeTextToClipboard(text);
+};
 
 const clientPackageIds = new WeakMap<object, string>();
 
@@ -199,6 +232,14 @@ export function PluginPanelView(props: {
   const manifest = record.manifest;
   const panel = manifest.ui?.panels.find((entry) => entry.id === parsed.panelId);
   if (panel === undefined) return null;
+  if (!isHostApiCompatible(manifest.hostApi)) {
+    return (
+      <PluginPanelState
+        title="Update T3 Code to use this plugin"
+        description={`${manifest.name} needs a newer version of this app.`}
+      />
+    );
+  }
   if (!record.enabled) {
     return (
       <PluginPanelState title={`${manifest.name} is disabled`}>
@@ -298,6 +339,16 @@ export function PluginPanelView(props: {
     },
     attach: (request: PluginAttachRequest) =>
       services.attach(request, props.chatTarget, attachSource),
+    saveFile: saveToDevice,
+    writeClipboard: copyToClipboard,
+    chatTargets: (query: string) =>
+      install.kind === "environment"
+        ? selectPluginChatTargets(
+            { threads: readThreadShells(), projects: readProjects() },
+            install.environmentId,
+            query,
+          )
+        : { threads: [], projects: [] },
   };
   const frameKey = `${panelKey}@${version}`;
   if (install.kind === "client") {
@@ -345,6 +396,8 @@ export function PluginPanelView(props: {
 export function PluginPanelSurface(props: {
   readonly panelKey: PluginPanelKey;
   readonly chatTarget: PluginChatTarget;
+  /** On its own page the chat target is only a recent chat, so calls carry no hint. */
+  readonly page?: boolean;
 }) {
   const registry = useContext(RegistryContext);
   const router = useRouter();
@@ -360,6 +413,8 @@ export function PluginPanelSurface(props: {
   const logs = useAtomCommand(pluginEnvironment.logs, { reportFailure: false });
   const [logsView, setLogsView] = useState<PluginLogsView | null>(null);
   const attachConfirm = usePluginAttachConfirm();
+  const chatHint = () =>
+    props.page === true ? undefined : dockedChatHint(props.chatTarget, installEnvironmentId);
 
   const services: PluginPanelServices = {
     readState: (panelKey) => clientPluginStore.readState(panelKey),
@@ -367,6 +422,7 @@ export function PluginPanelSurface(props: {
       clientPluginStore.writeState(panelKey, value, version),
     backend: ({ environmentId, pluginId, version, manifest }) => ({
       call: async (operation, input) => {
+        const chat = chatHint();
         const mutates =
           manifest.backend?.operations.find((entry) => entry.name === operation)?.mutates ?? true;
         const result = await runAtomCommand(
@@ -379,6 +435,7 @@ export function PluginPanelSurface(props: {
               operation,
               input: input as Schema.Json,
               expectedVersion: version,
+              ...(chat === undefined ? {} : { chat }),
             },
           },
           { reportFailure: false },

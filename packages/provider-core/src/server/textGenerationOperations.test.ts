@@ -160,3 +160,38 @@ describe("image description operation", () => {
     }),
   );
 });
+
+describe("web search operation", () => {
+  it.effect("asks only runners that search the web, and refuses the rest", () =>
+    Effect.gen(function* () {
+      const requests: Array<Parameters<Runner>[0]> = [];
+      const replies = [
+        '{"answer":"  ","sources":[]}',
+        '{"answer":"Effect 4.","sources":[{"title":"x","url":"javascript:alert(1)"}]}',
+      ];
+      const runner: Runner = (request) => {
+        const reply = replies[requests.length] ?? "{}";
+        requests.push(request);
+        return decodeJsonReply(request, "FakeNative", reply);
+      };
+      const search = {
+        cwd: "/srv/t3/web-search/run",
+        query: "Latest Effect release?",
+        modelSelection: input.modelSelection,
+      };
+      const searching = fromRunner("FakeNative", runner, { searchesWeb: true });
+      expect((yield* Effect.flip(searching.webSearch(search))).detail).toContain("empty answer");
+      // An answer without a usable source likely came from memory, not a search.
+      expect((yield* Effect.flip(searching.webSearch(search))).detail).toContain(
+        "returned no sources",
+      );
+      expect(requests[0]?.webSearch).toEqual({ timeoutMs: 300_000 });
+      expect(requests[0]?.cwd).toBe(search.cwd);
+      expect(requests[0]?.prompt).toContain("Latest Effect release?");
+
+      const refused = yield* Effect.flip(fromRunner("FakeNative", runner).webSearch(search));
+      expect(refused.detail).toContain("cannot search the web");
+      expect(requests).toHaveLength(2);
+    }),
+  );
+});

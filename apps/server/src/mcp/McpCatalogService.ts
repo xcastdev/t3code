@@ -54,7 +54,7 @@ export type PersistedMcpCatalogWriteInput = Omit<McpCatalogWriteInput, "operatio
         readonly logicalServerId?: McpServerId;
         readonly definition: Pick<
           McpCatalogDefinition,
-          "name" | "enabled" | "providerInstanceIds" | "transport"
+          "name" | "enabled" | "providerInstanceIds" | "allProviders" | "transport"
         >;
         readonly definitionId?: McpDefinitionId;
       }
@@ -63,7 +63,7 @@ export type PersistedMcpCatalogWriteInput = Omit<McpCatalogWriteInput, "operatio
         readonly logicalServerId: McpServerId;
         readonly definition: Pick<
           McpCatalogDefinition,
-          "name" | "enabled" | "providerInstanceIds" | "transport"
+          "name" | "enabled" | "providerInstanceIds" | "allProviders" | "transport"
         >;
         readonly definitionId?: McpDefinitionId;
       }

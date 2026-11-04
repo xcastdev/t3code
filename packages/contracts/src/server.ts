@@ -281,6 +281,17 @@ export const isProviderTextGenerationCapable = (snapshot: ServerProvider): boole
 /** Drivers whose text generation can look at an image file, for the view image tool. */
 export const VISION_MODEL_DRIVERS: ReadonlySet<string> = new Set(["codex", "opencode"]);
 
+/** Drivers whose text generation can run their native web search, for the web search tool. */
+export const WEB_SEARCH_MODEL_DRIVERS: ReadonlySet<string> = new Set(["claudeAgent", "codex"]);
+
+/** Drivers whose agents search the web themselves, so T3 does not offer them its web search tool. */
+export const NATIVE_WEB_SEARCH_DRIVERS: ReadonlySet<string> = new Set([
+  "claudeAgent",
+  "codex",
+  "cursor",
+  "grok",
+]);
+
 export const OtlpEndpointSource = Schema.Literals(["environment", "bootstrap", "settings"]);
 export type OtlpEndpointSource = typeof OtlpEndpointSource.Type;
 

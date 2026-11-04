@@ -222,6 +222,7 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.mcpCatalogSessionForThread]: AuthOrchestrationReadScope,
   [WS_METHODS.mcpCatalogOAuthStatus]: AuthOrchestrationReadScope,
   [WS_METHODS.mcpCatalogSecretPrepare]: AuthSettingsWriteScope,
+  [WS_METHODS.mcpCatalogTestConnection]: AuthSettingsWriteScope,
   [WS_METHODS.mcpCatalogWrite]: AuthSettingsWriteScope,
   [WS_METHODS.mcpCatalogSessionGet]: AuthOrchestrationReadScope,
   [WS_METHODS.mcpCatalogSessionReset]: AuthSettingsWriteScope,

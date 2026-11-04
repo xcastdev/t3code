@@ -11,6 +11,7 @@ import {
   OrchestratorMcpEnvironmentTarget,
   OrchestratorMcpFailure,
   PreviewTabId,
+  ProviderDriverKind,
   ProviderInstanceId,
   ProviderInteractionMode,
   RuntimeMode,
@@ -52,6 +53,9 @@ import { ProjectToolkit } from "./toolkits/project/tools.ts";
 import * as ViewImageHandlers from "./toolkits/viewImage/handlers.ts";
 import { ViewImageToolkit } from "./toolkits/viewImage/tools.ts";
 import * as ViewImageMcpService from "./ViewImageMcpService.ts";
+import * as WebSearchHandlers from "./toolkits/webSearch/handlers.ts";
+import { WebSearchToolkit } from "./toolkits/webSearch/tools.ts";
+import * as WebSearchMcpService from "./WebSearchMcpService.ts";
 
 const environmentId = EnvironmentId.make("environment-mcp-test");
 const threadId = ThreadId.make("thread-mcp-test");
@@ -1365,6 +1369,160 @@ it.effect(
           result: { structuredContent: { description: "A chart." } },
         });
         expect(roots).toEqual(["/repo/.t3/worktrees/feature"]);
+      }),
+    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect(
+  "lists t3_web_search only while it is on with a model, to harnesses without their own web search",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const scopeFor = (
+          token: string,
+          providerInstanceId: string,
+        ): McpInvocationContext.McpThreadInvocationScope => ({
+          environmentId,
+          requestNamespace: token,
+          thread: {
+            threadId: ThreadId.make(`thread-${token}`),
+            providerSessionId: token,
+            providerInstanceId: ProviderInstanceId.make(providerInstanceId),
+          },
+          client: undefined,
+          capabilities: new Set(["orchestration"]),
+          issuedAt: 1,
+        });
+        const scopes = new Map(
+          (
+            [
+              ["opencodeToken", "opencode"],
+              ["cursorToken", "cursor"],
+              ["grokToken", "grok"],
+              ["claudeToken", "claudeAgent"],
+              ["codexWorkToken", "codex_work"],
+            ] as const
+          ).map(([token, instance]): [string, McpInvocationContext.McpThreadInvocationScope] => [
+            token,
+            scopeFor(token, instance),
+          ]),
+        );
+        const queries: Array<string> = [];
+        const settingsContext = yield* Layer.build(
+          ServerSettings.layerTest({
+            providerInstances: {
+              [ProviderInstanceId.make("codex_work")]: {
+                driver: ProviderDriverKind.make("codex"),
+                config: {},
+              },
+            },
+          }),
+        );
+        const settings = Context.get(settingsContext, ServerSettings.ServerSettingsService);
+        const serverLayer = McpHttpServer.toolkitRegistration(
+          WebSearchToolkit,
+          WebSearchHandlers.layer,
+        ).pipe(
+          Layer.provideMerge(
+            McpHttpServer.layerMcpTransport.pipe(
+              Layer.provide(Layer.succeedContext(settingsContext)),
+            ),
+          ),
+          Layer.provide(
+            Layer.mergeAll(
+              Layer.mock(WebSearchMcpService.WebSearchMcpService)({
+                search: (input) =>
+                  Effect.sync(() => {
+                    queries.push(input.query);
+                    return { answer: "Yes.", sources: [{ title: "Docs", url: "https://x.dev" }] };
+                  }),
+              }),
+              Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+                resolve: (presented) => Effect.succeed(scopes.get(presented)),
+              }),
+            ),
+          ),
+        );
+        yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
+          Layer.build,
+        );
+        const httpClient = yield* HttpClient.HttpClient;
+        const connect = Effect.fn(function* (token: string) {
+          const headers = {
+            accept: "application/json, text/event-stream",
+            authorization: `Bearer ${token}`,
+          };
+          const initialize = yield* httpClient.post("/mcp", {
+            headers,
+            body: HttpBody.text(
+              `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1.0.0"}}}`,
+              "application/json",
+            ),
+          });
+          const rpc = (method: string, params: object) =>
+            httpClient
+              .post("/mcp", {
+                headers: {
+                  ...headers,
+                  "mcp-session-id": initialize.headers["mcp-session-id"]!,
+                  "mcp-protocol-version": "2025-06-18",
+                },
+                body: HttpBody.text(
+                  JSON.stringify({ jsonrpc: "2.0", id: 2, method, params }),
+                  "application/json",
+                ),
+              })
+              .pipe(Effect.flatMap((response) => response.json));
+          const listed = rpc("tools/list", {}).pipe(
+            Effect.map((body) =>
+              (body as { result: { tools: ReadonlyArray<{ name: string }> } }).result.tools.map(
+                (tool) => tool.name,
+              ),
+            ),
+          );
+          return { rpc, listed };
+        });
+        const opencode = yield* connect("opencodeToken");
+        const listedFor = Effect.fn(function* () {
+          const result: Record<string, ReadonlyArray<string>> = {};
+          for (const token of scopes.keys()) result[token] = yield* (yield* connect(token)).listed;
+          return result;
+        });
+        const nobody = {
+          opencodeToken: [],
+          cursorToken: [],
+          grokToken: [],
+          claudeToken: [],
+          codexWorkToken: [],
+        };
+
+        expect(yield* listedFor()).toEqual(nobody);
+        yield* settings.updateSettings({ webSearchToolEnabled: true });
+        expect(yield* listedFor()).toEqual(nobody);
+        yield* settings.updateSettings({
+          webSearchModelSelection: {
+            instanceId: ProviderInstanceId.make("claudeAgent"),
+            model: "m",
+          },
+        });
+        expect(yield* listedFor()).toEqual({ ...nobody, opencodeToken: ["t3_web_search"] });
+        yield* settings.updateSettings({ webSearchToolEnabled: false });
+        expect(yield* opencode.listed).toEqual([]);
+
+        yield* settings.updateSettings({ webSearchToolEnabled: true });
+        const called = yield* opencode.rpc("tools/call", {
+          name: "t3_web_search",
+          arguments: { query: "Is it out?" },
+        });
+        expect(called).toMatchObject({
+          result: {
+            structuredContent: {
+              answer: "Yes.",
+              sources: [{ title: "Docs", url: "https://x.dev" }],
+            },
+          },
+        });
+        expect(queries).toEqual(["Is it out?"]);
       }),
     ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

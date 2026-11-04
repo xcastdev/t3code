@@ -7,13 +7,14 @@ import { type DraftStore, makeDraftStore } from "./bodies.ts";
 import {
   type InspectorTimer,
   makeReplayService,
+  type ReplayCarriers,
   type ReplayChannel,
   type ReplayMessage,
   type ReplayService,
   type ReplayServiceOptions,
 } from "./replay.ts";
 import { type InspectorStore, type InspectorStoreOptions, openInspectorStore } from "./store.ts";
-import { MiB, makeFlow, startCapture } from "./store.testkit.ts";
+import { DEFAULT_PROXY_OPTIONS, MiB, makeFlow, startRecording } from "./store.testkit.ts";
 
 export interface Deferred<T> {
   readonly promise: Promise<T>;
@@ -122,34 +123,61 @@ export function makeFakeChannel(onSend?: (message: ReplayMessage) => void): Fake
 
 export interface FakeTransient {
   readonly ready: Deferred<ReplayChannel>;
+  /** The source proxy the replay that started it came from. */
+  readonly proxyId: number | undefined;
+  readonly key: string;
   stops: number;
 }
 
-export function makeFakeCarriers() {
-  let capture: ReplayChannel | undefined;
+/**
+ * Fake D35 carriers. A channel set with `setRunning(proxyId, …)` carries that proxy's replays;
+ * `setCapture` sets one for every proxy. Otherwise a transient starts, keyed by `transientKey`.
+ */
+export function makeFakeCarriers(
+  transientKey: (proxyId: number | undefined) => string = () => "direct",
+) {
+  let everyProxy: ReplayChannel | undefined;
+  const running = new Map<number, ReplayChannel>();
   const transients: Array<FakeTransient> = [];
+  const asked: Array<number | undefined> = [];
   let started = deferred<FakeTransient>();
+  const carriers: ReplayCarriers = {
+    carrierFor: (proxyId) => {
+      asked.push(proxyId);
+      const channel = (proxyId === undefined ? undefined : running.get(proxyId)) ?? everyProxy;
+      if (channel?.isOpen() === true) return { kind: "running", channel };
+      const key = transientKey(proxyId);
+      return {
+        kind: "transient",
+        key,
+        start: () => {
+          const entry: FakeTransient = { ready: deferred(), proxyId, key, stops: 0 };
+          entry.ready.promise.catch(() => undefined);
+          transients.push(entry);
+          const current = started;
+          started = deferred();
+          current.resolve(entry);
+          return {
+            ready: entry.ready.promise,
+            stop: async () => {
+              entry.stops += 1;
+            },
+          };
+        },
+      };
+    },
+  };
   return {
-    carriers: {
-      capture: () => capture,
-      startTransient: () => {
-        const entry: FakeTransient = { ready: deferred(), stops: 0 };
-        entry.ready.promise.catch(() => undefined);
-        transients.push(entry);
-        const current = started;
-        started = deferred();
-        current.resolve(entry);
-        return {
-          ready: entry.ready.promise,
-          stop: async () => {
-            entry.stops += 1;
-          },
-        };
-      },
-    },
+    carriers,
     setCapture: (channel: ReplayChannel | undefined) => {
-      capture = channel;
+      everyProxy = channel;
     },
+    setRunning: (proxyId: number, channel: ReplayChannel | undefined) => {
+      if (channel === undefined) running.delete(proxyId);
+      else running.set(proxyId, channel);
+    },
+    /** The proxy id of each carrier lookup, in order. */
+    asked,
     transients,
     nextTransient: () =>
       transients.length > 0 ? Promise.resolve(transients.at(-1) as FakeTransient) : started.promise,
@@ -176,7 +204,7 @@ export interface ReplayHarness extends ReplayInstance, AsyncDisposable {
 
 export async function openReplayHarness(
   options: {
-    readonly store?: Omit<InspectorStoreOptions, "dataDir">;
+    readonly store?: Omit<InspectorStoreOptions, "dataDir" | "defaultProxyOptions">;
     readonly replay?: Partial<Omit<ReplayServiceOptions, "store" | "drafts">>;
     readonly dataDir?: string;
   } = {},
@@ -190,6 +218,7 @@ export async function openReplayHarness(
   ): ReplayInstance => {
     const store = openInspectorStore({
       maxDiskBytes: 64 * MiB,
+      defaultProxyOptions: DEFAULT_PROXY_OPTIONS,
       ...options.store,
       dataDir,
     });
@@ -208,15 +237,15 @@ export async function openReplayHarness(
     return { store, drafts, replay, timer, carriers };
   };
   const first = open(options.replay);
-  let captureId: number | undefined;
+  let recordingId: number | undefined;
   let index = 0;
   return {
     dataDir,
     ...first,
     reopen: open,
     source: async (bodyBytes = 64) => {
-      captureId ??= (await startCapture(first.store)).id;
-      const result = await first.store.insertFlow(makeFlow(captureId, index++, bodyBytes));
+      recordingId ??= (await startRecording(first.store)).id;
+      const result = await first.store.insertFlow(makeFlow(recordingId, index++, bodyBytes));
       if (!result.ok) throw new Error("insert failed");
       return result.id;
     },

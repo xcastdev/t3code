@@ -608,7 +608,7 @@ export type ProjectMcpOAuthBeginResult = typeof ProjectMcpOAuthBeginResult.Type;
 export const ProjectMcpOAuthDisconnectInput = Schema.Struct(ProjectMcpOAuthActionInputFields);
 export type ProjectMcpOAuthDisconnectInput = typeof ProjectMcpOAuthDisconnectInput.Type;
 
-/** Secret bytes enter through SecretRequests, never through catalog RPCs. */
+/** Saved secret bytes enter through SecretRequests, never through catalog writes. */
 export const McpCatalogCredentialInput = Schema.Struct({
   id: Schema.optional(ProjectMcpCredentialId),
   name: ProjectMcpCredentialName,
@@ -621,13 +621,16 @@ export const McpCatalogCredentialInput = Schema.Struct({
   ),
 );
 export type McpCatalogCredentialInput = typeof McpCatalogCredentialInput.Type;
-const CatalogHttpTransportInput = (type: "streamable-http" | "legacy-sse") =>
+const catalogHttpTransportInput = <C extends Schema.Top>(
+  type: "streamable-http" | "legacy-sse",
+  credential: C,
+) =>
   Schema.Struct({
     type: Schema.Literal(type),
     url: ProjectMcpUrl,
-    headers: Schema.Array(
-      Schema.Struct({ name: ProjectMcpHeaderName, credential: McpCatalogCredentialInput }),
-    ).check(Schema.isMaxLength(PROJECT_MCP_HEADER_LIMIT)),
+    headers: Schema.Array(Schema.Struct({ name: ProjectMcpHeaderName, credential })).check(
+      Schema.isMaxLength(PROJECT_MCP_HEADER_LIMIT),
+    ),
     authorization: Schema.Union([
       Schema.Struct({ type: Schema.Literal("none") }),
       Schema.Struct({
@@ -637,39 +640,63 @@ const CatalogHttpTransportInput = (type: "streamable-http" | "legacy-sse") =>
           Schema.Struct({
             type: Schema.Literal("pre-registered"),
             clientId: TrimmedNonEmptyString,
-            clientSecret: Schema.optional(McpCatalogCredentialInput),
+            clientSecret: Schema.optional(credential),
           }),
         ]),
       }),
     ]),
-  }).check(
-    Schema.makeFilter(
-      (transport) =>
-        hasDistinctHeaderNames(transport.headers) && hasNoOAuthAuthorizationHeader(transport),
-      { message: "Expected distinct headers and no Authorization header with OAuth" },
-    ),
-  );
-export const McpCatalogTransportInput = Schema.Union([
-  CatalogHttpTransportInput("streamable-http"),
-  CatalogHttpTransportInput("legacy-sse"),
-  Schema.Struct({
-    type: Schema.Literal("stdio"),
-    command: ProjectMcpStdioCommand,
-    args: Schema.Array(ProjectMcpStdioArgument).check(
-      Schema.isMaxLength(PROJECT_MCP_STDIO_ARGUMENT_LIMIT),
-    ),
-    cwd: Schema.optional(TrimmedNonEmptyString),
-    env: Schema.Array(
-      Schema.Struct({
-        name: ProjectMcpEnvironmentVariableName,
-        credential: McpCatalogCredentialInput,
-      }),
-    ).check(Schema.isMaxLength(PROJECT_MCP_ENVIRONMENT_VARIABLE_LIMIT)),
-    authorization: Schema.optional(Schema.Never),
-  }).check(
-    Schema.makeFilter((transport) => hasDistinctEnvironmentVariableNames(transport.env), {
-      message: "Expected distinct environment variable names",
+  });
+const catalogTransportInput = <C extends Schema.Top>(credential: C) =>
+  Schema.Union([
+    catalogHttpTransportInput("streamable-http", credential),
+    catalogHttpTransportInput("legacy-sse", credential),
+    Schema.Struct({
+      type: Schema.Literal("stdio"),
+      command: ProjectMcpStdioCommand,
+      args: Schema.Array(ProjectMcpStdioArgument).check(
+        Schema.isMaxLength(PROJECT_MCP_STDIO_ARGUMENT_LIMIT),
+      ),
+      cwd: Schema.optional(TrimmedNonEmptyString),
+      env: Schema.Array(
+        Schema.Struct({ name: ProjectMcpEnvironmentVariableName, credential }),
+      ).check(Schema.isMaxLength(PROJECT_MCP_ENVIRONMENT_VARIABLE_LIMIT)),
+      authorization: Schema.optional(Schema.Never),
     }),
-  ),
-]);
+  ]);
+const catalogTransportNames = Schema.makeFilter(
+  (
+    transport:
+      | { readonly type: "stdio"; readonly env: ReadonlyArray<{ readonly name: string }> }
+      | {
+          readonly type: "streamable-http" | "legacy-sse";
+          readonly authorization: { readonly type: "none" | "oauth" };
+          readonly headers: ReadonlyArray<{ readonly name: string }>;
+        },
+  ) =>
+    transport.type === "stdio"
+      ? hasDistinctEnvironmentVariableNames(transport.env)
+      : hasDistinctHeaderNames(transport.headers) && hasNoOAuthAuthorizationHeader(transport),
+  { message: "Expected distinct names and no Authorization header with OAuth" },
+);
+export const McpCatalogTransportInput =
+  catalogTransportInput(McpCatalogCredentialInput).check(catalogTransportNames);
 export type McpCatalogTransportInput = typeof McpCatalogTransportInput.Type;
+
+/** A typed value is used for one test connection and never stored. */
+export const McpCatalogTestCredentialInput = Schema.Struct({
+  id: Schema.optional(ProjectMcpCredentialId),
+  name: ProjectMcpCredentialName,
+  secret: Schema.optional(Schema.RedactedFromValue(ProjectMcpCredentialValue)),
+}).check(
+  Schema.makeFilter(
+    (credential) => credential.id !== undefined || credential.secret !== undefined,
+    {
+      message: "Expected a retained credential id or a secret value",
+    },
+  ),
+);
+export type McpCatalogTestCredentialInput = typeof McpCatalogTestCredentialInput.Type;
+export const McpCatalogTestTransportInput = catalogTransportInput(
+  McpCatalogTestCredentialInput,
+).check(catalogTransportNames);
+export type McpCatalogTestTransportInput = typeof McpCatalogTestTransportInput.Type;

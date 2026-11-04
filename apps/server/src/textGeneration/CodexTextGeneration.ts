@@ -37,6 +37,23 @@ const CODEX_NO_PLUGIN_ARGS = [
   "--config",
   "features.apps=false",
 ] as const;
+// `web_search="live"` is what top-level `codex --search` sets; `codex exec` has no such flag.
+// Fetched pages may carry instructions, so the search also loses the shell, image viewing and
+// the checkout's AGENTS.md. apply_patch stays, but the read-only sandbox refuses its writes.
+const CODEX_WEB_SEARCH_ARGS = [
+  "--config",
+  'web_search="live"',
+  "--config",
+  "features.shell_tool=false",
+  "--config",
+  "features.unified_exec=false",
+  "--config",
+  "features.view_image=false",
+  "--config",
+  "features.image_generation=false",
+  "--config",
+  "project_doc_max_bytes=0",
+] as const;
 const CodexMcpServers = Schema.fromJsonString(
   Schema.Array(Schema.Struct({ name: Schema.String, enabled: Schema.Boolean })),
 );
@@ -218,6 +235,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
     modelSelection,
     attachments,
     imageFiles,
+    webSearch,
     investigate,
   }: TextGenerationOperations.Request<S>): Effect.fn.Return<
     S["Type"],
@@ -288,6 +306,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
           // A user's MCP server could act on the text-generation prompt.
           ...CODEX_NO_PLUGIN_ARGS,
           ...(mcpServersOff ? ["--config", mcpServersOff] : []),
+          ...(webSearch ? CODEX_WEB_SEARCH_ARGS : []),
           "--ephemeral",
           "--skip-git-repo-check",
           "-s",
@@ -358,7 +377,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
     return yield* Effect.gen(function* () {
       yield* runCodexCommand().pipe(
         Effect.scoped,
-        Effect.timeoutOption(investigate?.timeoutMs ?? CODEX_TIMEOUT_MS),
+        Effect.timeoutOption(investigate?.timeoutMs ?? webSearch?.timeoutMs ?? CODEX_TIMEOUT_MS),
         Effect.flatMap(
           Option.match({
             onNone: () =>
@@ -401,5 +420,6 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
 
   return TextGenerationOperations.fromRunner("CodexTextGeneration", runCodexJson, {
     viewsImages: true,
+    searchesWeb: true,
   });
 });

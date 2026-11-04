@@ -136,6 +136,8 @@ export interface McpInvocationScope {
   readonly linkedEnvironments?: boolean;
   /** True while the view image tool is on and has a vision model; `/mcp` reads it per request. */
   readonly viewImage?: boolean;
+  /** True while web search is on with a model and the caller's harness has no search of its own. */
+  readonly webSearch?: boolean;
 }
 
 /**
@@ -186,6 +188,13 @@ export const visibleWhileViewImageOn = (): boolean => {
   const fiber = Fiber.getCurrent();
   const scope = fiber && Context.getOrUndefined(fiber.context, McpInvocationContext);
   return scope?.viewImage === true;
+};
+
+/** `McpSchema.EnabledWhen` for `t3_web_search`, listed only while the request scope allows it. */
+export const visibleWhileWebSearchOn = (): boolean => {
+  const fiber = Fiber.getCurrent();
+  const scope = fiber && Context.getOrUndefined(fiber.context, McpInvocationContext);
+  return scope?.webSearch === true;
 };
 
 export type McpCapabilityError<C extends McpCapability> = C extends "preview"

@@ -10,7 +10,12 @@ import { requestDetail } from "./inspector.ts";
 import { DRAFT_MISSING_DETAIL } from "./refusals.ts";
 import { makeReplayService } from "./replay.ts";
 import { makeFakeCarriers } from "./replay.testkit.ts";
-import { type InspectorStore, InspectorRefusal, type RequestRecord } from "./store.ts";
+import {
+  DEFAULT_PROXY_ID,
+  type InspectorStore,
+  InspectorRefusal,
+  type RequestRecord,
+} from "./store.ts";
 import {
   header,
   KiB,
@@ -18,15 +23,15 @@ import {
   MiB,
   openTempStore,
   patternBytes,
-  startCapture,
+  startRecording,
 } from "./store.testkit.ts";
 
 const jsonBytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
 
 const insertBody = async (store: InspectorStore, bytes: Buffer, encoding?: string) => {
-  const capture = await startCapture(store);
+  const recording = await startRecording(store);
   const result = await store.insertFlow(
-    makeFlow(capture.id, 0, 0, {
+    makeFlow(recording.id, 0, 0, {
       response: {
         status: 200,
         httpVersion: "HTTP/1.1",
@@ -39,7 +44,7 @@ const insertBody = async (store: InspectorStore, bytes: Buffer, encoding?: strin
     }),
   );
   if (!result.ok) throw new Error("insert failed");
-  return { requestId: result.id, captureId: capture.id };
+  return { requestId: result.id, recordingId: recording.id };
 };
 
 describe("read_body", () => {
@@ -95,7 +100,7 @@ describe("read_body", () => {
     expect(decoded).toMatchObject({ totalBytes: text.byteLength, eof: true });
 
     const brotli = await store.insertFlow(
-      makeFlow(store.captureStatus().running?.id ?? 0, 1, 0, {
+      makeFlow(store.openRecording(DEFAULT_PROXY_ID)?.id ?? 0, 1, 0, {
         response: {
           status: 200,
           httpVersion: "HTTP/1.1",
@@ -119,14 +124,14 @@ describe("read_body", () => {
     await using temp = await openTempStore({ maxDiskBytes: 256 * MiB, maxBodyBytes: 1 * MiB });
     const { store } = temp;
     const body = patternBytes(1 * MiB, 3);
-    const { requestId, captureId } = await insertBody(store, body);
+    const { requestId, recordingId } = await insertBody(store, body);
     for (let index = 0; index < 250; index += 1) {
-      await store.insertFlow(makeFlow(captureId, index, 0, { path: `/${"p".repeat(4000)}` }));
+      await store.insertFlow(makeFlow(recordingId, index, 0, { path: `/${"p".repeat(4000)}` }));
     }
     const control = "\x01".repeat(32 * KiB);
     const textSide = [header("content-type", "text/plain")];
     const escaped = await store.insertFlow(
-      makeFlow(captureId, 251, 0, {
+      makeFlow(recordingId, 251, 0, {
         path: `/${control}`,
         headers: [
           ...textSide,
@@ -155,7 +160,6 @@ describe("read_body", () => {
       requestDetail(store, store.getRequest(escaped.id) as RequestRecord, {
         previewBytes: 32768,
         bodies: "both",
-        includeSensitiveHeaders: true,
       }),
       read({ requestId, side: "response", offset: 0, length: BODY_LIMITS.maxChunkBytes }),
       read({
@@ -169,7 +173,6 @@ describe("read_body", () => {
       requestDetail(store, store.getRequest(requestId) as RequestRecord, {
         previewBytes: 32768,
         bodies: "both",
-        includeSensitiveHeaders: true,
       }),
       await drafts.write({
         offset: 0,

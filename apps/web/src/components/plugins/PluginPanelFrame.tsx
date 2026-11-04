@@ -80,10 +80,9 @@ export function PluginPanelFrame(props: {
   const attachFrame = (frame: HTMLIFrameElement) => {
     frameRef.current = frame;
     const target = () => frameRef.current?.contentWindow ?? null;
-    const hostContext = (): PluginHostContext => {
+    const hostContext = (): Omit<PluginHostContext, "apiVersion"> => {
       const current = readLive();
       return {
-        apiVersion: "1.0",
         theme: current.theme.appearance,
         styles: { variables: mcpAppStyleVariables(current.theme.variables) },
         containerDimensions: current.size,
@@ -119,13 +118,27 @@ export function PluginPanelFrame(props: {
           }),
       openSurface: (contributionId) => options().openSurface(contributionId),
       attach: (request, activated) => options().attach(request, activated),
+      saveFile: (file) => options().saveFile(file),
+      writeClipboard: (text) => options().writeClipboard(text),
+      chatTargets: (query) => options().chatTargets(query),
     });
     bridgeRef.current = bridge;
-    // Real input in the frame focuses it and activates this page; recent page input does not count.
+    // Pointer moves are not activation and the panel cannot fake them: while the pointer has
+    // stayed on the frame since the last page input, the page's activation came from the frame.
+    let pointerEnteredAt: number | null = null;
+    const onPointerEnter = () => {
+      pointerEnteredAt = performance.now();
+    };
+    const onPointerLeave = () => {
+      pointerEnteredAt = null;
+    };
+    frame.addEventListener("pointerenter", onPointerEnter);
+    frame.addEventListener("pointerleave", onPointerLeave);
     const activated = () =>
       document.activeElement === frameRef.current &&
       navigator.userActivation?.isActive === true &&
-      performance.now() - lastPageInputAt >= PAGE_ACTIVATION_MS;
+      ((pointerEnteredAt !== null && pointerEnteredAt > lastPageInputAt) ||
+        performance.now() - lastPageInputAt >= PAGE_ACTIVATION_MS);
     const receive = (event: MessageEvent) => {
       if (event.source !== null && event.source === target()) {
         bridge.receive(event.data, activated());
@@ -134,6 +147,8 @@ export function PluginPanelFrame(props: {
     window.addEventListener("message", receive);
     return () => {
       window.removeEventListener("message", receive);
+      frame.removeEventListener("pointerenter", onPointerEnter);
+      frame.removeEventListener("pointerleave", onPointerLeave);
       bridge.dispose();
       bridgeRef.current = null;
       frameRef.current = null;

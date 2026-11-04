@@ -776,6 +776,7 @@ export const CoreServerWsRpcGroup = ServerWsRpcGroup.omit(
   WS_METHODS.mcpCatalogSessionForThread,
   WS_METHODS.mcpCatalogOAuthStatus,
   WS_METHODS.mcpCatalogSecretPrepare,
+  WS_METHODS.mcpCatalogTestConnection,
   WS_METHODS.mcpCatalogRead,
   WS_METHODS.mcpCatalogWrite,
   WS_METHODS.mcpCatalogSessionGet,
@@ -822,6 +823,7 @@ const catalogRpcMethods = [
   WS_METHODS.mcpCatalogSessionForThread,
   WS_METHODS.mcpCatalogOAuthStatus,
   WS_METHODS.mcpCatalogSecretPrepare,
+  WS_METHODS.mcpCatalogTestConnection,
   WS_METHODS.mcpCatalogRead,
   WS_METHODS.mcpCatalogWrite,
   WS_METHODS.mcpCatalogSessionGet,
@@ -4122,6 +4124,8 @@ export const layerWsRpc = (
             mcpCatalog.oauthStatus(input, currentSessionId),
           [WS_METHODS.mcpCatalogSecretPrepare]: (input) =>
             mcpCatalog.secretPrepare(input, currentSessionId),
+          [WS_METHODS.mcpCatalogTestConnection]: (input) =>
+            mcpCatalog.testConnection(input, currentSessionId),
           [WS_METHODS.mcpCatalogRead]: (input) => mcpCatalog.read(input, currentSessionId),
           [WS_METHODS.mcpCatalogWrite]: (input) => mcpCatalog.write(input, currentSessionId),
           [WS_METHODS.mcpCatalogSessionGet]: (input) =>

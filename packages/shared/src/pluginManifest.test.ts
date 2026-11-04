@@ -196,12 +196,13 @@ describe("PLUGIN_LIMITS", () => {
 describe("isHostApiCompatible", () => {
   it.each([
     ["1.0", true],
-    ["1.1", false],
+    ["1.1", true],
+    ["1.2", false],
     ["2.0", false],
     ["0.9", false],
     ["1", false],
     ["1.0.0", false],
-  ])("hostApi %s compatible with 1.0 → %s", (version, ok) => {
+  ])("hostApi %s compatible with 1.1 → %s", (version, ok) => {
     expect(isHostApiCompatible(version)).toBe(ok);
   });
 });

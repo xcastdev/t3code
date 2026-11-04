@@ -1,3 +1,5 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Pins the alias hash independently of the implementation.
+import * as NodeCrypto from "node:crypto";
 import * as Schema from "effect/Schema";
 import { AssistantNativeResources } from "../assistants/AssistantNativeResources.ts";
 import { expect, it } from "@effect/vitest";
@@ -8,6 +10,7 @@ import {
   PLUGIN_LIMITS,
   PluginId,
   PluginRequestError,
+  ProjectId,
   ProviderInstanceId,
   ThreadId,
   type OrchestrationV2ThreadShell,
@@ -29,7 +32,6 @@ import {
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import {
   __testing,
-  namespaceName,
   PLUGIN_MUTATION_REFUSED_MESSAGE,
   type RegisterCatalogSessionInput,
 } from "./McpCatalogGateway.ts";
@@ -83,7 +85,7 @@ const setup = Effect.gen(function* () {
     echo: "absent" as "absent" | "enabled" | "disabled",
     // Disabled after the catalog read: agentCatalog still lists it, callOperation refuses.
     disabledMidCall: false,
-    calls: [] as Array<{ operation: string; input: unknown }>,
+    calls: [] as Array<{ operation: string; input: unknown; context?: unknown }>,
     result: undefined as unknown,
     call: undefined as undefined | Effect.Effect<unknown>,
     threadShell: "present" as "present" | "missing",
@@ -106,11 +108,15 @@ const setup = Effect.gen(function* () {
           ]) as unknown as ReadonlyArray<PluginInstallRecord>,
       retainedData: [],
     })),
-    callOperation: (request: { operation: string; input: unknown }) =>
+    callOperation: (request: { operation: string; input: unknown; context: unknown }) =>
       plugins.echo === "enabled" && !plugins.disabledMidCall
         ? (plugins.call ??
           Effect.sync(() => {
-            plugins.calls.push({ operation: request.operation, input: request.input });
+            plugins.calls.push({
+              operation: request.operation,
+              input: request.input,
+              context: request.context,
+            });
             return plugins.result ?? { echoed: request.operation };
           }))
         : Effect.fail(new PluginRequestError({ reason: "disabled" })),
@@ -121,7 +127,17 @@ const setup = Effect.gen(function* () {
         expect(threadId).toBe(binding.threadId);
         return plugins.threadShell === "missing"
           ? null
-          : ({ ...threadModes, deletedAt: null } as OrchestrationV2ThreadShell);
+          : ({
+              ...threadModes,
+              id: threadId,
+              projectId: ProjectId.make("project"),
+              lineage: {
+                parentThreadId: ThreadId.make("parent"),
+                relationshipToParent: "subagent",
+                rootThreadId: ThreadId.make("root"),
+              },
+              deletedAt: null,
+            } as OrchestrationV2ThreadShell);
       }),
   } as unknown as ProjectionStoreV2["Service"];
   const gateway = yield* __testing.make.pipe(
@@ -439,7 +455,7 @@ it.effect("forwards every prompt and resource template page through the real MCP
         }),
       );
       const result = yield* Effect.promise(() => response.json());
-      const prefix = "mcp_" + Buffer.from("server").toString("hex") + "__";
+      const prefix = "server__";
       expect(result).toMatchObject({
         result: {
           [method === "prompts/list" ? "prompts" : "resourceTemplates"]: [
@@ -532,6 +548,87 @@ it.effect.each(["tools/list", "resources/list", "resources/templates/list", "pro
     }),
 );
 
+it.effect("exposes readable server aliases and routes each call back to its server", () =>
+  Effect.gen(function* () {
+    const { gateway, input, setConnect } = yield* setup;
+    setConnect((entry) =>
+      Effect.gen(function* () {
+        const [left, right] = InMemoryTransport.createLinkedPair();
+        const upstream = new Server(
+          { name: "fixture", version: "1" },
+          { capabilities: { tools: {} } },
+        );
+        upstream.setRequestHandler(ListToolsRequestSchema, () => ({
+          tools: [
+            { name: "traffic_search", inputSchema: { type: "object" } },
+            { name: "a__b", inputSchema: { type: "object" } },
+          ],
+        }));
+        upstream.setRequestHandler(CallToolRequestSchema, (request) => ({
+          content: [{ type: "text", text: `${entry.logicalServerId}:${request.params.name}` }],
+        }));
+        const client = new Client({ name: "fixture", version: "1" });
+        yield* Effect.acquireRelease(
+          Effect.promise(async () => {
+            await upstream.connect(right);
+            await client.connect(left);
+          }),
+          () =>
+            Effect.promise(async () => {
+              await client.close();
+              await upstream.close();
+            }),
+        );
+        return { entry, client };
+      }),
+    );
+    const entry = (id: string, name: string) => ({
+      logicalServerId: McpServerId.make(id),
+      transportDefinitionId: McpDefinitionId.make(id),
+      name,
+      providerInstanceId: input.providerInstanceId,
+      scope: "project" as const,
+      scopeId: "project",
+      transport: { type: "stdio" as const, command: "unused", args: [], env: [] },
+    });
+    yield* gateway.applyCatalogRevision({
+      ...input,
+      entries: [entry("b", "browser-mcp"), entry("a", "Browser MCP"), entry("c", "Docs")],
+    });
+    const listed = (yield* rpc(gateway, input, "tools/list", {})) as {
+      result: { tools: ReadonlyArray<{ name: string }> };
+    };
+    const hashed = (base: string, id: string) =>
+      `${base}_${NodeCrypto.createHash("sha256").update(id).digest("hex").slice(0, 6)}`;
+    const [a, b] = [hashed("browser_mcp", "a"), hashed("browser_mcp", "b")];
+    expect(listed.result.tools.map((tool) => tool.name).toSorted()).toEqual(
+      [
+        `${a}__a__b`,
+        `${a}__traffic_search`,
+        `${b}__a__b`,
+        `${b}__traffic_search`,
+        "docs__a__b",
+        "docs__traffic_search",
+      ].toSorted(),
+    );
+    for (const [name, routed] of [
+      [`${a}__traffic_search`, "a:traffic_search"],
+      [`${b}__traffic_search`, "b:traffic_search"],
+      [`${b}__a__b`, "b:a__b"],
+      ["docs__a__b", "c:a__b"],
+    ])
+      expect(yield* rpc(gateway, input, "tools/call", { name, arguments: {} })).toMatchObject({
+        result: { content: [{ text: routed }] },
+      });
+    expect(
+      yield* rpc(gateway, input, "tools/call", {
+        name: "browser_mcp__traffic_search",
+        arguments: {},
+      }),
+    ).toMatchObject({ error: { message: "Unknown MCP catalog item." } });
+  }),
+);
+
 const encodeAssistantMcpPacket = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 it.effect(
   "assistant tool selection filters discovery and revocation blocks the next native call",
@@ -606,17 +703,17 @@ it.effect(
         return yield* Effect.promise(() => response.json());
       });
       expect(yield* request("tools/list", {})).toMatchObject({
-        result: { tools: [{ name: namespaceName(logicalServerId, "read") }] },
+        result: { tools: [{ name: "selected__read" }] },
       });
       yield* request("tools/call", {
-        name: namespaceName(logicalServerId, "write"),
+        name: "selected__write",
         arguments: {},
       });
       expect(calls).toBe(0);
-      yield* request("tools/call", { name: namespaceName(logicalServerId, "read"), arguments: {} });
+      yield* request("tools/call", { name: "selected__read", arguments: {} });
       expect(calls).toBe(1);
       setAllowedTools([]);
-      yield* request("tools/call", { name: namespaceName(logicalServerId, "read"), arguments: {} });
+      yield* request("tools/call", { name: "selected__read", arguments: {} });
       expect(calls).toBe(1);
     }),
 );
@@ -659,7 +756,21 @@ it.effect("omits non-agent operations and refuses calling them by name", () =>
     expect(
       yield* rpc(gateway, input, "tools/call", { name: "plugin_echo__ping", arguments: { a: 1 } }),
     ).toMatchObject({ result: { content: [{ type: "text", text: '{"echoed":"ping"}' }] } });
-    expect(plugins.calls).toEqual([{ operation: "ping", input: { a: 1 } }]);
+    expect(plugins.calls).toEqual([
+      {
+        operation: "ping",
+        input: { a: 1 },
+        context: {
+          projectId: "project",
+          thread: {
+            id: "thread",
+            parentThreadId: "parent",
+            rootThreadId: "root",
+            relationshipToParent: "subagent",
+          },
+        },
+      },
+    ]);
     plugins.result = { text: "x".repeat(PLUGIN_LIMITS.maxPayloadBytes) };
     expect(
       yield* rpc(gateway, input, "tools/call", { name: "plugin_echo__ping", arguments: {} }),
@@ -823,7 +934,21 @@ it.effect("reads a plugin resource through its declared operation", () =>
         ],
       },
     });
-    expect(plugins.calls).toEqual([{ operation: "ping", input: {} }]);
+    expect(plugins.calls).toEqual([
+      {
+        operation: "ping",
+        input: {},
+        context: {
+          projectId: "project",
+          thread: {
+            id: "thread",
+            parentThreadId: "parent",
+            rootThreadId: "root",
+            relationshipToParent: "subagent",
+          },
+        },
+      },
+    ]);
   }),
 );
 

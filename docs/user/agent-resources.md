@@ -15,9 +15,11 @@ its management section; **MCP**, **Skills**, **Commands** and **Snippets** show 
 ## MCP servers
 
 Add a server with its URL or local command and assign it to the providers that should receive
-it. A server assigned to no provider reaches no session. Type a secret header or environment
-variable into its masked field; it is sent privately once when you save and is never shown
-again. A stored secret stays as it is until you replace it. A project or thread can override any
+it. **All providers** also covers providers you add later. A server assigned to no provider reaches no session. Type a secret header or environment
+variable into its masked field; it is sent privately when you test or save and is never shown
+again. A stored secret stays as it is until you replace it. **Test** connects with the form as
+it is, before you save, and lists the server's tools or says why it couldn't connect; an OAuth
+server must be saved and signed in first. A project or thread can override any
 field of an inherited server, including its name and connection. Fields you leave alone keep
 following the server, and **Follow definition** puts a changed one back. A replaced connection
 needs its secrets entered again. OAuth servers sign in per project with **Sign in**, then **Continue** after

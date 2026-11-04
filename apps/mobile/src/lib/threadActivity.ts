@@ -52,7 +52,13 @@ import type {
   ScheduledTaskId,
   TurnItemId,
 } from "@t3tools/contracts";
-import { idleCompactionOf, isCompactionCommandMessage, RunId, ThreadId } from "@t3tools/contracts";
+import {
+  idleCompactionOf,
+  isCompactionCommandMessage,
+  isOrchestrationV2WorkActive,
+  RunId,
+  ThreadId,
+} from "@t3tools/contracts";
 import {
   classifyToolActivity,
   collectToolFilePaths,
@@ -599,7 +605,7 @@ function itemSummary(
     case "file_search":
       return item.title?.trim() || formatSearchToolLabel(item) || "Searched files";
     case "web_search":
-      return "Searched the web";
+      return isOrchestrationV2WorkActive(item.status) ? "Searching the web" : "Searched the web";
     case "approval_request":
       return "Approval requested";
     case "user_input_request":

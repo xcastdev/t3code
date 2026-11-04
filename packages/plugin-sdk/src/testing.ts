@@ -7,7 +7,12 @@ import type * as NodeStream from "node:stream";
 import type { PluginSubscriptionEvent } from "@t3tools/contracts";
 import JSZip from "jszip";
 
-import { PLUGIN_WORKER_PROTOCOL_VERSION, type PluginCaller } from "./backend.ts";
+import {
+  PLUGIN_WORKER_PROTOCOL_VERSION,
+  type PluginCallContextView,
+  type PluginCaller,
+  type PluginContextRef,
+} from "./backend.ts";
 
 export class WorkerRequestError extends Error {
   readonly code: number;
@@ -30,12 +35,19 @@ export interface WorkerInitializeParams {
   readonly secrets: Readonly<Record<string, string>>;
 }
 
+/** Answers the worker's `t3/context.resolve` requests in place of the T3 server. */
+export type FakeContextResolver = (
+  ref: PluginContextRef,
+) => PluginCallContextView | null | Promise<PluginCallContextView | null>;
+
 export interface WorkerClient {
   readonly initialize: (overrides?: Partial<WorkerInitializeParams>) => Promise<unknown>;
   readonly invoke: (
     operation: string,
     input: unknown,
     caller?: PluginCaller,
+    /** Omitted, the worker sees an empty context, as from a host before API 1.1. */
+    context?: PluginCallContextView,
   ) => { readonly id: number; readonly result: Promise<unknown> };
   readonly cancel: (id: number) => void;
   readonly subscribe: (
@@ -59,6 +71,8 @@ export function makeWorkerClient(options: {
   readonly input: NodeStream.Readable;
   readonly output: NodeStream.Writable;
   readonly initialize: WorkerInitializeParams;
+  /** Without one, `t3/context.resolve` fails with method-not-found. */
+  readonly resolveContext?: FakeContextResolver;
 }): WorkerClient {
   let nextId = 1;
   let nextSubscription = 1;
@@ -81,8 +95,44 @@ export function makeWorkerClient(options: {
     return { id, result };
   };
 
+  const answerContextResolve = (id: unknown, params: unknown) => {
+    const resolver = options.resolveContext;
+    if (resolver === undefined) {
+      send({
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32601, message: "This test client has no context resolver." },
+      });
+      return;
+    }
+    void Promise.resolve()
+      .then(() => resolver(params as PluginContextRef))
+      .then(
+        (result) => send({ jsonrpc: "2.0", id, result }),
+        (error: unknown) =>
+          send({
+            jsonrpc: "2.0",
+            id,
+            error: {
+              code: -32000,
+              message: error instanceof Error ? error.message : String(error),
+            },
+          }),
+      );
+  };
+
   const handle = (message: unknown) => {
     if (!isRecord(message)) return;
+    if (message.id !== undefined && typeof message.method === "string") {
+      if (message.method === "t3/context.resolve") answerContextResolve(message.id, message.params);
+      else
+        send({
+          jsonrpc: "2.0",
+          id: message.id,
+          error: { code: -32601, message: "Unknown method." },
+        });
+      return;
+    }
     if (typeof message.id === "number") {
       const waiter = pending.get(message.id);
       pending.delete(message.id);
@@ -136,7 +186,13 @@ export function makeWorkerClient(options: {
         ...options.initialize,
         ...overrides,
       }).result,
-    invoke: (operation, input, caller = "ui") => request("invoke", { operation, input, caller }),
+    invoke: (operation, input, caller = "ui", context) =>
+      request(
+        "invoke",
+        context === undefined
+          ? { operation, input, caller }
+          : { operation, input, caller, context },
+      ),
     cancel: (id) => send({ jsonrpc: "2.0", method: "cancel", params: { id } }),
     subscribe: async (topic, params, onEvent) => {
       const subscriptionId = `s${nextSubscription++}`;
@@ -198,6 +254,7 @@ export function startPackedBackend(options: {
   readonly version?: string;
   readonly config?: Readonly<Record<string, unknown>>;
   readonly secrets?: Readonly<Record<string, string>>;
+  readonly resolveContext?: FakeContextResolver;
 }): PackedBackend {
   const child = NodeChildProcess.spawn(process.execPath, [options.entryPath], {
     stdio: ["pipe", "pipe", "pipe"],
@@ -221,6 +278,7 @@ export function startPackedBackend(options: {
       config: options.config ?? {},
       secrets: options.secrets ?? {},
     },
+    ...(options.resolveContext === undefined ? {} : { resolveContext: options.resolveContext }),
   });
   return {
     ...client,

@@ -752,6 +752,18 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["image viewing describe screenshot picture codex opencode"],
   },
   {
+    id: "web-search-tool",
+    title: "Web search tool",
+    to: "/settings/threads",
+    searchTerms: ["internet browse lookup online agents without built-in web search"],
+  },
+  {
+    id: "search-model",
+    title: "Search model",
+    to: "/settings/threads",
+    searchTerms: ["web search internet lookup claude codex"],
+  },
+  {
     id: "thread-title-instructions",
     title: "Thread title instructions",
     to: "/settings/threads",

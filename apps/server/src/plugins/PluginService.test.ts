@@ -1,12 +1,17 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import {
+  EMPTY_PLUGIN_CALL_CONTEXT,
+  type OrchestrationV2ThreadShell,
   PLUGIN_LIMITS,
+  type PluginCallContext,
   type PluginId,
   type PluginManifest,
   type PluginOperationDecl,
   PluginRequestError,
   type PluginSubscriptionEvent,
+  ProjectId,
+  ThreadId,
 } from "@t3tools/contracts";
 import { packPlugin } from "@t3tools/plugin-sdk/pack";
 import * as Deferred from "effect/Deferred";
@@ -14,6 +19,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import type * as PlatformError from "effect/PlatformError";
 import * as PubSub from "effect/PubSub";
@@ -25,11 +31,48 @@ import * as TestClock from "effect/testing/TestClock";
 import { attachmentFileExtension, createPendingAttachmentId } from "../attachmentStore.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as PluginPackageStore from "./PluginPackageStore.ts";
 import * as PluginService from "./PluginService.ts";
 import * as PluginWorkerSupervisor from "./PluginWorkerSupervisor.ts";
 
 const PROBE = "probe" as PluginId;
+const PROJECT = ProjectId.make("project-1");
+const PARENT_THREAD = ThreadId.make("thread-parent");
+const SUBAGENT_THREAD = ThreadId.make("thread-subagent");
+const DELETED_THREAD = ThreadId.make("thread-deleted");
+
+const threadShell = (id: ThreadId, deleted: boolean) =>
+  ({
+    id,
+    projectId: PROJECT,
+    deletedAt: deleted ? "2026-01-01T00:00:00.000Z" : null,
+    lineage: {
+      parentThreadId: PARENT_THREAD,
+      relationshipToParent: "subagent",
+      rootThreadId: PARENT_THREAD,
+    },
+  }) as unknown as OrchestrationV2ThreadShell;
+
+const projectionsLayer = Layer.mergeAll(
+  Layer.mock(ProjectionStore.ProjectionStoreV2)({
+    getThreadShell: (threadId) =>
+      Effect.succeed(
+        threadId === SUBAGENT_THREAD || threadId === DELETED_THREAD
+          ? threadShell(threadId, threadId === DELETED_THREAD)
+          : null,
+      ),
+  }),
+  Layer.mock(ProjectStore.ProjectStoreV2)({
+    get: (projectId) =>
+      Effect.succeed(
+        projectId === PROJECT
+          ? Option.some({ projectId } as ProjectStore.ProjectRow)
+          : Option.none(),
+      ),
+  }),
+);
 const encoder = new TextEncoder();
 
 const operation = (name: string, mutates: boolean, agent: boolean): PluginOperationDecl => ({
@@ -111,6 +154,7 @@ const makeFakeSupervisor = Effect.gen(function* () {
   const statuses = new Map<PluginId, PluginWorkerSupervisor.PluginWorkerStatus>();
   const workers = new Map<PluginId, MemoryWorker>();
   const events: Array<string> = [];
+  const contexts: Array<PluginCallContext> = [];
   const failingVersions = new Set<string>();
   const subscriptionOverride: {
     current?: Stream.Stream<PluginSubscriptionEvent, PluginRequestError>;
@@ -161,6 +205,7 @@ const makeFakeSupervisor = Effect.gen(function* () {
       Effect.suspend(() => {
         if (!workers.has(pluginId)) return Effect.fail(notRunning());
         events.push(`invoke ${request.operation}`);
+        contexts.push(request.context);
         return Effect.succeed({ echoed: request.input });
       }),
     subscribe: (pluginId, topic, params) =>
@@ -182,6 +227,7 @@ const makeFakeSupervisor = Effect.gen(function* () {
   return {
     service,
     events,
+    contexts,
     failingVersions,
     subscriptionOverride,
     stopGate,
@@ -227,6 +273,7 @@ const withService = <A, E>(
       Effect.provide(
         PluginService.layer.pipe(
           Layer.provide(Layer.succeed(PluginWorkerSupervisor.PluginWorkerSupervisor, fake.service)),
+          Layer.provide(projectionsLayer),
         ),
       ),
     );
@@ -299,6 +346,7 @@ describe("PluginService", () => {
               operation: "internal",
               input: {},
               caller: "agent",
+              context: EMPTY_PLUGIN_CALL_CONTEXT,
             }),
           ),
         ).toBe("unknown-operation");
@@ -308,6 +356,43 @@ describe("PluginService", () => {
         ]);
       }),
     ),
+  );
+
+  it.effect(
+    "panel chat hints resolve on the server, and a gone thread gives the empty context",
+    () =>
+      withService(({ service, fake, installProbe }) =>
+        Effect.gen(function* () {
+          yield* installProbe;
+          const read = { pluginId: PROBE, operation: "read", input: {} };
+          yield* service.query({ ...read, chat: { threadId: SUBAGENT_THREAD } });
+          yield* service.mutate({
+            ...read,
+            operation: "write",
+            chat: { threadId: DELETED_THREAD },
+          });
+          yield* service.query({ ...read, chat: { threadId: ThreadId.make("thread-unknown") } });
+          yield* service.query({ ...read, chat: { projectId: PROJECT } });
+          yield* service.query({ ...read, chat: { projectId: ProjectId.make("project-unknown") } });
+          yield* service.query(read);
+          expect(fake.contexts).toEqual([
+            {
+              projectId: PROJECT,
+              thread: {
+                id: SUBAGENT_THREAD,
+                parentThreadId: PARENT_THREAD,
+                rootThreadId: PARENT_THREAD,
+                relationshipToParent: "subagent",
+              },
+            },
+            EMPTY_PLUGIN_CALL_CONTEXT,
+            EMPTY_PLUGIN_CALL_CONTEXT,
+            { projectId: PROJECT, thread: null },
+            EMPTY_PLUGIN_CALL_CONTEXT,
+            EMPTY_PLUGIN_CALL_CONTEXT,
+          ]);
+        }),
+      ),
   );
 
   it.effect("calls after disable fail with plugin-disabled and re-enable restores them", () =>

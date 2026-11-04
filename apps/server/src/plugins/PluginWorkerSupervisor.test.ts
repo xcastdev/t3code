@@ -5,10 +5,19 @@ import * as NodeURL from "node:url";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
-import { PLUGIN_LIMITS, type PluginId, type PluginSubscriptionEvent } from "@t3tools/contracts";
+import {
+  EMPTY_PLUGIN_CALL_CONTEXT,
+  PLUGIN_LIMITS,
+  type PluginCallContext,
+  type PluginId,
+  type PluginSubscriptionEvent,
+  ProjectId,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { packPlugin } from "@t3tools/plugin-sdk/pack";
 import type * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -36,6 +45,27 @@ const BIN_PATH = NodeURL.fileURLToPath(new URL("../bin.ts", import.meta.url));
 const ECHO = "echo" as PluginId;
 
 const encoder = new TextEncoder();
+
+const KNOWN_PROJECT = ProjectId.make("project-known");
+const CALL_CONTEXT: PluginCallContext = {
+  projectId: KNOWN_PROJECT,
+  thread: {
+    id: ThreadId.make("thread-child"),
+    parentThreadId: ThreadId.make("thread-parent"),
+    rootThreadId: ThreadId.make("thread-parent"),
+    relationshipToParent: "subagent",
+  },
+};
+const resolveContext: PluginWorkerSupervisor.PluginContextResolver = (params) =>
+  Effect.succeed(
+    params.projectId === KNOWN_PROJECT ? { projectId: KNOWN_PROJECT, thread: null } : null,
+  );
+const call = (operation: string, input: unknown = {}, caller: "ui" | "agent" = "ui") => ({
+  operation,
+  input,
+  caller,
+  context: EMPTY_PLUGIN_CALL_CONTEXT,
+});
 
 /** A pid is gone once signalling it fails, or (Linux) once only its zombie remains. */
 const isGone = (pid: number) => {
@@ -104,6 +134,7 @@ const installEcho = Effect.fn("test.installEcho")(function* () {
         config: {},
         secrets: {},
         prerequisites: [],
+        resolveContext,
       },
     } satisfies InstalledEcho;
   }).pipe(
@@ -142,13 +173,16 @@ const NodeChildProcess = require("node:child_process");
 const reply = (id, result) =>
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\\n");
 let buffer = "";
+let resolving;
 process.stdin.on("data", (chunk) => {
   buffer += chunk;
   for (let index = buffer.indexOf("\\n"); index >= 0; index = buffer.indexOf("\\n")) {
     const message = JSON.parse(buffer.slice(0, index));
     buffer = buffer.slice(index + 1);
     const params = message.params ?? {};
-    if (message.method === "initialize") {
+    if (typeof message.id === "string") {
+      reply(resolving, "result" in message ? message.result : message.error);
+    } else if (message.method === "initialize") {
       if (!params.config.hang) reply(message.id, null);
       else process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "status", params: { state: "running", detail: String(process.pid) } }) + "\\n");
     } else if (message.method === "shutdown") {
@@ -163,6 +197,11 @@ process.stdin.on("data", (chunk) => {
       reply(message.id, { pid: child.pid });
     } else if (params.operation === "crash") {
       process.exit(3);
+    } else if (params.operation === "context") {
+      reply(message.id, params.context);
+    } else if (params.operation === "resolve") {
+      resolving = message.id;
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: "w1", method: params.input.method, params: params.input.params }) + "\\n");
     }
   }
 });
@@ -185,6 +224,7 @@ const rawWorkerStart = Effect.fn("test.rawWorkerStart")(function* (config: {
     config,
     secrets: {},
     prerequisites: [],
+    resolveContext,
   } satisfies PluginWorkerSupervisor.PluginWorkerStartInput;
 });
 
@@ -211,9 +251,10 @@ describe("PluginWorkerSupervisor with the packed echo backend", () => {
           if (path.dirname(dir) === dir) break;
         }
         yield* supervisor.start(echo.start);
-        expect(
-          yield* supervisor.invoke(ECHO, { operation: "ping", input: {}, caller: "ui" }),
-        ).toEqual({ message: "ping", caller: "ui" });
+        expect(yield* supervisor.invoke(ECHO, call("ping"))).toEqual({
+          message: "ping",
+          caller: "ui",
+        });
       }),
     ),
   );
@@ -229,19 +270,14 @@ describe("PluginWorkerSupervisor with the packed echo backend", () => {
             operation: "ping",
             input: { message: "hi" },
             caller: "agent",
+            context: EMPTY_PLUGIN_CALL_CONTEXT,
           }),
         ).toEqual({ message: "hi", caller: "agent" });
-        expect(
-          yield* reasonOf(
-            supervisor.invoke(ECHO, { operation: "missing", input: {}, caller: "ui" }),
-          ),
-        ).toBe("unknown-operation");
+        expect(yield* reasonOf(supervisor.invoke(ECHO, call("missing")))).toBe("unknown-operation");
 
         const events = yield* supervisor.subscribe(ECHO, "ticks", {}).pipe(
           Stream.tap((event) =>
-            event.type === "snapshot"
-              ? supervisor.invoke(ECHO, { operation: "pong", input: {}, caller: "ui" })
-              : Effect.void,
+            event.type === "snapshot" ? supervisor.invoke(ECHO, call("pong")) : Effect.void,
           ),
           Stream.take(2),
           Stream.runCollect,
@@ -253,9 +289,7 @@ describe("PluginWorkerSupervisor with the packed echo backend", () => {
 
         yield* supervisor.stop(ECHO, "plugin-disabled");
         expect(yield* supervisor.status(ECHO)).toEqual({ status: "stopped" });
-        expect(
-          yield* reasonOf(supervisor.invoke(ECHO, { operation: "ping", input: {}, caller: "ui" })),
-        ).toBe("not-running");
+        expect(yield* reasonOf(supervisor.invoke(ECHO, call("ping")))).toBe("not-running");
       }),
     ),
   );
@@ -272,9 +306,7 @@ describe("PluginWorkerSupervisor with the packed echo backend", () => {
         expect(status.detail).toContain("t3-missing-prerequisite-xyz");
         expect(status.detail).toContain("Install it.");
         expect(yield* supervisor.logs(ECHO, 10)).toEqual([]);
-        expect(
-          yield* reasonOf(supervisor.invoke(ECHO, { operation: "ping", input: {}, caller: "ui" })),
-        ).toBe("not-running");
+        expect(yield* reasonOf(supervisor.invoke(ECHO, call("ping")))).toBe("not-running");
       }),
     ),
   );
@@ -283,10 +315,8 @@ describe("PluginWorkerSupervisor with the packed echo backend", () => {
     withSupervisor((supervisor, echo) =>
       Effect.gen(function* () {
         yield* supervisor.start(echo.start);
-        yield* supervisor.invoke(ECHO, { operation: "log", input: { lines: 1200 }, caller: "ui" });
-        expect(
-          yield* reasonOf(supervisor.invoke(ECHO, { operation: "crash", input: {}, caller: "ui" })),
-        ).toBe("worker-failed");
+        yield* supervisor.invoke(ECHO, call("log", { lines: 1200 }));
+        expect(yield* reasonOf(supervisor.invoke(ECHO, call("crash")))).toBe("worker-failed");
         const failed = yield* awaitStatus(supervisor, "failed");
         expect(Option.getOrThrow(failed).detail).toBe("The plugin worker exited with code 3.");
 
@@ -311,6 +341,7 @@ describe("PluginWorkerSupervisor with the packed echo backend", () => {
           operation: "spawn_child",
           input: { untracked: true },
           caller: "ui",
+          context: EMPTY_PLUGIN_CALL_CONTEXT,
         })) as { pid: number };
         expect(isGone(pid)).toBe(false);
         yield* supervisor.stop(ECHO, "plugin-disabled");
@@ -331,6 +362,7 @@ describe("PluginWorkerSupervisor with the packed echo backend", () => {
                 operation: "big",
                 input: { bytes: PLUGIN_LIMITS.maxPayloadBytes + 1 },
                 caller: "ui",
+                context: EMPTY_PLUGIN_CALL_CONTEXT,
               }),
             ),
           ).toBe("too-large");
@@ -340,12 +372,14 @@ describe("PluginWorkerSupervisor with the packed echo backend", () => {
                 operation: "ping",
                 input: { message: "x".repeat(PLUGIN_LIMITS.maxPayloadBytes + 1) },
                 caller: "ui",
+                context: EMPTY_PLUGIN_CALL_CONTEXT,
               }),
             ),
           ).toBe("too-large");
-          expect(
-            yield* supervisor.invoke(ECHO, { operation: "ping", input: {}, caller: "ui" }),
-          ).toEqual({ message: "ping", caller: "ui" });
+          expect(yield* supervisor.invoke(ECHO, call("ping"))).toEqual({
+            message: "ping",
+            caller: "ui",
+          });
         }),
       ),
   );
@@ -360,6 +394,7 @@ describe("PluginWorkerSupervisor with the packed echo backend", () => {
           operation: "asset",
           input: {},
           caller: "ui",
+          context: EMPTY_PLUGIN_CALL_CONTEXT,
         })) as { path: string; text: string };
         expect(path.dirname(asset.path)).toBe(path.join(echo.dataDir, "runtime"));
         expect(asset.text).toBe("Hello from the echo plugin.\n");
@@ -376,9 +411,7 @@ describe("PluginWorkerSupervisor with the packed echo backend", () => {
           .pipe(Effect.forkChild);
         const reported = Option.getOrThrow(yield* awaitStatus(supervisor, "running"));
         const pid = Number(reported.detail);
-        expect(
-          yield* reasonOf(supervisor.invoke(ECHO, { operation: "ping", input: {}, caller: "ui" })),
-        ).toBe("not-running");
+        expect(yield* reasonOf(supervisor.invoke(ECHO, call("ping")))).toBe("not-running");
         yield* Fiber.interrupt(starting);
         expect(yield* supervisor.status(ECHO)).toEqual({ status: "stopped" });
         expect(isGone(pid)).toBe(true);
@@ -395,9 +428,7 @@ describe("PluginWorkerSupervisor with the packed echo backend", () => {
         yield* awaitStatus(supervisor, "starting");
         yield* Fiber.interrupt(starting);
         expect(yield* supervisor.status(ECHO)).toEqual({ status: "stopped" });
-        expect(
-          yield* reasonOf(supervisor.invoke(ECHO, { operation: "ping", input: {}, caller: "ui" })),
-        ).toBe("not-running");
+        expect(yield* reasonOf(supervisor.invoke(ECHO, call("ping")))).toBe("not-running");
       }),
     ),
   );
@@ -410,14 +441,35 @@ describe("PluginWorkerSupervisor with the packed echo backend", () => {
           operation: "grandchild",
           input: {},
           caller: "ui",
+          context: EMPTY_PLUGIN_CALL_CONTEXT,
         })) as { pid: number };
         yield* Effect.addFinalizer(() => Effect.sync(() => process.kill(pid, "SIGKILL")));
-        expect(
-          yield* reasonOf(supervisor.invoke(ECHO, { operation: "crash", input: {}, caller: "ui" })),
-        ).toBe("worker-failed");
+        expect(yield* reasonOf(supervisor.invoke(ECHO, call("crash")))).toBe("worker-failed");
         const failed = yield* awaitStatus(supervisor, "failed");
         expect(Option.getOrThrow(failed).detail).toBe("The plugin worker exited with code 3.");
         expect(isGone(pid)).toBe(false);
+      }),
+    ),
+  );
+
+  it.live("invoke sends the caller context and the host answers t3/context.resolve", () =>
+    withSupervisor((supervisor) =>
+      Effect.gen(function* () {
+        yield* supervisor.start(yield* rawWorkerStart({}));
+        expect(
+          yield* supervisor.invoke(ECHO, { ...call("context"), context: CALL_CONTEXT }),
+        ).toEqual(CALL_CONTEXT);
+        const resolve = (method: string, params: unknown) =>
+          supervisor.invoke(ECHO, call("resolve", { method, params }));
+        expect(yield* resolve("t3/context.resolve", { projectId: KNOWN_PROJECT })).toEqual({
+          projectId: KNOWN_PROJECT,
+          thread: null,
+        });
+        expect(yield* resolve("t3/context.resolve", { threadId: "thread-unknown" })).toBeNull();
+        expect(
+          yield* resolve("t3/context.resolve", { threadId: "t", projectId: KNOWN_PROJECT }),
+        ).toMatchObject({ code: -32602 });
+        expect(yield* resolve("t3/unknown", {})).toMatchObject({ code: -32601 });
       }),
     ),
   );
@@ -470,12 +522,15 @@ describe("PluginWorkerSupervisor with the packed echo backend", () => {
   );
 });
 
-const memoryConnection = Effect.gen(function* () {
+const memoryConnectionWith = Effect.fn("test.memoryConnection")(function* (
+  handlers: PluginWorkerSupervisor.WorkerConnectionHandlers = {},
+) {
   const input = yield* Queue.unbounded<Uint8Array>();
   const output = yield* Queue.unbounded<string>();
   const connection = yield* PluginWorkerSupervisor.makeWorkerConnection(
     Stream.fromQueue(input),
     output,
+    handlers,
   );
   const feedText = (text: string) => Queue.offer(input, encoder.encode(`${text}\n`));
   return {
@@ -485,6 +540,7 @@ const memoryConnection = Effect.gen(function* () {
     sent: Effect.map(Queue.take(output), (line) => JSON.parse(line) as Record<string, any>),
   };
 });
+const memoryConnection = memoryConnectionWith();
 
 describe("makeWorkerConnection", () => {
   it.effect(
@@ -515,6 +571,31 @@ describe("makeWorkerConnection", () => {
         yield* feed({ jsonrpc: "2.0", id: nextRequest.id, result: "fresh" });
         expect(yield* Fiber.join(next)).toBe("fresh");
       }).pipe(Effect.scoped),
+  );
+
+  it.effect("refuses worker requests past maxPendingRequests until one is answered", () =>
+    Effect.gen(function* () {
+      const release = yield* Deferred.make<void>();
+      const { feed, sent } = yield* memoryConnectionWith({
+        resolveContext: () => Deferred.await(release).pipe(Effect.as(null)),
+      });
+      const resolveRequest = (id: string) =>
+        feed({ jsonrpc: "2.0", id, method: "t3/context.resolve", params: { projectId: "p" } });
+      for (let index = 0; index <= PLUGIN_LIMITS.maxPendingRequests; index += 1) {
+        yield* resolveRequest(`w${index}`);
+      }
+      expect(yield* sent).toEqual({
+        jsonrpc: "2.0",
+        id: `w${PLUGIN_LIMITS.maxPendingRequests}`,
+        error: { code: -32000, message: "Too many requests in flight." },
+      });
+      yield* Deferred.succeed(release, undefined);
+      for (let index = 0; index < PLUGIN_LIMITS.maxPendingRequests; index += 1) {
+        expect(yield* sent).toMatchObject({ result: null });
+      }
+      yield* resolveRequest("w-next");
+      expect(yield* sent).toEqual({ jsonrpc: "2.0", id: "w-next", result: null });
+    }).pipe(Effect.scoped),
   );
 
   it.effect("interrupting invoke sends cancel for that request id", () =>

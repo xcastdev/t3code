@@ -21,6 +21,7 @@ import {
   fromRunner,
   imagesUnsupported,
   investigationUnsupported,
+  webSearchUnsupported,
 } from "@t3tools/provider-core/server/textGenerationOperations";
 import {
   buildBranchNamePrompt,
@@ -359,5 +360,6 @@ export const makeMuseTextGeneration = Effect.fn("makeMuseTextGeneration")(functi
     generateThreadTitle,
     generateReviewGuide,
     describeImage: () => Effect.fail(imagesUnsupported()),
+    webSearch: () => Effect.fail(webSearchUnsupported()),
   } satisfies ProviderTextGeneration;
 });

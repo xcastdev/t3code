@@ -124,6 +124,8 @@ import {
   McpCatalogOAuthStatusResult,
   McpCatalogSecretPrepareInput,
   McpCatalogSecretPrepareResult,
+  McpCatalogTestConnectionInput,
+  McpCatalogTestConnectionResult,
   McpCatalogReadInput,
   McpCatalogReadResult,
   McpCatalogWriteInput,
@@ -605,6 +607,7 @@ export const WS_METHODS = {
   mcpCatalogSessionForThread: "mcpCatalog.sessionForThread",
   mcpCatalogOAuthStatus: "mcpCatalog.oauthStatus",
   mcpCatalogSecretPrepare: "mcpCatalog.secretPrepare",
+  mcpCatalogTestConnection: "mcpCatalog.testConnection",
   mcpCatalogRead: "mcpCatalog.read",
   mcpCatalogWrite: "mcpCatalog.write",
   mcpCatalogSessionGet: "mcpCatalog.sessionGet",
@@ -2485,6 +2488,11 @@ const WsMcpCatalogSecretPrepareRpc = Rpc.make(WS_METHODS.mcpCatalogSecretPrepare
   success: McpCatalogSecretPrepareResult,
   error: catalogRpcError,
 });
+const WsMcpCatalogTestConnectionRpc = Rpc.make(WS_METHODS.mcpCatalogTestConnection, {
+  payload: McpCatalogTestConnectionInput,
+  success: McpCatalogTestConnectionResult,
+  error: catalogRpcError,
+});
 const WsMcpCatalogReadRpc = Rpc.make(WS_METHODS.mcpCatalogRead, {
   payload: McpCatalogReadInput,
   success: McpCatalogReadResult,
@@ -2996,6 +3004,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsMcpCatalogSessionForThreadRpc,
   WsMcpCatalogOAuthStatusRpc,
   WsMcpCatalogSecretPrepareRpc,
+  WsMcpCatalogTestConnectionRpc,
   WsMcpCatalogReadRpc,
   WsMcpCatalogWriteRpc,
   WsMcpCatalogSessionGetRpc,

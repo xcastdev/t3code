@@ -57,10 +57,9 @@ export function PluginWebView(props: {
   // Per-render values are read through `latest`: a new ref callback would rebuild the bridge.
   const attachWebView = (view: WebView<object> | null) => {
     if (view === null) return;
-    const hostContext = (): PluginHostContext => {
+    const hostContext = (): Omit<PluginHostContext, "apiVersion"> => {
       const current = latest.current;
       return {
-        apiVersion: "1.0",
         theme: current.theme.appearance,
         styles: { variables: mcpAppStyleVariables(current.theme.variables) },
         containerDimensions: current.size,
@@ -95,6 +94,9 @@ export function PluginWebView(props: {
           }),
       openSurface: (contributionId) => options().openSurface(contributionId),
       attach: (request, activated) => options().attach(request, activated),
+      saveFile: (file) => options().saveFile(file),
+      writeClipboard: (text) => options().writeClipboard(text),
+      chatTargets: (query) => options().chatTargets(query),
     });
     bridgeRef.current = bridge;
     return () => {

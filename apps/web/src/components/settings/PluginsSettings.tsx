@@ -57,7 +57,14 @@ import {
 } from "../ui/dialog";
 import { Input } from "../ui/input";
 import { Label } from "../ui/label";
-import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from "../ui/menu";
+import {
+  Menu,
+  MenuCheckboxItem,
+  MenuItem,
+  MenuPopup,
+  MenuSeparator,
+  MenuTrigger,
+} from "../ui/menu";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Switch } from "../ui/switch";
 import { toastManager } from "../ui/toast";
@@ -134,6 +141,52 @@ function OpenPanelsButton(props: {
           <MenuItem key={panel.id} onClick={() => open(panel.id)}>
             {panel.title}
           </MenuItem>
+        ))}
+      </MenuPopup>
+    </Menu>
+  );
+}
+
+function PinPanelsControl(props: {
+  readonly scope: EnvironmentId | "client";
+  readonly pluginId: PluginId;
+  readonly manifest: PluginManifest;
+}) {
+  const pinned = usePluginPanelStore((state) => state.pinned);
+  const panels = props.manifest.ui?.panels ?? [];
+  const first = panels[0];
+  if (first === undefined) return null;
+  const keyOf = (panelId: string) => pluginPanelKey(props.scope, props.pluginId, panelId);
+  const setPinned = (panelId: string, next: boolean) => {
+    const store = usePluginPanelStore.getState();
+    if (next) store.pin(keyOf(panelId));
+    else store.unpin(keyOf(panelId));
+  };
+  if (panels.length === 1) {
+    return (
+      <Label>
+        <Switch
+          size="sm"
+          checked={pinned.includes(keyOf(first.id))}
+          aria-label={`Pin ${first.title} to right panel`}
+          onCheckedChange={(checked) => setPinned(first.id, Boolean(checked))}
+        />
+        Pin
+      </Label>
+    );
+  }
+  return (
+    <Menu>
+      <MenuTrigger render={<Button size="xs" variant="outline" />}>Pin</MenuTrigger>
+      <MenuPopup align="end">
+        {panels.map((panel) => (
+          <MenuCheckboxItem
+            key={panel.id}
+            checked={pinned.includes(keyOf(panel.id))}
+            onCheckedChange={(checked) => setPinned(panel.id, Boolean(checked))}
+          >
+            {panel.title}
+          </MenuCheckboxItem>
         ))}
       </MenuPopup>
     </Menu>
@@ -253,11 +306,18 @@ function DevicePlugins() {
             control={
               <div className="flex items-center gap-2">
                 {record.enabled ? (
-                  <OpenPanelsButton
-                    scope="client"
-                    pluginId={record.pluginId}
-                    manifest={record.manifest}
-                  />
+                  <>
+                    <PinPanelsControl
+                      scope="client"
+                      pluginId={record.pluginId}
+                      manifest={record.manifest}
+                    />
+                    <OpenPanelsButton
+                      scope="client"
+                      pluginId={record.pluginId}
+                      manifest={record.manifest}
+                    />
+                  </>
                 ) : null}
                 <Switch
                   checked={record.enabled}
@@ -565,11 +625,18 @@ function EnvironmentPlugins(props: { readonly environment: EnvironmentPresentati
               control={
                 <div className="flex items-center gap-2">
                   {record.enabled ? (
-                    <OpenPanelsButton
-                      scope={environmentId}
-                      pluginId={record.pluginId}
-                      manifest={record.manifest}
-                    />
+                    <>
+                      <PinPanelsControl
+                        scope={environmentId}
+                        pluginId={record.pluginId}
+                        manifest={record.manifest}
+                      />
+                      <OpenPanelsButton
+                        scope={environmentId}
+                        pluginId={record.pluginId}
+                        manifest={record.manifest}
+                      />
+                    </>
                   ) : null}
                   {record.enabled && hasBackend ? (
                     running ? (

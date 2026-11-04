@@ -1,6 +1,10 @@
 import { RegistryContext } from "@effect/atom-react";
 import { StackActions, useNavigation, type StaticScreenProps } from "@react-navigation/native";
-import type { PluginBridgeOptions } from "@t3tools/client-runtime/plugins/bridge";
+import {
+  selectPluginChatTargets,
+  type PluginBridgeOptions,
+  type PluginSaveFile,
+} from "@t3tools/client-runtime/plugins/bridge";
 import {
   parsePluginPanelKey,
   pluginPanelKey,
@@ -14,6 +18,8 @@ import {
   type PluginManifest,
   type PluginSubscriptionEvent,
 } from "@t3tools/contracts";
+import { isHostApiCompatible } from "@t3tools/shared/pluginManifest";
+import * as Clipboard from "expo-clipboard";
 import * as Schema from "effect/Schema";
 import { useContext, useState } from "react";
 import { View } from "react-native";
@@ -21,9 +27,14 @@ import { View } from "react-native";
 import { Button } from "../../components/ui/Button";
 import * as Dialog from "../../components/ui/Dialog";
 import { EmptyState } from "../../components/ui/EmptyState";
+import { beginForegroundHandoff } from "../../lib/foreground-handoff";
+import { uuidv4 } from "../../lib/uuid";
 import { NativeStackScreenOptions } from "../../native/StackHeader";
 import { useAssetUrlState } from "../../state/assets";
+import { appAtomRegistry } from "../../state/atom-registry";
 import { pluginEnvironment } from "../../state/plugins";
+import { environmentProjects } from "../../state/projects";
+import { environmentThreadShells } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { openSettings } from "../settings/settings-navigation";
 import { attachPluginRequestToChat } from "./attachToChat";
@@ -62,6 +73,49 @@ const subscriptionClosedReason = (
     default:
       return "worker-failed";
   }
+};
+
+const SAVE_DIRECTORY = "t3-plugin-saves";
+const SAVE_RETENTION_MS = 24 * 60 * 60_000;
+
+/** Writes the file to the cache and opens the share sheet. Its dismissal is not reported. */
+async function shareSavedFile(file: PluginSaveFile): Promise<"saved" | "cancelled"> {
+  const Sharing = await import("expo-sharing");
+  if (!(await Sharing.isAvailableAsync())) {
+    throw new Error("Saving and sharing files is unavailable on this device.");
+  }
+  const { Directory, File, Paths } = await import("expo-file-system");
+  const root = new Directory(Paths.cache, SAVE_DIRECTORY);
+  root.create({ idempotent: true, intermediates: true });
+  const now = Date.now();
+  // A receiver can still be reading after the sheet closes, so old saves are pruned later.
+  for (const entry of root.list()) {
+    if (
+      entry instanceof Directory &&
+      Number(entry.name.split("-", 1)[0]) < now - SAVE_RETENTION_MS
+    ) {
+      entry.delete();
+    }
+  }
+  const directory = new Directory(root, `${now}-${uuidv4()}`);
+  directory.create();
+  const target = new File(directory, file.name);
+  target.create();
+  for (const part of file.parts) await target.write(part, { append: true });
+  const endHandoff = beginForegroundHandoff();
+  try {
+    await Sharing.shareAsync(target.uri, {
+      mimeType: file.mimeType || "application/octet-stream",
+      dialogTitle: file.name,
+    });
+  } finally {
+    endHandoff();
+  }
+  return "saved";
+}
+
+const copyToClipboard = async (text: string) => {
+  await Clipboard.setStringAsync(text);
 };
 
 const failureText = (result: Parameters<typeof squashAtomCommandFailure>[0]) => {
@@ -168,6 +222,14 @@ function PluginPanelSurface(props: {
   const manifest = record.manifest;
   const panel = manifest.ui?.panels.find((entry) => entry.id === parsed.panelId);
   if (panel === undefined) return <PluginPanelMissing />;
+  if (!isHostApiCompatible(manifest.hostApi)) {
+    return (
+      <PanelState
+        title="Update T3 Code to use this plugin"
+        detail={`${manifest.name} needs a newer version of this app.`}
+      />
+    );
+  }
   const environmentTarget =
     install.kind === "environment"
       ? { environmentId: install.environmentId, input: { pluginId: install.record.pluginId } }
@@ -317,6 +379,19 @@ function PluginPanelSurface(props: {
     },
     attach: (request: Parameters<PluginBridgeOptions["attach"]>[0]) =>
       attachPluginRequestToChat({ request, chat, manifest, destination }),
+    saveFile: shareSavedFile,
+    writeClipboard: copyToClipboard,
+    chatTargets: (query: string) =>
+      install.kind === "environment"
+        ? selectPluginChatTargets(
+            {
+              threads: appAtomRegistry.get(environmentThreadShells.threadShellsAtom),
+              projects: appAtomRegistry.get(environmentProjects.projectsAtom),
+            },
+            install.environmentId,
+            query,
+          )
+        : { threads: [], projects: [] },
   };
   const chatTarget = chat === null ? null : { key: chat.key, title: chat.title };
   const frameKey = `${panelKey}@${version}`;

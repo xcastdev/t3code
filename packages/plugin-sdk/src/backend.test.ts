@@ -16,9 +16,22 @@ import {
   type PluginBackendDefinition,
   type TopicEmitter,
 } from "./backend.ts";
-import { makeWorkerClient, WorkerRequestError } from "./testing.ts";
+import { makeWorkerClient, WorkerRequestError, type FakeContextResolver } from "./testing.ts";
 
-const startBackend = async (definition: PluginBackendDefinition) => {
+const subagentContext = {
+  projectId: "project-1",
+  thread: {
+    id: "thread-child",
+    parentThreadId: "thread-parent",
+    rootThreadId: "thread-parent",
+    relationshipToParent: "subagent",
+  },
+} as const;
+
+const startBackend = async (
+  definition: PluginBackendDefinition,
+  resolveContext?: FakeContextResolver,
+) => {
   const toWorker = new NodeStream.PassThrough();
   const fromWorker = new NodeStream.PassThrough();
   const exited = Promise.withResolvers<number>();
@@ -36,6 +49,7 @@ const startBackend = async (definition: PluginBackendDefinition) => {
     input: fromWorker,
     output: toWorker,
     initialize: { pluginId: "echo", version: "0.1.0", dataDir, config: {}, secrets: {} },
+    ...(resolveContext === undefined ? {} : { resolveContext }),
   });
   await client.initialize();
   return { client, dataDir, fromWorker, exits, exited: exited.promise };
@@ -81,6 +95,53 @@ describe("definePluginBackend", () => {
     const missing = await client.invoke("nope", {}).result.catch((error: unknown) => error);
     expect(missing).toBeInstanceOf(WorkerRequestError);
     expect(missing).toMatchObject({ reason: "unknown-operation" });
+  });
+
+  it("forwards the invoke context to ctx.context and rejects a malformed one", async () => {
+    const { client } = await startBackend({
+      operations: { where: async (_input, ctx) => ctx.context },
+    });
+    await expect(client.invoke("where", {}, "agent", subagentContext).result).resolves.toEqual(
+      subagentContext,
+    );
+    const malformed = { projectId: null, thread: { id: "t" } } as never;
+    await expect(client.invoke("where", {}, "ui", malformed).result).rejects.toMatchObject({
+      code: -32602,
+    });
+  });
+
+  it("gives an empty ctx.context when the host sends none", async () => {
+    const { client } = await startBackend({
+      operations: { where: async (_input, ctx) => ctx.context },
+    });
+    await expect(client.invoke("where", {}).result).resolves.toEqual({
+      projectId: null,
+      thread: null,
+    });
+  });
+
+  it("ctx.host.resolveContext asks the host and returns its answer", async () => {
+    const asked: Array<unknown> = [];
+    const { client } = await startBackend(
+      {
+        operations: {
+          resolve: async (input, ctx) =>
+            ctx.host.resolveContext(input as { readonly threadId: string }),
+        },
+      },
+      (ref) => {
+        asked.push(ref);
+        return "threadId" in ref && ref.threadId === "thread-child" ? subagentContext : null;
+      },
+    );
+    await expect(client.invoke("resolve", { threadId: "thread-child" }).result).resolves.toEqual(
+      subagentContext,
+    );
+    await expect(client.invoke("resolve", { threadId: "gone" }).result).resolves.toBeNull();
+    await expect(
+      client.invoke("resolve", { threadId: "a", projectId: "b" }).result,
+    ).rejects.toMatchObject({ reason: "operation-failed" });
+    expect(asked).toEqual([{ threadId: "thread-child" }, { threadId: "gone" }]);
   });
 
   it("reports a thrown handler error as operation-failed, an oversized result as too-large, and status changes", async () => {

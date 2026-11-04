@@ -446,7 +446,7 @@ function toolGroupActionLabel(action: ToolGroupAction, count: number): string {
     case "browser":
       return `Used browser ${count} ${count === 1 ? "time" : "times"}`;
     case "search":
-      return `Searched the web ${count} ${count === 1 ? "time" : "times"}`;
+      return count === 1 ? "Searched the web" : `Searched the web ${count} times`;
     case "code-search":
       return `Searched code ${count} ${count === 1 ? "time" : "times"}`;
     case "other":

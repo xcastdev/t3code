@@ -1,6 +1,6 @@
 import * as Schema from "effect/Schema";
 
-import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NonNegativeInt, ProjectId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 export const PLUGIN_LIMITS = {
   maxPayloadBytes: 240 * 1024,
@@ -8,9 +8,11 @@ export const PLUGIN_LIMITS = {
   maxBatchBytes: 64 * 1024,
   maxBodyChunkBytes: 128 * 1024,
   maxPendingRequests: 16,
+  maxSaveBytes: 32 * 1024 * 1024,
+  maxChatTargets: 50,
 } as const;
 
-export const PLUGIN_HOST_API = { major: 1, minor: 0 } as const;
+export const PLUGIN_HOST_API = { major: 1, minor: 1 } as const;
 
 const PLUGIN_ID_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 const PLUGIN_OPERATION_NAME_PATTERN = /^[a-z][a-z0-9_]{0,31}$/;
@@ -120,7 +122,12 @@ export const PluginSettingField = Schema.Struct({
 });
 export type PluginSettingField = typeof PluginSettingField.Type;
 
-export const PluginCapability = Schema.Literals(["chat.attach", "chat.reference"]);
+export const PluginCapability = Schema.Literals([
+  "chat.attach",
+  "chat.reference",
+  "file.save",
+  "clipboard.write",
+]);
 export type PluginCapability = typeof PluginCapability.Type;
 
 export const PluginManifest = Schema.Struct({
@@ -235,7 +242,9 @@ export class PluginRequestError extends Schema.TaggedError<PluginRequestError>()
       case "incompatible-host-api":
         return "This plugin needs a newer or different version of T3 Code.";
       case "invalid-package":
-        return "This file is not a valid T3 Code plugin package.";
+        return this.detail === undefined
+          ? "This file is not a valid T3 Code plugin package."
+          : `This file is not a valid T3 Code plugin package: ${this.detail}`;
       case "too-large":
         return "The plugin request or response is too large.";
       case "worker-failed":
@@ -336,12 +345,37 @@ export const PluginLogs = Schema.Struct({
 });
 export type PluginLogs = typeof PluginLogs.Type;
 
+/** Names one thread or one project; carrying both keys is rejected. */
+export const PluginChatHint = Schema.Union([
+  Schema.Struct({ threadId: ThreadId, projectId: Schema.optionalKey(Schema.Never) }),
+  Schema.Struct({ projectId: ProjectId, threadId: Schema.optionalKey(Schema.Never) }),
+]);
+export type PluginChatHint = typeof PluginChatHint.Type;
+
+/** Resolved by the server from a hint or the agent's thread, never taken from the caller. */
+export const PluginCallContext = Schema.Struct({
+  projectId: Schema.NullOr(ProjectId),
+  thread: Schema.NullOr(
+    Schema.Struct({
+      id: ThreadId,
+      parentThreadId: Schema.NullOr(ThreadId),
+      rootThreadId: ThreadId,
+      relationshipToParent: Schema.NullOr(Schema.Literals(["fork", "subagent", "chat"])),
+    }),
+  ),
+});
+export type PluginCallContext = typeof PluginCallContext.Type;
+
+export const EMPTY_PLUGIN_CALL_CONTEXT: PluginCallContext = { projectId: null, thread: null };
+
 /** Panels always send `expectedVersion`; agent calls and references omit it. */
 export const PluginOperationCallInput = Schema.Struct({
   pluginId: PluginId,
   operation: PluginOperationName,
   input: Schema.Json,
   expectedVersion: Schema.optionalKey(PluginVersion),
+  /** Docked panels only: the chat beside the panel, in the install's environment. */
+  chat: Schema.optionalKey(PluginChatHint),
 });
 export type PluginOperationCallInput = typeof PluginOperationCallInput.Type;
 
@@ -370,3 +404,31 @@ export const PluginResolvedReference = Schema.Struct({
   detail: Schema.String,
 });
 export type PluginResolvedReference = typeof PluginResolvedReference.Type;
+
+/** Worker → host request: validates a thread or project id; unknown or deleted gives `null`. */
+export const PLUGIN_WORKER_CONTEXT_RESOLVE_METHOD = "t3/context.resolve";
+export const PluginContextResolveParams = PluginChatHint;
+export type PluginContextResolveParams = typeof PluginContextResolveParams.Type;
+export const PluginContextResolveResult = Schema.NullOr(PluginCallContext);
+export type PluginContextResolveResult = typeof PluginContextResolveResult.Type;
+
+/** Panel → host bridge request `t3/chat.targets.list`. */
+export const PluginChatTargetsListParams = Schema.Struct({
+  query: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(256))),
+});
+export type PluginChatTargetsListParams = typeof PluginChatTargetsListParams.Type;
+
+export const PluginChatTargets = Schema.Struct({
+  threads: Schema.Array(
+    Schema.Struct({
+      threadId: ThreadId,
+      title: Schema.String,
+      projectId: ProjectId,
+      projectName: Schema.String,
+    }),
+  ).check(Schema.isMaxLength(PLUGIN_LIMITS.maxChatTargets)),
+  projects: Schema.Array(Schema.Struct({ projectId: ProjectId, name: Schema.String })).check(
+    Schema.isMaxLength(PLUGIN_LIMITS.maxChatTargets),
+  ),
+});
+export type PluginChatTargets = typeof PluginChatTargets.Type;

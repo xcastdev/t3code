@@ -167,6 +167,11 @@ function selectOpenCodeRuntimeTextGeneration(
         v1: v1.describeImage(input),
         v2: v2.describeImage(input),
       }),
+    webSearch: (input) =>
+      byOpenCodeRuntime(probe.get, {
+        v1: v1.webSearch(input),
+        v2: v2.webSearch(input),
+      }),
   };
 }
 

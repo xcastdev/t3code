@@ -1,6 +1,8 @@
 import { parseScopedThreadKey } from "@t3tools/client-runtime/environment";
 import {
   parsePluginPanelKey,
+  pluginPanelKey,
+  type PluginInstallEntry,
   type PluginPanelKey,
   type PluginPanelScope,
 } from "@t3tools/client-runtime/plugins/commands";
@@ -8,6 +10,7 @@ import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 
 import { resolveStorage } from "./lib/storage";
+import { resolvePluginOpenTarget } from "./plugins/openPluginPanel";
 import { type RightPanelSurface, useRightPanelStore } from "./rightPanelStore";
 
 const PLUGIN_PANEL_STORAGE_KEY = "t3code:plugin-panels:v1";
@@ -25,12 +28,16 @@ type ByEnvironment = Readonly<Record<string, DockedPluginPanels>>;
 
 interface PluginPanelStoreState {
   readonly byEnvironment: ByEnvironment;
+  /** Panels pinned to the right-panel rail on this device, in pin order. */
+  readonly pinned: ReadonlyArray<PluginPanelKey>;
   /** Docks the panel and focuses it for chats in `chatEnvironmentId`. */
   readonly open: (key: PluginPanelKey, chatEnvironmentId: string) => void;
   readonly focus: (key: PluginPanelKey, chatEnvironmentId: string) => void;
   readonly blur: (chatEnvironmentId: string) => void;
   readonly close: (key: PluginPanelKey) => void;
-  /** Removes every docked panel of a plugin in one scope, as on uninstall. */
+  readonly pin: (key: PluginPanelKey) => void;
+  readonly unpin: (key: PluginPanelKey) => void;
+  /** Removes every docked and pinned panel of a plugin in one scope, as on uninstall. */
   readonly dropPlugin: (scope: PluginPanelScope, pluginId: string) => void;
 }
 
@@ -82,6 +89,31 @@ export function selectDockedPluginPanels(
   return { open, focused };
 }
 
+export interface PinnedRailPanel {
+  readonly key: PluginPanelKey;
+  readonly title: string;
+  readonly icon: string | undefined;
+}
+
+/** Pins a chat in `chatEnvironmentId` can dock, given the enabled installs. Others stay pinned. */
+export function selectPinnedRailPanels(
+  pinned: ReadonlyArray<PluginPanelKey>,
+  enabledInstalls: ReadonlyArray<PluginInstallEntry>,
+  chatEnvironmentId: string | null,
+): ReadonlyArray<PinnedRailPanel> {
+  if (chatEnvironmentId === null) return [];
+  const chat = { environmentId: chatEnvironmentId };
+  const panels = new Map<PluginPanelKey, PinnedRailPanel>();
+  for (const { scope, record } of enabledInstalls) {
+    if (resolvePluginOpenTarget({ scope, chat }) !== "dock") continue;
+    for (const panel of record.manifest.ui?.panels ?? []) {
+      const key = pluginPanelKey(scope, record.pluginId, panel.id);
+      panels.set(key, { key, title: panel.title, icon: panel.icon });
+    }
+  }
+  return pinned.flatMap((key) => panels.get(key) ?? []);
+}
+
 // usePanelPresence compares surfaces by identity during render, and a mount has no memo
 // cache to fall back on, so plugin surfaces must keep their identity without the compiler.
 const pluginSurfaceCache = new Map<string, RightPanelSurface>();
@@ -110,6 +142,19 @@ export function combineRightPanelSurfaces(
     next.every((surface, index) => surface === lastCombinedSurfaces[index]);
   if (!unchanged) lastCombinedSurfaces = next;
   return lastCombinedSurfaces;
+}
+
+function sanitizePinned(persisted: unknown): ReadonlyArray<PluginPanelKey> {
+  const raw =
+    persisted && typeof persisted === "object" && "pinned" in persisted
+      ? (persisted as { pinned: unknown }).pinned
+      : null;
+  if (!Array.isArray(raw)) return [];
+  const keys = raw.filter(
+    (key): key is PluginPanelKey =>
+      typeof key === "string" && parsePluginPanelKey(key) !== undefined,
+  );
+  return [...new Set(keys)];
 }
 
 function sanitize(persisted: unknown): ByEnvironment {
@@ -141,6 +186,7 @@ export const usePluginPanelStore = create<PluginPanelStoreState>()(
   persist(
     (set) => ({
       byEnvironment: {},
+      pinned: [],
       open: (key, chatEnvironmentId) =>
         set((state) => {
           const scope = scopeOf(key);
@@ -170,22 +216,45 @@ export const usePluginPanelStore = create<PluginPanelStoreState>()(
         set((state) => ({
           byEnvironment: removeKeys(state.byEnvironment, (entry) => entry === key),
         })),
+      pin: (key) =>
+        set((state) =>
+          state.pinned.includes(key) || parsePluginPanelKey(key) === undefined
+            ? state
+            : { pinned: [...state.pinned, key] },
+        ),
+      unpin: (key) =>
+        set((state) =>
+          state.pinned.includes(key)
+            ? { pinned: state.pinned.filter((entry) => entry !== key) }
+            : state,
+        ),
       dropPlugin: (scope, pluginId) =>
-        set((state) => ({
-          byEnvironment: removeKeys(state.byEnvironment, (key) => {
+        set((state) => {
+          const removed = (key: PluginPanelKey) => {
             const parsed = parsePluginPanelKey(key);
             return parsed?.scope === scope && parsed.pluginId === pluginId;
-          }),
-        })),
+          };
+          const pinned = state.pinned.filter((key) => !removed(key));
+          return {
+            byEnvironment: removeKeys(state.byEnvironment, removed),
+            pinned: pinned.length === state.pinned.length ? state.pinned : pinned,
+          };
+        }),
     }),
     {
       name: PLUGIN_PANEL_STORAGE_KEY,
-      version: 1,
+      version: 2,
       storage: createJSONStorage(() =>
         resolveStorage(typeof window !== "undefined" ? window.localStorage : undefined),
       ),
-      partialize: (state) => ({ byEnvironment: state.byEnvironment }),
-      merge: (persisted, current) => ({ ...current, byEnvironment: sanitize(persisted) }),
+      // v1 had no pins; merge sanitizes whatever shape arrives.
+      migrate: (persisted) => persisted,
+      partialize: (state) => ({ byEnvironment: state.byEnvironment, pinned: state.pinned }),
+      merge: (persisted, current) => ({
+        ...current,
+        byEnvironment: sanitize(persisted),
+        pinned: sanitizePinned(persisted),
+      }),
     },
   ),
 );

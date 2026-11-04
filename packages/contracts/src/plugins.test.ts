@@ -2,10 +2,15 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import { KeybindingCommand } from "./keybindings.ts";
-import { PluginRequestError, PluginSubscriptionEvent } from "./plugins.ts";
+import {
+  PluginOperationCallInput,
+  PluginRequestError,
+  PluginSubscriptionEvent,
+} from "./plugins.ts";
 
 const isKeybindingCommand = Schema.is(KeybindingCommand);
 const isSubscriptionEvent = Schema.is(PluginSubscriptionEvent);
+const decodeCallInput = Schema.decodeUnknownExit(PluginOperationCallInput);
 
 describe("plugin keybinding commands", () => {
   it("decodes plugin.converter.open as a KeybindingCommand", () => {
@@ -49,5 +54,21 @@ describe("PluginRequestError", () => {
     expect(new PluginRequestError({ reason: "version-changed" }).message).toBe(
       "This plugin was updated. Reload the panel.",
     );
+  });
+});
+
+describe("PluginOperationCallInput", () => {
+  const base = { pluginId: "request-inspector", operation: "list_proxies", input: {} };
+
+  it.each([
+    ["no chat hint", base, true],
+    ["a thread hint", { ...base, chat: { threadId: "thread-1" } }, true],
+    ["a project hint", { ...base, chat: { projectId: "project-1" } }, true],
+    ["a hint with both keys", { ...base, chat: { threadId: "t", projectId: "p" } }, false],
+    ["an empty hint", { ...base, chat: {} }, false],
+  ])("%s decodes → %s", (_name, input, ok) => {
+    const exit = decodeCallInput(input);
+    expect(exit._tag === "Success").toBe(ok);
+    if (exit._tag === "Success" && "chat" in input) expect(exit.value.chat).toEqual(input.chat);
   });
 });

@@ -1,5 +1,9 @@
 import {
+  EMPTY_PLUGIN_CALL_CONTEXT,
+  type OrchestrationV2ThreadShell,
   PLUGIN_LIMITS,
+  type PluginCallContext,
+  type PluginChatHint,
   type PluginConfig,
   type PluginConfigureInput,
   type PluginId,
@@ -31,6 +35,8 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as PluginPackageStore from "./PluginPackageStore.ts";
 import * as PluginWorkerSupervisor from "./PluginWorkerSupervisor.ts";
 
@@ -59,6 +65,22 @@ const requireWithinPayload = (value: unknown, what: string) =>
         requestError("too-large", `The ${what} exceeds ${PLUGIN_LIMITS.maxPayloadBytes} bytes.`),
       )
     : Effect.void;
+
+/** A missing or deleted thread has no context. */
+export const pluginCallContextFromShell = (
+  shell: Pick<OrchestrationV2ThreadShell, "id" | "projectId" | "lineage" | "deletedAt"> | null,
+): PluginCallContext | null =>
+  shell === null || shell.deletedAt !== null
+    ? null
+    : {
+        projectId: shell.projectId,
+        thread: {
+          id: shell.id,
+          parentThreadId: shell.lineage.parentThreadId,
+          rootThreadId: shell.lineage.rootThreadId,
+          relationshipToParent: shell.lineage.relationshipToParent,
+        },
+      };
 
 export interface PluginAgentCatalogEntry {
   readonly pluginId: PluginId;
@@ -114,6 +136,7 @@ export class PluginService extends Context.Service<
       readonly operation: string;
       readonly input: unknown;
       readonly caller: "ui" | "agent";
+      readonly context: PluginCallContext;
     }) => Effect.Effect<unknown, PluginRequestError>;
     /** Enabled plugins with a backend. */
     readonly agentCatalog: Effect.Effect<ReadonlyArray<PluginAgentCatalogEntry>>;
@@ -123,6 +146,8 @@ export class PluginService extends Context.Service<
 const make = Effect.gen(function* () {
   const store = yield* PluginPackageStore.PluginPackageStore;
   const supervisor = yield* PluginWorkerSupervisor.PluginWorkerSupervisor;
+  const projections = yield* ProjectionStore.ProjectionStoreV2;
+  const projects = yield* ProjectStore.ProjectStoreV2;
   const path = yield* Path.Path;
   const lifecycleLock = yield* KeyedLock.make<PluginId>();
   const subscriptionCounts = new Map<string, number>();
@@ -171,6 +196,36 @@ const make = Effect.gen(function* () {
       return Effect.succeed(record);
     });
 
+  /** Unknown or deleted ids resolve to `null`; a store failure fails. */
+  const resolveContext = Effect.fn("PluginService.resolveContext")(function* (
+    hint: PluginChatHint,
+  ) {
+    if (hint.threadId !== undefined) {
+      return pluginCallContextFromShell(yield* projections.getThreadShell(hint.threadId));
+    }
+    const project = yield* projects.get(hint.projectId);
+    return project._tag === "None" ? null : { projectId: project.value.projectId, thread: null };
+  });
+
+  const resolveForWorker: PluginWorkerSupervisor.PluginContextResolver = (params) =>
+    resolveContext(params).pipe(
+      Effect.mapError(() => requestError("operation-failed", "The context lookup failed.")),
+    );
+
+  // D8: a panel beside a chat that just went away still works, with no context.
+  const resolvePanelContext = (hint: PluginChatHint | undefined) =>
+    hint === undefined
+      ? Effect.succeed(EMPTY_PLUGIN_CALL_CONTEXT)
+      : resolveContext(hint).pipe(
+          Effect.map((context) => context ?? EMPTY_PLUGIN_CALL_CONTEXT),
+          Effect.catch((error) =>
+            Effect.as(
+              Effect.logWarning("Plugin panel context lookup failed.", { error }),
+              EMPTY_PLUGIN_CALL_CONTEXT,
+            ),
+          ),
+        );
+
   /** Callers hold the plugin's lifecycle lock. */
   const startBackend = Effect.fn("PluginService.startBackend")(function* (
     record: PluginInstallRecord,
@@ -189,6 +244,7 @@ const make = Effect.gen(function* () {
       secrets: runtime.secrets,
       previousVersion,
       prerequisites: backend.prerequisites,
+      resolveContext: resolveForWorker,
     });
     if (
       record.failedUpdate?.to === record.version &&
@@ -394,9 +450,12 @@ const make = Effect.gen(function* () {
       : Effect.succeed(declared);
   };
 
-  const invoke = (pluginId: PluginId, operation: string, input: unknown, caller: "ui" | "agent") =>
-    requireWithinPayload(input, "operation input").pipe(
-      Effect.andThen(supervisor.invoke(pluginId, { operation, input, caller })),
+  const invoke = (
+    pluginId: PluginId,
+    request: Parameters<PluginWorkerSupervisor.PluginWorkerSupervisor["Service"]["invoke"]>[1],
+  ) =>
+    requireWithinPayload(request.input, "operation input").pipe(
+      Effect.andThen(supervisor.invoke(pluginId, request)),
     );
 
   const callOperation: PluginService["Service"]["callOperation"] = Effect.fn(
@@ -409,7 +468,12 @@ const make = Effect.gen(function* () {
     });
     const record = yield* requireEnabled(request.pluginId);
     yield* resolveOperation(record, request.operation, request.caller);
-    return yield* invoke(request.pluginId, request.operation, request.input, request.caller);
+    return yield* invoke(request.pluginId, {
+      operation: request.operation,
+      input: request.input,
+      caller: request.caller,
+      context: request.context,
+    });
   });
 
   // Untraced: runs only inside the query or mutate span.
@@ -425,7 +489,12 @@ const make = Effect.gen(function* () {
             : "This operation changes state; call it as a mutation.",
         );
       }
-      return yield* invoke(input.pluginId, input.operation, input.input, "ui");
+      return yield* invoke(input.pluginId, {
+        operation: input.operation,
+        input: input.input,
+        caller: "ui",
+        context: yield* resolvePanelContext(input.chat),
+      });
     });
 
   const query: PluginService["Service"]["query"] = Effect.fn("PluginService.query")(

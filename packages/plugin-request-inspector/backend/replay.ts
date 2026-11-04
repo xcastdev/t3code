@@ -84,7 +84,7 @@ export interface ReplayMessage {
 
 /** A replayed flow as mitmproxy finished it: the request as sent, then a response or an error. */
 export type ReplayResult =
-  | { readonly replayId: string; readonly flow: Omit<FlowInput, "captureId"> }
+  | { readonly replayId: string; readonly flow: Omit<FlowInput, "recordingId"> }
   | { readonly replayId: string; readonly error: string };
 
 /** A live control connection to one mitmdump. */
@@ -103,10 +103,19 @@ export interface TransientCarrier {
   readonly stop: () => Promise<void>;
 }
 
+/** How a replay leaves (D35): through its source proxy's process, or a replay-only one. */
+export type ReplayCarrier =
+  | { readonly kind: "running"; readonly channel: ReplayChannel }
+  | {
+      readonly kind: "transient";
+      /** Replays whose carriers share a key share one replay-only mitmdump. */
+      readonly key: string;
+      readonly start: () => TransientCarrier;
+    };
+
 export interface ReplayCarriers {
-  /** The running capture's mitmdump, if any. */
-  readonly capture: () => ReplayChannel | undefined;
-  readonly startTransient: () => TransientCarrier;
+  /** `proxyId` is the source request's proxy, undefined when the source is gone. */
+  readonly carrierFor: (proxyId: number | undefined) => ReplayCarrier;
 }
 
 export interface ReplayPreview {
@@ -135,7 +144,7 @@ export interface ReplayView {
   readonly destination: ReplayDestination;
 }
 
-/** The `capture_status` topic item for one replay row change. */
+/** The `proxies` topic item for one replay row change. */
 export interface ReplayStatusItem {
   readonly kind: "replay";
   readonly replayId: string;
@@ -234,6 +243,7 @@ type BuiltBody =
     };
 
 interface BuiltReplay {
+  readonly proxyId: number;
   readonly destination: ReplayDestination;
   readonly method: string;
   readonly authority: string;
@@ -333,6 +343,7 @@ function buildReplay(store: InspectorStore, drafts: DraftStore, input: ReplayInp
 
   const refusal = refusals[0];
   return {
+    proxyId: record.summary.proxyId,
     destination,
     method,
     authority,
@@ -376,6 +387,7 @@ export interface ReplayService {
 }
 
 interface TransientEntry {
+  readonly key: string;
   readonly carrier: TransientCarrier;
   readonly ready: Promise<ReplayChannel | undefined>;
   readonly users: Set<string>;
@@ -389,12 +401,12 @@ export function makeReplayService(options: ReplayServiceOptions): ReplayService 
   const maxReplayHistory = options.maxReplayHistory ?? REPLAY_LIMITS.maxReplayHistory;
   const log = options.log ?? (() => undefined);
 
-  const prepared = new Map<string, ReplayMessage>();
+  const prepared = new Map<string, { readonly message: ReplayMessage; readonly proxyId: number }>();
   const inflight = new Map<string, ReplayChannel>();
   const deadlines = new Map<string, () => void>();
   const transientOf = new Map<string, TransientEntry>();
   const watched = new WeakSet<ReplayChannel>();
-  let transient: TransientEntry | undefined;
+  const transients = new Map<string, TransientEntry>();
   let stopped = false;
 
   const bodyFile = (replayId: string) => NodePath.join(store.replayDir, `${replayId}.bin`);
@@ -402,7 +414,7 @@ export function makeReplayService(options: ReplayServiceOptions): ReplayService 
   const stopTransient = (entry: TransientEntry) => {
     if (entry.stopping) return Promise.resolve();
     entry.stopping = true;
-    if (transient === entry) transient = undefined;
+    if (transients.get(entry.key) === entry) transients.delete(entry.key);
     return entry.carrier.stop().catch(() => log("Stopping the replay mitmdump failed."));
   };
 
@@ -475,11 +487,15 @@ export function makeReplayService(options: ReplayServiceOptions): ReplayService 
     void channel.closed.then(() => interruptChannel(channel));
   };
 
-  const acquireChannel = async (replayId: string): Promise<ReplayChannel | undefined> => {
-    const capture = carriers.capture();
-    if (capture?.isOpen() === true) return capture;
-    if (transient === undefined) {
-      const carrier = carriers.startTransient();
+  const acquireChannel = async (
+    replayId: string,
+    proxyId: number,
+  ): Promise<ReplayChannel | undefined> => {
+    const chosen = carriers.carrierFor(proxyId);
+    if (chosen.kind === "running") return chosen.channel;
+    let entry = transients.get(chosen.key);
+    if (entry === undefined) {
+      const carrier = chosen.start();
       const ready = new Promise<ReplayChannel | undefined>((resolve) => {
         const cancel = timer.after(REPLAY_LIMITS.startupMs, () => resolve(undefined));
         carrier.ready.then(
@@ -493,22 +509,29 @@ export function makeReplayService(options: ReplayServiceOptions): ReplayService 
           },
         );
       });
-      const entry: TransientEntry = { carrier, ready, users: new Set(), stopping: false };
-      transient = entry;
+      const created: TransientEntry = {
+        key: chosen.key,
+        carrier,
+        ready,
+        users: new Set(),
+        stopping: false,
+      };
+      entry = created;
+      transients.set(chosen.key, created);
       void ready.then((channel) => {
-        if (channel === undefined) void stopTransient(entry);
+        if (channel === undefined) void stopTransient(created);
       });
     }
-    const entry = transient;
     entry.users.add(replayId);
     transientOf.set(replayId, entry);
     return entry.ready;
   };
 
   const dispatch = async (replayId: string) => {
-    const message = prepared.get(replayId);
-    if (message === undefined) return;
-    const channel = await acquireChannel(replayId);
+    const entry = prepared.get(replayId);
+    if (entry === undefined) return;
+    const { message } = entry;
+    const channel = await acquireChannel(replayId, entry.proxyId);
     if (stopped) return;
     if (channel === undefined || !channel.isOpen()) {
       await settle(replayId, { state: "failed", detail: REPLAY_DETAILS.notStarted });
@@ -666,7 +689,10 @@ export function makeReplayService(options: ReplayServiceOptions): ReplayService 
           return outcome;
         }
         if (first.built.body.kind === "draft") drafts.remove(lane, first.built.body.draftId);
-        prepared.set(replayId, toMessage(replayId, first.built, path));
+        prepared.set(replayId, {
+          message: toMessage(replayId, first.built, path),
+          proxyId: first.built.proxyId,
+        });
         return outcome;
       } catch (error) {
         removeBody();
@@ -742,7 +768,7 @@ export function makeReplayService(options: ReplayServiceOptions): ReplayService 
             ? undefined
             : lane.insertFlow({
                 ...result.flow,
-                captureId: source.summary.captureId,
+                recordingId: source.summary.recordingId,
                 replayOf: String(row.sourceRequestId),
               });
         settleInLane(
@@ -787,7 +813,7 @@ export function makeReplayService(options: ReplayServiceOptions): ReplayService 
       stopped = true;
       for (const cancel of deadlines.values()) cancel();
       deadlines.clear();
-      if (transient !== undefined) await stopTransient(transient);
+      await Promise.all([...transients.values()].map(stopTransient));
       await settlePending();
     },
   };

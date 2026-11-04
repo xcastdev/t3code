@@ -299,6 +299,7 @@ it.layer(layerCodexTextGenerationTest)("CodexTextGeneration", (it) => {
         ],
         requireArg:
           '--config features.plugins=false --config features.apps=false --config mcp_servers={"augmenter"={enabled=false},"my.server"={enabled=false}}',
+        forbidArg: "features.shell_tool=false",
       },
       (textGeneration) =>
         Effect.gen(function* () {
@@ -490,6 +491,41 @@ it.layer(layerCodexTextGenerationTest)("CodexTextGeneration", (it) => {
       expect(described).toEqual({ description: "A red error banner." });
     }).pipe(Effect.scoped),
   );
+
+  it.effect("turns on live web search, read-only and ephemeral, only for a web search", () =>
+    withFakeCodexEnv(
+      {
+        output: JSON.stringify({
+          answer: "  Node 26 is current.  ",
+          sources: [
+            { title: "Releases", url: "https://nodejs.org/en/about/previous-releases" },
+            { title: "Not a page", url: "javascript:alert(1)" },
+          ],
+        }),
+        requireArg: [
+          '--config web_search="live"',
+          "--config features.shell_tool=false --config features.unified_exec=false",
+          "--config features.view_image=false --config features.image_generation=false",
+          "--config project_doc_max_bytes=0",
+          "--ephemeral --skip-git-repo-check -s read-only",
+        ].join(" "),
+        stdinMustContain: "Which Node.js release is current?",
+      },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          expect(
+            yield* textGeneration.webSearch({
+              cwd: process.cwd(),
+              query: "Which Node.js release is current?",
+              modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+            }),
+          ).toEqual({
+            answer: "Node 26 is current.",
+            sources: [{ title: "Releases", url: "https://nodejs.org/en/about/previous-releases" }],
+          });
+        }),
+    ),
+  );
 });
 
 it.effect.each([false, true])("text generation preflight: exhausted=%s", (exhausted) =>
@@ -503,6 +539,7 @@ it.effect.each([false, true])("text generation preflight: exhausted=%s", (exhaus
     };
     const calls: ModelSelection[] = [];
     const imageCalls: ModelSelection[] = [];
+    const searchCalls: ModelSelection[] = [];
     const instances: ProviderInstance[] = [primary, fallback].map((instanceId) => {
       const driver = ProviderDriverKind.make(instanceId === primary ? "codex" : "claudeAgent");
       const snapshot: ServerProvider = {
@@ -544,6 +581,11 @@ it.effect.each([false, true])("text generation preflight: exhausted=%s", (exhaus
             Effect.sync(() => {
               imageCalls.push(input.modelSelection);
               return { description: "Seen" };
+            }),
+          webSearch: (input) =>
+            Effect.sync(() => {
+              searchCalls.push(input.modelSelection);
+              return { answer: "Found", sources: [] };
             }),
           generateThreadTitle: (input) =>
             Effect.sync(() => {
@@ -605,5 +647,22 @@ it.effect.each([false, true])("text generation preflight: exhausted=%s", (exhaus
     );
     expect(refused.detail).toContain("cannot look at images");
     expect(imageCalls).toEqual([selection]);
+
+    // Claude and Codex both search the web, so an exhausted Codex falls back to Claude.
+    expect(
+      yield* service.webSearch({ cwd: "/tmp", query: "q", modelSelection: selection }),
+    ).toEqual({
+      answer: "Found",
+      sources: [],
+    });
+    expect(searchCalls).toEqual([
+      exhausted
+        ? {
+            instanceId: fallback,
+            model:
+              DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER[ProviderDriverKind.make("claudeAgent")],
+          }
+        : selection,
+    ]);
   }),
 );

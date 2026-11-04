@@ -33,6 +33,27 @@ export type PluginCaller = "ui" | "agent";
 export type PluginConfig = Readonly<Record<string, unknown>>;
 export type PluginSecrets = Readonly<Record<string, string>>;
 
+/** The caller's chat, resolved by the host. Both fields are null when there is none. */
+export interface PluginCallContextView {
+  readonly projectId: string | null;
+  readonly thread: {
+    readonly id: string;
+    readonly parentThreadId: string | null;
+    readonly rootThreadId: string;
+    readonly relationshipToParent: "fork" | "subagent" | "chat" | null;
+  } | null;
+}
+
+export type PluginContextRef = { readonly threadId: string } | { readonly projectId: string };
+
+export interface PluginHostRequests {
+  /**
+   * Asks the host whether a thread or project exists and returns its context, or `null` when it is
+   * unknown or deleted. Rejects when the operation's signal aborts.
+   */
+  readonly resolveContext: (ref: PluginContextRef) => Promise<PluginCallContextView | null>;
+}
+
 export interface StartContext {
   readonly pluginId: string;
   readonly version: string;
@@ -45,6 +66,8 @@ export interface StartContext {
 
 export interface OperationContext {
   readonly caller: PluginCaller;
+  readonly context: PluginCallContextView;
+  readonly host: PluginHostRequests;
   readonly signal: AbortSignal;
   readonly dataDir: string;
   readonly config: PluginConfig;
@@ -118,7 +141,7 @@ const jsonBytes = (value: unknown): number => {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-const isId = (value: unknown): value is JsonRpcId =>
+const isRpcId = (value: unknown): value is JsonRpcId =>
   typeof value === "string" || (typeof value === "number" && Number.isFinite(value));
 
 const stringRecord = (value: unknown): Record<string, string> | undefined => {
@@ -136,6 +159,46 @@ const errorText = (error: unknown): string => {
 
 const invalidParams = (message: string) =>
   new WorkerError(PLUGIN_WORKER_ERROR_CODES.invalidParams, message);
+
+const RELATIONSHIPS: ReadonlySet<unknown> = new Set(["fork", "subagent", "chat", null]);
+const isId = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+const isNullableId = (value: unknown) => value === null || isId(value);
+
+/** Checks the shape of `PluginCallContext` from @t3tools/contracts. */
+const readCallContext = (value: unknown): PluginCallContextView | undefined => {
+  if (!isRecord(value) || !isNullableId(value.projectId)) return undefined;
+  const { thread } = value;
+  if (thread === null) return { projectId: value.projectId as string | null, thread: null };
+  if (
+    !isRecord(thread) ||
+    !isId(thread.id) ||
+    !isNullableId(thread.parentThreadId) ||
+    !isId(thread.rootThreadId) ||
+    !RELATIONSHIPS.has(thread.relationshipToParent)
+  ) {
+    return undefined;
+  }
+  return {
+    projectId: value.projectId as string | null,
+    thread: {
+      id: thread.id,
+      parentThreadId: thread.parentThreadId as string | null,
+      rootThreadId: thread.rootThreadId,
+      relationshipToParent: thread.relationshipToParent as "fork" | "subagent" | "chat" | null,
+    },
+  };
+};
+
+const contextRefParams = (ref: PluginContextRef): PluginContextRef => {
+  const keys = isRecord(ref) ? Object.keys(ref) : [];
+  if (keys.length === 1 && "threadId" in ref && isId(ref.threadId)) {
+    return { threadId: ref.threadId };
+  }
+  if (keys.length === 1 && "projectId" in ref && isId(ref.projectId)) {
+    return { projectId: ref.projectId };
+  }
+  throw new Error("resolveContext takes exactly one of { threadId } or { projectId }.");
+};
 
 let activeDataDir: string | undefined;
 let activeWrite: ((message: unknown) => void) | undefined;
@@ -238,6 +301,12 @@ export function definePluginBackend(
     console.error(message);
   };
   const pendingCalls = new Map<JsonRpcId, AbortController>();
+  // Worker → host requests use string ids so the host never mistakes them for its own.
+  const hostRequests = new Map<
+    string,
+    { readonly resolve: (result: unknown) => void; readonly reject: (error: Error) => void }
+  >();
+  let nextHostRequest = 1;
   const subscriptions = new Map<string, () => void>();
   let session:
     | { readonly dataDir: string; readonly config: PluginConfig; readonly secrets: PluginSecrets }
@@ -298,9 +367,63 @@ export function definePluginBackend(
     });
   };
 
+  const requestHost = (method: string, params: unknown, signal: AbortSignal): Promise<unknown> => {
+    if (signal.aborted) return Promise.reject(new Error("The operation was cancelled."));
+    if (stopping !== undefined) return Promise.reject(new Error("The plugin is stopping."));
+    const id = `w${nextHostRequest++}`;
+    return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        hostRequests.delete(id);
+        reject(new Error("The operation was cancelled."));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      hostRequests.set(id, {
+        resolve: (result) => {
+          signal.removeEventListener("abort", onAbort);
+          resolve(result);
+        },
+        reject: (error) => {
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      });
+      writeLine({ jsonrpc: "2.0", id, method, params });
+    });
+  };
+
+  const handleHostResponse = (message: Record<string, unknown>) => {
+    const waiter = typeof message.id === "string" ? hostRequests.get(message.id) : undefined;
+    if (waiter === undefined) return;
+    hostRequests.delete(message.id as string);
+    if (isRecord(message.error)) {
+      waiter.reject(
+        new Error(
+          typeof message.error.message === "string"
+            ? message.error.message
+            : "Host request failed.",
+        ),
+      );
+    } else {
+      waiter.resolve(message.result);
+    }
+  };
+
+  const hostFor = (signal: AbortSignal): PluginHostRequests => ({
+    resolveContext: async (ref) => {
+      const result = await requestHost("t3/context.resolve", contextRefParams(ref), signal);
+      if (result === null || result === undefined) return null;
+      const context = readCallContext(result);
+      if (context === undefined) throw new Error("The host returned an invalid context.");
+      return context;
+    },
+  });
+
   const stop = (): Promise<void> => {
     stopping ??= (async () => {
       for (const controller of pendingCalls.values()) controller.abort();
+      for (const waiter of hostRequests.values())
+        waiter.reject(new Error("The plugin is stopping."));
+      hostRequests.clear();
       for (const dispose of subscriptions.values()) {
         try {
           dispose();
@@ -355,6 +478,12 @@ export function definePluginBackend(
     if (typeof operation !== "string" || (caller !== "ui" && caller !== "agent")) {
       throw invalidParams("Invalid invoke params.");
     }
+    // Hosts before host API 1.1 send no context.
+    const context =
+      params.context === undefined
+        ? { projectId: null, thread: null }
+        : readCallContext(params.context);
+    if (context === undefined) throw invalidParams("Invalid invoke context.");
     const handler = Object.hasOwn(definition.operations, operation)
       ? definition.operations[operation]
       : undefined;
@@ -370,6 +499,8 @@ export function definePluginBackend(
     try {
       const result = await handler(input, {
         caller,
+        context,
+        host: hostFor(controller.signal),
         signal: controller.signal,
         dataDir: session.dataDir,
         config: session.config,
@@ -510,6 +641,15 @@ export function definePluginBackend(
   };
 
   const handleMessage = (message: unknown) => {
+    if (
+      isRecord(message) &&
+      message.jsonrpc === "2.0" &&
+      message.method === undefined &&
+      ("result" in message || "error" in message)
+    ) {
+      handleHostResponse(message);
+      return;
+    }
     if (!isRecord(message) || message.jsonrpc !== "2.0" || typeof message.method !== "string") {
       respondError(
         null,
@@ -519,11 +659,11 @@ export function definePluginBackend(
     }
     const params = isRecord(message.params) ? message.params : {};
     if (message.id === undefined) {
-      if (message.method === "cancel" && isId(params.id)) pendingCalls.get(params.id)?.abort();
+      if (message.method === "cancel" && isRpcId(params.id)) pendingCalls.get(params.id)?.abort();
       return;
     }
     const id = message.id;
-    if (!isId(id)) {
+    if (!isRpcId(id)) {
       respondError(null, new WorkerError(PLUGIN_WORKER_ERROR_CODES.invalidRequest, "Invalid id."));
       return;
     }

@@ -18,6 +18,7 @@ import {
   buildPrContentPrompt,
   buildReviewGuidePrompt,
   buildThreadTitlePrompt,
+  buildWebSearchPrompt,
 } from "./textGenerationPrompts.ts";
 import {
   sanitizeCommitSubject,
@@ -38,11 +39,14 @@ export interface Request<S extends Schema.Top> {
   readonly imageFiles?:
     | ReadonlyArray<{ readonly path: string; readonly mimeType: string }>
     | undefined;
+  /** Allow only the provider's native web search tools; only runners built with `searchesWeb` get it. */
+  readonly webSearch?: { readonly timeoutMs: number } | undefined;
   /** Investigate cwd with read-only tools across turns; fail if the runner cannot guarantee read-only access. */
   readonly investigate?: { readonly timeoutMs: number } | undefined;
 }
 
 const INVESTIGATION_TIMEOUT_MS = 15 * 60_000;
+const WEB_SEARCH_TIMEOUT_MS = 5 * 60_000;
 
 const encodeMemorySource = Schema.encodeEffect(
   Schema.fromJsonString(Schema.Struct({ sourceText: Schema.String })),
@@ -98,10 +102,16 @@ export const imagesUnsupported = () =>
     detail: "This provider cannot look at images. Choose a Codex or OpenCode vision model.",
   });
 
+export const webSearchUnsupported = () =>
+  new TextGenerationError({
+    operation: "webSearch",
+    detail: "This provider cannot search the web. Choose a Claude or Codex web search model.",
+  });
+
 export function fromRunner(
   name: string,
   run: Runner,
-  options?: { readonly viewsImages?: boolean },
+  options?: { readonly viewsImages?: boolean; readonly searchesWeb?: boolean },
 ): ProviderTextGeneration {
   const extractMemoryFacts: ProviderTextGeneration["extractMemoryFacts"] = Effect.fn(
     `${name}.extractMemoryFacts`,
@@ -273,6 +283,39 @@ export function fromRunner(
     },
   );
 
+  const webSearch: ProviderTextGeneration["webSearch"] = Effect.fn(`${name}.webSearch`)(
+    function* (input) {
+      if (options?.searchesWeb !== true) return yield* webSearchUnsupported();
+      const generated = yield* run({
+        operation: "webSearch",
+        cwd: input.cwd,
+        modelSelection: input.modelSelection,
+        webSearch: { timeoutMs: WEB_SEARCH_TIMEOUT_MS },
+        ...buildWebSearchPrompt({ query: input.query, instructions: input.instructions }),
+      });
+      const answer = generated.answer.trim();
+      if (answer.length === 0) {
+        return yield* new TextGenerationError({
+          operation: "webSearch",
+          detail: `${name} returned an empty answer.`,
+        });
+      }
+      const sources = generated.sources.flatMap((source) => {
+        const url = source.url.trim();
+        return /^https?:\/\//i.test(url) ? [{ title: source.title.trim() || url, url }] : [];
+      });
+      // Without sources the answer likely came from the model's memory, not a search.
+      if (sources.length === 0) {
+        return yield* new TextGenerationError({
+          operation: "webSearch",
+          detail:
+            "The search model returned no sources; its provider may not support live web search.",
+        });
+      }
+      return { answer, sources };
+    },
+  );
+
   return {
     extractMemoryFacts,
     generateCommitMessage,
@@ -281,5 +324,6 @@ export function fromRunner(
     generateThreadTitle,
     generateReviewGuide,
     describeImage,
+    webSearch,
   } satisfies ProviderTextGeneration;
 }

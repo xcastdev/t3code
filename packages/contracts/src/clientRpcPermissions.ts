@@ -53,6 +53,7 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
 
   [WS_METHODS.mcpCatalogWrite]: AuthSettingsWriteScope,
   [WS_METHODS.mcpCatalogSecretPrepare]: AuthSettingsWriteScope,
+  [WS_METHODS.mcpCatalogTestConnection]: AuthSettingsWriteScope,
   [WS_METHODS.mcpCatalogSessionReset]: AuthSettingsWriteScope,
   [WS_METHODS.mcpCatalogOAuthBegin]: AuthSettingsWriteScope,
   [WS_METHODS.mcpCatalogOAuthContinue]: AuthSettingsWriteScope,

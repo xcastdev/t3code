@@ -82,6 +82,10 @@ export function createMcpCatalogEnvironmentAtoms<R, E>(
       label: "environment-command:mcp-catalog:secret-prepare",
       tag: WS_METHODS.mcpCatalogSecretPrepare,
     }),
+    testConnection: createEnvironmentRpcCommand(runtime, {
+      label: "environment-command:mcp-catalog:test-connection",
+      tag: WS_METHODS.mcpCatalogTestConnection,
+    }),
     read: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:mcp-catalog:read",
       tag: WS_METHODS.mcpCatalogRead,

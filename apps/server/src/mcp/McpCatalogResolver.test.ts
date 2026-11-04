@@ -124,6 +124,37 @@ describe("McpCatalogResolver", () => {
     }
   });
 
+  it("delivers an all-providers server to providers it does not name, unless an override narrows it", () => {
+    const everywhere = {
+      ...server("weather", "Weather"),
+      providerInstanceIds: [],
+      allProviders: true,
+    };
+    const later = ProviderInstanceId.make("added-later");
+    expect(
+      resolveProjectCatalog(
+        projectInput({ globalDefinitions: [everywhere], providerInstanceId: later }),
+      ).map((entry) => entry.logicalServerId),
+    ).toEqual(["weather"]);
+    expect(
+      resolveProjectCatalog(
+        projectInput({
+          globalDefinitions: [everywhere],
+          projectOverrides: [override("weather", { providerInstanceIds: [provider] })],
+          providerInstanceId: later,
+        }),
+      ),
+    ).toEqual([]);
+    expect(() =>
+      validateEffectiveCatalog({
+        definitions: [
+          everywhere,
+          { ...server("other", "Weather"), providerInstanceIds: [], allProviders: true },
+        ],
+      }),
+    ).toThrow(McpCatalogNameConflictError);
+  });
+
   it("keeps a transport replacement's definition identity", () => {
     const replaced = {
       ...server("weather", "Weather"),

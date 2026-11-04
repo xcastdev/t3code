@@ -46,7 +46,7 @@ export function PluginPanelPage(props: {
           {panelKey === null ? (
             <PluginPanelMissing />
           ) : (
-            <PluginPanelSurface panelKey={panelKey} chatTarget={chatTarget} />
+            <PluginPanelSurface panelKey={panelKey} chatTarget={chatTarget} page />
           )}
         </div>
       </div>

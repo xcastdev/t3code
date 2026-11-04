@@ -551,6 +551,7 @@ const layerServerEnvironment = ServerEnvironment.layer.pipe(Layer.provide(Server
 
 // Exposes the store too: asset delivery resolves panel files through it.
 const layerPlugins = PluginService.layer.pipe(
+  Layer.provide(Layer.merge(ProjectionStoreV2.layer, ProjectStore.layer)),
   Layer.provideMerge(PluginWorkerSupervisor.layer),
   Layer.provideMerge(PluginPackageStore.layer),
   Layer.provide(ServerSecretStore.layer),

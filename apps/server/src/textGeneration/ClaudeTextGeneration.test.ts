@@ -1,3 +1,5 @@
+import * as NodeOS from "node:os";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import { ClaudeSettings, ProviderInstanceId } from "@t3tools/contracts";
@@ -241,6 +243,39 @@ it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
             },
           });
           expect(result.facts[0]?.key).toBe("storage");
+        }),
+    ),
+  );
+
+  it.effect("searches the web with only Claude's web tools, in the directory it is given", () =>
+    withFakeClaudeEnv(
+      {
+        output: JSON.stringify({
+          structured_output: {
+            answer: "Effect 4 is in beta.",
+            sources: [{ title: "", url: "https://effect.website/blog" }],
+          },
+        }),
+        cwdMustNotBe: process.cwd(),
+        argsMustContain:
+          "--tools WebSearch,WebFetch --allowedTools WebSearch,WebFetch --disallowedTools mcp__* --disable-slash-commands",
+        stdinMustContain: "Focus on release status.",
+      },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          const result = yield* textGeneration.webSearch({
+            cwd: NodeOS.tmpdir(),
+            query: "Is Effect 4 released?",
+            instructions: "Focus on release status.",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("claudeAgent"),
+              model: SYNTHETIC_CLAUDE_STANDARD_MODEL,
+            },
+          });
+          expect(result).toEqual({
+            answer: "Effect 4 is in beta.",
+            sources: [{ title: "https://effect.website/blog", url: "https://effect.website/blog" }],
+          });
         }),
     ),
   );

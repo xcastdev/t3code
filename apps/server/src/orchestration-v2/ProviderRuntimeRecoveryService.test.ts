@@ -845,6 +845,7 @@ it.effect(
     );
     const providerSessionId = ProviderSessionId.make("provider_session_recovery_background");
     const settledStaleItemId = TurnItemId.make("turn_item_recovery_background_stale");
+    const settledStaleSearchItemId = TurnItemId.make("turn_item_recovery_background_search");
     const activeRunItemId = TurnItemId.make("turn_item_recovery_background_active");
     const nullRunCommandItemId = TurnItemId.make("turn_item_recovery_background_null_run");
     const nullRunSubagentItemId = TurnItemId.make("turn_item_recovery_background_null_subagent");
@@ -922,6 +923,14 @@ it.effect(
           status: "running",
         },
         {
+          id: settledStaleSearchItemId,
+          runId: settledRunId,
+          nodeId: null,
+          providerThreadId: idleProviderThreadId,
+          type: "web_search",
+          status: "running",
+        },
+        {
           id: activeRunItemId,
           runId: activeRunId,
           nodeId: activeRootNodeId,
@@ -984,12 +993,18 @@ it.effect(
         (event) => event.type === "turn-item.updated" && event.payload.status === "cancelled",
       );
 
-      assert.equal(turnItemCancels.length, 4);
+      assert.equal(turnItemCancels.length, 5);
       assert.deepEqual(
         turnItemCancels
           .map((event) => event.type === "turn-item.updated" && event.payload.id)
           .sort(),
-        [activeRunItemId, nullRunCommandItemId, nullRunSubagentItemId, settledStaleItemId].sort(),
+        [
+          activeRunItemId,
+          nullRunCommandItemId,
+          nullRunSubagentItemId,
+          settledStaleItemId,
+          settledStaleSearchItemId,
+        ].sort(),
       );
 
       const cancelById = (id: TurnItemId) =>

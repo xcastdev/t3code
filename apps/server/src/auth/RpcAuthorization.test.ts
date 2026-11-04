@@ -96,6 +96,8 @@ describe("RPC authorization scopes", () => {
     [WS_METHODS.pluginsInstall, AuthEnvironmentMaintainScope],
     [WS_METHODS.pluginsMutate, AuthOrchestrationOperateScope],
     [WS_METHODS.pluginsLogs, AuthDiagnosticsReadScope],
+    // A stdio test spawns a host command, the same power as saving one.
+    [WS_METHODS.mcpCatalogTestConnection, AuthSettingsWriteScope],
   ] as const)("%s requires %s", (method, scope) => {
     expect(requiredScopeForRpcMethod(method)).toBe(scope);
   });

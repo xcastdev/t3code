@@ -381,6 +381,13 @@ describe("effectiveMcpCatalogDefinitions", () => {
       ],
     });
     expect(effective).toMatchObject({ name: "Docs here", enabled: false });
+    expect(
+      effectiveMcpCatalogDefinitions({
+        inherited: [definition],
+        own: [{ ...(definition as object), scope: "session", name: "Docs (thread)" } as never],
+        overrides: [],
+      }).map((entry) => entry.name),
+    ).toEqual(["Docs (thread)"]);
   });
 });
 

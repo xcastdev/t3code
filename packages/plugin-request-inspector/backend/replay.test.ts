@@ -31,26 +31,28 @@ import {
   type ReplayHarness,
 } from "./replay.testkit.ts";
 import {
+  DEFAULT_PROXY_ID,
   type InspectorStore,
   type StorageStep,
   type StoreLane,
   type StoreWriteTx,
 } from "./store.ts";
 import {
+  DEFAULT_PROXY_OPTIONS,
   header,
   KiB,
   makeFlow,
   measureDataDir,
   MiB,
   patternBytes,
-  startCapture,
+  startRecording,
 } from "./store.testkit.ts";
 
 const settled = (replay: ReplayService, replayId: string) =>
   replay.get(replayId, { waitMs: 20_000 });
 
 const responseResult = (replayId: string, bodyBytes = 16): ReplayResult => {
-  const { captureId: _captureId, ...flow } = makeFlow(0, 0, 8, {
+  const { recordingId: _recordingId, ...flow } = makeFlow(0, 0, 8, {
     response: {
       status: 200,
       httpVersion: "HTTP/1.1",
@@ -200,6 +202,38 @@ describe("replay identity and outcome", () => {
       detail: REPLAY_DETAILS.notStarted,
     });
     expect(transient.stops).toBe(1);
+  });
+
+  it("a replay leaves through its source proxy's running process, else a transient carrier for that proxy (D35)", async () => {
+    const carriers = makeFakeCarriers((proxyId) => `proxy-${proxyId}`);
+    await using harness = await openReplayHarness({ replay: { carriers: carriers.carriers } });
+    const upstream = await harness.store.exclusive((lane) =>
+      lane.createProxy({
+        name: "Upstream",
+        createdAt: 1,
+        options: {
+          ...DEFAULT_PROXY_OPTIONS,
+          mode: { kind: "upstream", url: "http://127.0.0.1:9" },
+        },
+      }),
+    );
+    const recording = await startRecording(harness.store, 1, upstream.id);
+    const inserted = await harness.store.insertFlow(makeFlow(recording.id, 0, 8));
+    if (!inserted.ok) throw new Error("insert failed");
+    const onDefault = await harness.source();
+    const running = makeFakeChannel();
+    carriers.setRunning(DEFAULT_PROXY_ID, running.channel);
+
+    const viaRunning = await acceptFresh(harness, onDefault);
+    expect((await running.nextMessage()).replayId).toBe(viaRunning.replayId);
+    const viaTransient = await acceptFresh(harness, inserted.id);
+    const transient = await carriers.nextTransient();
+    expect(transient).toMatchObject({ proxyId: upstream.id, key: `proxy-${upstream.id}` });
+    const fake = makeFakeChannel();
+    transient.ready.resolve(fake.channel);
+    expect((await fake.nextMessage()).replayId).toBe(viaTransient.replayId);
+    expect(running.sent).toHaveLength(1);
+    expect(carriers.asked).toEqual([DEFAULT_PROXY_ID, upstream.id]);
   });
 
   it("worker start marks dispatched pending replays unknown and undispatched ones failed", async () => {
@@ -503,13 +537,13 @@ describe("replay identity and outcome", () => {
     dataDir = harness.dataDir;
     const fake = makeFakeChannel();
     harness.carriers.setCapture(fake.channel);
-    const capture = await startCapture(harness.store);
+    const capture = await startRecording(harness.store);
     const ids: Array<number> = [];
     for (let index = 0; index < 16; index += 1) {
       const result = await harness.store.insertFlow(makeFlow(capture.id, index, 256 * KiB));
       if (result.ok) ids.push(result.id);
     }
-    await harness.store.exclusive((lane) => lane.stopCapture(capture.id, 1));
+    await harness.store.exclusive((lane) => lane.stopRecording(capture.id, 1));
     const survivors = harness.store.search({}, { limit: 200 }).items.map((item) => item.id);
     const source = Math.min(...survivors);
     const removed: Array<number> = [];
@@ -550,7 +584,7 @@ describe("replay identity and outcome", () => {
           new AbortController().signal,
         ),
       ).rejects.toThrow(STORAGE_FULL_DETAIL);
-      expect(harness.store.captureStatus().storageBlocked).toBe(true);
+      expect(harness.store.status().storageBlocked).toBe(true);
       expect(countReplayRows(dataDir)).toBe(1);
       expect(replayFiles(harness)).toEqual([`${accepted.replayId}.bin`]);
       expect(
@@ -614,7 +648,9 @@ describe("replay identity and outcome", () => {
     expect(result.seq).toBe(items.at(-1)?.seq);
     const stored = harness.store.getRequest(Number(result.resultRequestId));
     expect(stored?.summary.replayOf).toBe(String(requestId));
-    expect(stored?.summary.captureId).toBe(harness.store.getRequest(requestId)?.summary.captureId);
+    expect(stored?.summary.recordingId).toBe(
+      harness.store.getRequest(requestId)?.summary.recordingId,
+    );
   });
 });
 
@@ -624,7 +660,7 @@ describe("replay refusals", () => {
     const { store, drafts } = harness;
     const fake = makeFakeChannel();
     harness.carriers.setCapture(fake.channel);
-    const capture = await startCapture(store);
+    const capture = await startRecording(store);
     const sources: Array<number> = [];
     for (let index = 0; index < 10; index += 1) {
       const result = await store.insertFlow(makeFlow(capture.id, index, 256 * KiB));
@@ -741,7 +777,7 @@ describe("replay refusals", () => {
   it("replay with an edited body rewrites an existing Content-Length and never adds Transfer-Encoding", async () => {
     await using harness = await openReplayHarness();
     const { fake, requestId } = await withCapture(harness);
-    const capture = harness.store.getRequest(requestId)?.summary.captureId as number;
+    const capture = harness.store.getRequest(requestId)?.summary.recordingId as number;
     const bare = await harness.store.insertFlow(
       makeFlow(capture, 50, 8, { headers: [header("content-type", "text/plain")] }),
     );

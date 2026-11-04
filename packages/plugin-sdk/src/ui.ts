@@ -1,10 +1,12 @@
 // @effect-diagnostics globalTimers:off - Runs inside a sandboxed plugin frame, outside any Effect runtime.
 import type { PluginRequestErrorReason, PluginSubscriptionEvent } from "@t3tools/contracts";
 
+// The oldest bridge this SDK speaks; a plugin's manifest `hostApi` says what it needs.
 const PLUGIN_BRIDGE_API_VERSION = "1.0";
 
 export interface PluginHostContext {
-  readonly apiVersion: "1.0";
+  /** The host's bridge version, such as "1.1". */
+  readonly apiVersion: string;
   readonly theme: "light" | "dark";
   readonly styles: { readonly variables: Readonly<Record<string, string>> };
   readonly containerDimensions: { readonly width: number; readonly height: number };
@@ -26,6 +28,26 @@ export type PluginAttachRequest =
       readonly expectedChatTargetKey?: string | null;
     };
 
+/**
+ * Bytes for `saveFile`. A stream starts the save before reading, so the click still counts;
+ * give `{ size, chunks }` when the size is known to have the host check it.
+ */
+export type PluginSaveData =
+  | string
+  | Uint8Array
+  | (() => AsyncIterable<Uint8Array>)
+  | { readonly size: number; readonly chunks: () => AsyncIterable<Uint8Array> };
+
+export interface PluginChatTargets {
+  readonly threads: ReadonlyArray<{
+    readonly threadId: string;
+    readonly title: string;
+    readonly projectId: string;
+    readonly projectName: string;
+  }>;
+  readonly projects: ReadonlyArray<{ readonly projectId: string; readonly name: string }>;
+}
+
 export interface PluginStoredState {
   readonly value: unknown;
   /** The plugin version whose UI wrote this value. */
@@ -33,6 +55,8 @@ export interface PluginStoredState {
 }
 
 export interface T3PluginClient {
+  /** The bridge version the host reported, such as "1.1". */
+  readonly hostApi: string;
   readonly context: PluginHostContext;
   readonly onContextChange: (listener: (context: PluginHostContext) => void) => () => void;
   readonly state: {
@@ -47,6 +71,19 @@ export interface T3PluginClient {
   ) => () => void;
   readonly openSurface: (contributionId: string) => Promise<void>;
   readonly attach: (request: PluginAttachRequest) => Promise<"inserted" | "cancelled">;
+  /**
+   * Needs a click or key press and the `file.save` capability. At most 32 MiB. "cancelled" is
+   * best-effort: some hosts (mobile share sheets) cannot tell a dismissal from a save.
+   */
+  readonly saveFile: (
+    name: string,
+    mimeType: string,
+    data: PluginSaveData,
+  ) => Promise<"saved" | "cancelled">;
+  /** Needs a click or key press and the `clipboard.write` capability. */
+  readonly copyText: (text: string) => Promise<void>;
+  /** Threads and projects in the plugin's environment, at most 50 of each. */
+  readonly listChatTargets: (query?: string) => Promise<PluginChatTargets>;
 }
 
 export class T3PluginError extends Error {
@@ -62,6 +99,29 @@ export class T3PluginError extends Error {
 }
 
 type JsonRpcId = string | number;
+
+// 96 KiB raw is 128 KiB of base64, well inside one 256 KiB bridge message.
+const SAVE_CHUNK_BYTES = 96 * 1024;
+
+const toBase64 = (bytes: Uint8Array): string => {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+};
+
+async function* inChunks(source: AsyncIterable<Uint8Array>): AsyncIterable<Uint8Array> {
+  for await (const part of source) {
+    for (let offset = 0; offset < part.length; offset += SAVE_CHUNK_BYTES) {
+      yield part.subarray(offset, offset + SAVE_CHUNK_BYTES);
+    }
+  }
+}
+
+async function* once(bytes: Uint8Array): AsyncIterable<Uint8Array> {
+  yield bytes;
+}
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -184,12 +244,61 @@ function connect(): Promise<T3PluginClient> {
     };
   };
 
+  const saveFile = async (
+    name: string,
+    mimeType: string,
+    data: PluginSaveData,
+  ): Promise<"saved" | "cancelled"> => {
+    let size: number | undefined;
+    let chunks: () => AsyncIterable<Uint8Array>;
+    if (typeof data === "string" || data instanceof Uint8Array) {
+      const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+      size = bytes.length;
+      chunks = () => once(bytes);
+    } else if (typeof data === "function") {
+      chunks = data;
+    } else {
+      size = data.size;
+      chunks = data.chunks;
+    }
+    // Begin before reading anything, while the click still counts.
+    const begun = await request("t3/file.save.begin", {
+      name,
+      mimeType,
+      ...(size === undefined ? {} : { size }),
+    });
+    if (!isRecord(begun) || typeof begun.saveId !== "string") {
+      throw new T3PluginError(-32603, "The host did not start the save.");
+    }
+    const saveId = begun.saveId;
+    try {
+      let sent = 0;
+      for await (const chunk of inChunks(chunks())) {
+        sent += chunk.length;
+        if (size !== undefined && sent > size) {
+          throw new T3PluginError(-32602, `The file is larger than ${size} bytes.`);
+        }
+        await request("t3/file.save.append", { saveId, base64: toBase64(chunk) });
+      }
+      if (size !== undefined && sent !== size) {
+        throw new T3PluginError(-32602, `The file is ${sent} bytes, not ${size}.`);
+      }
+      const committed = await request("t3/file.save.commit", { saveId });
+      return isRecord(committed) && committed.outcome === "saved" ? "saved" : "cancelled";
+    } catch (error) {
+      void request("t3/file.save.abort", { saveId }).catch(() => {});
+      throw error;
+    }
+  };
+
   return request("t3/initialize", { apiVersion: PLUGIN_BRIDGE_API_VERSION }).then((result) => {
     if (!isRecord(result) || !isRecord(result.hostContext)) {
       throw new T3PluginError(-32603, "The host did not return a host context.");
     }
     context = result.hostContext as unknown as PluginHostContext;
+    const hostApi = typeof result.apiVersion === "string" ? result.apiVersion : context.apiVersion;
     const client: T3PluginClient = {
+      hostApi,
       get context() {
         return context as PluginHostContext;
       },
@@ -220,6 +329,18 @@ function connect(): Promise<T3PluginClient> {
             attachRequest.expectedChatTargetKey ?? context?.chatTarget?.key ?? null,
         });
         return isRecord(result) && result.outcome === "inserted" ? "inserted" : "cancelled";
+      },
+      saveFile,
+      copyText: async (text) => {
+        await request("t3/clipboard.write", { text });
+      },
+      listChatTargets: async (query) => {
+        const targets = await request("t3/chat.targets.list", query === undefined ? {} : { query });
+        return isRecord(targets) &&
+          Array.isArray(targets.threads) &&
+          Array.isArray(targets.projects)
+          ? (targets as unknown as PluginChatTargets)
+          : { threads: [], projects: [] };
       },
     };
     return client;

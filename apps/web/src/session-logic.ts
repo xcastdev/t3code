@@ -1,6 +1,7 @@
 import type { ThreadStructure, ThreadStructureRuntime } from "@t3tools/client-runtime/state/shell";
 import { resolveThreadWorkingStartedAt } from "@t3tools/client-runtime/state/models";
 import {
+  isOrchestrationV2WorkActive,
   type AssetResource,
   type OrchestrationV2Checkpoint,
   type OrchestrationV2ExecutionNode,
@@ -464,7 +465,9 @@ function projectedWorkEntry(row: OrchestrationV2ProjectedTurnItem): WorkLogEntry
     case "web_search":
       return {
         ...common,
-        label: title ?? "Searched the web",
+        label:
+          title ??
+          (isOrchestrationV2WorkActive(item.status) ? "Searching the web" : "Searched the web"),
         ...(item.patterns?.length ? { detail: item.patterns.join(", ") } : {}),
         toolTitle: title ?? "Web search",
         toolData: item,

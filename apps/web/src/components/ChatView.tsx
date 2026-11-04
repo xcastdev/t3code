@@ -46,9 +46,11 @@ import {
   combineRightPanelSurfaces,
   pluginRightPanelSurface,
   selectDockedPluginPanels,
+  selectPinnedRailPanels,
   usePluginPanelStore,
 } from "../pluginPanelStore";
-import { useAllPluginInstalls } from "../plugins/pluginInstalls";
+import { pluginPanelIcon } from "../plugins/pluginIcons";
+import { useAllPluginInstalls, useEnabledPluginInstalls } from "../plugins/pluginInstalls";
 import { usePendingThreadRequests } from "./chat/usePendingThreadRequests";
 import { isScratchProject } from "@t3tools/client-runtime/state/projects";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
@@ -1088,6 +1090,22 @@ export default function ChatView(props: ChatViewProps) {
       (surface) => surface.kind === "plugin" && surface.panelKey === dockedPlugins.focused,
     ) ?? null;
   const displayedRightPanelSurface = dockedPluginSurface ?? activeRightPanelSurface;
+  const pinnedPluginPanels = selectPinnedRailPanels(
+    usePluginPanelStore((state) => state.pinned),
+    useEnabledPluginInstalls(),
+    pluginChatEnvironmentId,
+  );
+  const pluginActions = pinnedPluginPanels.map((panel) => ({
+    panelKey: panel.key,
+    label: panel.title,
+    icon: pluginPanelIcon(panel.icon),
+    onClick: () => {
+      if (pluginChatEnvironmentId !== null) {
+        usePluginPanelStore.getState().open(panel.key, pluginChatEnvironmentId);
+      }
+    },
+    onUnpin: () => usePluginPanelStore.getState().unpin(panel.key),
+  }));
   const activePreviewState = useThreadPreviewState(activeThreadRef);
   const activePreviewServerEpoch = activePreviewState.serverEpoch;
   const resolvePreviewRuntimeTabId = activeThreadRef
@@ -4186,6 +4204,7 @@ export default function ChatView(props: ChatViewProps) {
           deviceAvailable={activeThreadRef !== null}
           sideChatAvailable={sideChat.available}
           sideChatDisabledReason={sideChatDisabledReason}
+          pluginActions={pluginActions}
         >
           {rightPanelContent}
         </ChatRightPanel>

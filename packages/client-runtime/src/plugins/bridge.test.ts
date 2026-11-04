@@ -1,6 +1,9 @@
 import {
+  PLUGIN_HOST_API,
   PLUGIN_LIMITS,
   PluginManifest,
+  ProjectId,
+  ThreadId,
   PluginRequestError,
   type PluginSubscriptionEvent,
 } from "@t3tools/contracts";
@@ -9,9 +12,11 @@ import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
   makePluginBridge,
+  selectPluginChatTargets,
   type PluginAttachRequest,
   type PluginBridgeOptions,
   type PluginHostContext,
+  type PluginSaveFile,
 } from "./bridge.ts";
 
 const baseManifest = {
@@ -47,7 +52,7 @@ const baseManifest = {
 const decodeManifest = Schema.decodeUnknownSync(PluginManifest);
 
 const context = (theme: "light" | "dark" = "dark"): PluginHostContext => ({
-  apiVersion: "1.0",
+  apiVersion: `${PLUGIN_HOST_API.major}.${PLUGIN_HOST_API.minor}`,
   theme,
   styles: { variables: { "--background": theme === "dark" ? "#000" : "#fff" } },
   containerDimensions: { width: 400, height: 600 },
@@ -77,6 +82,8 @@ function setup(
   const attach = vi.fn(
     async (_request: PluginAttachRequest, _activated: boolean) => "inserted" as const,
   );
+  const saveFile = vi.fn(async (_file: PluginSaveFile) => "saved" as const);
+  const writeClipboard = vi.fn(async (_text: string) => undefined);
 
   const bridge = makePluginBridge({
     manifest: decodeManifest(options.manifest ?? baseManifest),
@@ -91,7 +98,10 @@ function setup(
         waiter(record);
       }
     },
-    hostContext: () => context(theme),
+    hostContext: () => {
+      const { apiVersion: _apiVersion, ...rest } = context(theme);
+      return rest;
+    },
     state: {
       get: async () => stored,
       set: async (value) => {
@@ -108,6 +118,9 @@ function setup(
     },
     openSurface: async () => undefined,
     attach,
+    saveFile,
+    writeClipboard,
+    chatTargets: () => ({ threads: [], projects: [] }),
     ...options.overrides,
   });
 
@@ -130,6 +143,8 @@ function setup(
     bridge,
     sent,
     attach,
+    saveFile,
+    writeClipboard,
     subscriptions,
     request,
     initialize,
@@ -153,14 +168,14 @@ describe("makePluginBridge", () => {
     expect(errorOf(response).code).toBe(-32002);
   });
 
-  it("initialize negotiates apiVersion 1.0 and returns host context", async () => {
+  it("initialize accepts a 1.0 panel and reports the host's apiVersion and context", async () => {
     const { request, bridge, notifications, setTheme } = setup();
     const refused = await request("t3/initialize", { apiVersion: "2.0" });
     expect(errorOf(refused).data?.reason).toBe("incompatible-host-api");
 
     const response = await request("t3/initialize", { apiVersion: "1.0" });
     expect(response.result).toEqual({
-      apiVersion: "1.0",
+      apiVersion: `${PLUGIN_HOST_API.major}.${PLUGIN_HOST_API.minor}`,
       pluginId: "echo",
       panelId: "main",
       pluginVersion: "1.0.0",
@@ -432,5 +447,251 @@ describe("makePluginBridge", () => {
       { subscriptionId, event: { type: "resync" } },
       { subscriptionId, event: fresh },
     ]);
+  });
+
+  it.each([
+    {
+      name: "file.save.begin without the capability",
+      capabilities: ["chat.attach"],
+      method: "t3/file.save.begin",
+      params: { name: "a.har", mimeType: "application/json", size: 2 },
+      activated: true,
+      reason: "capability-denied",
+    },
+    {
+      name: "file.save.begin without activation",
+      capabilities: ["file.save"],
+      method: "t3/file.save.begin",
+      params: { name: "a.har", mimeType: "application/json", size: 2 },
+      activated: false,
+      message: "Saving a file must follow a click or key press in the panel.",
+    },
+    {
+      name: "file.save.begin over maxSaveBytes",
+      capabilities: ["file.save"],
+      method: "t3/file.save.begin",
+      params: { name: "a.har", mimeType: "application/json", size: PLUGIN_LIMITS.maxSaveBytes + 1 },
+      activated: true,
+      reason: "too-large",
+    },
+    {
+      name: "clipboard.write without the capability",
+      capabilities: ["file.save"],
+      method: "t3/clipboard.write",
+      params: { text: "hi" },
+      activated: true,
+      reason: "capability-denied",
+    },
+    {
+      name: "clipboard.write without activation",
+      capabilities: ["clipboard.write"],
+      method: "t3/clipboard.write",
+      params: { text: "hi" },
+      activated: false,
+      message: "Copying must follow a click or key press in the panel.",
+    },
+    {
+      name: "clipboard.write over maxPayloadBytes",
+      capabilities: ["clipboard.write"],
+      method: "t3/clipboard.write",
+      params: { text: "é".repeat(PLUGIN_LIMITS.maxPayloadBytes / 2 + 1) },
+      activated: true,
+      reason: "too-large",
+    },
+  ])("refuses $name", async ({ capabilities, method, params, activated, reason, message }) => {
+    const { request, initialize, saveFile, writeClipboard } = setup({
+      manifest: { ...baseManifest, capabilities },
+    });
+    await initialize();
+    const error = errorOf(await request(method, params, activated));
+    if (reason !== undefined) expect(error.data?.reason).toBe(reason);
+    if (message !== undefined) expect(error.message).toBe(message);
+    expect(saveFile).not.toHaveBeenCalled();
+    expect(writeClipboard).not.toHaveBeenCalled();
+  });
+
+  it("file.save joins appended chunks, refuses overruns and short commits, and frees on abort", async () => {
+    const { request, initialize, saveFile } = setup({
+      manifest: { ...baseManifest, capabilities: ["file.save"] },
+    });
+    await initialize();
+    const begin = async (size: number | undefined, name = "../exports/a.har") => {
+      const response = await request(
+        "t3/file.save.begin",
+        { name, mimeType: "application/json", ...(size === undefined ? {} : { size }) },
+        true,
+      );
+      return (response.result as { saveId: string }).saveId;
+    };
+    const append = (saveId: string, text: string) =>
+      request("t3/file.save.append", { saveId, base64: btoa(text) });
+
+    const overrun = await begin(3);
+    expect(
+      errorOf(await request("t3/file.save.begin", { name: "b", mimeType: "", size: 1 }, true))
+        .message,
+    ).toBe("Another save is still in progress.");
+    expect((await append(overrun, "ab")).result).toEqual({});
+    expect(errorOf(await append(overrun, "cd")).code).toBe(-32602);
+    expect(errorOf(await request("t3/file.save.commit", { saveId: overrun })).code).toBe(-32602);
+
+    const short = await begin(3);
+    await append(short, "ab");
+    expect(errorOf(await request("t3/file.save.commit", { saveId: short })).message).toBe(
+      "The file is 2 bytes, not 3.",
+    );
+
+    const aborted = await begin(3);
+    await append(aborted, "ab");
+    expect((await request("t3/file.save.abort", { saveId: aborted })).result).toEqual({});
+    expect(errorOf(await append(aborted, "c")).code).toBe(-32602);
+    expect(saveFile).not.toHaveBeenCalled();
+
+    const saved = await begin(5);
+    await append(saved, "he");
+    await append(saved, "llo");
+    expect((await request("t3/file.save.commit", { saveId: saved })).result).toEqual({
+      outcome: "saved",
+    });
+    expect(saveFile).toHaveBeenCalledOnce();
+    const file = saveFile.mock.calls[0]![0];
+    expect({ name: file.name, mimeType: file.mimeType }).toEqual({
+      name: "a.har",
+      mimeType: "application/json",
+    });
+    expect(new TextDecoder().decode(new Uint8Array(file.parts.flatMap((part) => [...part])))).toBe(
+      "hello",
+    );
+
+    const unsized = await begin(undefined);
+    await append(unsized, "hi");
+    expect((await request("t3/file.save.commit", { saveId: unsized })).result).toEqual({
+      outcome: "saved",
+    });
+
+    const tooLarge = await begin(undefined);
+    const fullChunk = btoa("x".repeat(PLUGIN_LIMITS.maxBodyChunkBytes));
+    const chunks = PLUGIN_LIMITS.maxSaveBytes / PLUGIN_LIMITS.maxBodyChunkBytes;
+    for (let index = 0; index < chunks; index += 1) {
+      await request("t3/file.save.append", { saveId: tooLarge, base64: fullChunk });
+    }
+    expect(errorOf(await append(tooLarge, "x")).data?.reason).toBe("too-large");
+    expect(errorOf(await request("t3/file.save.commit", { saveId: tooLarge })).code).toBe(-32602);
+    expect(saveFile).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["../exports/a.har", "a.har"],
+    ["C:\\Users\\me\\a.har", "a.har"],
+    ["..", "download"],
+    ["a\u0000b.txt", "a_b.txt"],
+    ["invoice\u202Erah.exe", "invoice_rah.exe"],
+    ["a\u2066b\u2069\u200e\u200f.txt", "a_b___.txt"],
+    [`${"a".repeat(250)}.har`, `${"a".repeat(196)}.har`],
+    [`${"é".repeat(120)}.har`, `${"é".repeat(98)}.har`],
+    ["a".repeat(250), "a".repeat(200)],
+  ])("file.save names %j as %j", async (name, expected) => {
+    const { request, initialize, saveFile } = setup({
+      manifest: { ...baseManifest, capabilities: ["file.save"] },
+    });
+    await initialize();
+    const begun = await request("t3/file.save.begin", { name, mimeType: "" }, true);
+    const saveId = (begun.result as { saveId: string }).saveId;
+    await request("t3/file.save.commit", { saveId });
+    expect(saveFile.mock.calls[0]![0].name).toBe(expected);
+  });
+
+  it("clipboard.write passes the text to the host", async () => {
+    const { request, initialize, writeClipboard } = setup({
+      manifest: { ...baseManifest, capabilities: ["clipboard.write"] },
+    });
+    await initialize();
+    expect((await request("t3/clipboard.write", { text: "Cookie: a=1" }, true)).result).toEqual({});
+    expect(writeClipboard).toHaveBeenCalledWith("Cookie: a=1");
+  });
+
+  it("chat.targets.list passes the query and caps each list at maxChatTargets", async () => {
+    const queries: Array<string> = [];
+    const many = PLUGIN_LIMITS.maxChatTargets + 10;
+    const { request, initialize } = setup({
+      overrides: {
+        chatTargets: async (query) => {
+          queries.push(query);
+          return {
+            threads: Array.from({ length: many }, (_, index) => ({
+              threadId: ThreadId.make(`t${index}`),
+              title: `Thread ${index}`,
+              projectId: ProjectId.make("p"),
+              projectName: "Project",
+            })),
+            projects: Array.from({ length: many }, (_, index) => ({
+              projectId: ProjectId.make(`p${index}`),
+              name: `Project ${index}`,
+            })),
+          };
+        },
+      },
+    });
+    await initialize();
+    const listed = (await request("t3/chat.targets.list", { query: "api" })).result as {
+      threads: ReadonlyArray<unknown>;
+      projects: ReadonlyArray<unknown>;
+    };
+    expect([listed.threads.length, listed.projects.length]).toEqual([
+      PLUGIN_LIMITS.maxChatTargets,
+      PLUGIN_LIMITS.maxChatTargets,
+    ]);
+    await request("t3/chat.targets.list");
+    expect(queries).toEqual(["api", ""]);
+    const tooLong = await request("t3/chat.targets.list", { query: "x".repeat(257) });
+    expect(errorOf(tooLong).code).toBe(-32602);
+  });
+});
+
+describe("selectPluginChatTargets", () => {
+  it("keeps one environment's live threads and unarchived projects, newest first, matching the query", () => {
+    const thread = (id: string, title: string, updatedAt: string, extra: object = {}) => ({
+      environmentId: "env-1",
+      id: ThreadId.make(id),
+      projectId: ProjectId.make("p1"),
+      title,
+      updatedAt,
+      deletedAt: null,
+      ...extra,
+    });
+    const project = (id: string, title: string, updatedAt: string, extra: object = {}) => ({
+      environmentId: "env-1",
+      id: ProjectId.make(id),
+      title,
+      updatedAt,
+      ...extra,
+    });
+    const source = {
+      threads: [
+        thread("t1", "Fix login", "2026-01-01"),
+        thread("t2", "Proxy setup", "2026-01-03"),
+        thread("t3", "Deleted", "2026-01-04", { deletedAt: "2026-01-05" }),
+        thread("t4", "Other env", "2026-01-04", { environmentId: "env-2" }),
+      ],
+      projects: [
+        project("p1", "Web App", "2026-01-01"),
+        project("p2", "Archived", "2026-01-02", { archivedAt: "2026-01-03" }),
+        project("p3", "Api", "2026-01-04"),
+      ],
+    };
+    expect(selectPluginChatTargets(source, "env-1", "")).toEqual({
+      threads: [
+        { threadId: "t2", title: "Proxy setup", projectId: "p1", projectName: "Web App" },
+        { threadId: "t1", title: "Fix login", projectId: "p1", projectName: "Web App" },
+      ],
+      projects: [
+        { projectId: "p3", name: "Api" },
+        { projectId: "p1", name: "Web App" },
+      ],
+    });
+    expect(selectPluginChatTargets(source, "env-1", " LOGIN ")).toEqual({
+      threads: [{ threadId: "t1", title: "Fix login", projectId: "p1", projectName: "Web App" }],
+      projects: [],
+    });
   });
 });

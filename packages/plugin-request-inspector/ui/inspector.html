@@ -144,32 +144,6 @@
       .faint {
         color: var(--text-faint);
       }
-      .bar {
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
-        padding: 10px 12px 8px;
-        border-bottom: 1px solid var(--border);
-      }
-      .dot {
-        display: inline-block;
-        width: 7px;
-        height: 7px;
-        margin-right: 6px;
-        border-radius: 50%;
-        background: var(--text-faint);
-        vertical-align: 1px;
-      }
-      .dot.live {
-        background: var(--success);
-      }
-      #capture-text {
-        flex: 1;
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
       .notice {
         padding: 6px 8px;
         border-radius: calc(var(--radius) - 2px);
@@ -184,93 +158,19 @@
         background: var(--danger-bg);
         color: var(--danger);
       }
-      details.hint {
-        color: var(--text-muted);
-        font-size: 12px;
-      }
-      details.hint summary {
-        cursor: pointer;
-      }
-      details.hint p {
-        margin: 4px 0 0;
-      }
-      .filters {
+      .notices {
         display: flex;
-        flex-wrap: wrap;
-        gap: 6px;
-      }
-      #f-query {
-        flex: 1 1 160px;
-      }
-      #f-method {
-        flex: 0 0 auto;
-      }
-      #f-status {
-        flex: 0 0 70px;
-      }
-      #f-host {
-        flex: 1 1 120px;
-      }
-      #f-capture {
-        flex: 1 1 140px;
-      }
-      main {
-        display: flex;
-        flex: 1;
-        min-height: 0;
-      }
-      .pane {
-        display: flex;
-        flex: 1;
         flex-direction: column;
-        min-width: 0;
-        min-height: 0;
+        gap: 6px;
+        padding: 8px 12px 0;
       }
-      #list {
-        flex: 1;
-        margin: 0;
-        padding: 0;
-        overflow-y: auto;
-        list-style: none;
+      .notices:empty {
+        display: none;
       }
-      .req {
-        display: grid;
-        grid-template-columns: 52px 1fr auto;
-        gap: 2px 8px;
-        align-items: baseline;
-        width: 100%;
-        height: auto;
-        padding: 6px 12px;
-        border: 0;
-        border-bottom: 1px solid var(--border);
-        border-radius: 0;
-        background: transparent;
-        text-align: left;
-      }
-      .req[aria-selected="true"] {
-        background: var(--muted);
-      }
-      .req .method {
-        font: 600 11px/1.4 var(--mono);
+      .empty {
+        padding: 24px 16px;
         color: var(--text-muted);
-      }
-      .req .path {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        font: 12px/1.4 var(--mono);
-      }
-      .req .status {
-        font: 12px/1.4 var(--mono);
-        text-align: right;
-      }
-      .req .meta {
-        grid-column: 2 / 4;
-        overflow: hidden;
-        color: var(--text-faint);
-        font-size: 11px;
-        text-overflow: ellipsis;
-        white-space: nowrap;
+        text-align: center;
       }
       .s2 {
         color: var(--success);
@@ -284,203 +184,6 @@
       .s5 {
         color: var(--danger);
       }
-      .tag {
-        display: inline-block;
-        margin-right: 4px;
-        padding: 0 4px;
-        border: 1px solid var(--input-border);
-        border-radius: 4px;
-        color: var(--text-muted);
-        font-size: 10px;
-        line-height: 14px;
-      }
-      .footer {
-        padding: 6px 12px;
-        border-top: 1px solid var(--border);
-        color: var(--text-muted);
-        font-size: 12px;
-      }
-      .empty {
-        padding: 24px 16px;
-        color: var(--text-muted);
-        text-align: center;
-      }
-      #detail {
-        border-left: 1px solid var(--border);
-      }
-      .detail-head {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 8px 12px;
-        border-bottom: 1px solid var(--border);
-      }
-      #detail-title {
-        flex: 1;
-        min-width: 0;
-        overflow: hidden;
-        font: 12px/1.4 var(--mono);
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .tabs {
-        display: flex;
-        gap: 2px;
-        padding: 6px 12px 0;
-        border-bottom: 1px solid var(--border);
-        overflow-x: auto;
-      }
-      .tabs button {
-        height: 30px;
-        border: 0;
-        border-bottom: 2px solid transparent;
-        border-radius: 0;
-        background: transparent;
-        color: var(--text-muted);
-      }
-      .tabs button[aria-selected="true"] {
-        border-bottom-color: var(--text);
-        color: var(--text);
-      }
-      .tab {
-        display: flex;
-        flex: 1;
-        flex-direction: column;
-        gap: 10px;
-        min-height: 0;
-        padding: 10px 12px;
-        overflow-y: auto;
-      }
-      h3 {
-        margin: 0;
-        color: var(--text-muted);
-        font-size: 11px;
-        font-weight: 600;
-        letter-spacing: 0.04em;
-        text-transform: uppercase;
-      }
-      .line {
-        font: 12px/1.5 var(--mono);
-        overflow-wrap: anywhere;
-      }
-      table.headers {
-        width: 100%;
-        border-collapse: collapse;
-        font: 12px/1.5 var(--mono);
-      }
-      table.headers td {
-        padding: 1px 0;
-        vertical-align: top;
-        overflow-wrap: anywhere;
-      }
-      table.headers td:first-child {
-        width: 1%;
-        padding-right: 10px;
-        color: var(--text-muted);
-        white-space: nowrap;
-      }
-      pre.body {
-        flex: 1;
-        min-height: 120px;
-        margin: 0;
-        padding: 8px 10px;
-        border: 1px solid var(--border);
-        border-radius: calc(var(--radius) - 2px);
-        background: var(--surface);
-        font: 12px/1.5 var(--mono);
-        overflow: auto;
-        white-space: pre-wrap;
-        overflow-wrap: anywhere;
-      }
-      .seg {
-        display: inline-flex;
-        padding: 2px;
-        border: 1px solid var(--border);
-        border-radius: var(--radius);
-        background: var(--surface);
-      }
-      .seg button {
-        height: 22px;
-        border: 0;
-        background: transparent;
-        color: var(--text-muted);
-        font-size: 12px;
-      }
-      .seg button[aria-pressed="true"] {
-        background: var(--muted);
-        color: var(--text);
-      }
-      .field {
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-      }
-      .field label,
-      label.check {
-        color: var(--text-muted);
-        font-size: 12px;
-      }
-      label.check {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-      }
-      label.check input {
-        height: auto;
-      }
-      .destination {
-        padding: 8px 10px;
-        border: 1px solid var(--border);
-        border-radius: calc(var(--radius) - 2px);
-        font: 12px/1.5 var(--mono);
-        overflow-wrap: anywhere;
-      }
-      .actions {
-        padding: 8px 12px;
-        border-top: 1px solid var(--border);
-      }
-      #replays {
-        border-bottom: 1px solid var(--border);
-      }
-      #replays summary {
-        padding: 6px 12px;
-        color: var(--text-muted);
-        font-size: 12px;
-        cursor: pointer;
-      }
-      #replay-list {
-        max-height: 30vh;
-        margin: 0;
-        padding: 0 12px 8px;
-        overflow-y: auto;
-        list-style: none;
-      }
-      #replay-list li {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 4px 8px;
-        padding: 4px 0;
-        border-top: 1px solid var(--border);
-        font-size: 12px;
-      }
-      #replay-list .what {
-        flex: 1 1 140px;
-        min-width: 0;
-        overflow: hidden;
-        font-family: var(--mono);
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      #replay-list .why {
-        flex-basis: 100%;
-        color: var(--text-muted);
-        overflow-wrap: anywhere;
-      }
-      #replay-list button {
-        height: 22px;
-        font-size: 12px;
-      }
       .state-pending {
         color: var(--info);
       }
@@ -493,141 +196,21 @@
       .state-maybe {
         color: var(--warning);
       }
-      /* Narrow: one pane at a time. */
-      body.has-detail #list-pane {
-        display: none;
+      label.check {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        color: var(--text-muted);
+        font-size: 12px;
       }
-      #detail {
-        border-left: 0;
-      }
-      @media (min-width: 760px) {
-        body.has-detail #list-pane {
-          display: flex;
-        }
-        #list-pane {
-          flex: 0 0 42%;
-          max-width: 520px;
-        }
-        #detail {
-          border-left: 1px solid var(--border);
-        }
-        #back {
-          display: none;
-        }
+      label.check input {
+        height: auto;
       }
     </style>
   </head>
   <body>
-    <header class="bar">
-      <div class="row">
-        <span id="capture-text" class="muted"><span class="dot"></span>Connecting…</span>
-        <button type="button" id="capture-toggle" class="primary" disabled>Start capture</button>
-      </div>
-      <div id="notices"></div>
-      <details class="hint" id="proxy-hint" hidden>
-        <summary>How to send traffic through the proxy</summary>
-        <p>
-          Point a client at <span class="mono" id="proxy-url"></span>, for example with
-          <span class="mono">HTTPS_PROXY</span> and <span class="mono">HTTP_PROXY</span>. Only
-          traffic you route there is captured. For HTTPS, trust mitmproxy's CA certificate yourself;
-          T3 never changes system trust.
-        </p>
-      </details>
-      <div class="filters">
-        <input id="f-query" type="search" placeholder="Search host or path" aria-label="Search" />
-        <select id="f-method" aria-label="Method">
-          <option value="">Any method</option>
-          <option>GET</option>
-          <option>POST</option>
-          <option>PUT</option>
-          <option>PATCH</option>
-          <option>DELETE</option>
-          <option>HEAD</option>
-          <option>OPTIONS</option>
-        </select>
-        <input id="f-status" inputmode="numeric" placeholder="Status" aria-label="Status code" />
-        <input id="f-host" placeholder="Exact host" aria-label="Host" />
-        <select id="f-capture" aria-label="Capture">
-          <option value="">All captures</option>
-        </select>
-        <button type="button" id="delete-capture" hidden>Delete capture</button>
-      </div>
-    </header>
-    <details id="replays" hidden>
-      <summary id="replays-summary">Replays</summary>
-      <ul id="replay-list"></ul>
-    </details>
-    <main>
-      <section class="pane" id="list-pane">
-        <ul id="list" role="listbox" aria-label="Captured requests"></ul>
-        <div class="footer row">
-          <span id="list-count"></span>
-          <span class="spacer"></span>
-          <button type="button" id="load-older" hidden>Load older</button>
-        </div>
-      </section>
-      <section class="pane" id="detail" hidden>
-        <div class="detail-head">
-          <button type="button" id="back" class="ghost" aria-label="Back to list">←</button>
-          <div id="detail-title"></div>
-          <button type="button" id="close-detail" class="ghost" aria-label="Close">✕</button>
-        </div>
-        <div class="tabs" role="tablist">
-          <button type="button" role="tab" data-tab="headers" aria-selected="true">Headers</button>
-          <button type="button" role="tab" data-tab="request" aria-selected="false">Request</button>
-          <button type="button" role="tab" data-tab="response" aria-selected="false">
-            Response
-          </button>
-          <button type="button" role="tab" data-tab="replay" aria-selected="false">Replay</button>
-        </div>
-        <div class="tab" id="tab-headers"></div>
-        <div class="tab" id="tab-body" hidden>
-          <div class="row">
-            <div class="seg" role="group" aria-label="Body encoding">
-              <button type="button" id="body-decoded" aria-pressed="true">Decoded</button>
-              <button type="button" id="body-raw" aria-pressed="false">Raw</button>
-            </div>
-            <span id="body-meta" class="muted"></span>
-          </div>
-          <pre class="body" id="body-view"></pre>
-          <div class="row">
-            <span id="body-progress" class="faint"></span>
-            <span class="spacer"></span>
-            <button type="button" id="body-more" hidden>Load more</button>
-          </div>
-        </div>
-        <div class="tab" id="tab-replay" hidden>
-          <div class="row">
-            <div class="field" style="flex: 0 0 96px">
-              <label for="r-method">Method</label>
-              <input id="r-method" class="mono" spellcheck="false" />
-            </div>
-            <div class="field" style="flex: 1 1 200px">
-              <label for="r-url">URL</label>
-              <input id="r-url" class="mono" spellcheck="false" />
-            </div>
-          </div>
-          <div class="field">
-            <label for="r-headers">Headers, one "Name: value" per line</label>
-            <textarea id="r-headers" rows="6" spellcheck="false"></textarea>
-          </div>
-          <label class="check"><input type="checkbox" id="r-body-on" /> Replace the body</label>
-          <textarea id="r-body" rows="6" spellcheck="false" hidden></textarea>
-          <div id="r-notes"></div>
-          <div class="destination" id="r-destination">Checking destination…</div>
-          <div class="row">
-            <span class="faint" style="flex: 1 1 160px">Each Send is a new replay.</span>
-            <button type="button" id="r-reset">Reset</button>
-            <button type="button" id="r-send" class="primary" disabled>Send</button>
-          </div>
-        </div>
-        <div class="actions row">
-          <span id="detail-error" class="faint"></span>
-          <span class="spacer"></span>
-          <button type="button" id="attach-text" disabled>Attach as text</button>
-          <button type="button" id="attach-ref" class="primary" disabled>Attach to chat</button>
-        </div>
-      </section>
-    </main>
+    <nav class="topnav" id="nav" aria-label="Inspector views"></nav>
+    <div class="notices" id="notices"></div>
+    <div id="views" class="view"></div>
   </body>
 </html>

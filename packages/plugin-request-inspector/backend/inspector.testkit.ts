@@ -7,14 +7,35 @@ import * as NodeStream from "node:stream";
 
 import type { PluginSubscriptionEvent } from "@t3tools/contracts";
 import { definePluginBackend } from "@t3tools/plugin-sdk/backend";
-import { makeWorkerClient, type WorkerClient } from "@t3tools/plugin-sdk/testing";
+import {
+  type FakeContextResolver,
+  makeWorkerClient,
+  type WorkerClient,
+} from "@t3tools/plugin-sdk/testing";
 
 import { createInspectorBackend, type InspectorDeps } from "./inspector.ts";
-import { CONTROL_ENV, type MitmSpawner } from "./mitm.ts";
+import { CONTROL_ENV, type MitmSpawner, MitmStartError } from "./mitm.ts";
 import type { ReplayMessage } from "./replay.ts";
 import { deferred, makeFakeTimer } from "./replay.testkit.ts";
 
 export const ADDON_SOURCE = "# fake addon for tests\n";
+
+export type CallContext = NonNullable<Parameters<WorkerClient["invoke"]>[3]>;
+
+/** A caller context for a thread, optionally a subagent of `parentThreadId`. */
+export const threadContext = (
+  threadId: string,
+  projectId: string,
+  parentThreadId: string | null = null,
+): CallContext => ({
+  projectId,
+  thread: {
+    id: threadId,
+    parentThreadId,
+    rootThreadId: parentThreadId ?? threadId,
+    relationshipToParent: parentThreadId === null ? null : "subagent",
+  },
+});
 
 const b64 = (text: string | Uint8Array) => Buffer.from(text).toString("base64");
 
@@ -66,14 +87,22 @@ export interface FakeSpawn {
   readonly pid: number;
   readonly signals: Array<NodeJS.Signals>;
   readonly replays: Array<ReplayMessage>;
+  /** record and hosts control messages, in arrival order. */
+  readonly controls: Array<Readonly<Record<string, unknown>>>;
   readonly exited: Promise<void>;
   readonly send: (message: unknown) => void;
   readonly sendLine: (line: string) => void;
 }
 
+/** The listen port a fake capture spawn was given, from its argv. */
+export const listenPortOf = (spawn: FakeSpawn) =>
+  Number(spawn.args[spawn.args.indexOf("--listen-port") + 1]);
+
 /**
  * A spawner whose "mitmdump" is an in-test fake addon: it connects to the control socket from
- * env, says hello, and answers each replay with a 200 response, or with `replyTo`'s result.
+ * env, says hello, acknowledges record and hosts controls, and answers each replay with a 200
+ * response, or with `replyTo`'s result. `send` a `{"type":"flow"}` or `{"type":"tunnel"}` line
+ * to report traffic.
  */
 export function makeFakeMitmdump(
   replyTo?: (message: ReplayMessage) => Readonly<Record<string, unknown>> | undefined,
@@ -93,6 +122,7 @@ export function makeFakeMitmdump(
       pid: 4_000_000 + spawns.length,
       signals: [],
       replays: [],
+      controls: [],
       exited: exited.promise,
       send,
       sendLine: (line) => socket.write(`${line}\n`),
@@ -103,8 +133,14 @@ export function makeFakeMitmdump(
     socket.on("data", (chunk: string) => {
       buffered += chunk;
       for (let newline = buffered.indexOf("\n"); newline !== -1; newline = buffered.indexOf("\n")) {
-        const message = JSON.parse(buffered.slice(0, newline)) as ReplayMessage;
+        const parsed = JSON.parse(buffered.slice(0, newline)) as Readonly<Record<string, unknown>>;
         buffered = buffered.slice(newline + 1);
+        if (parsed.type === "record" || parsed.type === "hosts") {
+          spawn.controls.push(parsed);
+          send({ type: "applied", id: parsed.id });
+          continue;
+        }
+        const message = parsed as unknown as ReplayMessage;
         spawn.replays.push(message);
         const reply = replyTo === undefined ? undefined : replyTo(message);
         send(
@@ -143,6 +179,12 @@ export interface InspectorHarness extends AsyncDisposable {
   readonly dataDir: string;
   readonly client: WorkerClient;
   readonly timer: ReturnType<typeof makeFakeTimer>;
+  /** Invokes `operation` as `caller` with `context` and resolves with its result. */
+  readonly call: (
+    operation: string,
+    input?: unknown,
+    options?: { readonly caller?: "ui" | "agent"; readonly context?: CallContext },
+  ) => Promise<unknown>;
   /** Subscribes and resolves with the first snapshot or batch whose items satisfy `match`. */
   readonly nextBatch: (
     topic: string,
@@ -157,6 +199,8 @@ export async function startInspector(options: {
   readonly deps?: Partial<InspectorDeps>;
   /** A directory holding an executable named mitmdump; the fake spawner never runs it. */
   readonly withMitmdumpOnPath?: boolean;
+  readonly resolveContext?: FakeContextResolver;
+  readonly busyPorts?: ReadonlyArray<number>;
 }): Promise<InspectorHarness> {
   const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "request-inspector-worker-"));
   const dataDir = NodePath.join(root, "data");
@@ -167,6 +211,9 @@ export async function startInspector(options: {
       mode: 0o755,
     });
   }
+  // As if mitmdump already ran once: an upstream-auth start links this CA into its confdir.
+  await NodeFSP.mkdir(NodePath.join(dataDir, "mitmproxy"), { recursive: true });
+  await NodeFSP.writeFile(NodePath.join(dataDir, "mitmproxy", "mitmproxy-ca.pem"), "FAKE CA\n");
   const timer = makeFakeTimer();
   const toWorker = new NodeStream.PassThrough();
   const fromWorker = new NodeStream.PassThrough();
@@ -176,6 +223,12 @@ export async function startInspector(options: {
       addonSource: ADDON_SOURCE,
       searchPath: binDir,
       timer: timer.timer,
+      // No test binds a real port; `busyPorts` stands in for ports other programs hold.
+      probePort: async (_host, port) => {
+        if (options.busyPorts?.includes(port) === true) {
+          throw new MitmStartError("port-in-use", `Port ${port} is already in use.`);
+        }
+      },
       ...options.deps,
     }),
     { input: toWorker, output: fromWorker, exit: (code) => exited.resolve(code) },
@@ -183,6 +236,7 @@ export async function startInspector(options: {
   const client = makeWorkerClient({
     input: fromWorker,
     output: toWorker,
+    ...(options.resolveContext === undefined ? {} : { resolveContext: options.resolveContext }),
     initialize: {
       pluginId: "request-inspector",
       version: "0.1.0",
@@ -196,6 +250,8 @@ export async function startInspector(options: {
     dataDir,
     client,
     timer,
+    call: (operation, input = {}, callOptions = {}) =>
+      client.invoke(operation, input, callOptions.caller ?? "ui", callOptions.context).result,
     nextBatch: async (topic, params, match) => {
       const found = deferred<ReadonlyArray<unknown>>();
       const stop = await client.subscribe(topic, params, (event: PluginSubscriptionEvent) => {

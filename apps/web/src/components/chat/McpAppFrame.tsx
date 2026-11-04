@@ -35,6 +35,7 @@ import { useTurnItemDetail } from "~/state/queries";
 import { mcpAppEnvironment } from "~/state/mcpApps";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { observeResize } from "~/lib/observeResize";
+import { saveBlob } from "~/lib/saveBlob";
 
 const commandFailure = (result: {
   readonly cause: Parameters<typeof squashAtomCommandFailure>[0]["cause"];
@@ -63,16 +64,6 @@ if (typeof window !== "undefined") {
   for (const type of ["pointerdown", "pointerup", "touchend", "keydown"] as const) {
     window.addEventListener(type, note, true);
   }
-}
-
-function saveBlob(blob: Blob, name: string) {
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = name;
-  link.click();
-  // Browsers may start downloading after the click's task; defer revocation.
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 export function McpAppFrame(props: {

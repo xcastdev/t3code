@@ -1,5 +1,9 @@
 import {
   PLUGIN_LIMITS,
+  PLUGIN_WORKER_CONTEXT_RESOLVE_METHOD,
+  type PluginCallContext,
+  PluginContextResolveParams,
+  type PluginContextResolveResult,
   type PluginId,
   type PluginPrerequisiteDecl,
   PluginRequestError,
@@ -84,6 +88,10 @@ export interface PluginWorkerLogLine {
 }
 
 const isSubscriptionEvent = Schema.is(PluginSubscriptionEvent);
+const decodeContextResolveParams = Schema.decodeUnknownOption(PluginContextResolveParams);
+const METHOD_NOT_FOUND = -32601;
+const INVALID_PARAMS = -32602;
+const HOST_FAILED = -32000;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -210,7 +218,13 @@ export interface WorkerConnectionHandlers {
   readonly onStatus?: (status: PluginWorkerStatus) => Effect.Effect<void>;
   /** Worker stdout that is not protocol, and notes about dropped messages. */
   readonly onOutput?: (line: string) => Effect.Effect<void>;
+  /** Answers the worker's `t3/context.resolve`; without it the method is not found. */
+  readonly resolveContext?: PluginContextResolver;
 }
+
+export type PluginContextResolver = (
+  params: PluginContextResolveParams,
+) => Effect.Effect<PluginContextResolveResult, PluginRequestError>;
 
 /**
  * The host side of the NDJSON JSON-RPC worker protocol. `input` is the worker's stdout and
@@ -232,6 +246,8 @@ export const makeWorkerConnection = Effect.fn("PluginWorkerSupervisor.makeWorker
     const overflowed = new Set<string>();
     const onOutput = handlers.onOutput ?? (() => Effect.void);
     const onStatus = handlers.onStatus ?? (() => Effect.void);
+    const connectionScope = yield* Effect.scope;
+    let workerRequests = 0;
 
     const send = (method: string, params: unknown, id?: number) =>
       ended
@@ -240,6 +256,57 @@ export const makeWorkerConnection = Effect.fn("PluginWorkerSupervisor.makeWorker
             output,
             `${encodeMessage(id === undefined ? { jsonrpc: "2.0", method, params } : { jsonrpc: "2.0", id, method, params })}\n`,
           ).pipe(Effect.asVoid);
+
+    const reply = (
+      id: string,
+      outcome: { result: unknown } | { error: Record<string, unknown> },
+    ) =>
+      ended
+        ? Effect.void
+        : Queue.offer(output, `${encodeMessage({ jsonrpc: "2.0", id, ...outcome })}\n`).pipe(
+            Effect.asVoid,
+          );
+
+    // Forked so a slow lookup never stalls the worker's other messages.
+    const answerWorkerRequest = (id: string, method: string, params: unknown) => {
+      const resolveContext = handlers.resolveContext;
+      if (method !== PLUGIN_WORKER_CONTEXT_RESOLVE_METHOD || resolveContext === undefined) {
+        return reply(id, { error: { code: METHOD_NOT_FOUND, message: "Method not found." } });
+      }
+      const decoded = decodeContextResolveParams(params);
+      if (decoded._tag === "None") {
+        return reply(id, {
+          error: {
+            code: INVALID_PARAMS,
+            message: "Expected exactly one of threadId or projectId.",
+          },
+        });
+      }
+      return Effect.suspend(() => {
+        if (workerRequests >= PLUGIN_LIMITS.maxPendingRequests) {
+          return reply(id, {
+            error: { code: HOST_FAILED, message: "Too many requests in flight." },
+          });
+        }
+        workerRequests += 1;
+        return resolveContext(decoded.value).pipe(
+          Effect.matchEffect({
+            onFailure: () =>
+              reply(id, {
+                error: { code: HOST_FAILED, message: "The host could not resolve the context." },
+              }),
+            onSuccess: (result) => reply(id, { result }),
+          }),
+          Effect.ensuring(
+            Effect.sync(() => {
+              workerRequests -= 1;
+            }),
+          ),
+          Effect.forkIn(connectionScope),
+          Effect.asVoid,
+        );
+      });
+    };
 
     // Untraced: a request runs inside the calling service operation's span.
     const request = Effect.fnUntraced(function* (
@@ -349,6 +416,10 @@ export const makeWorkerConnection = Effect.fn("PluginWorkerSupervisor.makeWorker
             : Effect.succeed(message.result ?? null),
         );
         return;
+      }
+      // Worker → host requests carry string ids, so they never collide with the host's own.
+      if (typeof message.id === "string" && typeof message.method === "string") {
+        return yield* answerWorkerRequest(message.id, message.method, message.params);
       }
       const params = isRecord(message.params) ? message.params : {};
       if (message.method === "event" && typeof params.subscriptionId === "string") {
@@ -484,6 +555,7 @@ export interface PluginWorkerStartInput {
   readonly secrets: Readonly<Record<string, string>>;
   readonly previousVersion?: string | undefined;
   readonly prerequisites: ReadonlyArray<PluginPrerequisiteDecl>;
+  readonly resolveContext: PluginContextResolver;
 }
 
 export class PluginWorkerSupervisor extends Context.Service<
@@ -502,6 +574,7 @@ export class PluginWorkerSupervisor extends Context.Service<
         readonly operation: string;
         readonly input: unknown;
         readonly caller: "ui" | "agent";
+        readonly context: PluginCallContext;
       },
     ) => Effect.Effect<unknown, PluginRequestError>;
     /** One worker subscription per stream; ending the stream unsubscribes. */
@@ -700,6 +773,7 @@ const make = Effect.gen(function* () {
             ? setStatus(pluginId, status)
             : Effect.void,
         onOutput: (line) => appendLog(pluginId, line),
+        resolveContext: input.resolveContext,
       }).pipe(Scope.provide(scope));
       const active: ActiveWorker = {
         scope,
@@ -812,6 +886,7 @@ const make = Effect.gen(function* () {
       operation: request.operation,
       input: request.input ?? null,
       caller: request.caller,
+      context: request.context,
     });
     if (jsonBytes(result) > PLUGIN_LIMITS.maxPayloadBytes) {
       return yield* requestError(

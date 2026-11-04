@@ -7,6 +7,7 @@ import {
   isProviderTextGenerationCapable,
   resolveProjectProviderInstanceEnabled,
   VISION_MODEL_DRIVERS,
+  WEB_SEARCH_MODEL_DRIVERS,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import { exhaustedUsageWindow } from "@t3tools/shared/usageLimits";
@@ -48,7 +49,8 @@ type TextGenerationOp =
   | "generateThreadTitle"
   | "generateReviewGuide"
   | "extractMemoryFacts"
-  | "describeImage";
+  | "describeImage"
+  | "webSearch";
 
 const resolveInstance = (
   registry: ProviderInstanceRegistry.ProviderInstanceRegistry["Service"],
@@ -71,7 +73,14 @@ const resolveInstance = (
                 detail: `'${instanceId}' runs ${instance.driverKind}, which cannot look at images. Choose a Codex or OpenCode vision model.`,
               }),
             )
-          : Effect.succeed(instance.textGeneration),
+          : operation === "webSearch" && !WEB_SEARCH_MODEL_DRIVERS.has(instance.driverKind)
+            ? Effect.fail(
+                new TextGenerationError({
+                  operation,
+                  detail: `'${instanceId}' runs ${instance.driverKind}, which cannot search the web. Choose a Claude or Codex web search model.`,
+                }),
+              )
+            : Effect.succeed(instance.textGeneration),
     ),
   );
 
@@ -128,6 +137,7 @@ export const make = Effect.gen(function* () {
               isProviderTextGenerationCapable(provider) &&
               (operation !== "generateReviewGuide" || INVESTIGATING_DRIVERS.has(driver)) &&
               (operation !== "describeImage" || VISION_MODEL_DRIVERS.has(driver)) &&
+              (operation !== "webSearch" || WEB_SEARCH_MODEL_DRIVERS.has(driver)) &&
               !exhaustedUsageWindow(provider, now, defaultTextGenerationModel(driver))
             );
           },
@@ -167,6 +177,11 @@ export const make = Effect.gen(function* () {
     describeImage: Effect.fn("TextGeneration.describeImage")(function (input) {
       return generate("describeImage", input.modelSelection, (service, modelSelection) =>
         service.describeImage({ ...input, modelSelection }),
+      );
+    }),
+    webSearch: Effect.fn("TextGeneration.webSearch")(function (input) {
+      return generate("webSearch", input.modelSelection, (service, modelSelection) =>
+        service.webSearch({ ...input, modelSelection }),
       );
     }),
     generateThreadTitle: Effect.fn("TextGeneration.generateThreadTitle")(function (input) {

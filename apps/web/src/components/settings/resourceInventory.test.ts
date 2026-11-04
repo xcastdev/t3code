@@ -82,6 +82,7 @@ describe("MCP editor form", () => {
         name: "Docs v2",
         enabled: true,
         providerInstanceIds: [codex],
+        allProviders: false,
         transport: {
           type: "streamable-http",
           url: "https://mcp.example.com/mcp",
@@ -164,7 +165,12 @@ describe("mcpCatalogRows", () => {
     const rows = mcpCatalogRows({
       inherited: [definition()],
       own: [
-        definition({ definitionId: McpDefinitionId.make("own"), scope: "project", name: "Local" }),
+        definition({
+          definitionId: McpDefinitionId.make("own"),
+          logicalServerId: McpServerId.make("server-local"),
+          scope: "project",
+          name: "Local",
+        }),
       ],
       overrides: [
         {
@@ -183,6 +189,32 @@ describe("mcpCatalogRows", () => {
       ["Docs", true, false, []],
       ["Local", false, true, [codex]],
     ]);
+  });
+
+  it("lists a session's own copy of an inherited server once, in place of the inherited one", () => {
+    const rows = mcpCatalogRows({
+      inherited: [definition()],
+      own: [definition({ scope: "session", name: "Docs (thread)" })],
+      overrides: [],
+    });
+    expect(rows.map((row) => [row.name, row.inherited])).toEqual([["Docs (thread)", false]]);
+  });
+
+  it("keeps an inherited all-providers selection until an override names providers", () => {
+    const everywhere = definition({ allProviders: true, providerInstanceIds: [] });
+    const narrowed = {
+      id: McpCatalogOverrideId.make("override-1"),
+      scope: "project" as const,
+      scopeId: "project-1",
+      targetId: McpServerId.make("server-1"),
+      providerInstanceIds: [codex],
+    };
+    expect(
+      [[], [narrowed]].map(
+        (overrides) =>
+          mcpCatalogRows({ inherited: [everywhere], own: [], overrides })[0]!.allProviders,
+      ),
+    ).toEqual([true, false]);
   });
 });
 
@@ -281,7 +313,12 @@ describe("MCP override editor fields", () => {
     const row = mcpCatalogRows({ inherited: [definition()], own: [], overrides: [] })[0]!;
     // The editor shows the inherited on/providers values without making them fields.
     const fields = mcpOverrideFieldsFromRow(row);
-    expect(fields).toEqual({ name: "", enabled: null, providerInstanceIds: null });
+    expect(fields).toEqual({
+      name: "",
+      enabled: null,
+      providerInstanceIds: null,
+      allProviders: null,
+    });
     expect(build(row, { ...fields, name: "Docs (project)" })).toEqual({
       ok: true,
       value: {
@@ -458,9 +495,7 @@ describe("mcpApplicationSummary", () => {
   });
 
   it("only reports applied from a receipt for the desired revision", () => {
-    expect(mcpApplicationSummary(snapshot({})).label).toBe(
-      "Waiting for delivery (desired r2, applied r1)",
-    );
+    expect(mcpApplicationSummary(snapshot({})).label).toBe("Waiting for delivery");
     expect(
       mcpApplicationSummary(
         snapshot({
@@ -481,7 +516,7 @@ describe("mcpApplicationSummary", () => {
         }),
       ),
     ).toEqual({
-      label: "Restart required (desired r2, applied r1): Provider must restart",
+      label: "Restart required: Provider must restart",
       tone: "warning",
     });
   });

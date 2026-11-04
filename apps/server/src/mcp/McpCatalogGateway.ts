@@ -2,6 +2,7 @@ import * as AssistantResources from "../assistants/AssistantNativeResources.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as PluginService from "../plugins/PluginService.ts";
 import {
+  EMPTY_PLUGIN_CALL_CONTEXT,
   PLUGIN_LIMITS,
   PluginRequestError,
   type McpCatalogSessionId,
@@ -40,11 +41,13 @@ import * as Semaphore from "effect/Semaphore";
 import * as Registry from "./McpSessionRegistry.ts";
 import * as Proxy from "./ProjectMcpProxyRegistry.ts";
 import {
+  catalogAliases,
   namespaceName,
   namespaceResourceUri,
   namespaceResourceTemplate,
   denamespaceResourceUri,
   namespaceContentUris,
+  splitNamespacedName,
 } from "./ProjectMcpBroker.ts";
 export {
   namespaceName,
@@ -187,13 +190,17 @@ const makeServer = (
       if (inflight.get(extra.requestId) === controller) inflight.delete(extra.requestId);
     }
   };
+  const aliases = catalogAliases(generation.connections.map((connection) => connection.entry));
+  const alias = (entry: ResolvedMcpCatalogEntry) => aliases.get(entry.logicalServerId)!;
+  const byAlias = new Map(
+    generation.connections.map((connection) => [alias(connection.entry), connection]),
+  );
   const named = (name: string) => {
-    for (const connection of generation.connections) {
-      const prefix = namespaceName(connection.entry.logicalServerId, "");
-      if (name.startsWith(prefix) && name.length > prefix.length)
-        return { ...connection, name: name.slice(prefix.length) };
-    }
-    throw new Error("Unknown MCP catalog item.");
+    const parts = splitNamespacedName(name);
+    const connection = parts && byAlias.get(parts.alias);
+    if (parts === undefined || connection === undefined)
+      throw new Error("Unknown MCP catalog item.");
+    return { ...connection, name: parts.name };
   };
   const resource = (uri: string) => {
     for (const connection of generation.connections) {
@@ -220,7 +227,7 @@ const makeServer = (
           )
           .map((tool) => ({
             ...tool,
-            name: namespaceName(entry.logicalServerId, tool.name),
+            name: namespaceName(alias(entry), tool.name),
           })),
       );
       if (tools.length > MAX_DISCOVERY_ITEMS)
@@ -292,7 +299,7 @@ const makeServer = (
         ...upstream.map((item) => ({
           ...item,
           uri: namespaceResourceUri(entry.logicalServerId, item.uri),
-          name: namespaceName(entry.logicalServerId, item.name),
+          name: namespaceName(alias(entry), item.name),
         })),
       );
       if (resources.length > MAX_DISCOVERY_ITEMS)
@@ -322,7 +329,7 @@ const makeServer = (
         ...upstream.map((item) => ({
           ...item,
           uriTemplate: namespaceResourceTemplate(entry.logicalServerId, item.uriTemplate),
-          name: namespaceName(entry.logicalServerId, item.name),
+          name: namespaceName(alias(entry), item.name),
         })),
       );
       if (resourceTemplates.length > MAX_DISCOVERY_ITEMS)
@@ -360,7 +367,7 @@ const makeServer = (
       prompts.push(
         ...upstream.map((item) => ({
           ...item,
-          name: namespaceName(entry.logicalServerId, item.name),
+          name: namespaceName(alias(entry), item.name),
         })),
       );
       if (prompts.length > MAX_DISCOVERY_ITEMS)
@@ -424,24 +431,24 @@ const make = Effect.gen(function* () {
     );
     if (declared === undefined)
       return yield* new PluginRequestError({ reason: "unknown-operation" });
-    if (declared.mutates) {
-      const shell = yield* projections
-        .getThreadShell(threadId)
-        .pipe(Effect.orElseSucceed(() => null));
-      if (
-        shell === null ||
-        shell.deletedAt !== null ||
-        shell.runtimeMode !== "full-access" ||
-        shell.interactionMode !== "default"
-      )
-        return yield* Effect.fail(new McpCatalogPluginRefusal(PLUGIN_MUTATION_REFUSED_MESSAGE));
-    }
+    const shell = yield* projections
+      .getThreadShell(threadId)
+      .pipe(Effect.orElseSucceed(() => null));
+    const context = PluginService.pluginCallContextFromShell(shell);
+    if (
+      declared.mutates &&
+      (context === null ||
+        shell?.runtimeMode !== "full-access" ||
+        shell.interactionMode !== "default")
+    )
+      return yield* Effect.fail(new McpCatalogPluginRefusal(PLUGIN_MUTATION_REFUSED_MESSAGE));
     const result = yield* plugins
       .callOperation({
         pluginId,
         operation: declared.name,
         input: target.kind === "tool" ? target.input : {},
         caller: "agent",
+        context: context ?? EMPTY_PLUGIN_CALL_CONTEXT,
       })
       .pipe(
         Effect.catchTags({

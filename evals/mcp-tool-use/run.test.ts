@@ -293,7 +293,7 @@ it("rebuilds the template from this checkout and sends a child T3's task prompt"
   assert.notEqual(prompt?.text, childCase.prompt);
 });
 
-it("lists link and view image tools only while a case turns them on, and sends chips as T3 projects them", () => {
+it("lists link, view image and web search tools only while a case turns them on, and sends chips as T3 projects them", () => {
   const off = buildBase(template, { model: "claude-sonnet-5-5", keepUserInstructions: false });
   const on = buildBase(template, {
     model: "claude-sonnet-5-5",
@@ -319,6 +319,28 @@ it("lists link and view image tools only while a case turns them on, and sends c
       viewImage: true,
     }).t3.map((tool) => tool.name),
     "mcp__t3-code__t3_view_image",
+  );
+  assert.notInclude(
+    off.t3.map((tool) => tool.name),
+    "mcp__t3-code__t3_web_search",
+  );
+  const withWebTools = JSON.parse(
+    JSON.stringify(template).replace("Monitor\\n", "Monitor\\nWebSearch\\n"),
+  ) as typeof template;
+  const webSearchFor = (webSearch: boolean) =>
+    buildBase(withWebTools, { model: "claude-sonnet-5-5", keepUserInstructions: false, webSearch });
+  assert.include(
+    webSearchFor(false).deferred.map((tool) => tool.name),
+    "WebSearch",
+  );
+  assert.include(
+    webSearchFor(true).t3.map((tool) => tool.name),
+    "mcp__t3-code__t3_web_search",
+  );
+  // T3 lists it only to harnesses without web search, so the case's Claude has none of its own.
+  assert.notInclude(
+    webSearchFor(true).deferred.map((tool) => tool.name),
+    "WebSearch",
   );
   const pluginTool = "mcp__t3_catalog__plugin_request_inspector__search_requests";
   assert.notInclude(

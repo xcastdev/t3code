@@ -237,6 +237,7 @@ const RPC_AGGREGATES = {
   [WS_METHODS.mcpCatalogSessionForThread]: "mcpCatalog",
   [WS_METHODS.mcpCatalogOAuthStatus]: "mcpCatalog",
   [WS_METHODS.mcpCatalogSecretPrepare]: "mcpCatalog",
+  [WS_METHODS.mcpCatalogTestConnection]: "mcpCatalog",
   [WS_METHODS.mcpCatalogWrite]: "mcpCatalog",
   [WS_METHODS.mcpCatalogSessionGet]: "mcpCatalog",
   [WS_METHODS.mcpCatalogSessionReset]: "mcpCatalog",

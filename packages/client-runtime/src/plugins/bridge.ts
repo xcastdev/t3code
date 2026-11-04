@@ -2,22 +2,31 @@ import {
   COMPOSER_CONTEXT_LABEL_MAX_CHARS,
   PLUGIN_HOST_API,
   PLUGIN_LIMITS,
+  PluginChatTargetsListParams,
   PluginContributionId,
   PluginReferenceLocator,
   PluginRequestError,
+  type PluginChatTargets,
   type PluginManifest,
   type PluginRequestErrorReason,
   type PluginSubscriptionEvent,
+  type ProjectId,
+  type ThreadId,
 } from "@t3tools/contracts";
 import { isHostApiCompatible } from "@t3tools/shared/pluginManifest";
+import * as Base64 from "effect/encoding/Base64";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 
 import { jsonBytes } from "../mcpApps/host.ts";
 
+/** The bridge version this client speaks, as `t3/initialize` and the host context report it. */
+const PLUGIN_HOST_API_VERSION = `${PLUGIN_HOST_API.major}.${PLUGIN_HOST_API.minor}`;
+
 export interface PluginHostContext {
-  readonly apiVersion: "1.0";
+  readonly apiVersion: string;
   readonly theme: "light" | "dark";
   readonly styles: { readonly variables: Readonly<Record<string, string>> };
   readonly containerDimensions: { readonly width: number; readonly height: number };
@@ -32,7 +41,7 @@ export interface PluginBridgeOptions {
   readonly manifest: PluginManifest;
   readonly panelId: string;
   readonly post: (message: unknown) => void;
-  readonly hostContext: () => PluginHostContext;
+  readonly hostContext: () => Omit<PluginHostContext, "apiVersion">;
   readonly pluginVersion: string;
   readonly state: {
     readonly get: () => Promise<{ readonly value: unknown; readonly version: string } | null>;
@@ -51,6 +60,17 @@ export interface PluginBridgeOptions {
     request: PluginAttachRequest,
     activated: boolean,
   ) => Promise<"inserted" | "cancelled">;
+  readonly saveFile: (file: PluginSaveFile) => Promise<"saved" | "cancelled">;
+  readonly writeClipboard: (text: string) => Promise<void>;
+  /** Threads and projects in the install's environment; the bridge caps each list. */
+  readonly chatTargets: (query: string) => PluginChatTargets | Promise<PluginChatTargets>;
+}
+
+export interface PluginSaveFile {
+  /** Already reduced to a basename. */
+  readonly name: string;
+  readonly mimeType: string;
+  readonly parts: ReadonlyArray<Uint8Array<ArrayBuffer>>;
 }
 
 export type PluginAttachRequest =
@@ -109,6 +129,16 @@ const AttachParams = Schema.Union([
     expectedChatTargetKey: ChatTargetKey,
   }),
 ]);
+
+const FileSaveBeginParams = Schema.Struct({
+  name: NonEmptyText.check(Schema.isMaxLength(255)),
+  mimeType: Schema.String.check(Schema.isMaxLength(128)),
+  /** Omit it when the panel cannot know it yet; the running total is still capped. */
+  size: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+});
+const FileSaveAppendParams = Schema.Struct({ saveId: Schema.String, base64: Schema.String });
+const FileSaveIdParams = Schema.Struct({ saveId: Schema.String });
+const ClipboardWriteParams = Schema.Struct({ text: Schema.String });
 
 const decode = <S extends Schema.Top & { readonly DecodingServices: never }>(
   schema: S,
@@ -200,6 +230,102 @@ const normaliseMessage = (data: unknown) => {
   return { bytes, value: JSON.parse(json) as unknown };
 };
 
+const SAVE_NAME_MAX_BYTES = 200;
+
+const truncateUtf8 = (text: string, maxBytes: number) => {
+  let bytes = 0;
+  let end = 0;
+  for (const char of text) {
+    bytes += encoder.encode(char).byteLength;
+    if (bytes > maxBytes) break;
+    end += char.length;
+  }
+  return text.slice(0, end);
+};
+
+/**
+ * Keeps the last path segment, replaces control and bidi characters (which can disguise an
+ * extension), and caps the length while keeping a short extension.
+ */
+const saveFileName = (name: string) => {
+  const basename = (name.split(/[\\/]/).at(-1) ?? "")
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "_")
+    .trim();
+  if (basename === "" || /^\.+$/.test(basename)) return "download";
+  if (encoder.encode(basename).byteLength <= SAVE_NAME_MAX_BYTES) return basename;
+  const dot = basename.lastIndexOf(".");
+  const extension = dot > 0 && basename.length - dot <= 16 ? basename.slice(dot) : "";
+  const stem = extension === "" ? basename : basename.slice(0, dot);
+  return truncateUtf8(stem, SAVE_NAME_MAX_BYTES - encoder.encode(extension).byteLength) + extension;
+};
+
+interface OpenSave {
+  readonly saveId: string;
+  readonly name: string;
+  readonly mimeType: string;
+  readonly size: number | undefined;
+  readonly parts: Array<Uint8Array<ArrayBuffer>>;
+  received: number;
+}
+
+type ChatTargetSource = {
+  readonly threads: ReadonlyArray<{
+    readonly environmentId: string;
+    readonly id: ThreadId;
+    readonly projectId: ProjectId;
+    readonly title: string;
+    readonly updatedAt: string;
+    readonly deletedAt: string | null;
+  }>;
+  readonly projects: ReadonlyArray<{
+    readonly environmentId: string;
+    readonly id: ProjectId;
+    readonly title: string;
+    readonly updatedAt: string;
+    readonly archivedAt?: string | null | undefined;
+  }>;
+};
+
+/** Recent threads and projects of one environment matching `query`, as `t3/chat.targets.list` answers. */
+export function selectPluginChatTargets(
+  source: ChatTargetSource,
+  environmentId: string,
+  query: string,
+): PluginChatTargets {
+  const needle = query.trim().toLowerCase();
+  const matches = (...texts: ReadonlyArray<string>) =>
+    needle === "" || texts.some((text) => text.toLowerCase().includes(needle));
+  const newestFirst = (a: { readonly updatedAt: string }, b: { readonly updatedAt: string }) =>
+    b.updatedAt.localeCompare(a.updatedAt);
+  const projectNames = new Map<string, string>();
+  for (const project of source.projects) {
+    if (project.environmentId === environmentId) projectNames.set(project.id, project.title);
+  }
+  const threads = source.threads
+    .filter((thread) => thread.environmentId === environmentId && thread.deletedAt === null)
+    .map((thread) => ({ thread, projectName: projectNames.get(thread.projectId) ?? "" }))
+    .filter(({ thread, projectName }) => matches(thread.title, projectName))
+    .sort((a, b) => newestFirst(a.thread, b.thread))
+    .slice(0, PLUGIN_LIMITS.maxChatTargets)
+    .map(({ thread, projectName }) => ({
+      threadId: thread.id,
+      title: thread.title,
+      projectId: thread.projectId,
+      projectName,
+    }));
+  const projects = source.projects
+    .filter(
+      (project) =>
+        project.environmentId === environmentId &&
+        (project.archivedAt ?? null) === null &&
+        matches(project.title),
+    )
+    .sort(newestFirst)
+    .slice(0, PLUGIN_LIMITS.maxChatTargets)
+    .map((project) => ({ projectId: project.id, name: project.title }));
+  return { threads, projects };
+}
+
 interface LiveSubscription {
   readonly topic: string;
   readonly params: unknown;
@@ -214,8 +340,14 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
   let pending = 0;
   let sentContext = "";
   let nextSubscriptionId = 0;
+  let nextSaveId = 0;
+  let save: OpenSave | null = null;
   const subscriptions = new Map<string, LiveSubscription>();
 
+  const currentHostContext = (): PluginHostContext => ({
+    ...options.hostContext(),
+    apiVersion: PLUGIN_HOST_API_VERSION,
+  });
   const post = (message: unknown) => {
     if (!disposed) options.post(message);
   };
@@ -308,15 +440,31 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
     else dispose();
   };
 
+  const requireActivation = (activated: boolean, action: string) => {
+    if (!activated) {
+      throw new BridgeFailure(
+        REQUEST_FAILED,
+        `${action} must follow a click or key press in the panel.`,
+      );
+    }
+  };
+
+  const openSave = (saveId: string) => {
+    if (save === null || save.saveId !== saveId) {
+      throw new BridgeFailure(INVALID_PARAMS, "No such save is open.");
+    }
+    return save;
+  };
+
   const handleRequest = (id: JsonRpcId, method: string, rawParams: unknown, activated: boolean) => {
     if (method === "t3/initialize") {
       const { apiVersion } = params(InitializeParams, rawParams, method);
       if (!isHostApiCompatible(apiVersion)) throw refusal("incompatible-host-api");
-      const hostContext = options.hostContext();
+      const hostContext = currentHostContext();
       sentContext = JSON.stringify(hostContext);
       initialized = true;
       respond(id, {
-        apiVersion: `${PLUGIN_HOST_API.major}.${PLUGIN_HOST_API.minor}`,
+        apiVersion: PLUGIN_HOST_API_VERSION,
         pluginId: manifest.id,
         panelId: options.panelId,
         pluginVersion: options.pluginVersion,
@@ -383,13 +531,86 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
         const request = params(AttachParams, rawParams, method);
         const capability = request.kind === "text" ? "chat.attach" : "chat.reference";
         if (!manifest.capabilities.includes(capability)) throw refusal("capability-denied");
-        if (!activated) {
+        requireActivation(activated, "Attaching to chat");
+        answer(id, () => options.attach(request, activated).then((outcome) => ({ outcome })));
+        return;
+      }
+      case "t3/file.save.begin": {
+        const { name, mimeType, size } = params(FileSaveBeginParams, rawParams, method);
+        if (!manifest.capabilities.includes("file.save")) throw refusal("capability-denied");
+        requireActivation(activated, "Saving a file");
+        if (size !== undefined && size > PLUGIN_LIMITS.maxSaveBytes) throw refusal("too-large");
+        if (save !== null) {
+          throw new BridgeFailure(REQUEST_FAILED, "Another save is still in progress.");
+        }
+        const saveId = `save-${nextSaveId++}`;
+        save = { saveId, name: saveFileName(name), mimeType, size, parts: [], received: 0 };
+        respond(id, { saveId });
+        return;
+      }
+      case "t3/file.save.append": {
+        const { saveId, base64 } = params(FileSaveAppendParams, rawParams, method);
+        const current = openSave(saveId);
+        const decoded = Base64.decode(base64);
+        if (Result.isFailure(decoded)) {
+          throw new BridgeFailure(INVALID_PARAMS, "The chunk is not valid base64.");
+        }
+        // A copy owns its ArrayBuffer, which Blob parts require.
+        const chunk = new Uint8Array(decoded.success);
+        if (chunk.byteLength > PLUGIN_LIMITS.maxBodyChunkBytes) throw refusal("too-large");
+        const received = current.received + chunk.byteLength;
+        if (current.size !== undefined && received > current.size) {
+          save = null;
+          throw new BridgeFailure(INVALID_PARAMS, `The file is larger than ${current.size} bytes.`);
+        }
+        if (received > PLUGIN_LIMITS.maxSaveBytes) {
+          save = null;
+          throw refusal("too-large");
+        }
+        current.parts.push(chunk);
+        current.received += chunk.byteLength;
+        respond(id, {});
+        return;
+      }
+      case "t3/file.save.commit": {
+        const { saveId } = params(FileSaveIdParams, rawParams, method);
+        const current = openSave(saveId);
+        save = null;
+        if (current.size !== undefined && current.received !== current.size) {
           throw new BridgeFailure(
-            REQUEST_FAILED,
-            "Attaching to chat must follow a click or key press in the panel.",
+            INVALID_PARAMS,
+            `The file is ${current.received} bytes, not ${current.size}.`,
           );
         }
-        answer(id, () => options.attach(request, activated).then((outcome) => ({ outcome })));
+        const file = { name: current.name, mimeType: current.mimeType, parts: current.parts };
+        answer(id, () => options.saveFile(file).then((outcome) => ({ outcome })));
+        return;
+      }
+      case "t3/file.save.abort": {
+        const { saveId } = params(FileSaveIdParams, rawParams, method);
+        if (save?.saveId === saveId) save = null;
+        respond(id, {});
+        return;
+      }
+      case "t3/clipboard.write": {
+        const { text } = params(ClipboardWriteParams, rawParams, method);
+        if (!manifest.capabilities.includes("clipboard.write")) throw refusal("capability-denied");
+        requireActivation(activated, "Copying");
+        if (encoder.encode(text).byteLength > PLUGIN_LIMITS.maxPayloadBytes) {
+          throw refusal("too-large");
+        }
+        answer(id, () => options.writeClipboard(text).then(() => ({})));
+        return;
+      }
+      case "t3/chat.targets.list": {
+        const { query } = params(PluginChatTargetsListParams, rawParams, method);
+        answer(id, async () => {
+          const targets = await options.chatTargets(query ?? "");
+          return {
+            threads: targets.threads.slice(0, PLUGIN_LIMITS.maxChatTargets),
+            projects: targets.projects.slice(0, PLUGIN_LIMITS.maxChatTargets),
+          };
+        });
         return;
       }
       default:
@@ -421,7 +642,7 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
     },
     updateHostContext: () => {
       if (!initialized) return;
-      const hostContext = options.hostContext();
+      const hostContext = currentHostContext();
       const serialized = JSON.stringify(hostContext);
       if (serialized === sentContext) return;
       sentContext = serialized;
@@ -443,6 +664,7 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
     },
     dispose: () => {
       disposed = true;
+      save = null;
       const live = [...subscriptions.values()];
       subscriptions.clear();
       for (const entry of live) entry.dispose();

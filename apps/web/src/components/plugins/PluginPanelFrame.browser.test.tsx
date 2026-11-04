@@ -131,6 +131,9 @@ describe("PluginPanelFrame", () => {
             state: { get: getState, set: async () => {} },
             openSurface: async () => {},
             attach: async () => "inserted",
+            saveFile: async () => "saved",
+            writeClipboard: async () => {},
+            chatTargets: () => ({ threads: [], projects: [] }),
           }}
           destination={{ kind: "client" }}
           chatTarget={null}
@@ -147,6 +150,46 @@ describe("PluginPanelFrame", () => {
     window.postMessage({ jsonrpc: "2.0", id: 99, method: "t3/state.get", params: {} }, "*");
     await delivered;
     expect(getState).not.toHaveBeenCalled();
+  });
+
+  it("credits a click in the panel right after a click elsewhere in T3", async () => {
+    const writeClipboard = vi.fn(async (_text: string) => {});
+    await using screen = await render(
+      <div style={{ width: 400, height: 300 }}>
+        <button type="button">Open panel</button>
+        <PluginPanelFrame
+          title="Echo"
+          document={{
+            kind: "srcdoc",
+            html: pluginPanelTestHtml(
+              `document.getElementById("copy").onclick = async () =>
+                probe("copied", await call("t3/clipboard.write", { text: "hi" }));`,
+              `<button id="copy">Copy</button>`,
+            ),
+          }}
+          bridge={{
+            manifest: { ...manifest("1.0.0"), capabilities: ["clipboard.write"] },
+            panelId: "main",
+            pluginVersion: "1",
+            state: { get: async () => null, set: async () => {} },
+            openSurface: async () => {},
+            attach: async () => "inserted",
+            saveFile: async () => "saved",
+            writeClipboard,
+            chatTargets: () => ({ threads: [], projects: [] }),
+          }}
+          destination={{ kind: "client" }}
+          chatTarget={null}
+        />
+      </div>,
+    );
+    using probes = collectPanelProbes(screen.container);
+    await probes.probe("initialized");
+
+    await page.getByRole("button", { name: "Open panel" }).click();
+    await page.frameLocator(page.getByTitle("Echo")).getByRole("button", { name: "Copy" }).click();
+    expect(await probes.probe("copied")).toEqual({ jsonrpc: "2.0", id: 2, result: {} });
+    expect(writeClipboard).toHaveBeenCalledWith("hi");
   });
 
   it("shows Enable for a disabled plugin, only with permission, and does not mount the frame", async () => {

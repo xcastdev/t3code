@@ -3,5 +3,5 @@
   "compilerOptions": {
     "types": ["node"]
   },
-  "include": ["backend", "ui", "integration"]
+  "include": ["backend", "shared", "ui", "integration"]
 }
