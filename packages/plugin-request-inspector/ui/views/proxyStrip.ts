@@ -124,6 +124,11 @@ export const styles = `
   font-family: var(--mono);
   font-size: 11px;
 }
+@media (max-width: 400px) {
+  .picker-trigger .picker-label {
+    display: none;
+  }
+}
 .picker-caret {
   display: inline-flex;
   color: var(--text-faint);

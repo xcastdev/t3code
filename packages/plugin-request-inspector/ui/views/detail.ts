@@ -193,10 +193,10 @@ pre.raw {
   background: var(--muted);
   color: var(--text);
 }
-details.menu {
+details.copy-menu {
   position: relative;
 }
-details.menu summary {
+details.copy-menu summary {
   display: inline-flex;
   align-items: center;
   height: 24px;
@@ -208,7 +208,7 @@ details.menu summary {
   cursor: pointer;
   list-style: none;
 }
-details.menu summary::-webkit-details-marker {
+details.copy-menu summary::-webkit-details-marker {
   display: none;
 }
 .menu-list {
@@ -233,6 +233,35 @@ details.menu summary::-webkit-details-marker {
 .actions {
   padding: 8px 12px;
   border-top: 1px solid var(--border);
+}
+/* Narrow: a header's name sits above its value so long names leave the value room. */
+@media (max-width: 479px) {
+  table.headers,
+  table.headers tbody {
+    display: block;
+  }
+  table.headers tr {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    padding: 2px 0;
+  }
+  table.headers td.pick {
+    grid-area: 1 / 1;
+    width: auto;
+  }
+  table.headers td.name {
+    grid-area: 1 / 2;
+    width: auto;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  table.headers td.act {
+    grid-area: 1 / 3;
+    width: auto;
+  }
+  table.headers td.value {
+    grid-area: 2 / 2 / 3 / 4;
+  }
 }
 @media (min-width: 760px) {
   .detail-head .back {
@@ -775,7 +804,7 @@ export const mount = (root: HTMLElement, app: App): (() => void) => {
   };
 
   const copyMenu = (value: Detail, side: Side) => {
-    const menu = h("details", { class: "menu", "data-host-tools": "" });
+    const menu = h("details", { class: "copy-menu", "data-host-tools": "" });
     menu.append(
       h("summary", {}, "Copy as…"),
       h(
@@ -830,7 +859,7 @@ export const mount = (root: HTMLElement, app: App): (() => void) => {
                 }),
             ),
           h("td", { class: "name" }, name),
-          h("td", {}, headerText),
+          h("td", { class: "value" }, headerText),
           h(
             "td",
             { class: "act" },
@@ -875,8 +904,8 @@ export const mount = (root: HTMLElement, app: App): (() => void) => {
                 ),
               ),
             h("td", { class: "name" }, cookie.name === "" ? "(unnamed)" : cookie.name),
-            h("td", {}, cookie.value),
-            h("td", {}),
+            h("td", { class: "value" }, cookie.value),
+            h("td", { class: "act" }),
           ),
         );
       }
@@ -1038,7 +1067,7 @@ export const mount = (root: HTMLElement, app: App): (() => void) => {
     });
   }
   const closeMenus = (event: Event) => {
-    for (const menu of root.querySelectorAll<HTMLDetailsElement>("details.menu[open]")) {
+    for (const menu of root.querySelectorAll<HTMLDetailsElement>("details.copy-menu[open]")) {
       if (!menu.contains(event.target as Node)) menu.open = false;
     }
   };

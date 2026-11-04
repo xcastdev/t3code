@@ -591,6 +591,7 @@ function RightPanelEmptyState(props: {
                 <button
                   type="button"
                   onClick={action.onClick}
+                  onContextMenu={unpinOnContextMenu(action.onUnpin)}
                   className={cn(
                     "flex h-8 w-full cursor-pointer items-center gap-2.5 rounded-(--control-radius) px-2.5 text-left text-sm transition-colors group-hover:bg-accent/60",
                     isHighlighted(action) && "bg-accent/60",
@@ -687,6 +688,9 @@ const showUnpinMenu = async (event: ReactMouseEvent, onUnpin: () => void) => {
   if (action === "unpin") onUnpin();
 };
 
+const unpinOnContextMenu = (onUnpin: (() => void) | undefined) =>
+  onUnpin ? (event: ReactMouseEvent) => void showUnpinMenu(event, onUnpin) : undefined;
+
 type WorkAttentionKeys = {
   readonly overview: ReadonlyArray<string>;
   readonly tasks: ReadonlyArray<string>;
@@ -752,67 +756,70 @@ function RightPanelSurfaceRail(props: {
           onKeyDown={handleKeyDown}
           aria-label="Open a surface"
           data-surface-launcher-keys={props.launcherKeys}
-          className="flex min-h-0 flex-1 flex-col items-center gap-1.5 overflow-y-auto py-1.5 outline-none [scrollbar-width:none]"
+          className="flex min-h-0 flex-1 flex-col outline-none"
         >
-          {props.actions.map((action, index) => {
-            const Icon = action.icon;
-            const onUnpin = action.onUnpin;
-            const browserMenu =
-              action.id === BROWSER_ACTION_ID && action.available && hasProfileChoice;
-            const hint = !action.available
-              ? action.disabledReason
-              : browserMenu
-                ? "Right-click to choose a profile."
-                : action.description;
-            return (
-              <Fragment key={action.id ?? action.label}>
-                {index > 0 && props.actions[index - 1]?.group !== action.group ? (
-                  <div aria-hidden className="my-1.5 h-px w-4 shrink-0 bg-border" />
-                ) : null}
-                <Tooltip disabled={browserMenu && profileMenuOpen}>
-                  <TooltipTrigger
-                    render={
-                      <Button
-                        ref={browserMenu ? browserButtonRef : undefined}
-                        data-rail-action
-                        aria-label={action.label}
-                        aria-keyshortcuts={
-                          action.available && action.shortcut ? action.shortcut : undefined
+          <ScrollArea scrollFade hideScrollbars viewportTabIndex={-1}>
+            <div className="flex flex-col items-center gap-1.5 py-1.5">
+              {props.actions.map((action, index) => {
+                const Icon = action.icon;
+                const browserMenu =
+                  action.id === BROWSER_ACTION_ID && action.available && hasProfileChoice;
+                const hint = !action.available
+                  ? action.disabledReason
+                  : browserMenu
+                    ? "Right-click to choose a profile."
+                    : action.description;
+                return (
+                  <Fragment key={action.id ?? action.label}>
+                    {index > 0 && props.actions[index - 1]?.group !== action.group ? (
+                      <div aria-hidden className="my-1.5 h-px w-4 shrink-0 bg-border" />
+                    ) : null}
+                    <Tooltip disabled={browserMenu && profileMenuOpen}>
+                      <TooltipTrigger
+                        render={
+                          <Button
+                            ref={browserMenu ? browserButtonRef : undefined}
+                            data-rail-action
+                            aria-label={action.label}
+                            aria-keyshortcuts={
+                              action.available && action.shortcut ? action.shortcut : undefined
+                            }
+                            aria-disabled={action.available ? undefined : true}
+                            onClick={action.available ? action.onClick : undefined}
+                            onContextMenu={
+                              browserMenu
+                                ? (event) => {
+                                    event.preventDefault();
+                                    setProfileMenuOpen(true);
+                                  }
+                                : unpinOnContextMenu(action.onUnpin)
+                            }
+                            size="icon"
+                            variant="ghost-muted"
+                          />
                         }
-                        aria-disabled={action.available ? undefined : true}
-                        onClick={action.available ? action.onClick : undefined}
-                        onContextMenu={
-                          browserMenu
-                            ? (event) => {
-                                event.preventDefault();
-                                setProfileMenuOpen(true);
-                              }
-                            : onUnpin
-                              ? (event) => void showUnpinMenu(event, onUnpin)
-                              : undefined
-                        }
-                        size="icon"
-                        variant="ghost-muted"
-                      />
-                    }
-                  >
-                    <AttentionIcon attention={action.attention}>
-                      <Icon className="size-5.5" />
-                    </AttentionIcon>
-                  </TooltipTrigger>
-                  <TooltipPopup side="left" sideOffset={8} variant="soft">
-                    <div className="flex flex-col gap-0.5 py-0.5">
-                      <span className="flex items-center justify-between gap-3">
-                        <span className="font-medium text-foreground">{action.label}</span>
-                        {action.available && action.shortcut ? <Kbd>{action.shortcut}</Kbd> : null}
-                      </span>
-                      {hint ? <span className="text-muted-foreground">{hint}</span> : null}
-                    </div>
-                  </TooltipPopup>
-                </Tooltip>
-              </Fragment>
-            );
-          })}
+                      >
+                        <AttentionIcon attention={action.attention}>
+                          <Icon className="size-5.5" />
+                        </AttentionIcon>
+                      </TooltipTrigger>
+                      <TooltipPopup side="left" sideOffset={8} variant="soft">
+                        <div className="flex flex-col gap-0.5 py-0.5">
+                          <span className="flex items-center justify-between gap-3">
+                            <span className="font-medium text-foreground">{action.label}</span>
+                            {action.available && action.shortcut ? (
+                              <Kbd>{action.shortcut}</Kbd>
+                            ) : null}
+                          </span>
+                          {hint ? <span className="text-muted-foreground">{hint}</span> : null}
+                        </div>
+                      </TooltipPopup>
+                    </Tooltip>
+                  </Fragment>
+                );
+              })}
+            </div>
+          </ScrollArea>
         </nav>
       </TooltipProvider>
       {hasProfileChoice ? (
