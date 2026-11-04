@@ -308,11 +308,7 @@ export const ChatHeader = memo(function ChatHeader({
         "flex min-w-0 flex-1 items-center gap-2 sm:gap-3",
         // Ends 8px before the thread details toggle, which moves between the header and the window corner.
         // Phones get larger touch-size toggles.
-        rightPanelOpen
-          ? "pr-18"
-          : rightPanelRail
-            ? "pr-16 max-sm:pr-21"
-            : "pr-25.75 max-sm:pr-30.75",
+        rightPanelOpen ? "pr-18" : rightPanelRail ? "pr-16" : "pr-25.75 max-sm:pr-30.75",
       )}
       onContextMenu={handleHeaderContextMenu}
     >

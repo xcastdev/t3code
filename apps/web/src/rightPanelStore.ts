@@ -506,7 +506,7 @@ const closeAction = (
     threadKey,
     (current) => {
       const next = updater(current);
-      // An emptied panel is the launcher rail, which cannot stay maximized.
+      // An emptied panel is the surface launcher, which cannot stay maximized.
       if (next.surfaces.length > 0 || next.maximized !== true) return next;
       const { maximized: _maximized, ...rest } = next;
       return rest;
@@ -1032,7 +1032,7 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             const index = current.surfaces.findIndex((surface) => surface.id === surfaceId);
             if (index < 0) return current;
             const surfaces = current.surfaces.filter((surface) => surface.id !== surfaceId);
-            // An emptied panel stays open as the launcher rail.
+            // An emptied panel stays open as the surface launcher.
             const next = { ...current, surfaces };
             if (current.activeSurfaceId !== surfaceId) {
               return next;

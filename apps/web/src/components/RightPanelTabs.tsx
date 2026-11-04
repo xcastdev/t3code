@@ -94,6 +94,13 @@ import { useBrowserDefaults } from "~/browser/browserDefaults";
 import { pluginPanelIcon } from "~/plugins/pluginIcons";
 import { usePluginPanelInstall } from "~/plugins/pluginInstalls";
 import { ScrollArea } from "~/components/ui/scroll-area";
+import { Separator } from "~/components/ui/separator";
+import {
+  SidebarGroup,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+} from "~/components/ui/sidebar";
 import { PanelTabCloseButton } from "~/components/ui/panel-tab-close-button";
 import { faviconUrlForOrigin } from "@t3tools/shared/favicon";
 import { useTheme } from "~/hooks/useTheme";
@@ -344,6 +351,8 @@ function SurfaceMenuItem(props: {
 const BROWSER_ACTION_ID = "browser";
 
 function RightPanelEmptyState(props: {
+  layout: SurfaceLauncherLayout;
+  layoutControls?: ReactNode;
   onAddBrowser: () => void;
   onAddBrowserInProfile: (profileId: string) => void;
   browserProfiles: ReadonlyArray<{ readonly id: string; readonly name: string }>;
@@ -507,7 +516,9 @@ function RightPanelEmptyState(props: {
   }, []);
 
   return (
-    <RightPanelSurfaceRail
+    <RightPanelSurfaceLauncher
+      layout={props.layout}
+      layoutControls={props.layoutControls}
       actions={actions}
       launcherKeys={availableActions.map((action) => action.shortcut).join("")}
       browserProfiles={props.browserProfiles}
@@ -516,8 +527,11 @@ function RightPanelEmptyState(props: {
   );
 }
 
+/** The slim icon rail beside the chat, or the labeled list a small screen shows in an overlay. */
+type SurfaceLauncherLayout = "rail" | "list";
+
 const RAIL_ACTION_SELECTOR = "[data-rail-action]:not([aria-disabled='true'])";
-const RAIL_FIRST_ACTION_SELECTOR = `[data-surface-launcher-keys] ${RAIL_ACTION_SELECTOR}`;
+export const RAIL_FIRST_ACTION_SELECTOR = `[data-surface-launcher-keys] ${RAIL_ACTION_SELECTOR}`;
 
 interface RailSurfaceAction {
   /** Distinguishes actions that share a label, such as one plugin's panel in two scopes. */
@@ -571,7 +585,20 @@ function AttentionIcon(props: {
   );
 }
 
-function RightPanelSurfaceRail(props: {
+/** Runs of adjacent actions that share a group, in order. */
+function actionGroups(actions: readonly RailSurfaceAction[]): RailSurfaceAction[][] {
+  const groups: RailSurfaceAction[][] = [];
+  for (const action of actions) {
+    const last = groups.at(-1);
+    if (last && last[0]?.group === action.group) last.push(action);
+    else groups.push([action]);
+  }
+  return groups;
+}
+
+function RightPanelSurfaceLauncher(props: {
+  layout: SurfaceLauncherLayout;
+  layoutControls?: ReactNode;
   actions: readonly RailSurfaceAction[];
   launcherKeys: string;
   browserProfiles: ReadonlyArray<{ readonly id: string; readonly name: string }>;
@@ -580,6 +607,7 @@ function RightPanelSurfaceRail(props: {
   const browserButtonRef = useRef<HTMLButtonElement>(null);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const hasProfileChoice = props.browserProfiles.length > 1;
+  const list = props.layout === "list";
 
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
@@ -600,12 +628,83 @@ function RightPanelSurfaceRail(props: {
     items[next]?.focus();
   };
 
+  const renderAction = (action: RailSurfaceAction) => {
+    const Icon = action.icon;
+    const browserMenu = action.id === BROWSER_ACTION_ID && action.available && hasProfileChoice;
+    const buttonProps = {
+      ref: browserMenu ? browserButtonRef : undefined,
+      "data-rail-action": true,
+      "aria-keyshortcuts": action.available && action.shortcut ? action.shortcut : undefined,
+      "aria-disabled": action.available ? undefined : true,
+      onClick: action.available ? action.onClick : undefined,
+      onContextMenu: browserMenu
+        ? (event: ReactMouseEvent) => {
+            event.preventDefault();
+            setProfileMenuOpen(true);
+          }
+        : unpinOnContextMenu(action.onUnpin),
+    };
+    if (list) {
+      const reason = action.available ? null : action.disabledReason;
+      return (
+        <SidebarMenuButton {...buttonProps} size={reason ? "lg" : "default"}>
+          <AttentionIcon attention={action.attention}>
+            <Icon className="size-4" />
+          </AttentionIcon>
+          {reason ? (
+            <span className="flex min-w-0 flex-1 flex-col">
+              <span className="truncate">{action.label}</span>
+              <span className="truncate font-normal text-xs">{reason}</span>
+            </span>
+          ) : (
+            <span className="min-w-0 flex-1 truncate">{action.label}</span>
+          )}
+          {action.available && action.shortcut ? <Kbd>{action.shortcut}</Kbd> : null}
+        </SidebarMenuButton>
+      );
+    }
+    const hint = !action.available
+      ? action.disabledReason
+      : browserMenu
+        ? "Right-click to choose a profile."
+        : action.description;
+    return (
+      <Tooltip disabled={browserMenu && profileMenuOpen}>
+        <TooltipTrigger
+          render={
+            <Button {...buttonProps} aria-label={action.label} size="icon" variant="ghost-muted" />
+          }
+        >
+          <AttentionIcon attention={action.attention}>
+            <Icon className="size-5.5" />
+          </AttentionIcon>
+        </TooltipTrigger>
+        <TooltipPopup side="left" sideOffset={8} variant="soft">
+          <div className="flex flex-col gap-0.5 py-0.5">
+            <span className="flex items-center justify-between gap-3">
+              <span className="font-medium text-foreground">{action.label}</span>
+              {action.available && action.shortcut ? <Kbd>{action.shortcut}</Kbd> : null}
+            </span>
+            {hint ? <span className="text-muted-foreground">{hint}</span> : null}
+          </div>
+        </TooltipPopup>
+      </Tooltip>
+    );
+  };
+
   return (
     <>
-      <div
-        aria-hidden
-        className={cn("h-(--workspace-topbar-height) shrink-0", isElectron && "drag-region")}
-      />
+      {list ? (
+        <div className="flex h-(--workspace-topbar-height) shrink-0 items-center gap-2 pr-3 pl-4.5">
+          <span className="min-w-0 flex-1 truncate font-medium text-sm">Open a surface</span>
+          {props.layoutControls}
+        </div>
+      ) : (
+        <div
+          aria-hidden
+          className={cn("h-(--workspace-topbar-height) shrink-0", isElectron && "drag-region")}
+        />
+      )}
       <TooltipProvider delay={100} closeDelay={0} timeout={400}>
         <nav
           data-workspace-focus-default
@@ -616,66 +715,33 @@ function RightPanelSurfaceRail(props: {
           className="flex min-h-0 flex-1 flex-col outline-none"
         >
           <ScrollArea scrollFade hideScrollbars viewportTabIndex={-1}>
-            <div className="flex flex-col items-center gap-1.5 py-1.5">
-              {props.actions.map((action, index) => {
-                const Icon = action.icon;
-                const browserMenu =
-                  action.id === BROWSER_ACTION_ID && action.available && hasProfileChoice;
-                const hint = !action.available
-                  ? action.disabledReason
-                  : browserMenu
-                    ? "Right-click to choose a profile."
-                    : action.description;
-                return (
+            {list ? (
+              <SidebarGroup>
+                {actionGroups(props.actions).map((group, index) => (
+                  <Fragment key={group[0]?.group}>
+                    {index > 0 ? <Separator className="my-1" /> : null}
+                    <SidebarMenu>
+                      {group.map((action) => (
+                        <SidebarMenuItem key={action.id ?? action.label}>
+                          {renderAction(action)}
+                        </SidebarMenuItem>
+                      ))}
+                    </SidebarMenu>
+                  </Fragment>
+                ))}
+              </SidebarGroup>
+            ) : (
+              <div className="flex flex-col items-center gap-1.5 py-1.5">
+                {props.actions.map((action, index) => (
                   <Fragment key={action.id ?? action.label}>
                     {index > 0 && props.actions[index - 1]?.group !== action.group ? (
                       <div aria-hidden className="my-1.5 h-px w-4 shrink-0 bg-border" />
                     ) : null}
-                    <Tooltip disabled={browserMenu && profileMenuOpen}>
-                      <TooltipTrigger
-                        render={
-                          <Button
-                            ref={browserMenu ? browserButtonRef : undefined}
-                            data-rail-action
-                            aria-label={action.label}
-                            aria-keyshortcuts={
-                              action.available && action.shortcut ? action.shortcut : undefined
-                            }
-                            aria-disabled={action.available ? undefined : true}
-                            onClick={action.available ? action.onClick : undefined}
-                            onContextMenu={
-                              browserMenu
-                                ? (event) => {
-                                    event.preventDefault();
-                                    setProfileMenuOpen(true);
-                                  }
-                                : unpinOnContextMenu(action.onUnpin)
-                            }
-                            size="icon"
-                            variant="ghost-muted"
-                          />
-                        }
-                      >
-                        <AttentionIcon attention={action.attention}>
-                          <Icon className="size-5.5" />
-                        </AttentionIcon>
-                      </TooltipTrigger>
-                      <TooltipPopup side="left" sideOffset={8} variant="soft">
-                        <div className="flex flex-col gap-0.5 py-0.5">
-                          <span className="flex items-center justify-between gap-3">
-                            <span className="font-medium text-foreground">{action.label}</span>
-                            {action.available && action.shortcut ? (
-                              <Kbd>{action.shortcut}</Kbd>
-                            ) : null}
-                          </span>
-                          {hint ? <span className="text-muted-foreground">{hint}</span> : null}
-                        </div>
-                      </TooltipPopup>
-                    </Tooltip>
+                    {renderAction(action)}
                   </Fragment>
-                );
-              })}
-            </div>
+                ))}
+              </div>
+            )}
           </ScrollArea>
         </nav>
       </TooltipProvider>
@@ -684,8 +750,8 @@ function RightPanelSurfaceRail(props: {
           <MenuPopup
             anchor={browserButtonRef}
             align="start"
-            side="left"
-            sideOffset={8}
+            side={list ? "bottom" : "left"}
+            sideOffset={list ? 4 : 8}
             className="max-w-56"
           >
             {props.browserProfiles.map((profile) => (
@@ -1746,6 +1812,8 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       <div className="flex min-h-0 flex-1 flex-col" data-right-panel-surface-content>
         {props.activeSurfaceId === null ? (
           <RightPanelEmptyState
+            layout={props.mode === "sheet" ? "list" : "rail"}
+            layoutControls={props.layoutControls}
             onAddBrowser={props.onAddBrowser}
             onAddBrowserInProfile={props.onAddBrowserInProfile}
             browserProfiles={browserProfiles}

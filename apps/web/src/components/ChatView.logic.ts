@@ -137,6 +137,24 @@ export function agentControlledBrowserCloseConfirmation(
   ].join("\n");
 }
 
+/**
+ * The thread whose open but empty right panel a narrow layout shows as the launcher overlay, if
+ * any. It waits for the user in that thread, so a saved open panel stays hidden through a reload,
+ * resize, or thread switch; a surface seen there returns to the overlay when its last tab closes.
+ * `narrow` ignores the maximized flag, which a closing last tab clears.
+ */
+export function nextCompactLauncherThreadKey(input: {
+  readonly current: string | null;
+  readonly threadKey: string | null;
+  readonly narrow: boolean;
+  readonly panelOpen: boolean;
+  readonly surfaceShown: boolean;
+}): string | null {
+  if (!input.narrow || !input.panelOpen || input.threadKey === null) return null;
+  if (input.surfaceShown) return input.threadKey;
+  return input.current === input.threadKey ? input.current : null;
+}
+
 export function shouldRenderPreviewMiniPlayer(
   source: PreviewMiniPlayerSource | null,
   renderedRightPanelSurface: RightPanelSurface | null,
