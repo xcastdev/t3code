@@ -168,7 +168,7 @@ admitted snapshot, and plugin resources are hidden whenever an assistant policy 
 
 | Provider                                         | Plugin tools                       |
 | ------------------------------------------------ | ---------------------------------- |
-| Codex, Claude, Cursor, OpenCode, Pi, Muse        | Supported through catalog endpoint |
+| Codex, Claude, Cursor, OpenCode, Pi, OMP, Muse   | Supported through catalog endpoint |
 | Grok, Fx, Antigravity, trusted-bridge ACP agents | Supported through the ACP bridge   |
 | Other ACP registry agents                        | Unsupported                        |
 | OpenCode2                                        | Unsupported: no protocol proof     |
