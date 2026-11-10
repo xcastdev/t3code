@@ -6,8 +6,8 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import * as ProjectMcpOAuth from "./ProjectMcpOAuth.ts";
 
-export const projectMcpOAuthCallbackPath = "/oauth/project-mcp/callback";
-export const projectMcpOAuthClientMetadataPath = "/oauth/project-mcp/client-metadata";
+const projectMcpOAuthCallbackPath = "/oauth/project-mcp/callback";
+const projectMcpOAuthClientMetadataPath = "/oauth/project-mcp/client-metadata";
 
 const encodeJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 

@@ -24,6 +24,7 @@ it.effect(
                     {
                       id: "plain",
                       provider: "p",
+                      contextWindow: null,
                       reasoning: false,
                       thinking: { efforts: ["high"] },
                     },
@@ -44,6 +45,7 @@ it.effect(
       };
       const result = yield* discoverOmp(rpc);
       expect(result.models[0]?.id).toBe("p/m");
+      expect(result.models[2]?.contextWindow).toBeNull();
       expect(result.thinking).toEqual(["off", "high"]);
       expect(result.defaultThinking).toBe("high");
       const projected = projectOmpDiscovery(result);

@@ -35,7 +35,7 @@ export class ProjectWorkContentRejectedError extends Schema.TaggedError<ProjectW
     return "Project-work content contains a high-confidence secret and was rejected.";
   }
 }
-export const isProjectWorkContentRejectedError = Schema.is(ProjectWorkContentRejectedError);
+const isProjectWorkContentRejectedError = Schema.is(ProjectWorkContentRejectedError);
 
 const PRIVATE_KEY =
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z0-9 ]*PRIVATE KEY-----/gu;

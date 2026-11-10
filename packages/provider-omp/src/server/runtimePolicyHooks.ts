@@ -205,6 +205,43 @@ function subjectState(subject: object) {
 function owned(value: unknown): unknown {
   return structuredClone(value);
 }
+// The agent loop's ToolCallContext carries a live steering AbortSignal and context
+// sink; they stay shared by reference and are compared by identity, not cloned.
+function isLiveChannel(value: unknown): value is object {
+  return typeof value === "function" || value instanceof AbortSignal;
+}
+const liveChannelIds = new WeakMap<object, number>();
+let liveChannelCount = 0;
+function liveChannelId(value: object) {
+  let id = liveChannelIds.get(value);
+  if (id === undefined) {
+    id = ++liveChannelCount;
+    liveChannelIds.set(value, id);
+  }
+  return id;
+}
+function ownedToolCall<T extends object | undefined>(toolCall: T): T {
+  return (
+    toolCall &&
+    (Object.fromEntries(
+      Object.entries(toolCall).map(([key, value]) => [
+        key,
+        isLiveChannel(value) ? value : owned(value),
+      ]),
+    ) as T)
+  );
+}
+function toolCallState(toolCall: object | undefined) {
+  return (
+    toolCall &&
+    Object.fromEntries(
+      Object.entries(toolCall).map(([key, value]) => [
+        key,
+        isLiveChannel(value) ? { live: liveChannelId(value) } : { data: owned(value) },
+      ]),
+    )
+  );
+}
 export function captureAuthorization(
   token: Token,
   input: {
@@ -382,7 +419,10 @@ function ownedExecutionContext(context: object | undefined): object | undefined 
   for (const key of ["toolCall", "acpApprovedArgs"]) {
     const descriptor = descriptors[key];
     if (descriptor && "value" in descriptor)
-      descriptors[key] = { ...descriptor, value: owned(descriptor.value) };
+      descriptors[key] = {
+        ...descriptor,
+        value: key === "toolCall" ? ownedToolCall(descriptor.value) : owned(descriptor.value),
+      };
   }
   return Object.create(Object.getPrototypeOf(context), descriptors);
 }
@@ -430,7 +470,10 @@ export function assertExecutionBoundary(options: {
   if (
     derived &&
     "toolCall" in derived &&
-    !NodeUtil.isDeepStrictEqual(derived.toolCall, context?.toolCall)
+    !NodeUtil.isDeepStrictEqual(
+      toolCallState(derived.toolCall as object | undefined),
+      toolCallState(context?.toolCall),
+    )
   )
     throw new Error("OMP native execution metadata changed");
   const outputContext = ownedExecutionContext(options.derivedContext ?? context);
@@ -637,7 +680,7 @@ export function nativeContext(
     cwd: owner.cwd,
     contextCwd,
     session: context?.sessionManager?.getSessionId() ?? owner.sessionId,
-    metadata: context?.toolCall,
+    metadata: toolCallState(context?.toolCall),
     xdevPolicyKey: context?.xdevPolicyKey,
     acpApprovedArgs: context?.acpApprovedArgs,
   };
@@ -656,7 +699,7 @@ export function ownedNativeContext<T extends NativeContext | undefined>(context:
   if (!context) return context;
   return {
     ...context,
-    ...(context.toolCall ? { toolCall: structuredClone(context.toolCall) } : {}),
+    ...(context.toolCall ? { toolCall: ownedToolCall(context.toolCall) } : {}),
     ...(Object.hasOwn(context, "acpApprovedArgs")
       ? { acpApprovedArgs: structuredClone(context.acpApprovedArgs) }
       : {}),

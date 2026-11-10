@@ -388,16 +388,6 @@ const hasCredentialValues = (transport: ProjectMcpTransportDraft | undefined): b
   return credentials.every((credential) => credential.value !== undefined);
 };
 
-export const getProjectMcpTransport = (server: ProjectMcpServer): ProjectMcpTransport => {
-  if (server.transport !== undefined) return server.transport;
-  return {
-    type: "streamable-http",
-    url: server.url!,
-    headers: [],
-    authorization: { type: "none" },
-  };
-};
-
 export interface ResolvedProjectMcpServer {
   readonly id: McpServerId;
   readonly name: string;

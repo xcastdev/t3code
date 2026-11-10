@@ -21,7 +21,6 @@ import {
 import * as Schema from "effect/Schema";
 
 export {
-  describeResourceFailure,
   skillActions,
   skillReloadBaseline,
   skillEntryId,
@@ -368,7 +367,7 @@ export function effectiveMcpDefinitions(
 }
 
 /** The persisted connection as write input, keeping stored credentials by ID. */
-export function mcpTransportInputFromPersisted(
+function mcpTransportInputFromPersisted(
   transport: ProjectMcpTransport,
 ): FormResult<McpCatalogTransportInput> {
   return mcpTransportInputFromForm(

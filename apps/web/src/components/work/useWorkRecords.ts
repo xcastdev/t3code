@@ -16,7 +16,7 @@ import {
 
 const CHAIN_PAGE = 128;
 /** 2048 records: past this a set is reported as truncated, never as complete. */
-export const WORK_CHAIN_MAX_PAGES = 16;
+const WORK_CHAIN_MAX_PAGES = 16;
 
 type ChainInput = Pick<ProjectWorkClientRead, "projectId" | "operation" | "taskId" | "recordKind">;
 

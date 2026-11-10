@@ -72,7 +72,7 @@ const modelSelection = { instanceId, model: "gpt-5.4" };
 const decodeScheduledTask = Schema.decodeUnknownEffect(ScheduledTaskUpsertInput);
 
 /** Read production schedules without admitting their registered work in this seed/read composition. */
-export const preservationScheduleLayer = ScheduledTasks.layer.pipe(
+const preservationScheduleLayer = ScheduledTasks.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       NodeCrypto.layer,

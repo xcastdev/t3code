@@ -21,7 +21,7 @@ const inside = (root: string, target: string) => {
 };
 
 /** Resolve missing leaves too, so a symlinked existing ancestor cannot escape a fixture. */
-export function realTarget(target: string): string {
+function realTarget(target: string): string {
   if (!NodePath.isAbsolute(target)) throw new Error("Fixture paths must be absolute");
   if (NodeFS.existsSync(target)) return NodeFS.realpathSync(target);
   return NodePath.join(realTarget(NodePath.dirname(target)), NodePath.basename(target));

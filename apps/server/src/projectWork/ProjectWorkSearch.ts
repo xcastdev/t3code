@@ -89,11 +89,11 @@ export interface ProjectWorkRelationshipTraversal {
   readonly truncated: boolean;
 }
 
-export const PROJECT_WORK_SEARCH_MAX_LIMIT = 100;
-export const PROJECT_WORK_SEARCH_MAX_QUERY_LENGTH = 256;
-export const PROJECT_WORK_SEARCH_MAX_SNIPPET_CHARACTERS = 1_024;
-export const PROJECT_WORK_SEARCH_MAX_RELATIONSHIPS = 5_000;
-export const PROJECT_WORK_SEARCH_MAX_TRAVERSAL_DEPTH = 8;
+const PROJECT_WORK_SEARCH_MAX_LIMIT = 100;
+const PROJECT_WORK_SEARCH_MAX_QUERY_LENGTH = 256;
+const PROJECT_WORK_SEARCH_MAX_SNIPPET_CHARACTERS = 1_024;
+const PROJECT_WORK_SEARCH_MAX_RELATIONSHIPS = 5_000;
+const PROJECT_WORK_SEARCH_MAX_TRAVERSAL_DEPTH = 8;
 
 const json = (value: unknown): string => JSON.stringify(value);
 
@@ -131,7 +131,7 @@ const clip = (text: string, characters: number): string => {
  * terms keeps MATCH from becoming an SQL/FTS expression injection surface and
  * gives predictable AND semantics for multi-word searches.
  */
-export const toProjectWorkFtsQuery = (query: string): string => {
+const toProjectWorkFtsQuery = (query: string): string => {
   const trimmed = query.trim().slice(0, PROJECT_WORK_SEARCH_MAX_QUERY_LENGTH);
   if (trimmed === "*") return "*";
   // FTS5's unicode61 tokenizer treats punctuation as a boundary. Extracting
@@ -481,7 +481,3 @@ const makeProjectWorkSearch = Effect.gen(function* () {
 });
 
 export const ProjectWorkSearchLive = Layer.effect(ProjectWorkSearch, makeProjectWorkSearch);
-
-/** Useful for fixture setup and migration repair without constructing a service. */
-export const rebuildProjectWorkSearchIndex = (sql: SqlClient.SqlClient, projectId: string) =>
-  refreshSearchIndex(sql, projectId);

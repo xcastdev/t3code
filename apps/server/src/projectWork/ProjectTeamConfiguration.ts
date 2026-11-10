@@ -26,7 +26,7 @@ const idFor = (projectId: string, suffix: string) =>
   projectTeamDerivedRecordId(projectId, `team-configuration:${suffix}`);
 
 /** These are human-installed policy references, not execution or model-route authority. */
-export const projectTeamConfigurationGeneration = (state: ProjectWorkReducerState) =>
+const projectTeamConfigurationGeneration = (state: ProjectWorkReducerState) =>
   (state.foundationRecords ?? []).reduce(
     (generation, record) =>
       record.kind === "limits" &&

@@ -12,7 +12,7 @@ import { RightPanelResizeHandle } from "./RightPanelResizeHandle";
 export type PreviewPanelMode = "inline" | "sheet" | "sidebar" | "embedded";
 
 /** Inline rail width, border included: 22px icons with 8px each side. */
-export const PREVIEW_PANEL_RAIL_WIDTH = 39;
+const PREVIEW_PANEL_RAIL_WIDTH = 39;
 
 interface PreviewPanelShellProps {
   workspaceArea?: boolean;

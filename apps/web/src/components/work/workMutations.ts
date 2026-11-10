@@ -9,7 +9,6 @@ import {
   type ProjectWorkTaskId,
   type ProjectWorkBlockerId,
   type ProjectWorkEvidenceId,
-  type ProjectWorkRelationshipId,
   type ProjectWorkKnowledgeId,
   type ProjectWorkDecisionId,
   type ProjectWorkApprovalId,
@@ -21,8 +20,6 @@ import {
 } from "@t3tools/contracts";
 
 const decodeCriterion = Schema.decodeUnknownSync(ProjectWorkCriterion);
-
-type TaskCreateCommand = Extract<ProjectWorkCommand, { readonly type: "project-work.task.create" }>;
 type CriterionUpsertCommand = Extract<
   ProjectWorkCommand,
   { readonly type: "project-work.criterion.upsert" }
@@ -32,27 +29,6 @@ type TaskSpecifyCommand = Extract<
   { readonly type: "project-work.task.specify" }
 >;
 type TaskReadyCommand = Extract<ProjectWorkCommand, { readonly type: "project-work.task.ready" }>;
-
-export function makeProjectWorkTaskCreateCommand(input: {
-  readonly projectId: ProjectId;
-  readonly expectedRevision: number;
-  readonly taskId: ProjectWorkTaskId;
-  readonly commandId: CommandId;
-  readonly title: string;
-  readonly summary?: string;
-  readonly createdAt: string;
-}): TaskCreateCommand {
-  return {
-    type: "project-work.task.create",
-    commandId: input.commandId,
-    projectId: input.projectId,
-    expectedRevision: input.expectedRevision,
-    taskId: input.taskId,
-    title: input.title,
-    ...(input.summary === undefined ? {} : { summary: input.summary }),
-    createdAt: input.createdAt,
-  };
-}
 
 export function makeProjectWorkCriterionUpsertCommand(input: {
   readonly projectId: ProjectId;
@@ -311,38 +287,6 @@ export const makeProjectWorkProtectedRevisionCommand = (input: {
     },
   };
 };
-
-export const makeProjectWorkRelationshipCommand = (input: {
-  mode: "link" | "unlink";
-  projectId: ProjectId;
-  taskId: ProjectWorkTaskId;
-  otherTaskId: ProjectWorkTaskId;
-  expectedRevision: number;
-  commandId: CommandId;
-  relationshipId: ProjectWorkRelationshipId;
-  now: string;
-}): CommandOf<"project-work.relationship.link"> | CommandOf<"project-work.relationship.unlink"> =>
-  input.mode === "link"
-    ? {
-        ...base(input),
-        type: "project-work.relationship.link",
-        relationship: {
-          relationshipId: input.relationshipId,
-          projectId: input.projectId,
-          fromTaskId: input.taskId,
-          toTaskId: input.otherTaskId,
-          kind: "depends-on",
-          revision: 0,
-          createdAt: input.now,
-        },
-        linkedAt: input.now,
-      }
-    : {
-        ...base(input),
-        type: "project-work.relationship.unlink",
-        relationshipId: input.relationshipId,
-        unlinkedAt: input.now,
-      };
 
 export const makeProjectWorkKnowledgePromoteCommand = (input: {
   projectId: ProjectId;

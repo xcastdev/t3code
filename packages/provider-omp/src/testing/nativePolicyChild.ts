@@ -28,6 +28,9 @@ if (process.argv.includes("--review-case")) {
   if (selection === "adapter") {
     const { proveAdapterRegressions } = await import("./nativeAdapterRegressions.ts");
     await proveAdapterRegressions(root);
+  } else if (selection === "loop-eval") {
+    const { proveLoopEval } = await import("./nativeLoopEval.ts");
+    await proveLoopEval(root, process.argv[3]!);
   } else if (selection === "project-context") {
     const { proveProjectContext } = await import("./nativeProjectContext.ts");
     await proveProjectContext(root);
@@ -118,4 +121,6 @@ if (!process.argv.includes("--unguarded")) {
   await proveTransitions(root, process.argv[3]!);
   const { proveProjectContext } = await import("./nativeProjectContext.ts");
   await proveProjectContext(root);
+  const { proveLoopEval } = await import("./nativeLoopEval.ts");
+  await proveLoopEval(root, process.argv[3]!);
 }

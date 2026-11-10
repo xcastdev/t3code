@@ -36,6 +36,7 @@ import * as ThreadManagementService from "../orchestration-v2/ThreadManagementSe
 import * as ServerSettings from "../serverSettings.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import * as ProviderSecretInputs from "@t3tools/provider-core/server/ProviderSecretInputs";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import {
@@ -253,6 +254,7 @@ describe("orchestrator MCP toolkit", () => {
               Layer.provide(RunAdmission.layerOrdinary),
               Layer.provide(layerMemorySecretStore),
               Layer.provide(layerOrchestration),
+              Layer.provide(ProviderSecretInputs.layer),
             ),
           ),
           Layer.provide(Layer.mock(RemoteDelegation.RemoteDelegation)({})),

@@ -658,5 +658,3 @@ export class SkillRpcError extends Schema.TaggedError<SkillRpcError>()("SkillRpc
   code: TrimmedNonEmptyString,
   message: TrimmedNonEmptyString,
 }) {}
-
-export const MANAGED_SKILL_KEY_MAX_CHARS = MANAGED_SKILL_KEY_MAX_LENGTH;

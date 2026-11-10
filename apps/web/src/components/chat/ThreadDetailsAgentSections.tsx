@@ -30,7 +30,7 @@ import {
   THREAD_DETAILS_PANEL_ROW_CONTENT_CLASS,
 } from "./threadDetailsPanelStyles";
 
-export const ASSISTANT_TONE_DOT: Record<AssistantTone, string> = {
+const ASSISTANT_TONE_DOT: Record<AssistantTone, string> = {
   neutral: "bg-muted-foreground/40",
   info: "bg-info",
   success: "bg-success",

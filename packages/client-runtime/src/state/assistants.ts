@@ -43,7 +43,6 @@ import {
   EnvironmentRpcUnavailableError,
 } from "../rpc/client.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
-import type { ManagedResourceTarget } from "./managedResources.ts";
 import {
   createEnvironmentRpcCommand,
   createEnvironmentQueryAtomFamily,
@@ -67,9 +66,7 @@ export function normalizeAssistantList(input: AssistantListInput): AssistantList
   };
 }
 
-export function normalizeAssistantActivity(
-  input: AssistantActivityListInput,
-): AssistantActivityListInput {
+function normalizeAssistantActivity(input: AssistantActivityListInput): AssistantActivityListInput {
   return {
     environmentId: input.environmentId,
     assistantId: input.assistantId,
@@ -220,10 +217,6 @@ export function assistantHomeTarget(binding: AssistantHomeBinding) {
     projectId: binding.backingProjectId,
     threadId: binding.canonicalThreadId,
   };
-}
-
-export function assistantResourceTarget(binding: AssistantHomeBinding): ManagedResourceTarget {
-  return assistantHomeTarget(binding);
 }
 
 export interface AssistantConfigurationDraft {
@@ -447,7 +440,7 @@ export function assistantActivityState(input: {
   };
 }
 
-export function makeAssistantInvalidationSignals() {
+function makeAssistantInvalidationSignals() {
   const revisions = Atom.family((_key: string) => Atom.make(0));
   return {
     refresh: (environmentId: EnvironmentId) => revisions(environmentId),

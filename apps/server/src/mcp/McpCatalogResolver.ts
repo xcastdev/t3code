@@ -84,27 +84,6 @@ const applyOverrides = (
   });
 };
 
-const applyValidationOverrides = (
-  definitions: ReadonlyArray<CatalogValidationDefinition>,
-  overrides: ReadonlyArray<CatalogValidationOverride>,
-): ReadonlyArray<CatalogValidationDefinition> => {
-  const latest = new Map<string, CatalogValidationOverride>();
-  for (const override of overrides) latest.set(String(override.targetId), override);
-  return definitions.map((definition) => {
-    const override = latest.get(String(definition.logicalServerId));
-    return override === undefined
-      ? definition
-      : {
-          ...definition,
-          ...(override.enabled === undefined ? {} : { enabled: override.enabled }),
-          ...(override.name === undefined ? {} : { name: override.name }),
-          ...(override.providerInstanceIds === undefined
-            ? {}
-            : { providerInstanceIds: override.providerInstanceIds }),
-        };
-  });
-};
-
 const selectForProvider = <A extends CatalogValidationDefinition>(
   definitions: ReadonlyArray<A>,
   providerInstanceId: ProviderInstanceId,
@@ -201,10 +180,6 @@ export const catalogBaselineForProject = (input: CatalogBaselineInput) => [
     (definition) => definition.scope === "project" && definition.scopeId === input.projectId,
   ),
 ];
-
-export const effectiveCatalogForProject = catalogBaselineForProject;
-
-export const applyMcpCatalogValidationOverrides = applyValidationOverrides;
 
 /** Resolve global defaults, project overrides, and project-local definitions. */
 export const resolveProjectCatalog = (

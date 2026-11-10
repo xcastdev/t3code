@@ -234,7 +234,7 @@ export class DesktopAttachedBackend extends Context.Service<
   }
 >()("@t3tools/desktop/backend/DesktopAttachedBackend") {}
 
-export const make = Effect.gen(function* () {
+const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const settings = yield* DesktopAppSettings.DesktopAppSettings;
   const safeStorage = yield* ElectronSafeStorage.ElectronSafeStorage;

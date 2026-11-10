@@ -1,9 +1,6 @@
-// Kept identical to apps/mobile/src/features/work/workPresentation.ts until it moves into
-// @t3tools/client-runtime/project-work.
 import type {
   CommandId,
   ProjectId,
-  ProjectTeamBindingAccounting,
   ProjectTeamIntegrationSource,
   ProjectTeamIntegrationSourceRef,
   ProjectTeamRecordRead,
@@ -59,31 +56,6 @@ const BINDING_PHASES: Record<string, { label: string; tone: WorkTone; live: bool
 /** Unknown statuses from a newer server are shown as-is and never treated as live. */
 export function bindingPhase(status: string) {
   return BINDING_PHASES[status] ?? { label: status, tone: "secondary" as const, live: false };
-}
-
-/** Usage is an observation; unknown or unavailable usage stays visibly unknown. */
-export function accountingSummary(accounting: ProjectTeamBindingAccounting | undefined): {
-  readonly text: string;
-  readonly uncertain: boolean;
-} | null {
-  if (accounting === undefined) return null;
-  if (accounting.availability === "not-admitted")
-    return { text: "Not admitted yet", uncertain: false };
-  if (accounting.availability === "unavailable")
-    return {
-      text: `Usage unavailable (${accounting.reason.replaceAll("-", " ")})`,
-      uncertain: true,
-    };
-  const root = accounting.root;
-  const stopped = root.policy?.stoppedReason;
-  const unknown = root.unknownChargedTokens > 0 || stopped === "unknown-usage";
-  return {
-    text:
-      `${root.chargedTokens.toLocaleString()} of ${root.maximumTokens.toLocaleString()} tokens` +
-      (unknown ? " · some usage unknown" : "") +
-      (stopped === "threshold-reached" ? " · stopped at threshold" : ""),
-    uncertain: unknown,
-  };
 }
 
 export interface WorkSupervisionCounts {
@@ -275,7 +247,7 @@ export function startAvailability(input: {
 }
 
 /** Roles that write code only run in an isolated worktree. */
-export const roleNeedsWorktree = (role: WorkRoleRecord["role"]) =>
+const roleNeedsWorktree = (role: WorkRoleRecord["role"]) =>
   role === "implementer" || role === "integrator";
 
 export interface WorkStartCandidate {
@@ -628,7 +600,7 @@ export function splitArguments(value: string): string[] {
 // ── Integration source selection ───────────────────────────────────────────
 
 /** The exact reviewed source a delivery or plan names; any drift makes the server refuse it. */
-export function integrationSourceRefOf(
+function integrationSourceRefOf(
   source: ProjectTeamIntegrationSource,
 ): ProjectTeamIntegrationSourceRef {
   return {

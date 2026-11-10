@@ -19,7 +19,7 @@ export class ProjectWorkHumanPublicationRequest extends Context.Service<
     ) => Effect.Effect<Journal.DeliveryOperation, Journal.PublicationError>;
   }
 >()("t3/projectWork/ProjectWorkHumanPublicationRequest") {}
-export function publicationMatches(
+function publicationMatches(
   operation: Journal.DeliveryOperation,
   outcome: import("@t3tools/contracts").ProjectWorkPublicationOutcome,
 ): boolean {

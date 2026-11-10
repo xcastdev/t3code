@@ -139,19 +139,6 @@ export function resolveManagedTextResourceInsertion(input: {
   return { status: "inserted", ...insertion };
 }
 
-export const managedResourceInsertionTargetKey = managedResourceScopeKey;
-
-export function findManagedCommandCollision(
-  key: string,
-  managed: ReadonlyArray<ManagedTextResourceSummary>,
-  nativeKeys: ReadonlyArray<string>,
-): boolean {
-  return (
-    nativeKeys.includes(key) &&
-    managed.some((entry) => entry.kind === "command" && entry.key === key && entry.effective)
-  );
-}
-
 export type ManagedCommandSourceChoice = "managed" | "native";
 
 /** A matching native command needs an explicit source before managed content can expand. */

@@ -76,12 +76,22 @@ it("separates native cancellation, tool errors and sanitized transport failures"
 it("streams correlated authorized MCP progress before its final HTTP record and preserves the native image result", async () => {
   const { AuthorizedMcpClient } = await import("./toolBridge.ts");
   const progress = Promise.withResolvers<unknown>();
+  let responseId: unknown;
   let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
   const client = new AuthorizedMcpClient(
     { endpoint: "https://fixture.test/mcp", authorizationHeader: "Bearer private" },
     async (_url, init) => {
       const body = JSON.parse(String(init?.body));
       expect(new Headers(init?.headers).get("authorization")).toBe("Bearer private");
+      if (body.method === "initialize")
+        return Response.json(
+          { jsonrpc: "2.0", id: body.id, result: { protocolVersion: "2025-06-18" } },
+          { headers: { "mcp-session-id": "negotiated-session" } },
+        );
+      expect(new Headers(init?.headers).get("mcp-protocol-version")).toBe("2025-06-18");
+      expect(new Headers(init?.headers).get("mcp-session-id")).toBe("negotiated-session");
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      responseId = body.id;
       return new Response(
         new ReadableStream({
           start(controller) {
@@ -106,6 +116,7 @@ it("streams correlated authorized MCP progress before its final HTTP record and 
       );
     },
   );
+  await client.connect(new AbortController().signal);
   const result = client.callTool("tool", {}, new AbortController().signal, async (update) => {
     progress.resolve(update);
   });
@@ -116,7 +127,7 @@ it("streams correlated authorized MCP progress before its final HTTP record and 
       "data: " +
         JSON.stringify({
           jsonrpc: "2.0",
-          id: 1,
+          id: responseId,
           result: { content: [{ type: "image", mimeType: "image/png", data: "YQ==" }] },
         }) +
         "\n\n",

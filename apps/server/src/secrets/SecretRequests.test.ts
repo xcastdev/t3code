@@ -33,6 +33,8 @@ import * as Tracer from "effect/Tracer";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
 
+import * as ProviderSecretInputs from "@t3tools/provider-core/server/ProviderSecretInputs";
+
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as SecretRequests from "./SecretRequests.ts";
@@ -53,6 +55,7 @@ const withService = <A, E>(
     readonly service: SecretRequests.SecretRequests["Service"];
     readonly stored: Map<string, Uint8Array>;
     readonly dispatched: Array<OrchestrationV2ServerCommand>;
+    readonly inputs: ProviderSecretInputs.ProviderSecretInputs["Service"];
   }) => Effect.Effect<A, E>,
   options: {
     readonly beforeRead?: () => Effect.Effect<void>;
@@ -67,6 +70,7 @@ const withService = <A, E>(
     readonly removeFails?: boolean;
     readonly closedFirst?: boolean;
     readonly failedRecords?: number;
+    readonly native?: boolean;
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -81,6 +85,7 @@ const withService = <A, E>(
       }),
       NodeCrypto.layer,
       NodeServices.layer,
+      ProviderSecretInputs.layer,
       Layer.succeed(
         ServerSecretStore.ServerSecretStore,
         ServerSecretStore.ServerSecretStore.of({
@@ -164,6 +169,10 @@ const withService = <A, E>(
                 threadId: requestThreadId,
                 runId: "run-1",
                 nodeId: "node-root",
+                providerThreadId: execution.providerThreadId,
+                nativeItemRef: options.native
+                  ? { driver: "omp", nativeId: "secret:prompt", strength: "strong" }
+                  : null,
                 type: "secret_request",
                 label: "GitHub token",
                 reason: "Used as GH_TOKEN.",
@@ -191,8 +200,9 @@ const withService = <A, E>(
     );
     return yield* Effect.gen(function* () {
       const service = yield* SecretRequests.SecretRequests;
-      return yield* body({ service, stored, dispatched });
-    }).pipe(Effect.provide(SecretRequests.layer.pipe(Layer.provide(layerDependencies))));
+      const inputs = yield* ProviderSecretInputs.ProviderSecretInputs;
+      return yield* body({ service, stored, dispatched, inputs });
+    }).pipe(Effect.provide(SecretRequests.layer.pipe(Layer.provideMerge(layerDependencies))));
   });
 
 const valuesOf = (stored: Map<string, Uint8Array>) =>
@@ -206,7 +216,7 @@ it.effect("a saved answer becomes a one-use ref, and the thread only learns it w
       yield* service.answer({
         threadId,
         turnItemId,
-        answer: { type: "save", secret: "ghp_secret" },
+        answer: { type: "save", secret: "  ghp_secret  " },
       });
       assert.equal(dispatched.length, 1);
       assert.include(dispatched[0] as object, {
@@ -308,6 +318,96 @@ it.effect("declining stores nothing, and a request is answered once", () =>
       assert.equal(dispatched.length, 1);
       assert.deepEqual(valuesOf(stored), []);
     }),
+  ),
+);
+
+const liveReceiver = (
+  owner: Partial<ProviderSecretInputs.ProviderSecretInputOwner> = {},
+  accept = true,
+) => {
+  const answers: Array<ProviderSecretInputs.ProviderSecretInputAnswer> = [];
+  const receiver: ProviderSecretInputs.ProviderSecretInputReceiver = {
+    owner: { threadId, turnItemId, ...execution, ...owner },
+    deliver: (answer) => Effect.sync(() => (answers.push(answer), accept)),
+  };
+  return { receiver, answers };
+};
+
+it.effect("a native prompt's answer goes only to its live prompt and is never kept", () =>
+  withService(
+    ({ service, stored, dispatched, inputs }) =>
+      Effect.gen(function* () {
+        const { receiver, answers } = liveReceiver();
+        yield* inputs.register(receiver);
+        yield* service.answer({
+          threadId,
+          turnItemId,
+          answer: { type: "save", secret: "ghp_secret" },
+        });
+        assert.equal(answers.length, 1);
+        const delivered = answers[0];
+        assert.equal(
+          delivered?.type === "save" ? Redacted.value(delivered.secret) : undefined,
+          "ghp_secret",
+        );
+        assert.notInclude(String(delivered?.type === "save" ? delivered.secret : ""), "ghp_");
+        assert.deepEqual(valuesOf(stored), []);
+        assert.deepEqual(dispatched, []);
+        assert.isTrue(Option.isNone(yield* service.savedRef({ threadId, turnItemId })));
+        const again = yield* service
+          .answer({ threadId, turnItemId, answer: { type: "save", secret: "ghp_secret" } })
+          .pipe(Effect.flip);
+        assert.equal(again.reason, "agent_stopped");
+        assert.equal(answers.length, 1);
+
+        const declined = liveReceiver();
+        yield* inputs.register(declined.receiver);
+        yield* service.answer({ threadId, turnItemId, answer: { type: "decline" } });
+        assert.deepEqual(declined.answers, [{ type: "decline" }]);
+        assert.deepEqual(valuesOf(stored), []);
+        assert.deepEqual(dispatched, []);
+      }),
+    { native: true },
+  ),
+);
+
+it.effect.each([
+  ["no live prompt", undefined, true],
+  ["a closed prompt", {}, false],
+  ["an older attempt", { runAttemptId: RunAttemptId.make("attempt-0") }, true],
+  ["another provider session", { providerSessionId: ProviderSessionId.make("other") }, true],
+  ["another run", { runId: RunId.make("run-2") }, true],
+] as const)("a native answer for %s is dropped, not stored", ([, owner, accept]) =>
+  withService(
+    ({ service, stored, dispatched, inputs }) =>
+      Effect.gen(function* () {
+        const { receiver, answers } = liveReceiver(owner, accept);
+        if (owner !== undefined) yield* inputs.register(receiver);
+        const error = yield* service
+          .answer({ threadId, turnItemId, answer: { type: "save", secret: "ghp_secret" } })
+          .pipe(Effect.flip);
+        assert.equal(error.reason, "agent_stopped");
+        assert.equal(answers.length, accept ? 0 : 1);
+        assert.deepEqual(valuesOf(stored), []);
+        assert.deepEqual(dispatched, []);
+      }),
+    { native: true },
+  ),
+);
+
+it.effect("a native answer is withheld when admission no longer owns the attempt", () =>
+  withService(
+    ({ service, inputs }) =>
+      Effect.gen(function* () {
+        const { receiver, answers } = liveReceiver();
+        yield* inputs.register(receiver);
+        const error = yield* service
+          .answer({ threadId, turnItemId, answer: { type: "save", secret: "ghp_secret" } })
+          .pipe(Effect.flip);
+        assert.equal(error.reason, "agent_stopped");
+        assert.deepEqual(answers, []);
+      }),
+    { native: true, admissionCheck: () => Effect.succeed({ _tag: "denied" } as never) },
   ),
 );
 

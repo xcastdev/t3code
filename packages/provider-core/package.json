@@ -71,6 +71,10 @@
       "types": "./src/server/McpProviderSessions.ts",
       "import": "./src/server/McpProviderSessions.ts"
     },
+    "./server/ProviderSecretInputs": {
+      "types": "./src/server/ProviderSecretInputs.ts",
+      "import": "./src/server/ProviderSecretInputs.ts"
+    },
     "./server/mcpSession": {
       "types": "./src/server/mcpSession.ts",
       "import": "./src/server/mcpSession.ts"

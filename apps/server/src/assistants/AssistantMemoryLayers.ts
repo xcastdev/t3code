@@ -21,11 +21,11 @@ import * as Memory from "./AssistantMemory.ts";
 import { AssistantInstructionEpoch, assistantMemoryContextHash } from "./AssistantResources.ts";
 import { AssistantError } from "./AssistantRepository.ts";
 
-export const layerSources = Sources.layer.pipe(
+const layerSources = Sources.layer.pipe(
   Layer.provideMerge(Repository.layer),
   Layer.provide(Projection.layer),
 );
-export const layerOwnerAuthority = Layer.effect(
+const layerOwnerAuthority = Layer.effect(
   ProjectMemoryOwnerAuthority,
   Effect.gen(function* () {
     const ownership = yield* Ownership.AssistantOwnership;
@@ -45,7 +45,7 @@ export const layerSharedMemory = memoryLayer.pipe(
   Layer.provide(layerOwnerAuthority),
   Layer.provideMerge(Memory.layerFactPolicy),
 );
-export const layerProcessing = Processing.layer.pipe(
+const layerProcessing = Processing.layer.pipe(
   Layer.provideMerge(layerSharedMemory),
   Layer.provideMerge(Memory.layerFactPolicy),
   Layer.provideMerge(Configuration.layer),

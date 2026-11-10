@@ -1265,7 +1265,7 @@ const PullRequestRpcError = Schema.Union([
   EnvironmentAuthorizationError,
 ]);
 
-export const WsIssuesSearchRpc = Rpc.make(WS_METHODS.issuesSearch, {
+const WsIssuesSearchRpc = Rpc.make(WS_METHODS.issuesSearch, {
   payload: IssueSearchInput,
   success: IssueSearchResult,
   error: PullRequestRpcError,
@@ -2495,103 +2495,103 @@ export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthori
 ) {}
 
 const skillRpcError = Schema.Union([SkillRpcError, EnvironmentAuthorizationError]);
-export const WsSkillsCatalogListRpc = Rpc.make(WS_METHODS.skillsCatalogList, {
+const WsSkillsCatalogListRpc = Rpc.make(WS_METHODS.skillsCatalogList, {
   payload: SkillCatalogListInput,
   success: SkillCatalogListResult,
   error: skillRpcError,
 });
-export const WsSkillsCatalogSubscribeRpc = Rpc.make(WS_METHODS.skillsCatalogSubscribe, {
+const WsSkillsCatalogSubscribeRpc = Rpc.make(WS_METHODS.skillsCatalogSubscribe, {
   payload: SkillCatalogListInput,
   success: SkillCatalogChanged,
   error: skillRpcError,
   stream: true,
 });
-export const WsSkillsContentGetRpc = Rpc.make(WS_METHODS.skillsContentGet, {
+const WsSkillsContentGetRpc = Rpc.make(WS_METHODS.skillsContentGet, {
   payload: SkillContentGetInput,
   success: SkillContentGetResult,
   error: skillRpcError,
 });
-export const WsSkillsHistoryListRpc = Rpc.make(WS_METHODS.skillsHistoryList, {
+const WsSkillsHistoryListRpc = Rpc.make(WS_METHODS.skillsHistoryList, {
   payload: SkillHistoryListInput,
   success: SkillHistoryListResult,
   error: skillRpcError,
 });
-export const WsSkillsNativeContentGetRpc = Rpc.make(WS_METHODS.skillsNativeContentGet, {
+const WsSkillsNativeContentGetRpc = Rpc.make(WS_METHODS.skillsNativeContentGet, {
   payload: SkillNativeContentGetInput,
   success: SkillNativeContentGetResult,
   error: skillRpcError,
 });
-export const WsSkillsApplicationGetRpc = Rpc.make(WS_METHODS.skillsApplicationGet, {
+const WsSkillsApplicationGetRpc = Rpc.make(WS_METHODS.skillsApplicationGet, {
   payload: SkillApplicationGetInput,
   success: SkillApplicationGetResult,
   error: skillRpcError,
 });
-export const WsSkillsDeploymentListRpc = Rpc.make(WS_METHODS.skillsDeploymentList, {
+const WsSkillsDeploymentListRpc = Rpc.make(WS_METHODS.skillsDeploymentList, {
   payload: SkillDeploymentListInput,
   success: SkillDeploymentListResult,
   error: skillRpcError,
 });
-export const WsSkillsDeploymentChangeRpc = Rpc.make(WS_METHODS.skillsDeploymentChange, {
+const WsSkillsDeploymentChangeRpc = Rpc.make(WS_METHODS.skillsDeploymentChange, {
   payload: SkillDeploymentChangeInput,
   success: SkillDeploymentChangeResult,
   error: skillRpcError,
 });
-export const WsSkillsGlobalCreateRpc = Rpc.make(WS_METHODS.skillsGlobalCreate, {
+const WsSkillsGlobalCreateRpc = Rpc.make(WS_METHODS.skillsGlobalCreate, {
   payload: SkillGlobalCreateInput,
   success: SkillGlobalCreateResult,
   error: skillRpcError,
 });
-export const WsSkillsGlobalUpdateRpc = Rpc.make(WS_METHODS.skillsGlobalUpdate, {
+const WsSkillsGlobalUpdateRpc = Rpc.make(WS_METHODS.skillsGlobalUpdate, {
   payload: SkillGlobalUpdateInput,
   success: SkillGlobalUpdateResult,
   error: skillRpcError,
 });
-export const WsSkillsGlobalDeleteRpc = Rpc.make(WS_METHODS.skillsGlobalDelete, {
+const WsSkillsGlobalDeleteRpc = Rpc.make(WS_METHODS.skillsGlobalDelete, {
   payload: SkillGlobalDeleteInput,
   success: SkillGlobalDeleteResult,
   error: skillRpcError,
 });
-export const WsSkillsGlobalRenameRpc = Rpc.make(WS_METHODS.skillsGlobalRename, {
+const WsSkillsGlobalRenameRpc = Rpc.make(WS_METHODS.skillsGlobalRename, {
   payload: SkillGlobalRenameInput,
   success: SkillGlobalRenameResult,
   error: skillRpcError,
 });
-export const WsSkillsGlobalRollbackRpc = Rpc.make(WS_METHODS.skillsGlobalRollback, {
+const WsSkillsGlobalRollbackRpc = Rpc.make(WS_METHODS.skillsGlobalRollback, {
   payload: SkillGlobalRollbackInput,
   success: SkillGlobalRollbackResult,
   error: skillRpcError,
 });
-export const WsSkillsProjectSetOverrideRpc = Rpc.make(WS_METHODS.skillsProjectSetOverride, {
+const WsSkillsProjectSetOverrideRpc = Rpc.make(WS_METHODS.skillsProjectSetOverride, {
   payload: SkillProjectSetOverrideInput,
   success: SkillProjectSetOverrideResult,
   error: skillRpcError,
 });
-export const WsSkillsProjectSetDisabledRpc = Rpc.make(WS_METHODS.skillsProjectSetDisabled, {
+const WsSkillsProjectSetDisabledRpc = Rpc.make(WS_METHODS.skillsProjectSetDisabled, {
   payload: SkillProjectSetDisabledInput,
   success: SkillProjectSetDisabledResult,
   error: skillRpcError,
 });
-export const WsSkillsProjectDeleteStateRpc = Rpc.make(WS_METHODS.skillsProjectDeleteState, {
+const WsSkillsProjectDeleteStateRpc = Rpc.make(WS_METHODS.skillsProjectDeleteState, {
   payload: SkillProjectDeleteStateInput,
   success: SkillProjectDeleteStateResult,
   error: skillRpcError,
 });
-export const WsSkillsProjectRenameRpc = Rpc.make(WS_METHODS.skillsProjectRename, {
+const WsSkillsProjectRenameRpc = Rpc.make(WS_METHODS.skillsProjectRename, {
   payload: SkillProjectRenameInput,
   success: SkillProjectRenameResult,
   error: skillRpcError,
 });
-export const WsSkillsSessionSetEnabledRpc = Rpc.make(WS_METHODS.skillsSessionSetEnabled, {
+const WsSkillsSessionSetEnabledRpc = Rpc.make(WS_METHODS.skillsSessionSetEnabled, {
   payload: SkillSessionSetEnabledInput,
   success: SkillSessionSetEnabledResult,
   error: skillRpcError,
 });
-export const WsSkillsSessionResetRpc = Rpc.make(WS_METHODS.skillsSessionReset, {
+const WsSkillsSessionResetRpc = Rpc.make(WS_METHODS.skillsSessionReset, {
   payload: SkillSessionResetInput,
   success: SkillSessionResetResult,
   error: skillRpcError,
 });
-export const WsSkillsNativeImportRpc = Rpc.make(WS_METHODS.skillsNativeImport, {
+const WsSkillsNativeImportRpc = Rpc.make(WS_METHODS.skillsNativeImport, {
   payload: SkillNativeImportInput,
   success: SkillNativeImportResult,
   error: skillRpcError,
@@ -2601,15 +2601,12 @@ const managedTextResourceRpcError = Schema.Union([
   ManagedTextResourceRpcError,
   EnvironmentAuthorizationError,
 ]);
-export const WsManagedTextResourcesCatalogListRpc = Rpc.make(
-  WS_METHODS.managedTextResourcesCatalogList,
-  {
-    payload: ManagedTextResourceCatalogListInput,
-    success: ManagedTextResourceCatalogListResult,
-    error: managedTextResourceRpcError,
-  },
-);
-export const WsManagedTextResourcesCatalogSubscribeRpc = Rpc.make(
+const WsManagedTextResourcesCatalogListRpc = Rpc.make(WS_METHODS.managedTextResourcesCatalogList, {
+  payload: ManagedTextResourceCatalogListInput,
+  success: ManagedTextResourceCatalogListResult,
+  error: managedTextResourceRpcError,
+});
+const WsManagedTextResourcesCatalogSubscribeRpc = Rpc.make(
   WS_METHODS.managedTextResourcesCatalogSubscribe,
   {
     payload: ManagedTextResourceCatalogListInput,
@@ -2618,15 +2615,12 @@ export const WsManagedTextResourcesCatalogSubscribeRpc = Rpc.make(
     stream: true,
   },
 );
-export const WsManagedTextResourcesContentGetRpc = Rpc.make(
-  WS_METHODS.managedTextResourcesContentGet,
-  {
-    payload: ManagedTextResourceContentGetInput,
-    success: ManagedTextResourceContentGetResult,
-    error: managedTextResourceRpcError,
-  },
-);
-export const WsManagedTextResourcesEnvironmentCreateRpc = Rpc.make(
+const WsManagedTextResourcesContentGetRpc = Rpc.make(WS_METHODS.managedTextResourcesContentGet, {
+  payload: ManagedTextResourceContentGetInput,
+  success: ManagedTextResourceContentGetResult,
+  error: managedTextResourceRpcError,
+});
+const WsManagedTextResourcesEnvironmentCreateRpc = Rpc.make(
   WS_METHODS.managedTextResourcesEnvironmentCreate,
   {
     payload: ManagedTextResourceEnvironmentCreateInput,
@@ -2634,7 +2628,7 @@ export const WsManagedTextResourcesEnvironmentCreateRpc = Rpc.make(
     error: managedTextResourceRpcError,
   },
 );
-export const WsManagedTextResourcesEnvironmentUpdateRpc = Rpc.make(
+const WsManagedTextResourcesEnvironmentUpdateRpc = Rpc.make(
   WS_METHODS.managedTextResourcesEnvironmentUpdate,
   {
     payload: ManagedTextResourceEnvironmentUpdateInput,
@@ -2642,7 +2636,7 @@ export const WsManagedTextResourcesEnvironmentUpdateRpc = Rpc.make(
     error: managedTextResourceRpcError,
   },
 );
-export const WsManagedTextResourcesEnvironmentDeleteRpc = Rpc.make(
+const WsManagedTextResourcesEnvironmentDeleteRpc = Rpc.make(
   WS_METHODS.managedTextResourcesEnvironmentDelete,
   {
     payload: ManagedTextResourceEnvironmentDeleteInput,
@@ -2650,7 +2644,7 @@ export const WsManagedTextResourcesEnvironmentDeleteRpc = Rpc.make(
     error: managedTextResourceRpcError,
   },
 );
-export const WsManagedTextResourcesEnvironmentSetEnabledRpc = Rpc.make(
+const WsManagedTextResourcesEnvironmentSetEnabledRpc = Rpc.make(
   WS_METHODS.managedTextResourcesEnvironmentSetEnabled,
   {
     payload: ManagedTextResourceEnvironmentSetEnabledInput,
@@ -2658,7 +2652,7 @@ export const WsManagedTextResourcesEnvironmentSetEnabledRpc = Rpc.make(
     error: managedTextResourceRpcError,
   },
 );
-export const WsManagedTextResourcesProjectSetOverrideRpc = Rpc.make(
+const WsManagedTextResourcesProjectSetOverrideRpc = Rpc.make(
   WS_METHODS.managedTextResourcesProjectSetOverride,
   {
     payload: ManagedTextResourceProjectSetOverrideInput,
@@ -2666,7 +2660,7 @@ export const WsManagedTextResourcesProjectSetOverrideRpc = Rpc.make(
     error: managedTextResourceRpcError,
   },
 );
-export const WsManagedTextResourcesProjectSetDisabledRpc = Rpc.make(
+const WsManagedTextResourcesProjectSetDisabledRpc = Rpc.make(
   WS_METHODS.managedTextResourcesProjectSetDisabled,
   {
     payload: ManagedTextResourceProjectSetDisabledInput,
@@ -2674,7 +2668,7 @@ export const WsManagedTextResourcesProjectSetDisabledRpc = Rpc.make(
     error: managedTextResourceRpcError,
   },
 );
-export const WsManagedTextResourcesProjectDeleteStateRpc = Rpc.make(
+const WsManagedTextResourcesProjectDeleteStateRpc = Rpc.make(
   WS_METHODS.managedTextResourcesProjectDeleteState,
   {
     payload: ManagedTextResourceProjectDeleteStateInput,
@@ -2682,7 +2676,7 @@ export const WsManagedTextResourcesProjectDeleteStateRpc = Rpc.make(
     error: managedTextResourceRpcError,
   },
 );
-export const WsManagedTextResourcesThreadSetEnabledRpc = Rpc.make(
+const WsManagedTextResourcesThreadSetEnabledRpc = Rpc.make(
   WS_METHODS.managedTextResourcesThreadSetEnabled,
   {
     payload: ManagedTextResourceThreadSetEnabledInput,
@@ -2690,44 +2684,41 @@ export const WsManagedTextResourcesThreadSetEnabledRpc = Rpc.make(
     error: managedTextResourceRpcError,
   },
 );
-export const WsManagedTextResourcesThreadResetRpc = Rpc.make(
-  WS_METHODS.managedTextResourcesThreadReset,
-  {
-    payload: ManagedTextResourceThreadResetInput,
-    success: ManagedTextResourceMutationResult,
-    error: managedTextResourceRpcError,
-  },
-);
+const WsManagedTextResourcesThreadResetRpc = Rpc.make(WS_METHODS.managedTextResourcesThreadReset, {
+  payload: ManagedTextResourceThreadResetInput,
+  success: ManagedTextResourceMutationResult,
+  error: managedTextResourceRpcError,
+});
 
 const projectTerminalRpcError = Schema.Union([TerminalToolError, EnvironmentAuthorizationError]);
-export const WsProjectTerminalAttachRpc = Rpc.make(WS_METHODS.projectTerminalAttach, {
+const WsProjectTerminalAttachRpc = Rpc.make(WS_METHODS.projectTerminalAttach, {
   payload: ProjectTerminalHandle,
   success: ProjectTerminalAttachStreamEvent,
   error: projectTerminalRpcError,
   stream: true,
 });
-export const WsProjectTerminalMetadataRpc = Rpc.make(WS_METHODS.projectTerminalMetadata, {
+const WsProjectTerminalMetadataRpc = Rpc.make(WS_METHODS.projectTerminalMetadata, {
   payload: ProjectTerminalDockListInput.fields.projectId,
   success: ProjectTerminalMetadataStreamEvent,
   error: projectTerminalRpcError,
   stream: true,
 });
-export const WsProjectTerminalListRpc = Rpc.make(WS_METHODS.projectTerminalList, {
+const WsProjectTerminalListRpc = Rpc.make(WS_METHODS.projectTerminalList, {
   payload: ProjectTerminalDockListInput,
   success: ProjectTerminalDockListResult,
   error: projectTerminalRpcError,
 });
-export const WsProjectTerminalWriteRpc = Rpc.make(WS_METHODS.projectTerminalWrite, {
+const WsProjectTerminalWriteRpc = Rpc.make(WS_METHODS.projectTerminalWrite, {
   payload: ProjectTerminalWriteInput,
   success: Schema.Void,
   error: projectTerminalRpcError,
 });
-export const WsProjectTerminalResizeRpc = Rpc.make(WS_METHODS.projectTerminalResize, {
+const WsProjectTerminalResizeRpc = Rpc.make(WS_METHODS.projectTerminalResize, {
   payload: ProjectTerminalResizeInput,
   success: Schema.Void,
   error: projectTerminalRpcError,
 });
-export const WsProjectTerminalKillRpc = Rpc.make(WS_METHODS.projectTerminalKill, {
+const WsProjectTerminalKillRpc = Rpc.make(WS_METHODS.projectTerminalKill, {
   payload: ProjectTerminalKillInput,
   success: ProjectTerminalStopResult,
   error: projectTerminalRpcError,

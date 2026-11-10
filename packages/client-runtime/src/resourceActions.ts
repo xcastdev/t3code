@@ -56,7 +56,7 @@ export type SkillAction =
  * whichever package wins that key for the thread. Only the winning managed
  * package may offer it; a shadowed package with the same key never does.
  */
-export function isSessionSkillOwner(
+function isSessionSkillOwner(
   entry: SkillCatalogSummary,
   entries: ReadonlyArray<SkillCatalogSummary>,
 ): boolean {

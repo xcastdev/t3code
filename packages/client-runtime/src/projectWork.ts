@@ -20,7 +20,6 @@ import {
   ProjectWorkBriefingRead,
   ProjectTeamRecordRead,
   ProjectWorkTaskRead,
-  ProjectWorkCriterionRead,
   ProjectWorkKnowledgeRead,
   ProjectWorkDecisionRead,
   type EnvironmentId,
@@ -29,14 +28,10 @@ import * as Schema from "effect/Schema";
 import * as Option from "effect/Option";
 import type { ProjectWorkHumanCommand } from "./state/projectWork.ts";
 
-export const PROJECT_WORK_EXECUTION_UNAVAILABLE_REASON =
-  "Worker execution is unavailable until managed execution is enabled.";
-
 const decodeProjectWorkTaskContext = Schema.decodeUnknownOption(ProjectWorkTaskContext);
 const decodeProjectWorkBriefingRead = Schema.decodeUnknownOption(ProjectWorkBriefingRead);
 const decodeProjectTeamRecordRead = Schema.decodeUnknownOption(ProjectTeamRecordRead);
 const decodeProjectWorkTaskRead = Schema.decodeUnknownOption(ProjectWorkTaskRead);
-const decodeProjectWorkCriterionRead = Schema.decodeUnknownOption(ProjectWorkCriterionRead);
 const decodeProjectWorkKnowledgeRead = Schema.decodeUnknownOption(ProjectWorkKnowledgeRead);
 const decodeProjectWorkDecisionRead = Schema.decodeUnknownOption(ProjectWorkDecisionRead);
 
@@ -48,8 +43,6 @@ export const asProjectTeamRecord = (value: unknown) =>
   Option.getOrNull(decodeProjectTeamRecordRead(value));
 export const asProjectWorkTask = (value: unknown) =>
   Option.getOrNull(decodeProjectWorkTaskRead(value));
-export const asProjectWorkCriterion = (value: unknown) =>
-  Option.getOrNull(decodeProjectWorkCriterionRead(value));
 export const asProjectWorkKnowledge = (value: unknown) =>
   Option.getOrNull(decodeProjectWorkKnowledgeRead(value));
 export const asProjectWorkDecision = (value: unknown) =>
@@ -218,15 +211,15 @@ const decoder = <A>(schema: Schema.ConstraintDecoder<A, never>) => {
   const decode = Schema.decodeUnknownOption(schema);
   return (value: unknown) => Option.getOrNull(decode(value));
 };
-export const asProjectTeamSupervision = decoder(ProjectTeamSupervisionSummary);
-export const asProjectWorkVerificationJob = decoder(ProjectWorkVerificationJobRead);
-export const asProjectTeamIntegrationSources = decoder(ProjectTeamIntegrationSourcePage);
-export const asProjectTeamMemorySources = decoder(ProjectTeamMemorySourcesRead);
-export const asProjectTeamMemorySharedSources = decoder(ProjectTeamMemorySharedSourcesRead);
-export const asProjectTeamMemoryCurrent = decoder(MemoryCurrentRead);
-export const asProjectTeamMemoryConfiguration = decoder(MemoryConfigurationRead);
-export const asProjectWorkDeliveryRecovery = decoder(ProjectWorkDeliveryRecoveryRead);
-export const asProjectWorkMemoryObservations = decoder(ProjectWorkMemoryObservationsRead);
+const asProjectTeamSupervision = decoder(ProjectTeamSupervisionSummary);
+const asProjectWorkVerificationJob = decoder(ProjectWorkVerificationJobRead);
+const asProjectTeamIntegrationSources = decoder(ProjectTeamIntegrationSourcePage);
+const asProjectTeamMemorySources = decoder(ProjectTeamMemorySourcesRead);
+const asProjectTeamMemorySharedSources = decoder(ProjectTeamMemorySharedSourcesRead);
+const asProjectTeamMemoryCurrent = decoder(MemoryCurrentRead);
+const asProjectTeamMemoryConfiguration = decoder(MemoryConfigurationRead);
+const asProjectWorkDeliveryRecovery = decoder(ProjectWorkDeliveryRecoveryRead);
+const asProjectWorkMemoryObservations = decoder(ProjectWorkMemoryObservationsRead);
 
 /** Special reads retain server pagination and states rather than guessing from record arrays. */
 export function decodeProjectWorkSpecialRead(

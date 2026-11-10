@@ -5,6 +5,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import type { ProviderHost } from "@t3tools/provider-core/server/ProviderHost";
 import type { IdAllocatorV2 } from "@t3tools/provider-core/server/IdAllocator";
 import type { McpProviderSessions } from "@t3tools/provider-core/server/McpProviderSessions";
+import type { ProviderSecretInputs } from "@t3tools/provider-core/server/ProviderSecretInputs";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import {
   ProviderAdapterDriverCreateError,
@@ -16,6 +17,7 @@ export type OmpAdapterV2DriverEnv =
   | ProviderHost
   | IdAllocatorV2
   | McpProviderSessions
+  | ProviderSecretInputs
   | ChildProcessSpawner.ChildProcessSpawner;
 const decodeSettings = Schema.decodeSync(OmpSettings);
 export const OmpAdapterV2Driver: ProviderAdapterDriver<OmpSettings, OmpAdapterV2DriverEnv> = {

@@ -183,7 +183,7 @@ export const seed = Effect.fn("DispatchIntegration.seed")(function* (
     workspace,
   } satisfies ProjectTeamDispatchIntent;
 });
-export const inspect = Effect.gen(function* () {
+const inspect = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const state = yield* Repository.readCurrentState(sql, projectId);
   const binding = state.foundationRecords!.find((record) => record.kind === "run-binding");

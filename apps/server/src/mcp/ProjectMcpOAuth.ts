@@ -69,7 +69,7 @@ export const parseProjectMcpOAuthOrigin = (origin: string): string | undefined =
   }
 };
 
-export const callbackMatchesRedirect = (requestUrl: string, savedRedirectUrl: string): boolean => {
+const callbackMatchesRedirect = (requestUrl: string, savedRedirectUrl: string): boolean => {
   try {
     const request = new URL(requestUrl);
     const saved = new URL(savedRedirectUrl);

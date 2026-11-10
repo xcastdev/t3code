@@ -496,9 +496,6 @@ export const McpCatalogMutationError = Schema.Union([
 ]);
 export type McpCatalogMutationError = typeof McpCatalogMutationError.Type;
 
-export const MCP_CATALOG_PROVIDER_ENTRY_LIMIT = MCP_CATALOG_PROVIDER_LIMIT;
-export const MCP_CATALOG_NAME_MAX_CHARS = MCP_CATALOG_NAME_MAX_LENGTH;
-
 // Keep the environment/project aliases discoverable to callers that need to
 // build a scope-specific request without importing implementation details.
 export type McpCatalogScopeId = EnvironmentId | ProjectId | McpCatalogSessionId;

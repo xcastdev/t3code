@@ -2479,8 +2479,3 @@ export function applyProjectWorkEvents(
   }
   return next;
 }
-
-export const projectWorkResultInvalidationsFor = (
-  state: ProjectWorkState,
-): ReadonlyArray<ProjectWorkResultInvalidation> =>
-  (state as ProjectWorkReducerState).resultInvalidations ?? [];

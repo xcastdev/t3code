@@ -1,6 +1,5 @@
 import {
   type ManagedTextResourceChanged,
-  type ManagedTextResourceCatalogListInput,
   type ManagedTextResourceRpcError,
   ManagedTextResourceRpcError as ManagedTextResourceRpcErrorSchema,
   type ProjectId,
@@ -96,11 +95,3 @@ export function managedTextResourceChangeAffectsScope(
       return scope.threadId !== undefined && scope.threadId === change.scopeId;
   }
 }
-
-export const managedTextResourceListScope = (
-  input: ManagedTextResourceCatalogListInput,
-  resolved: ResolvedManagedTextResourceScope,
-) => ({
-  ...resolved,
-  ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
-});

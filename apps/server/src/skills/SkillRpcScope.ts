@@ -3,7 +3,6 @@ import {
   SkillRpcError,
   type ProviderInstanceId,
   type ThreadId,
-  type SkillCatalogChanged,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -33,22 +32,6 @@ export interface ResolvedSkillScope {
   readonly projectRoot?: string;
   readonly threadId?: ThreadId;
   readonly providerInstanceId?: ProviderInstanceId;
-}
-
-export function skillChangeAffectsScope(
-  scope: ResolvedSkillScope,
-  change: SkillCatalogChanged,
-): boolean {
-  switch (change.scope) {
-    case "global":
-      return true;
-    case "project":
-      return scope.projectId === change.scopeId;
-    case "session":
-      return scope.threadId === change.scopeId;
-    case "provider":
-      return scope.providerInstanceId === undefined || scope.providerInstanceId === change.scopeId;
-  }
 }
 
 /** Resolves opaque IDs against the server projection; no client path participates. */

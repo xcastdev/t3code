@@ -921,22 +921,6 @@ const stableProjectWorkAttributionForFingerprint = (
   recordedAt: attribution.recordedAt,
 });
 
-/** Fingerprint used before the server has minted the approval id and timestamp.
- * Adapters may bind an approval to this stable intent first; the authoritative
- * decider still verifies the complete payload fingerprint on write. */
-export const projectWorkProtectedRevisionIntentFingerprintPayload = (
-  command: ProjectWorkTaskReviseProtectedSpecificationCommand,
-): unknown => {
-  const payload = projectWorkProtectedRevisionFingerprintPayload(command) as Record<
-    string,
-    unknown
-  >;
-  return {
-    ...payload,
-    approval: { taskId: command.taskId, specRevision: command.specification.revision },
-  };
-};
-
 /** Alias retained for callers that use the noun-first operation name. */
 export const ProjectWorkTaskProtectedSpecificationReviseCommand =
   ProjectWorkTaskReviseProtectedSpecificationCommand;

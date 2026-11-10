@@ -276,4 +276,3 @@ export class AssistantRuntime extends Context.Service<
   Effect.Success<typeof make>
 >()("t3/assistants/AssistantRuntime") {}
 export const layer = Layer.effect(AssistantRuntime, make);
-export { layerOwnerAuthority as layerMemoryAuthority } from "./AssistantMemoryLayers.ts";

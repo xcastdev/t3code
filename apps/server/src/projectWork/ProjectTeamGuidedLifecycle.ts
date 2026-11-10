@@ -1572,9 +1572,7 @@ export const decideProjectTeamGuidedLifecycle = (
   return events;
 };
 
-export const projectTeamRepairHash = (
-  episode: Extract<ProjectTeamRecord, { kind: "repair-episode" }>,
-) =>
+const projectTeamRepairHash = (episode: Extract<ProjectTeamRecord, { kind: "repair-episode" }>) =>
   projectTeamPlanHash({
     content: `${episode.recordId}\n${episode.failureFingerprint}\n${episode.relevantRevision}\n${episode.semanticRepairs}`,
     dependencyTaskIds: [],

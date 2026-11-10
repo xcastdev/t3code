@@ -68,7 +68,13 @@ import {
   CLAUDE_PROVIDER,
   makeClaudeQueryOptions,
 } from "../../apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts";
-import { proxyConfig } from "../shared/proxy.ts";
+import {
+  type ModelTransport,
+  modelTransport,
+  OPENROUTER_URL,
+  openRouterModel,
+  transportBody,
+} from "../shared/proxy.ts";
 import { changeRequestsCreatedBy } from "../../apps/server/src/orchestration-v2/PullRequestSyncReactor.ts";
 import { DeviceExpect, gradeDevice } from "./device-grading.ts";
 import {
@@ -1379,7 +1385,7 @@ export const mockOutput = (sample: Sample, command: string) =>
 type Config = {
   readonly apiKey: string;
   readonly model: Model;
-  readonly proxy?: { readonly url: string; readonly headers: Readonly<Record<string, string>> };
+  readonly proxy?: ModelTransport;
   readonly effort: string;
   readonly maxSteps: number;
   readonly shellModel: PricedModel;
@@ -1680,16 +1686,21 @@ const CodexResponse = Schema.Struct({
 const decodeCodexResponse = Schema.decodeUnknownEffect(CodexResponse);
 const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
 
+export const completedResponsesEvent = (raw: string) =>
+  raw
+    .split("\n")
+    .filter((line) => line.startsWith("data: "))
+    .map((line) => line.slice(6).trim())
+    .filter((data) => data !== "[DONE]")
+    .map((data) => JSON.parse(data) as Record<string, unknown>)
+    .find((event) => event.type === "response.completed");
+
 const callCodex = Effect.fn("evaluateMcpToolUse.callCodex")(function* (
   config: Config,
   body: unknown,
 ) {
   const raw = yield* postModel("", body, config.proxy, true);
-  const completed = raw
-    .split("\n")
-    .filter((line) => line.startsWith("data: "))
-    .map((line) => JSON.parse(line.slice(6)) as Record<string, unknown>)
-    .find((event) => event.type === "response.completed");
+  const completed = completedResponsesEvent(raw);
   if (!completed)
     return yield* Effect.die(new Error("Responses stream ended without response.completed."));
   const response = yield* decodeCodexResponse(completed.response);
@@ -1756,7 +1767,7 @@ const postModel = Effect.fn("evaluateMcpToolUse.postModel")(function* (
       "anthropic-beta": "advanced-tool-use-2025-11-20",
       ...proxy?.headers,
     }),
-    HttpClientRequest.bodyJson(body),
+    HttpClientRequest.bodyJson(proxy && isRecord(body) ? transportBody(proxy, body) : body),
     Effect.flatMap(client.execute),
   );
   if (response.status !== 200) {
@@ -2014,7 +2025,7 @@ export const summarize = (
     `- Pass: ${percent(passRate(rows))} of ${finished} samples.`,
     ...(errors.length > 0 ? [errorNote] : []),
     codex
-      ? "- Cost: the agent is not priced. `vibeproxy` in `~/.codex/config.toml` may use a subscription or bill an API key per token; agent tokens are below."
+      ? "- Cost: agent API/proxy charges are not priced by this runner; agent tokens are below."
       : `- Estimated cost $${cost.toFixed(2)}, $${(cost / rows.length).toFixed(3)} per sample.`,
     `- Agent tokens: ${agent.tokens}${codex ? "." : ` ($${agent.cost.toFixed(2)}).`}`,
     `- Shell simulator (${options.shellModel}) tokens: ${shell.tokens} (API-price estimate $${shell.cost.toFixed(2)}).`,
@@ -2207,6 +2218,27 @@ const main = Effect.gen(function* () {
   const baseFor = (testCase: McpToolUseCase) => bases.get(baseKey(testCase)) ?? base;
   const effort = flags.effort ?? base.codex?.reasoning.effort ?? "high";
   const ompCases = selected.filter((testCase) => baseFor(testCase).ompSimulation);
+  // Labels only; the key is read again when the config is built.
+  const backend = codex && process.env.OPENROUTER_API_KEY ? "openrouter" : "codex-proxy";
+  const shellBackend = process.env.ANTHROPIC_API_KEY ? "anthropic" : backend;
+  const transport = codex
+    ? {
+        backend,
+        ...(backend === "openrouter"
+          ? {
+              url: `${OPENROUTER_URL}/responses`,
+              apiModel: openRouterModel(flags.model),
+              normalization:
+                "additional_tools input items moved to top-level tools in order; namespace and function types supplied for untyped OMP simulation tools",
+            }
+          : { apiModel: flags.model, normalization: "none" }),
+        shellBackend,
+        shellApiModel:
+          shellBackend === "openrouter"
+            ? openRouterModel(flags["shell-model"])
+            : flags["shell-model"],
+      }
+    : undefined;
   if (ompCases.length && flags.out) {
     const sourcePath = path.resolve(
       import.meta.dirname,
@@ -2223,6 +2255,7 @@ const main = Effect.gen(function* () {
       templateSha256: hash(template),
       instructionSource: "packages/provider-omp/src/server/instructions.ts",
       instructionSourceSha256: hash(source),
+      transport,
       cases: ompCases.map((testCase) => {
         const device = testCase.setup.world?.deviceAgentAccess !== false;
         const append = buildOmpInstructions({ model: flags.model, browser: true, device });
@@ -2259,7 +2292,7 @@ const main = Effect.gen(function* () {
       yield* Effect.scoped(withDevices(sample));
       const messages = buildMessages(sample);
       const body = sample.base.codex
-        ? codexRequest(sample.base, codexMessages(messages))
+        ? transportBody({ backend }, codexRequest(sample.base, codexMessages(messages)))
         : requestBody(sample, effort, messages);
       process.stdout.write(`${yield* encodeJson(body)}\n`);
     }
@@ -2275,7 +2308,7 @@ const main = Effect.gen(function* () {
   const config: Config = {
     apiKey,
     model: flags.model,
-    ...(codex ? { proxy: proxyConfig() } : {}),
+    ...(codex ? { proxy: modelTransport() } : {}),
     effort,
     maxSteps: flags["max-steps"] ?? (codex ? 10 : 6),
     shellModel: flags["shell-model"],
@@ -2381,7 +2414,7 @@ const main = Effect.gen(function* () {
         header,
         ...(ompCases.length
           ? [
-              "OMP cases use the imported provider-local append and simulated OMP context recorded in omp-context.json.",
+              `OMP cases use the imported provider-local append and simulated OMP context recorded in omp-context.json, over ${transport?.backend} (${transport?.apiModel}).`,
             ]
           : [t3ContextReport(flags.model)]),
         ...stopped,

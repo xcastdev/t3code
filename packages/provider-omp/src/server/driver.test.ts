@@ -5,6 +5,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Host from "@t3tools/provider-testing/TestProviderHost";
 import * as Ids from "@t3tools/provider-core/server/IdAllocator";
 import * as Catalogs from "@t3tools/provider-core/server/McpProviderSessions";
+import * as SecretInputs from "@t3tools/provider-core/server/ProviderSecretInputs";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import { ProviderInstanceId } from "@t3tools/contracts";
 import { OmpDriver } from "./driver.ts";
@@ -48,6 +49,7 @@ it.effect("default disabled provider snapshots and refreshes never launch native
         NodeServices.layer,
         Ids.layer,
         Catalogs.layer,
+        SecretInputs.layer,
         Host.layer().pipe(Layer.provide(NodeServices.layer)),
       ),
     ),

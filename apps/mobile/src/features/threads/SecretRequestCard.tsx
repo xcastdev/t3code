@@ -132,7 +132,7 @@ function PendingSecretRequestForm(props: {
         </Text>
       ) : null}
       <Button
-        label="Save securely"
+        label={item.nativeItemRef != null ? "Send privately" : "Save securely"}
         tone="primary"
         fullWidth
         disabled={submitting || secret.trim().length === 0}

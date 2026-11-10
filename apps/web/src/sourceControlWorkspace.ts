@@ -19,7 +19,7 @@ import { create } from "zustand";
 /** Rows rendered per index group; the rest are summarized so huge worktrees stay cheap. */
 export const SOURCE_CONTROL_VISIBLE_FILE_LIMIT = 300;
 /** The backend accepts at most this many paths per stage/unstage request. */
-export const SOURCE_CONTROL_MUTATION_PATH_LIMIT = 500;
+const SOURCE_CONTROL_MUTATION_PATH_LIMIT = 500;
 export const SOURCE_CONTROL_HISTORY_PAGE_SIZE = 50;
 
 export type SourceControlHistoryPageResult =
@@ -53,7 +53,7 @@ export interface SourceControlWorkspaceScope {
   readonly workspaceRoot: string;
 }
 
-export function sourceControlWorkspaceKey(scope: SourceControlWorkspaceScope): string {
+function sourceControlWorkspaceKey(scope: SourceControlWorkspaceScope): string {
   return JSON.stringify([scope.environmentId, scope.workspaceRoot]);
 }
 

@@ -21,8 +21,9 @@ are rejected.
 
 For a remote server, install and authenticate OMP there; the browser or phone does not run OMP.
 API keys can also be supplied through that provider instance's environment variables. Mark keys
-as sensitive. Protected secret-entry dialogs from OMP are currently unsupported and are cancelled;
-configure credentials on the server instead.
+as sensitive. During an agent turn, answer OMP’s single-line secret prompts in the private-input card.
+The answer goes directly to OMP and stays out of chat history. Stopping the agent closes the
+prompt; repeat the action if it needs to ask again.
 
 T3 Code refuses an installation whose required native source files differ from the supported
 recipe, even if its version number matches. It does not patch installed OMP files or change the

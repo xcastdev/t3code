@@ -19,9 +19,9 @@ const ofKind =
   <K extends ProjectTeamRecordRead["kind"]>(kind: K) =>
   (record: ProjectTeamRecordRead): record is Extract<ProjectTeamRecordRead, { kind: K }> =>
     record.kind === kind;
-export const isGateRecord = ofKind("gate");
-export const isPlanRecord = ofKind("plan-revision");
-export const isMembershipRecord = ofKind("task-membership");
+const isGateRecord = ofKind("gate");
+const isPlanRecord = ofKind("plan-revision");
+const isMembershipRecord = ofKind("task-membership");
 export const isIssueRecord = ofKind("issue");
 export const isMissionRecord = ofKind("mission");
 

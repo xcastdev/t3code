@@ -15,7 +15,7 @@ import {
   type StdioServerParameters,
 } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-export class ProjectMcpSecretUnavailableError extends Error {
+class ProjectMcpSecretUnavailableError extends Error {
   constructor(serverId: McpServerId, secretRef: string) {
     void secretRef;
     super(`MCP secret is unavailable for server '${serverId}'.`);
@@ -23,7 +23,7 @@ export class ProjectMcpSecretUnavailableError extends Error {
   }
 }
 
-export class ProjectMcpTransportConfigurationError extends Error {
+class ProjectMcpTransportConfigurationError extends Error {
   constructor(serverId: McpServerId, reason: "oauth_provider_required" | "authorization_header") {
     super(
       reason === "oauth_provider_required"

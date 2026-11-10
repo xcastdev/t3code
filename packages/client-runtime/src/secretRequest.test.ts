@@ -1,11 +1,38 @@
-import { SecretRequestError } from "@t3tools/contracts";
+import {
+  SecretRequestError,
+  SecretRequestAnswerInput,
+  ThreadId,
+  TurnItemId,
+  ProviderDriverKind,
+} from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   secretRequestDisplay,
   secretRequestFailureMessage,
   secretRequestPrivacyNote,
+  secretRequestAnswerInput,
 } from "./secretRequest.ts";
+
+const decodeAnswer = Schema.decodeUnknownSync(SecretRequestAnswerInput);
+
+it("preserves a native prompt's exact value across the answer RPC", () => {
+  const item = {
+    id: TurnItemId.make("secret-card"),
+    threadId: ThreadId.make("secret-thread"),
+    nativeItemRef: {
+      driver: ProviderDriverKind.make("omp"),
+      nativeId: "prompt",
+      strength: "strong" as const,
+    },
+  };
+  const secret = "  private phrase  ";
+  const answer = secretRequestAnswerInput(item, { type: "save", secret });
+  expect(decodeAnswer(answer)).toMatchObject({
+    answer: { type: "save", secret },
+  });
+});
 
 describe("secretRequestDisplay", () => {
   it("never offers the form for a request inherited from another thread", () => {

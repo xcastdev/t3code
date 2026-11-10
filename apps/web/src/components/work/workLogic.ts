@@ -1,5 +1,3 @@
-// Kept identical to apps/mobile/src/features/work/workLogic.ts until it moves into
-// @t3tools/client-runtime/project-work (see the P4a UI API notes).
 import {
   PROJECT_TEAM_DEFAULT_LIMITS,
   PROJECT_TEAM_PRESETS,
@@ -42,7 +40,7 @@ const STATUS_RANK: Record<WorkReadStatus, number> = {
   loading: 2,
   disconnected: 3,
 };
-export const worseReadStatus = (a: WorkReadStatus, b: WorkReadStatus): WorkReadStatus =>
+const worseReadStatus = (a: WorkReadStatus, b: WorkReadStatus): WorkReadStatus =>
   STATUS_RANK[b] > STATUS_RANK[a] ? b : a;
 
 export interface WorkPageSnapshot {
@@ -344,7 +342,7 @@ export function fillPresetNames(values: TeamConfigurationValues): TeamConfigurat
 type EffortDescriptor = Extract<ProviderOptionDescriptor, { type: "select" }>;
 
 /** The reasoning effort control a model offers, with the choices a picker may show. */
-export function teamEffortControl(
+function teamEffortControl(
   descriptors: ReadonlyArray<ProviderOptionDescriptor> | undefined,
 ): { readonly descriptor: EffortDescriptor; readonly choices: EffortDescriptor["options"] } | null {
   const descriptor = descriptors?.find(isReasoningSelect);
@@ -354,7 +352,7 @@ export function teamEffortControl(
 }
 
 /** A member's chosen effort, or null when it runs at the model's default. */
-export function teamEffortValue(
+function teamEffortValue(
   options: ReadonlyArray<ProviderOptionSelection> | undefined,
   descriptorId?: string,
 ): string | null {
@@ -362,17 +360,6 @@ export function teamEffortValue(
     descriptorId === undefined ? typeof option.value === "string" : option.id === descriptorId,
   );
   return typeof selection?.value === "string" ? selection.value : null;
-}
-
-/** Sets or clears one effort selection, keeping a member's other options. */
-export function withTeamEffort(
-  options: ReadonlyArray<ProviderOptionSelection> | undefined,
-  descriptorId: string,
-  value: string | null,
-): ReadonlyArray<ProviderOptionSelection> | undefined {
-  const rest = (options ?? []).filter((option) => option.id !== descriptorId);
-  const next = value === null ? rest : [...rest, { id: descriptorId, value }];
-  return next.length === 0 ? undefined : next;
 }
 
 /** The provider catalog labels come from: the same entries the model pickers offer. */
@@ -390,7 +377,7 @@ export interface WorkProviderCatalogEntry {
 }
 
 /** A provider's display name; its id when the catalog doesn't know it, such as when it's disabled. */
-export function workProviderLabel(
+function workProviderLabel(
   catalog: ReadonlyArray<WorkProviderCatalogEntry>,
   instanceId: string,
 ): string {
@@ -398,7 +385,7 @@ export function workProviderLabel(
 }
 
 /** A model's display name on its provider; its slug when the catalog doesn't know it. */
-export function workModelLabel(
+function workModelLabel(
   catalog: ReadonlyArray<WorkProviderCatalogEntry>,
   instanceId: string | null | undefined,
   model: string,
@@ -470,7 +457,7 @@ export function syncModelPolicies(values: TeamConfigurationValues): TeamConfigur
 const decodeConfiguration = Schema.decodeUnknownOption(ProjectTeamConfigurationIntent);
 
 /** Turning off an enabled team with exactly the recorded profiles, provider and limits. */
-export function isRecordedTeamDisable(
+function isRecordedTeamDisable(
   values: TeamConfigurationValues,
   recorded: TeamConfigurationValues | null,
 ): boolean {

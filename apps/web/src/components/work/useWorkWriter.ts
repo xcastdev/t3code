@@ -20,10 +20,9 @@ import { useContext, useRef, useState } from "react";
 import { projectWorkEnvironment } from "../../state/projectWork";
 import { describeWorkFailure } from "./workModel";
 
-export const STALE_SELECTION_MESSAGE =
+const STALE_SELECTION_MESSAGE =
   "This changed after you reviewed it. Check the current revision, then try again.";
-export const UNSUPPORTED_CHANGE_MESSAGE =
-  "This client can't send that change yet. Nothing was sent.";
+const UNSUPPORTED_CHANGE_MESSAGE = "This client can't send that change yet. Nothing was sent.";
 
 export interface WorkWriteFailure {
   readonly key: string;

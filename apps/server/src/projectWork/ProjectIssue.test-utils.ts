@@ -11,7 +11,7 @@ import * as Sync from "./ProjectIssueSyncWorker.ts";
 import * as Repository from "./ProjectWorkRepository.ts";
 
 export const projectId = ProjectId.make("issue-project");
-export const at = "1970-01-01T00:00:00.000Z";
+const at = "1970-01-01T00:00:00.000Z";
 export const account = {
   host: "github.com",
   accountId: "12",

@@ -263,5 +263,3 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
       );
     }),
   );
-
-export const layerFixtureServices = layerFixtureServicesForMode("preservation");

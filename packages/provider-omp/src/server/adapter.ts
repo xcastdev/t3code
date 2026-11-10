@@ -28,10 +28,15 @@ import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
+import * as Redacted from "effect/Redacted";
 import * as Ids from "@t3tools/provider-core/server/IdAllocator";
 import * as Adapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { ProviderHost } from "@t3tools/provider-core/server/ProviderHost";
 import { McpProviderSessions } from "@t3tools/provider-core/server/McpProviderSessions";
+import {
+  ProviderSecretInputs,
+  type ProviderSecretInputReceiver,
+} from "@t3tools/provider-core/server/ProviderSecretInputs";
 import {
   freezeInstructionSnapshot,
   sameInstructionSnapshot,
@@ -85,6 +90,7 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
   const host = yield* ProviderHost;
   const ids = yield* Ids.IdAllocatorV2;
   const catalogs = yield* McpProviderSessions;
+  const secretInputs = yield* ProviderSecretInputs;
   const root = ownedOmpSessionDirectory(host.paths.stateDir, options.instanceId);
   yield* Effect.tryPromise({
     try: () => NodeFSP.mkdir(root, { recursive: true, mode: 0o700 }),
@@ -325,6 +331,59 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
         );
         expirations.set(request.id, Fiber.interrupt(fiber).pipe(Effect.asVoid));
       });
+      // Masked native prompts. Their answers go straight to the live prompt and are never kept.
+      const secretPrompts = new Map<
+        string,
+        {
+          record: NativeRecord;
+          item: Extract<OrchestrationV2TurnItem, { type: "secret_request" }>;
+          receiver: ProviderSecretInputReceiver;
+          stopExpiry?: Effect.Effect<void>;
+        }
+      >();
+      const closeSecret = Effect.fn("OmpAdapter.closeSecret")(function* (
+        id: string,
+        secretStatus: "saved" | "declined" | "cancelled",
+        reply?: NativeRecord,
+      ) {
+        const pending = secretPrompts.get(id);
+        if (!pending) return false;
+        secretPrompts.delete(id);
+        yield* secretInputs.unregister(pending.receiver);
+        if (pending.stopExpiry) yield* pending.stopExpiry;
+        const sent = reply === undefined ? true : Exit.isSuccess(yield* Effect.exit(send(reply)));
+        const now = yield* DateTime.now;
+        yield* emit({
+          type: "turn_item.updated",
+          driver: OMP_DRIVER,
+          turnItem: {
+            ...pending.item,
+            secretStatus: sent ? secretStatus : "cancelled",
+            status: sent && secretStatus === "saved" ? "completed" : "cancelled",
+            completedAt: now,
+            updatedAt: now,
+          },
+        });
+        return sent;
+      });
+      const cancelSecrets = Effect.fn("OmpAdapter.cancelSecrets")(function* (
+        notifyNative: boolean,
+      ) {
+        for (const [id, pending] of secretPrompts)
+          yield* closeSecret(
+            id,
+            "cancelled",
+            notifyNative
+              ? { type: "extension_ui_response", id: pending.record.id, cancelled: true }
+              : undefined,
+          );
+      });
+      yield* Scope.addFinalizer(
+        scope,
+        Effect.forEach(secretPrompts.values(), (pending) =>
+          secretInputs.unregister(pending.receiver),
+        ),
+      );
       let tools = new OmpToolItems();
       const history = new OmpHistory();
       let generation = 0;
@@ -487,6 +546,8 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
               });
             }
             unfinishedTools.clear();
+            for (const id of runtimeRequests.keys()) yield* closeRequest(id, "cancelled");
+            yield* cancelSecrets(false);
             if (enrich)
               yield* Effect.tryPromise({
                 try: () => history.refresh((r) => run(connection.request(r, 5000))),
@@ -548,7 +609,6 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
                     threadDisposition: "reusable",
                   },
             );
-            for (const id of runtimeRequests.keys()) yield* closeRequest(id, "cancelled");
             active = undefined;
             yield* updateSession(failed ? "error" : "ready");
             continue;
@@ -898,6 +958,93 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
         Effect.forkIn(scope),
       );
       yield* syncCatalog();
+      /** False when the prompt cannot become a live secret card; the caller cancels it. */
+      const openSecret = Effect.fn("OmpAdapter.openSecret")(function* (record: NativeRecord) {
+        const turn = active;
+        const label = typeof record.title === "string" ? record.title.trim() : "";
+        if (
+          record.method !== "input" ||
+          typeof record.id !== "string" ||
+          !record.id ||
+          !turn ||
+          !thread ||
+          turn.input.providerThread.id !== thread.id
+        )
+          return false;
+        const captured = generation;
+        const base = yield* baseItem("secret:" + record.id);
+        const item: Extract<OrchestrationV2TurnItem, { type: "secret_request" }> = {
+          ...base,
+          runId: turn.input.runId,
+          nodeId: turn.input.rootNodeId,
+          providerThreadId: thread.id,
+          status: "waiting",
+          title: label || "Secret",
+          type: "secret_request",
+          label: label || "Secret",
+          reason: typeof record.message === "string" ? record.message : "",
+          ...(typeof record.placeholder === "string" ? { placeholder: record.placeholder } : {}),
+          secretStatus: "pending",
+        };
+        const receiver: ProviderSecretInputReceiver = {
+          owner: {
+            threadId: input.threadId,
+            turnItemId: item.id,
+            runId: turn.input.runId,
+            runAttemptId: turn.input.attemptId,
+            nodeId: turn.input.rootNodeId,
+            providerThreadId: thread.id,
+            providerSessionId: input.providerSessionId,
+          },
+          deliver: (answer) =>
+            Effect.suspend(() =>
+              captured === generation && secretPrompts.get(item.id)?.receiver === receiver
+                ? closeSecret(
+                    item.id,
+                    answer.type === "save" ? "saved" : "declined",
+                    answer.type === "save"
+                      ? {
+                          type: "extension_ui_response",
+                          id: record.id,
+                          value: Redacted.value(answer.secret),
+                        }
+                      : { type: "extension_ui_response", id: record.id, cancelled: true },
+                  )
+                : Effect.succeed(false),
+            ).pipe(lock.withPermits(1)),
+        };
+        secretPrompts.set(item.id, { record, item, receiver });
+        yield* secretInputs.register(receiver);
+        if (
+          typeof record.timeout === "number" &&
+          Number.isFinite(record.timeout) &&
+          record.timeout > 0
+        ) {
+          const fiber = yield* Effect.sleep(
+            Duration.millis(Math.min(record.timeout, 86400000)),
+          ).pipe(
+            Effect.andThen(
+              Effect.suspend(() => {
+                const pending = secretPrompts.get(item.id);
+                if (pending?.receiver !== receiver) return Effect.void;
+                delete pending.stopExpiry;
+                return closeSecret(item.id, "cancelled", {
+                  type: "extension_ui_response",
+                  id: record.id,
+                  cancelled: true,
+                  timedOut: true,
+                });
+              }).pipe(lock.withPermits(1)),
+            ),
+            Effect.ignore,
+            Effect.forkIn(scope),
+          );
+          const pending = secretPrompts.get(item.id);
+          if (pending) pending.stopExpiry = Fiber.interrupt(fiber).pipe(Effect.asVoid);
+        }
+        yield* emit({ type: "turn_item.updated", driver: OMP_DRIVER, turnItem: item });
+        return true;
+      });
       const handle = Effect.fn("OmpAdapter.handle")(function* (record: NativeRecord) {
         if (record.type === "available_commands_update" && Array.isArray(record.commands)) {
           commands = (yield* decodeOmpCommands(record).pipe(
@@ -928,6 +1075,8 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
               if (pending.record.id === record.targetId) {
                 yield* closeRequest(id, "cancelled");
               }
+            for (const [id, pending] of secretPrompts)
+              if (pending.record.id === record.targetId) yield* closeSecret(id, "cancelled");
             return;
           }
           if (
@@ -973,6 +1122,7 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
             }
             return;
           }
+          if (record.secret === true && (yield* openSecret(record))) return;
           const decoded = yield* Effect.try({
             try: () => ompQuestions(record),
             catch: (cause) => protocol("Unsupported native dialog was cancelled", cause),
@@ -991,7 +1141,7 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
                 completedAt: now,
                 message:
                   record.secret === true
-                    ? "Native secret input was cancelled: this provider has no protected secret-answer channel."
+                    ? "Native secret input was cancelled: only a single masked text prompt during a turn is supported."
                     : "Unsupported native dialog was cancelled.",
               },
             });
@@ -1093,6 +1243,8 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
               yield* drain(false).pipe(
                 Effect.ensuring(
                   Effect.gen(function* () {
+                    for (const id of runtimeRequests.keys()) yield* closeRequest(id, "cancelled");
+                    yield* cancelSecrets(false);
                     active = undefined;
                     yield* updateSession("error");
                     yield* Queue.fail(events, protocol("OMP event stream failed", cause));
@@ -1183,6 +1335,7 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
           yield* connection.terminate;
         }
         for (const id of runtimeRequests.keys()) yield* closeRequest(id, "cancelled");
+        yield* cancelSecrets(false);
         connection = yield* connect({
           ...launchOptions,
           config: {
@@ -1232,35 +1385,51 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
         }
         if (
           value.existingProviderThread &&
-          value.existingProviderThread.nativeThreadRef?.nativeId !== nativeFile
+          (value.existingProviderThread.driver !== OMP_DRIVER ||
+            value.existingProviderThread.providerInstanceId !== options.instanceId ||
+            value.existingProviderThread.appThreadId !== value.threadId ||
+            (value.existingProviderThread.nativeThreadRef !== null &&
+              value.existingProviderThread.nativeThreadRef.nativeId !== nativeFile))
         )
           return yield* protocol("OMP resume native identity mismatch");
         const now = yield* DateTime.now;
-        thread = value.existingProviderThread ?? {
-          id: ids.derive.providerThread({
-            driver: OMP_DRIVER,
-            nativeThreadId: nativeFile,
-            providerInstanceId: options.instanceId,
-          }),
-          driver: OMP_DRIVER,
-          providerInstanceId: options.instanceId,
-          providerSessionId: input.providerSessionId,
-          appThreadId: value.threadId,
-          ownerNodeId: null,
-          nativeThreadRef: ref(nativeFile),
-          nativeConversationHeadRef: null,
-          status: "idle",
-          firstRunOrdinal: null,
-          lastRunOrdinal: null,
-          handoffIds: [],
-          forkedFrom: null,
-          pendingBackgroundTasks: [],
-          contextUsage: null,
-          nativeMetadata: { itemIdentityVersion: 2 },
-          goal: null,
-          createdAt: now,
-          updatedAt: now,
-        };
+        thread = value.existingProviderThread
+          ? {
+              ...value.existingProviderThread,
+              providerSessionId: input.providerSessionId,
+              nativeThreadRef: ref(nativeFile),
+              nativeMetadata: {
+                ...value.existingProviderThread.nativeMetadata,
+                itemIdentityVersion: 2,
+              },
+              status: "idle",
+              updatedAt: now,
+            }
+          : {
+              id: ids.derive.providerThread({
+                driver: OMP_DRIVER,
+                nativeThreadId: nativeFile,
+                providerInstanceId: options.instanceId,
+              }),
+              driver: OMP_DRIVER,
+              providerInstanceId: options.instanceId,
+              providerSessionId: input.providerSessionId,
+              appThreadId: value.threadId,
+              ownerNodeId: null,
+              nativeThreadRef: ref(nativeFile),
+              nativeConversationHeadRef: null,
+              status: "idle",
+              firstRunOrdinal: null,
+              lastRunOrdinal: null,
+              handoffIds: [],
+              forkedFrom: null,
+              pendingBackgroundTasks: [],
+              contextUsage: null,
+              nativeMetadata: { itemIdentityVersion: 2 },
+              goal: null,
+              createdAt: now,
+              updatedAt: now,
+            };
         yield* Effect.tryPromise({
           try: () => history.refresh((r) => run(request(r))),
           catch: (cause) => protocol("OMP resume history failed", cause),
@@ -1322,7 +1491,7 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
           discovery.models.find(
             (m) =>
               m.id === (selection.model === "default" ? discovery.defaultModel : selection.model),
-          )?.contextWindow,
+          )?.contextWindow ?? undefined,
         canReuseContextUsage: (previous, next) => previous.model === next.model,
         instructionRevisionReplaced: true,
         ensureThread: (value) => ensure(value).pipe(lock.withPermits(1)),
@@ -1337,6 +1506,7 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
         terminateSession: Effect.suspend(() =>
           Effect.gen(function* () {
             for (const id of runtimeRequests.keys()) yield* closeRequest(id, "cancelled");
+            yield* cancelSecrets(false);
             yield* connection.terminate;
           }),
         ),
@@ -1462,6 +1632,7 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
                 });
               yield* closeRequest(id, "cancelled");
             }
+            yield* cancelSecrets(true);
             yield* Effect.tryPromise({
               try: () => bridge.cancelPending(),
               catch: (cause) => protocol("OMP Stop host cancellation failed", cause),

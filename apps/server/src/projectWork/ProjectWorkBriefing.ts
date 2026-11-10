@@ -38,7 +38,7 @@ export interface ProjectWorkBriefingBounds {
   readonly maxCharacters: number;
 }
 
-export const PROJECT_WORK_BRIEFING_BOUNDS: Readonly<
+const PROJECT_WORK_BRIEFING_BOUNDS: Readonly<
   Record<ProjectWorkBriefingKind, ProjectWorkBriefingBounds>
 > = {
   compact: { maxTasks: 8, maxKnowledge: 4, maxCharacters: 2_000 },

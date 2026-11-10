@@ -9,6 +9,8 @@ import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import * as DateTime from "effect/DateTime";
+import * as Option from "effect/Option";
+import * as Redacted from "effect/Redacted";
 import * as TestClock from "effect/testing/TestClock";
 import {
   MessageId,
@@ -16,15 +18,19 @@ import {
   ThreadId,
   ProviderSessionId,
   ProviderInstanceId,
+  ProviderDriverKind,
+  ProviderThreadId,
   NodeId,
   CheckpointId,
   RunId,
   RunAttemptId,
   type OrchestrationV2AppThread,
+  type OrchestrationV2ProviderThread,
 } from "@t3tools/contracts";
 import * as Host from "@t3tools/provider-testing/TestProviderHost";
 import * as Ids from "@t3tools/provider-core/server/IdAllocator";
 import * as Catalogs from "@t3tools/provider-core/server/McpProviderSessions";
+import * as SecretInputs from "@t3tools/provider-core/server/ProviderSecretInputs";
 import type { ProviderAdapterV2Event } from "@t3tools/provider-core/server/ProviderAdapter";
 import type { ControlEnvelope } from "./controlChannel.ts";
 import { OmpRpcError, type OmpRpcRecord } from "./rpc.ts";
@@ -34,6 +40,7 @@ const services = Layer.mergeAll(
   NodeServices.layer,
   Ids.layer,
   Catalogs.layer,
+  SecretInputs.layer,
   Host.layer().pipe(Layer.provide(NodeServices.layer)),
 );
 it.effect.each(["normal", "dead transport", "stop transport", "history unavailable"] as const)(
@@ -168,12 +175,61 @@ it.effect.each(["normal", "dead transport", "stop transport", "history unavailab
           if (predicate(event)) return event;
         }
       });
+      const now = yield* DateTime.now;
+      const pendingThreadId = ProviderThreadId.make("pending-thread");
+      const pendingThread: OrchestrationV2ProviderThread = {
+        id: pendingThreadId,
+        driver: adapter.driver,
+        providerInstanceId: instanceId,
+        providerSessionId: ProviderSessionId.make("old-session"),
+        appThreadId: threadId,
+        ownerNodeId: null,
+        nativeThreadRef: null,
+        nativeConversationHeadRef: null,
+        status: "not_loaded",
+        firstRunOrdinal: 1,
+        lastRunOrdinal: 1,
+        handoffIds: [],
+        forkedFrom: null,
+        pendingBackgroundTasks: [],
+        contextUsage: null,
+        nativeMetadata: null,
+        goal: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      if (scenario === "normal")
+        for (const mismatch of [
+          { driver: ProviderDriverKind.make("pi") },
+          { providerInstanceId: ProviderInstanceId.make("other-instance") },
+          { appThreadId: ThreadId.make("other-thread") },
+          {
+            nativeThreadRef: {
+              driver: adapter.driver,
+              nativeId: "other-native",
+              strength: "strong" as const,
+            },
+          },
+        ]) {
+          const error = yield* runtime
+            .ensureThread({
+              threadId,
+              modelSelection,
+              runtimePolicy,
+              existingProviderThread: { ...pendingThread, ...mismatch },
+            })
+            .pipe(Effect.flip);
+          expect(error.message).toContain("identity mismatch");
+        }
       const providerThread = yield* runtime.ensureThread({
         threadId,
         modelSelection,
         runtimePolicy,
+        existingProviderThread: pendingThread,
       });
-      const now = yield* DateTime.now;
+      expect(providerThread.id).toBe(pendingThreadId);
+      expect(providerThread.providerSessionId).toBe(ProviderSessionId.make("s"));
+      expect(providerThread.nativeThreadRef?.nativeId).toMatch(/native\.jsonl$/);
       const appThread: OrchestrationV2AppThread = {
         id: threadId,
         projectId: ProjectId.make("p"),
@@ -217,14 +273,46 @@ it.effect.each(["normal", "dead transport", "stop transport", "history unavailab
         runtimePolicy,
       });
       const prompt = yield* Queue.take(sent);
+      const inputs = yield* SecretInputs.ProviderSecretInputs;
+      const openSecret = Effect.fn("Fixture.openSecret")(function* (id: string) {
+        yield* Queue.offer(incoming, {
+          type: "extension_ui_request",
+          id,
+          method: "input",
+          secret: true,
+          title: "Private value",
+          placeholder: "token",
+        });
+        const card = yield* take(
+          (e) =>
+            e.type === "turn_item.updated" &&
+            e.turnItem.type === "secret_request" &&
+            e.turnItem.nativeItemRef?.nativeId === "secret:" + id,
+        );
+        if (card.type !== "turn_item.updated" || card.turnItem.type !== "secret_request")
+          throw new Error("Missing secret card");
+        expect(card.turnItem).toMatchObject({ secretStatus: "pending", runId: "r", nodeId: "n" });
+        const live = yield* inputs.lookup(threadId, card.turnItem.id);
+        return { card: card.turnItem, receiver: Option.getOrThrow(live) };
+      });
+      const secretOutcome = (turnItemId: string) =>
+        take(
+          (e) =>
+            e.type === "turn_item.updated" &&
+            e.turnItem.id === turnItemId &&
+            e.turnItem.type === "secret_request" &&
+            e.turnItem.secretStatus !== "pending",
+        );
+      const save = { type: "save", secret: Redacted.make("hunter2") } as const;
       if (scenario !== "normal") {
+        const pendingSecret = yield* openSecret("terminal-secret");
         dead = scenario !== "history unavailable";
         historyUnavailable = !dead;
         if (scenario === "stop transport") {
-          const running = yield* take(
+          const running = all.find(
             (e) => e.type === "provider_turn.updated" && e.providerTurn.status === "running",
           );
-          if (running.type !== "provider_turn.updated") throw new Error("Missing turn");
+          if (running?.type !== "provider_turn.updated") throw new Error("Missing turn");
           expect(
             (yield* runtime
               .interruptTurn({ providerThread, providerTurnId: running.providerTurn.id })
@@ -269,6 +357,17 @@ it.effect.each(["normal", "dead transport", "stop transport", "history unavailab
         );
         const terminal = yield* take((e) => e.type === "turn.terminal" && e.runOrdinal === 1);
         expect(terminal).toMatchObject({ status: dead ? "failed" : "completed" });
+        const cancelled = all.findIndex(
+          (e) =>
+            e.type === "turn_item.updated" &&
+            e.turnItem.id === pendingSecret.card.id &&
+            e.turnItem.type === "secret_request" &&
+            e.turnItem.secretStatus === "cancelled",
+        );
+        expect(cancelled).toBeGreaterThanOrEqual(0);
+        expect(cancelled).toBeLessThan(all.indexOf(terminal));
+        expect(Option.isNone(yield* inputs.lookup(threadId, pendingSecret.card.id))).toBe(true);
+        expect(yield* pendingSecret.receiver.deliver(save)).toBe(false);
         if (dead) {
           expect(Exit.isFailure(next) ? Cause.pretty(next.cause) : "").toContain(
             "transport is unavailable",
@@ -326,18 +425,48 @@ it.effect.each(["normal", "dead transport", "stop transport", "history unavailab
         message: "yield control",
       });
 
-      yield* Queue.offer(incoming, {
-        type: "extension_ui_request",
-        id: "secret",
-        method: "input",
-        secret: true,
-        title: "Private value",
+      const saved = yield* openSecret("secret");
+      expect(saved.receiver.owner).toEqual({
+        threadId,
+        turnItemId: saved.card.id,
+        runId: "r",
+        runAttemptId: "a",
+        nodeId: "n",
+        providerThreadId: providerThread.id,
+        providerSessionId: "s",
       });
+      expect(yield* saved.receiver.deliver(save)).toBe(true);
       expect(yield* Queue.take(sent)).toEqual({
         type: "extension_ui_response",
         id: "secret",
+        value: "hunter2",
+      });
+      expect(yield* secretOutcome(saved.card.id)).toMatchObject({
+        turnItem: { secretStatus: "saved", status: "completed" },
+      });
+      expect(yield* saved.receiver.deliver(save)).toBe(false);
+      expect(Option.isNone(yield* inputs.lookup(threadId, saved.card.id))).toBe(true);
+      const declined = yield* openSecret("secret-decline");
+      expect(yield* declined.receiver.deliver({ type: "decline" })).toBe(true);
+      expect(yield* Queue.take(sent)).toEqual({
+        type: "extension_ui_response",
+        id: "secret-decline",
         cancelled: true,
       });
+      expect(yield* secretOutcome(declined.card.id)).toMatchObject({
+        turnItem: { secretStatus: "declined", status: "cancelled" },
+      });
+      const withdrawn = yield* openSecret("secret-withdrawn");
+      yield* Queue.offer(incoming, {
+        type: "extension_ui_request",
+        id: "cancel-secret",
+        method: "cancel",
+        targetId: "secret-withdrawn",
+      });
+      expect(yield* secretOutcome(withdrawn.card.id)).toMatchObject({
+        turnItem: { secretStatus: "cancelled" },
+      });
+      expect(yield* withdrawn.receiver.deliver(save)).toBe(false);
       yield* Queue.offer(incoming, {
         type: "extension_ui_request",
         id: "q",
@@ -433,13 +562,23 @@ it.effect.each(["normal", "dead transport", "stop transport", "history unavailab
           })
           .pipe(Effect.flip))._tag,
       ).toBe("ProviderAdapterProtocolError");
+      const terminalSecret = yield* openSecret("turn-end-secret");
       yield* Queue.offer(incoming, {
         type: "prompt_result",
         id: prompt.id,
         status: "completed",
         sessionSettled: true,
       });
-      yield* take((e) => e.type === "turn.terminal");
+      const terminal = yield* take((e) => e.type === "turn.terminal");
+      const cancelled = all.findIndex(
+        (e) =>
+          e.type === "turn_item.updated" &&
+          e.turnItem.id === terminalSecret.card.id &&
+          e.turnItem.type === "secret_request" &&
+          e.turnItem.secretStatus === "cancelled",
+      );
+      expect(cancelled).toBeGreaterThanOrEqual(0);
+      expect(cancelled).toBeLessThan(all.indexOf(terminal));
       expect(all.filter((e) => e.type === "message.updated").at(-1)).toMatchObject({
         message: { text: "Final text", streaming: false },
       });
@@ -500,10 +639,34 @@ it.effect.each(["normal", "dead transport", "stop transport", "history unavailab
       );
       if (started.type !== "provider_turn.updated" || approval.type !== "runtime_request.updated")
         throw new Error("Missing owned turn/approval");
+      yield* Queue.offer(incoming, {
+        type: "extension_ui_request",
+        id: "stop-secret",
+        method: "input",
+        secret: true,
+        title: "Private value",
+      });
+      const stopCard = yield* take(
+        (e) => e.type === "turn_item.updated" && e.turnItem.type === "secret_request",
+      );
+      if (stopCard.type !== "turn_item.updated") throw new Error("Missing secret card");
+      const stopReceiver = Option.getOrThrow(yield* inputs.lookup(threadId, stopCard.turnItem.id));
+      expect(stopReceiver.owner).toMatchObject({ runId: "r2", runAttemptId: "a2", nodeId: "n2" });
       const stop = yield* runtime
         .interruptTurn({ providerThread, providerTurnId: started.providerTurn.id })
         .pipe(Effect.forkChild);
       yield* Fiber.join(stop);
+      expect(yield* Queue.take(sent)).toEqual({
+        type: "extension_ui_response",
+        id: "stop-secret",
+        cancelled: true,
+      });
+      expect(yield* stopReceiver.deliver(save)).toBe(false);
+      expect(Option.isNone(yield* inputs.lookup(threadId, stopCard.turnItem.id))).toBe(true);
+      expect(yield* secretOutcome(stopCard.turnItem.id)).toMatchObject({
+        turnItem: { secretStatus: "cancelled" },
+      });
+      expect(JSON.stringify(all)).not.toContain("hunter2");
       yield* Deferred.await(denied);
       expect(launches).toBe(2);
       yield* take((e) => e.type === "turn.terminal" && e.runOrdinal === 2);

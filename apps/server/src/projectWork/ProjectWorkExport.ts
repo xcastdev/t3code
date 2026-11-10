@@ -145,7 +145,7 @@ const renderRecordList = (
     values.map(({ label, ...value }) => ({ title: label, ...value })),
   );
 
-export const buildProjectWorkMarkdownExport = (
+const buildProjectWorkMarkdownExport = (
   snapshot: ProjectWorkSnapshot,
   options: Omit<ProjectWorkExportOptions, "environmentId"> & {
     readonly projectTitle?: string;

@@ -15,7 +15,7 @@ import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as Archive from "./ThreadHistoryArchiveService.ts";
-export const infrastructure = Layer.mergeAll(
+const infrastructure = Layer.mergeAll(
   Sqlite.layerMemory,
   NodeServices.layer,
   ServerConfig.layerTest(process.cwd(), { prefix: "t3-history-test-" }).pipe(
@@ -26,7 +26,7 @@ const git = Layer.merge(GitVcsDriver.layer, VcsDriverRegistry.layer).pipe(
   Layer.provideMerge(VcsProcess.layer),
   Layer.provideMerge(infrastructure),
 );
-export const store = CheckpointStore.layer.pipe(Layer.provideMerge(git));
+const store = CheckpointStore.layer.pipe(Layer.provideMerge(git));
 export const testLayer = Archive.layer.pipe(
   Layer.provideMerge(ProjectionStore.layer),
   Layer.provideMerge(store),

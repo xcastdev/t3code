@@ -166,7 +166,7 @@ const eventTouches = (
   return normalized === component || normalized.startsWith(`${component}/`);
 };
 
-export const makeWith = Effect.fn("SkillWatchService.make")(function* (
+const makeWith = Effect.fn("SkillWatchService.make")(function* (
   options: SkillWatchServiceOptions = {},
 ) {
   const repository = yield* ManagedSkillRepository;
@@ -563,5 +563,5 @@ export const makeWith = Effect.fn("SkillWatchService.make")(function* (
   });
 });
 
-export const make = makeWith();
+const make = makeWith();
 export const layer = Layer.effect(SkillWatchService, make);

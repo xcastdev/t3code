@@ -12,7 +12,7 @@ const Model = Schema.Struct({
   id: Schema.String,
   provider: Schema.String,
   name: Schema.optional(Schema.String),
-  contextWindow: Schema.optional(Schema.Number),
+  contextWindow: Schema.optional(Schema.NullOr(Schema.Number)),
   reasoning: Schema.optional(Schema.Boolean),
   thinking: Schema.optional(Schema.Struct({ efforts: Schema.Array(Schema.String) })),
 });

@@ -422,7 +422,7 @@ export function deriveProjectWorkTaskPolicy(
   };
 }
 
-export function requiredCriteriaFor(
+function requiredCriteriaFor(
   state: ProjectWorkState,
   task: ProjectWorkTask,
 ): ReadonlyArray<ProjectWorkCriterion> {
@@ -511,21 +511,6 @@ export function assertKnownCriterion(
   return criterionFor(state, criterionId);
 }
 
-export function assertKnownEvidence(
-  state: ProjectWorkState,
-  evidenceId: string,
-): ProjectWorkEvidence {
-  const evidence = state.evidence.find((entry) => entry.evidenceId === evidenceId);
-  if (evidence === undefined) {
-    throw new ProjectWorkPolicyError(
-      "unknown-evidence",
-      `Evidence '${evidenceId}' does not exist.`,
-      { evidenceId },
-    );
-  }
-  return evidence;
-}
-
 export function assertKnownBlocker(state: ProjectWorkState, blockerId: string): ProjectWorkBlocker {
   const blocker = state.blockers.find((entry) => entry.blockerId === blockerId);
   if (blocker === undefined) {
@@ -566,61 +551,8 @@ export function assertTaskCanBeReady(
   return task;
 }
 
-export function assertTaskCanBeCompleted(
-  state: ProjectWorkState,
-  taskId: ProjectWorkTaskId,
-  satisfiedCriterionIds: ReadonlyArray<string>,
-): ProjectWorkTask {
-  const task = taskFor(state, taskId);
-  if (task.state !== "in-progress" && task.state !== "in-review") {
-    throw new ProjectWorkPolicyError("invalid-state", `Task '${taskId}' is not running.`, {
-      taskId,
-    });
-  }
-  const supplied = new Set(satisfiedCriterionIds);
-  const required = requiredCriteriaFor(state, task);
-  for (const criterionId of supplied) {
-    const criterion = state.criteria.find((entry) => String(entry.criterionId) === criterionId);
-    if (criterion === undefined || criterion.taskId !== task.taskId) {
-      throw new ProjectWorkPolicyError(
-        "unknown-criterion",
-        `Criterion '${criterionId}' does not belong to task '${task.taskId}'.`,
-        { taskId: task.taskId, criterionId },
-      );
-    }
-    if (!required.some((entry) => entry.criterionId === criterion.criterionId)) {
-      throw new ProjectWorkPolicyError(
-        "unsatisfied-criterion",
-        `Criterion '${criterionId}' is not a required criterion for task '${task.taskId}'.`,
-        { taskId: task.taskId, criterionId },
-      );
-    }
-  }
-  const unsatisfied = required.filter(
-    (criterion) => criterion.status === "unsatisfied" && !supplied.has(criterion.criterionId),
-  );
-  if (unsatisfied.length > 0) {
-    throw new ProjectWorkPolicyError(
-      "unsatisfied-criterion",
-      `Task '${taskId}' cannot complete while required criteria remain unsatisfied: ${unsatisfied
-        .map((criterion) => criterion.criterionId)
-        .join(", ")}.`,
-      { taskId, criterionIds: unsatisfied.map((criterion) => criterion.criterionId) },
-    );
-  }
-  return task;
-}
-
-export function actorIsWatcher(task: ProjectWorkTask, actor: ProjectWorkActor): boolean {
-  return (task.watchers ?? []).some((watcher) => actorKey(watcher) === actorKey(actor));
-}
-
 export function projectWorkActorKey(actor: ProjectWorkActor): string {
   return actorKey(actor);
-}
-
-export function activeProjectWorkAttemptStates(): ReadonlySet<string> {
-  return activeAttemptStates;
 }
 
 /** Server-generated attribution timestamps must not make a retry look like a

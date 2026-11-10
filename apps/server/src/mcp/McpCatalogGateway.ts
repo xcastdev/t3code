@@ -31,13 +31,7 @@ import {
   denamespaceResourceUri,
   namespaceContentUris,
 } from "./ProjectMcpBroker.ts";
-export {
-  namespaceName,
-  namespaceResourceUri,
-  namespaceResourceTemplate,
-  denamespaceResourceUri,
-  namespaceContentUris,
-} from "./ProjectMcpBroker.ts";
+export { namespaceName } from "./ProjectMcpBroker.ts";
 
 export interface RegisterCatalogSessionInput {
   readonly catalogSessionId: McpCatalogSessionId;

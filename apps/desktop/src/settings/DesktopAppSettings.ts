@@ -136,7 +136,7 @@ const invalidPrimaryBackend = (reason: string): DesktopPrimaryBackendPreference 
   reason,
 });
 
-export function normalizePrimaryBackendPreference(
+function normalizePrimaryBackendPreference(
   value: unknown,
   now: number,
 ): DesktopPrimaryBackendPreference {

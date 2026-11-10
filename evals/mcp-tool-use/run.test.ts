@@ -11,6 +11,7 @@ import { projectComposerContextForProvider } from "@t3tools/shared/composerConte
 import {
   buildBase,
   buildMessages,
+  completedResponsesEvent,
   failedEarly,
   executeCodex,
   gradeSample,
@@ -32,6 +33,15 @@ import {
 } from "./run.ts";
 import { briefRoute, gradeDevice, shellInvocations } from "./device-grading.ts";
 import { taskPrompt } from "../../apps/server/src/mcp/delegatedTaskModes.ts";
+
+it("reads a completed Responses event followed by the OpenRouter stream sentinel", () => {
+  const completed = { type: "response.completed", response: { output: [] } };
+  expect(
+    completedResponsesEvent(
+      `: keepalive\r\ndata: ${JSON.stringify(completed)}\r\n\r\ndata: [DONE]\r\n\r\n`,
+    ),
+  ).toEqual(completed);
+});
 
 it("grades Codex shell and subagent calls with the shared rules", () => {
   const calls = [
@@ -3332,7 +3342,7 @@ it("OMP planned cases reject disabled routing and retain foreground eval with ac
   const call = (tool: string, input: unknown, step: number) => ({ tool, input, step });
   const correct = [
     [
-      call("terminal_spawn", { command: "pnpm run build:all" }, 0),
+      call("terminal_spawn", { command: "pnpm", args: ["run", "build:all"] }, 0),
       call(
         "terminal_subscribe_completion",
         { projectId: "project-app", terminalId: "terminal-1", mode: "noticeAndWake" },
@@ -3358,6 +3368,17 @@ it("OMP planned cases reject disabled routing and retain foreground eval with ac
     expect(
       failed(testCase.expect, { calls: correct[i]!, text: "10", stopReason: "end_turn" }),
     ).toEqual([]);
+    if (i === 0)
+      expect(
+        failed(testCase.expect, {
+          calls: [
+            call("terminal_spawn", { command: "pnpm run build:all" }, 0),
+            ...correct[i]!.slice(1),
+          ],
+          text: "done",
+          stopReason: "end_turn",
+        }).length,
+      ).toBeGreaterThan(0);
     const wrong =
       i === 3
         ? [call("delegate_task", { task: "Calculate 10" }, 0)]
@@ -3371,7 +3392,7 @@ it("OMP planned cases reject disabled routing and retain foreground eval with ac
   }
 });
 
-it("OMP simulated context preserves the actual provider-local append, including an empty baseline", () => {
+it("OMP simulated context preserves the actual provider-local append", () => {
   const append = buildOmpInstructions({ model: "gpt-6.1-sol", browser: true, device: false });
   const context = ompRoutingContext("gpt-6.1-sol", false);
   expect(context).toContain(`<t3_omp_instructions>${append}</t3_omp_instructions>`);

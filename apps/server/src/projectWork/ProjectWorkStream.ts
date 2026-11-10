@@ -18,9 +18,9 @@ import type { ProjectionRepositoryError } from "../persistence/Errors.ts";
 import type { ProjectWorkEvent } from "./ProjectWorkDecider.ts";
 import * as ProjectWorkEventBus from "./ProjectWorkEventBus.ts";
 
-export const PROJECT_WORK_STREAM_DEFAULT_LIMIT = 128;
-export const PROJECT_WORK_STREAM_MAX_LIMIT = 256;
-export const PROJECT_WORK_STREAM_MAX_REPLAY_BYTES = 2 * 1024 * 1024;
+const PROJECT_WORK_STREAM_DEFAULT_LIMIT = 128;
+const PROJECT_WORK_STREAM_MAX_LIMIT = 256;
+const PROJECT_WORK_STREAM_MAX_REPLAY_BYTES = 2 * 1024 * 1024;
 
 export class ProjectWorkStreamError extends Schema.TaggedError<ProjectWorkStreamError>()(
   "ProjectWorkStreamError",
@@ -109,10 +109,7 @@ const deltaKind = (type: ProjectWorkEvent["type"]): ProjectWorkDeltaType["kind"]
 };
 
 /** Convert an authoritative event to a bounded, non-authoritative delta. */
-export const projectWorkDeltaForEvent = (
-  event: ProjectWorkEvent,
-  cursor: number,
-): ProjectWorkDeltaType =>
+const projectWorkDeltaForEvent = (event: ProjectWorkEvent, cursor: number): ProjectWorkDeltaType =>
   decodeDelta({
     projectId: event.projectId,
     cursor,
@@ -129,7 +126,7 @@ export const projectWorkDeltaForEvent = (
     deleted: event.type === "project-work.relationship.unlinked",
   });
 
-export const boundProjectWorkReplay = (input: {
+const boundProjectWorkReplay = (input: {
   readonly afterCursor: number;
   readonly headCursor: number;
   readonly rows: ReadonlyArray<{ readonly cursor: number; readonly delta: ProjectWorkDeltaType }>;

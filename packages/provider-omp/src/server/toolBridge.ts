@@ -176,6 +176,7 @@ export interface OmpMcpEndpoint {
 export class AuthorizedMcpClient {
   private next = 0;
   private session: string | undefined;
+  private protocolVersion = "2025-06-18";
   private readonly config: OmpMcpEndpoint;
   private readonly fetcher: typeof fetch;
   constructor(config: OmpMcpEndpoint, fetcher: typeof fetch = fetch) {
@@ -198,7 +199,7 @@ export class AuthorizedMcpClient {
         authorization: this.config.authorizationHeader,
         "content-type": "application/json",
         accept: "application/json, text/event-stream",
-        "mcp-protocol-version": "2025-03-26",
+        "mcp-protocol-version": this.protocolVersion,
         ...(this.session ? { "mcp-session-id": this.session } : {}),
       },
       body: JSON.stringify({
@@ -279,15 +280,22 @@ export class AuthorizedMcpClient {
   }
 
   async connect(signal: AbortSignal) {
-    await this.post(
+    const result = await this.post(
       "initialize",
       {
-        protocolVersion: "2025-03-26",
+        protocolVersion: this.protocolVersion,
         capabilities: {},
         clientInfo: { name: "t3-omp", version: "1" },
       },
       signal,
     );
+    if (
+      !object(result) ||
+      typeof result.protocolVersion !== "string" ||
+      !["2025-06-18", "2025-03-26", "2024-11-05"].includes(result.protocolVersion)
+    )
+      throw new Error("Unsupported negotiated MCP protocol version");
+    this.protocolVersion = result.protocolVersion;
     await this.post("notifications/initialized", {}, signal, true);
   }
   async listTools(signal: AbortSignal) {

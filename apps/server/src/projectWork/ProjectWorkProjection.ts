@@ -66,15 +66,7 @@ export const emptyProjectWorkProjectionState = (projectId: string): ProjectWorkP
   comments: [],
 });
 
-/** Pure reducer entry point for tests; SQL writes are owned by the repository. */
-export function applyProjectWorkProjectionEvent(
-  state: ProjectWorkProjectionState,
-  event: ProjectWorkProjectionEvent,
-): ProjectWorkProjectionState {
-  return applyProjectWorkEvents(state, [event]) as ProjectWorkProjectionState;
-}
-
-export const applyProjectWorkProjectionEvents = (
+const applyProjectWorkProjectionEvents = (
   state: ProjectWorkProjectionState,
   events: ReadonlyArray<ProjectWorkProjectionEvent>,
 ): ProjectWorkProjectionState =>
@@ -159,279 +151,273 @@ const attemptFrom = (row: Record<string, unknown>): ProjectWorkAttempt =>
       : { attribution: readJson(row.attributionJson, undefined) }),
   }) as unknown as ProjectWorkAttempt;
 
-export const readProjectWorkState = Effect.fn("ProjectWorkProjection.readProjectWorkState")(
-  function* (sql: SqlClient.SqlClient, projectId: string) {
-    const state = emptyProjectWorkProjectionState(projectId);
-    const teamRows = yield* sql<{
-      payload: string;
-    }>`SELECT payload_json AS payload FROM t3_workflow_v2_team_records WHERE project_id = ${projectId} ORDER BY record_id`;
-    (state.foundationRecords ??= []).push(...teamRows.map((row) => decodeTeamRecord(row.payload)));
+const readProjectWorkState = Effect.fn("ProjectWorkProjection.readProjectWorkState")(function* (
+  sql: SqlClient.SqlClient,
+  projectId: string,
+) {
+  const state = emptyProjectWorkProjectionState(projectId);
+  const teamRows = yield* sql<{
+    payload: string;
+  }>`SELECT payload_json AS payload FROM t3_workflow_v2_team_records WHERE project_id = ${projectId} ORDER BY record_id`;
+  (state.foundationRecords ??= []).push(...teamRows.map((row) => decodeTeamRecord(row.payload)));
 
-    const tasks = yield* sql<
-      Record<string, unknown>
-    >`SELECT task_id AS taskId, project_id AS projectId, title, summary, state, specification_json AS specificationJson, assignee_json AS assigneeJson, watchers_json AS watchersJson, approval_json AS approvalJson, revision, spec_revision AS specRevision, active_attempt_id AS activeAttemptId, failure_kind AS failureKind, blocker_id AS blockerId, created_at AS createdAt, updated_at AS updatedAt, completed_at AS completedAt, canceled_at AS canceledAt, attribution_json AS attributionJson FROM t3_workflow_v2_work_tasks WHERE project_id = ${projectId}`;
-    state.tasks.push(...tasks.map(taskFrom));
-    const attempts = yield* sql<
-      Record<string, unknown>
-    >`SELECT attempt_id AS attemptId, task_id AS taskId, state, lease_token AS leaseToken, leased_until AS leasedUntil, started_at AS startedAt, ended_at AS endedAt, failure_kind AS failureKind, failure_reason AS failureReason, failure_evidence_ids_json AS failureEvidenceIdsJson, failure_resolved_at AS failureResolvedAt, failure_resolution_reason AS failureResolutionReason, failure_resolution_evidence_ids_json AS failureResolutionEvidenceIdsJson, failure_resolution_attribution_json AS failureResolutionAttributionJson, checkpoint_ids_json AS checkpointIdsJson, revision, attribution_json AS attributionJson FROM t3_workflow_v2_work_attempts WHERE project_id = ${projectId}`;
-    state.attempts.push(...attempts.map(attemptFrom));
-    const criteria = yield* sql<
-      Record<string, unknown>
-    >`SELECT criterion_id AS criterionId, task_id AS taskId, description, required, status, satisfied_by_evidence_ids_json AS satisfiedJson, waiver_json AS waiverJson, revision, updated_at AS updatedAt FROM t3_workflow_v2_work_criteria WHERE project_id = ${projectId}`;
-    state.criteria.push(
-      ...criteria.map(
-        (row) =>
-          ({
-            criterionId: ProjectWorkCriterionId.make(String(row.criterionId)),
-            taskId: ProjectWorkTaskId.make(String(row.taskId)),
-            description: String(row.description),
-            required: Number(row.required) === 1,
-            status: String(row.status) as ProjectWorkCriterion["status"],
-            satisfiedByEvidenceIds: readJson(row.satisfiedJson, []),
-            ...(row.waiverJson == null ? {} : { waiver: readJson(row.waiverJson, undefined) }),
-            revision: Number(row.revision),
-            updatedAt: String(row.updatedAt),
-          }) as unknown as ProjectWorkCriterion,
-      ),
-    );
-    const evidence = yield* sql<
-      Record<string, unknown>
-    >`SELECT *, evidence_id AS evidenceId, task_id AS taskId, criterion_id AS criterionId, kind, summary, detail, uri, recorded_at AS recordedAt, revision, attribution_json AS attributionJson FROM t3_workflow_v2_work_evidence WHERE project_id = ${projectId}`;
-    state.evidence.push(
-      ...evidence.map(
-        (row) =>
-          ({
-            evidenceId: ProjectWorkEvidenceId.make(String(row.evidenceId)),
-            ...readProjectWorkEvidenceMetadata(row),
-            ...(row.taskId == null ? {} : { taskId: ProjectWorkTaskId.make(String(row.taskId)) }),
-            ...(row.criterionId == null
-              ? {}
-              : { criterionId: ProjectWorkCriterionId.make(String(row.criterionId)) }),
-            kind: String(row.kind) as ProjectWorkEvidence["kind"],
-            summary: String(row.summary),
-            ...(row.detail == null ? {} : { detail: String(row.detail) }),
-            ...(row.uri == null ? {} : { uri: String(row.uri) }),
-            recordedAt: String(row.recordedAt),
-            revision: Number(row.revision),
-            ...(row.attributionJson == null
-              ? {}
-              : { attribution: readJson(row.attributionJson, undefined) }),
-          }) as unknown as ProjectWorkEvidence,
-      ),
-    );
-    const relationships = yield* sql<
-      Record<string, unknown>
-    >`SELECT relationship_id AS relationshipId, from_task_id AS fromTaskId, to_task_id AS toTaskId, kind, revision, created_at AS createdAt, attribution_json AS attributionJson FROM t3_workflow_v2_work_relationships WHERE project_id = ${projectId}`;
-    state.relationships.push(
-      ...relationships.map(
-        (row) =>
-          ({
-            relationshipId: ProjectWorkRelationshipId.make(String(row.relationshipId)),
-            projectId: projectId as ProjectWorkRelationship["projectId"],
-            fromTaskId: ProjectWorkTaskId.make(String(row.fromTaskId)),
-            toTaskId: ProjectWorkTaskId.make(String(row.toTaskId)),
-            kind: String(row.kind) as ProjectWorkRelationship["kind"],
-            revision: Number(row.revision),
-            createdAt: String(row.createdAt),
-            ...(row.attributionJson == null
-              ? {}
-              : { attribution: readJson(row.attributionJson, undefined) }),
-          }) as unknown as ProjectWorkRelationship,
-      ),
-    );
-    const blockers = yield* sql<
-      Record<string, unknown>
-    >`SELECT blocker_id AS blockerId, task_id AS taskId, reason, resolver, reference_ids_json AS referenceIdsJson, attention, resolved_at AS resolvedAt, revision, attribution_json AS attributionJson FROM t3_workflow_v2_work_blockers WHERE project_id = ${projectId}`;
-    state.blockers.push(
-      ...blockers.map(
-        (row) =>
-          ({
-            blockerId: ProjectWorkBlockerId.make(String(row.blockerId)),
-            taskId: ProjectWorkTaskId.make(String(row.taskId)),
-            reason: String(row.reason),
-            resolver: String(row.resolver),
-            referenceIds: readJson(row.referenceIdsJson, []),
-            attention: Number(row.attention) === 1,
-            ...(row.resolvedAt == null ? {} : { resolvedAt: String(row.resolvedAt) }),
-            revision: Number(row.revision),
-            ...(row.attributionJson == null
-              ? {}
-              : { attribution: readJson(row.attributionJson, undefined) }),
-          }) as unknown as ProjectWorkBlocker,
-      ),
-    );
-    const attention = yield* sql<
-      Record<string, unknown>
-    >`SELECT task_id AS taskId, reason, detail, seen_at AS seenAt, resolved_at AS resolvedAt, revision FROM t3_workflow_v2_work_attention WHERE project_id = ${projectId}`;
-    state.attention.push(
-      ...attention.map((row) => ({
-        taskId: ProjectWorkTaskId.make(String(row.taskId)),
-        reason: String(row.reason) as ProjectWorkState["attention"][number]["reason"],
-        ...(row.detail == null ? {} : { detail: String(row.detail) }),
-        ...(row.seenAt == null ? {} : { seenAt: String(row.seenAt) }),
-        ...(row.resolvedAt == null ? {} : { resolvedAt: String(row.resolvedAt) }),
-        revision: Number(row.revision),
-      })),
-    );
-    const checkpoints = yield* sql<
-      Record<string, unknown>
-    >`SELECT checkpoint_id AS checkpointId, task_id AS taskId, attempt_id AS attemptId, ref, captured_at AS capturedAt, revision, attribution_json AS attributionJson FROM t3_workflow_v2_work_checkpoints WHERE project_id = ${projectId}`;
-    state.checkpoints.push(
-      ...checkpoints.map(
-        (row) =>
-          ({
-            checkpointId: String(row.checkpointId),
-            projectId,
-            taskId: ProjectWorkTaskId.make(String(row.taskId)),
-            attemptId: ProjectWorkAttemptId.make(String(row.attemptId)),
-            ...(row.ref == null ? {} : { ref: String(row.ref) }),
-            capturedAt: String(row.capturedAt),
-            revision: Number(row.revision),
-            ...(row.attributionJson == null
-              ? {}
-              : { attribution: readJson(row.attributionJson, undefined) }),
-          }) as unknown as ProjectWorkCheckpoint,
-      ),
-    );
-    const activities = yield* sql<
-      Record<string, unknown>
-    >`SELECT activity_id AS activityId, task_id AS taskId, attempt_id AS attemptId, kind, summary, detail, occurred_at AS occurredAt, revision, attribution_json AS attributionJson FROM t3_workflow_v2_work_activity WHERE project_id = ${projectId}`;
-    state.activities.push(
-      ...activities.map(
-        (row) =>
-          ({
-            activityId: String(row.activityId),
-            projectId,
-            ...(row.taskId == null ? {} : { taskId: ProjectWorkTaskId.make(String(row.taskId)) }),
-            ...(row.attemptId == null
-              ? {}
-              : { attemptId: ProjectWorkAttemptId.make(String(row.attemptId)) }),
-            kind: String(row.kind),
-            summary: String(row.summary),
-            ...(row.detail == null ? {} : { detail: String(row.detail) }),
-            occurredAt: String(row.occurredAt),
-            revision: Number(row.revision),
-            ...(row.attributionJson == null
-              ? {}
-              : { attribution: readJson(row.attributionJson, undefined) }),
-          }) as unknown as ProjectWorkActivity,
-      ),
-    );
-    const knowledge = yield* sql<
-      Record<string, unknown>
-    >`SELECT knowledge_id AS knowledgeId, title, body, source_kind AS sourceKind, source_id AS sourceId, revision, supersedes_knowledge_id AS supersedesKnowledgeId, created_at AS createdAt, updated_at AS updatedAt, attribution_json AS attributionJson FROM t3_workflow_v2_work_knowledge WHERE project_id = ${projectId}`;
-    state.knowledge.push(
-      ...knowledge.map(
-        (row) =>
-          ({
-            knowledgeId: ProjectWorkKnowledgeId.make(String(row.knowledgeId)),
-            projectId: projectId as ProjectWorkKnowledge["projectId"],
-            title: String(row.title),
-            body: String(row.body),
-            sourceKind: String(row.sourceKind) as ProjectWorkKnowledge["sourceKind"],
-            sourceId: String(row.sourceId),
-            revision: Number(row.revision),
-            ...(row.supersedesKnowledgeId == null
-              ? {}
-              : {
-                  supersedesKnowledgeId: ProjectWorkKnowledgeId.make(
-                    String(row.supersedesKnowledgeId),
-                  ),
-                }),
-            createdAt: String(row.createdAt),
-            updatedAt: String(row.updatedAt),
-            ...(row.attributionJson == null
-              ? {}
-              : { attribution: readJson(row.attributionJson, undefined) }),
-          }) as unknown as ProjectWorkKnowledge,
-      ),
-    );
-    const decisions = yield* sql<
-      Record<string, unknown>
-    >`SELECT decision_id AS decisionId, title, body, state, supersedes_decision_id AS supersedesDecisionId, rejection_reason AS rejectionReason, rejected_at AS rejectedAt, state_transition_attribution_json AS stateTransitionAttributionJson, revision, created_at AS createdAt, updated_at AS updatedAt, attribution_json AS attributionJson FROM t3_workflow_v2_work_decisions WHERE project_id = ${projectId}`;
-    state.decisions.push(
-      ...decisions.map(
-        (row) =>
-          ({
-            decisionId: ProjectWorkDecisionId.make(String(row.decisionId)),
-            projectId: projectId as ProjectWorkDecision["projectId"],
-            title: String(row.title),
-            body: String(row.body),
-            state: String(row.state) as ProjectWorkDecision["state"],
-            ...(row.supersedesDecisionId == null
-              ? {}
-              : {
-                  supersedesDecisionId: ProjectWorkDecisionId.make(
-                    String(row.supersedesDecisionId),
-                  ),
-                }),
-            ...(row.rejectionReason == null
-              ? {}
-              : { rejectionReason: String(row.rejectionReason) }),
-            ...(row.rejectedAt == null ? {} : { rejectedAt: String(row.rejectedAt) }),
-            ...(row.stateTransitionAttributionJson == null
-              ? {}
-              : {
-                  stateTransitionAttribution: readJson(
-                    row.stateTransitionAttributionJson,
-                    undefined,
-                  ),
-                }),
-            revision: Number(row.revision),
-            createdAt: String(row.createdAt),
-            updatedAt: String(row.updatedAt),
-            ...(row.attributionJson == null
-              ? {}
-              : { attribution: readJson(row.attributionJson, undefined) }),
-          }) as unknown as ProjectWorkDecision,
-      ),
-    );
-    const comments = yield* sql<
-      Record<string, unknown>
-    >`SELECT comment_id AS commentId, task_id AS taskId, body, created_at AS createdAt, revision, attribution_json AS attributionJson FROM t3_workflow_v2_work_comments WHERE project_id = ${projectId}`;
-    state.comments.push(
-      ...comments.map(
-        (row) =>
-          ({
-            commentId: ProjectWorkCommentId.make(String(row.commentId)),
-            projectId: projectId as ProjectWorkComment["projectId"],
-            ...(row.taskId == null ? {} : { taskId: ProjectWorkTaskId.make(String(row.taskId)) }),
-            body: String(row.body),
-            createdAt: String(row.createdAt),
-            revision: Number(row.revision),
-            ...(row.attributionJson == null
-              ? {}
-              : { attribution: readJson(row.attributionJson, undefined) }),
-          }) as unknown as ProjectWorkComment,
-      ),
-    );
-    const eventRows = yield* sql<
-      Record<string, unknown>
-    >`SELECT payload_json AS payloadJson FROM t3_workflow_v2_work_events WHERE project_id = ${projectId} ORDER BY sequence ASC`;
-    state.history = eventRows.map((row) => {
-      const event = JSON.parse(String(row.payloadJson)) as {
-        readonly eventId: string;
-        readonly type: string;
-        readonly revision: number;
-        readonly occurredAt: string;
-      };
-      return {
-        eventId: EventId.make(event.eventId),
-        type: event.type as never,
-        revision: event.revision,
-        occurredAt: event.occurredAt,
-      };
-    });
-    state.revision = Math.max(
-      0,
-      ...state.history.map((entry) => entry.revision),
-      ...state.activities.map((entry) => entry.revision),
-      ...state.tasks.map((entry) => entry.revision),
-      ...state.attempts.map((entry) => entry.revision),
-    );
-    return state;
-  },
-);
+  const tasks = yield* sql<
+    Record<string, unknown>
+  >`SELECT task_id AS taskId, project_id AS projectId, title, summary, state, specification_json AS specificationJson, assignee_json AS assigneeJson, watchers_json AS watchersJson, approval_json AS approvalJson, revision, spec_revision AS specRevision, active_attempt_id AS activeAttemptId, failure_kind AS failureKind, blocker_id AS blockerId, created_at AS createdAt, updated_at AS updatedAt, completed_at AS completedAt, canceled_at AS canceledAt, attribution_json AS attributionJson FROM t3_workflow_v2_work_tasks WHERE project_id = ${projectId}`;
+  state.tasks.push(...tasks.map(taskFrom));
+  const attempts = yield* sql<
+    Record<string, unknown>
+  >`SELECT attempt_id AS attemptId, task_id AS taskId, state, lease_token AS leaseToken, leased_until AS leasedUntil, started_at AS startedAt, ended_at AS endedAt, failure_kind AS failureKind, failure_reason AS failureReason, failure_evidence_ids_json AS failureEvidenceIdsJson, failure_resolved_at AS failureResolvedAt, failure_resolution_reason AS failureResolutionReason, failure_resolution_evidence_ids_json AS failureResolutionEvidenceIdsJson, failure_resolution_attribution_json AS failureResolutionAttributionJson, checkpoint_ids_json AS checkpointIdsJson, revision, attribution_json AS attributionJson FROM t3_workflow_v2_work_attempts WHERE project_id = ${projectId}`;
+  state.attempts.push(...attempts.map(attemptFrom));
+  const criteria = yield* sql<
+    Record<string, unknown>
+  >`SELECT criterion_id AS criterionId, task_id AS taskId, description, required, status, satisfied_by_evidence_ids_json AS satisfiedJson, waiver_json AS waiverJson, revision, updated_at AS updatedAt FROM t3_workflow_v2_work_criteria WHERE project_id = ${projectId}`;
+  state.criteria.push(
+    ...criteria.map(
+      (row) =>
+        ({
+          criterionId: ProjectWorkCriterionId.make(String(row.criterionId)),
+          taskId: ProjectWorkTaskId.make(String(row.taskId)),
+          description: String(row.description),
+          required: Number(row.required) === 1,
+          status: String(row.status) as ProjectWorkCriterion["status"],
+          satisfiedByEvidenceIds: readJson(row.satisfiedJson, []),
+          ...(row.waiverJson == null ? {} : { waiver: readJson(row.waiverJson, undefined) }),
+          revision: Number(row.revision),
+          updatedAt: String(row.updatedAt),
+        }) as unknown as ProjectWorkCriterion,
+    ),
+  );
+  const evidence = yield* sql<
+    Record<string, unknown>
+  >`SELECT *, evidence_id AS evidenceId, task_id AS taskId, criterion_id AS criterionId, kind, summary, detail, uri, recorded_at AS recordedAt, revision, attribution_json AS attributionJson FROM t3_workflow_v2_work_evidence WHERE project_id = ${projectId}`;
+  state.evidence.push(
+    ...evidence.map(
+      (row) =>
+        ({
+          evidenceId: ProjectWorkEvidenceId.make(String(row.evidenceId)),
+          ...readProjectWorkEvidenceMetadata(row),
+          ...(row.taskId == null ? {} : { taskId: ProjectWorkTaskId.make(String(row.taskId)) }),
+          ...(row.criterionId == null
+            ? {}
+            : { criterionId: ProjectWorkCriterionId.make(String(row.criterionId)) }),
+          kind: String(row.kind) as ProjectWorkEvidence["kind"],
+          summary: String(row.summary),
+          ...(row.detail == null ? {} : { detail: String(row.detail) }),
+          ...(row.uri == null ? {} : { uri: String(row.uri) }),
+          recordedAt: String(row.recordedAt),
+          revision: Number(row.revision),
+          ...(row.attributionJson == null
+            ? {}
+            : { attribution: readJson(row.attributionJson, undefined) }),
+        }) as unknown as ProjectWorkEvidence,
+    ),
+  );
+  const relationships = yield* sql<
+    Record<string, unknown>
+  >`SELECT relationship_id AS relationshipId, from_task_id AS fromTaskId, to_task_id AS toTaskId, kind, revision, created_at AS createdAt, attribution_json AS attributionJson FROM t3_workflow_v2_work_relationships WHERE project_id = ${projectId}`;
+  state.relationships.push(
+    ...relationships.map(
+      (row) =>
+        ({
+          relationshipId: ProjectWorkRelationshipId.make(String(row.relationshipId)),
+          projectId: projectId as ProjectWorkRelationship["projectId"],
+          fromTaskId: ProjectWorkTaskId.make(String(row.fromTaskId)),
+          toTaskId: ProjectWorkTaskId.make(String(row.toTaskId)),
+          kind: String(row.kind) as ProjectWorkRelationship["kind"],
+          revision: Number(row.revision),
+          createdAt: String(row.createdAt),
+          ...(row.attributionJson == null
+            ? {}
+            : { attribution: readJson(row.attributionJson, undefined) }),
+        }) as unknown as ProjectWorkRelationship,
+    ),
+  );
+  const blockers = yield* sql<
+    Record<string, unknown>
+  >`SELECT blocker_id AS blockerId, task_id AS taskId, reason, resolver, reference_ids_json AS referenceIdsJson, attention, resolved_at AS resolvedAt, revision, attribution_json AS attributionJson FROM t3_workflow_v2_work_blockers WHERE project_id = ${projectId}`;
+  state.blockers.push(
+    ...blockers.map(
+      (row) =>
+        ({
+          blockerId: ProjectWorkBlockerId.make(String(row.blockerId)),
+          taskId: ProjectWorkTaskId.make(String(row.taskId)),
+          reason: String(row.reason),
+          resolver: String(row.resolver),
+          referenceIds: readJson(row.referenceIdsJson, []),
+          attention: Number(row.attention) === 1,
+          ...(row.resolvedAt == null ? {} : { resolvedAt: String(row.resolvedAt) }),
+          revision: Number(row.revision),
+          ...(row.attributionJson == null
+            ? {}
+            : { attribution: readJson(row.attributionJson, undefined) }),
+        }) as unknown as ProjectWorkBlocker,
+    ),
+  );
+  const attention = yield* sql<
+    Record<string, unknown>
+  >`SELECT task_id AS taskId, reason, detail, seen_at AS seenAt, resolved_at AS resolvedAt, revision FROM t3_workflow_v2_work_attention WHERE project_id = ${projectId}`;
+  state.attention.push(
+    ...attention.map((row) => ({
+      taskId: ProjectWorkTaskId.make(String(row.taskId)),
+      reason: String(row.reason) as ProjectWorkState["attention"][number]["reason"],
+      ...(row.detail == null ? {} : { detail: String(row.detail) }),
+      ...(row.seenAt == null ? {} : { seenAt: String(row.seenAt) }),
+      ...(row.resolvedAt == null ? {} : { resolvedAt: String(row.resolvedAt) }),
+      revision: Number(row.revision),
+    })),
+  );
+  const checkpoints = yield* sql<
+    Record<string, unknown>
+  >`SELECT checkpoint_id AS checkpointId, task_id AS taskId, attempt_id AS attemptId, ref, captured_at AS capturedAt, revision, attribution_json AS attributionJson FROM t3_workflow_v2_work_checkpoints WHERE project_id = ${projectId}`;
+  state.checkpoints.push(
+    ...checkpoints.map(
+      (row) =>
+        ({
+          checkpointId: String(row.checkpointId),
+          projectId,
+          taskId: ProjectWorkTaskId.make(String(row.taskId)),
+          attemptId: ProjectWorkAttemptId.make(String(row.attemptId)),
+          ...(row.ref == null ? {} : { ref: String(row.ref) }),
+          capturedAt: String(row.capturedAt),
+          revision: Number(row.revision),
+          ...(row.attributionJson == null
+            ? {}
+            : { attribution: readJson(row.attributionJson, undefined) }),
+        }) as unknown as ProjectWorkCheckpoint,
+    ),
+  );
+  const activities = yield* sql<
+    Record<string, unknown>
+  >`SELECT activity_id AS activityId, task_id AS taskId, attempt_id AS attemptId, kind, summary, detail, occurred_at AS occurredAt, revision, attribution_json AS attributionJson FROM t3_workflow_v2_work_activity WHERE project_id = ${projectId}`;
+  state.activities.push(
+    ...activities.map(
+      (row) =>
+        ({
+          activityId: String(row.activityId),
+          projectId,
+          ...(row.taskId == null ? {} : { taskId: ProjectWorkTaskId.make(String(row.taskId)) }),
+          ...(row.attemptId == null
+            ? {}
+            : { attemptId: ProjectWorkAttemptId.make(String(row.attemptId)) }),
+          kind: String(row.kind),
+          summary: String(row.summary),
+          ...(row.detail == null ? {} : { detail: String(row.detail) }),
+          occurredAt: String(row.occurredAt),
+          revision: Number(row.revision),
+          ...(row.attributionJson == null
+            ? {}
+            : { attribution: readJson(row.attributionJson, undefined) }),
+        }) as unknown as ProjectWorkActivity,
+    ),
+  );
+  const knowledge = yield* sql<
+    Record<string, unknown>
+  >`SELECT knowledge_id AS knowledgeId, title, body, source_kind AS sourceKind, source_id AS sourceId, revision, supersedes_knowledge_id AS supersedesKnowledgeId, created_at AS createdAt, updated_at AS updatedAt, attribution_json AS attributionJson FROM t3_workflow_v2_work_knowledge WHERE project_id = ${projectId}`;
+  state.knowledge.push(
+    ...knowledge.map(
+      (row) =>
+        ({
+          knowledgeId: ProjectWorkKnowledgeId.make(String(row.knowledgeId)),
+          projectId: projectId as ProjectWorkKnowledge["projectId"],
+          title: String(row.title),
+          body: String(row.body),
+          sourceKind: String(row.sourceKind) as ProjectWorkKnowledge["sourceKind"],
+          sourceId: String(row.sourceId),
+          revision: Number(row.revision),
+          ...(row.supersedesKnowledgeId == null
+            ? {}
+            : {
+                supersedesKnowledgeId: ProjectWorkKnowledgeId.make(
+                  String(row.supersedesKnowledgeId),
+                ),
+              }),
+          createdAt: String(row.createdAt),
+          updatedAt: String(row.updatedAt),
+          ...(row.attributionJson == null
+            ? {}
+            : { attribution: readJson(row.attributionJson, undefined) }),
+        }) as unknown as ProjectWorkKnowledge,
+    ),
+  );
+  const decisions = yield* sql<
+    Record<string, unknown>
+  >`SELECT decision_id AS decisionId, title, body, state, supersedes_decision_id AS supersedesDecisionId, rejection_reason AS rejectionReason, rejected_at AS rejectedAt, state_transition_attribution_json AS stateTransitionAttributionJson, revision, created_at AS createdAt, updated_at AS updatedAt, attribution_json AS attributionJson FROM t3_workflow_v2_work_decisions WHERE project_id = ${projectId}`;
+  state.decisions.push(
+    ...decisions.map(
+      (row) =>
+        ({
+          decisionId: ProjectWorkDecisionId.make(String(row.decisionId)),
+          projectId: projectId as ProjectWorkDecision["projectId"],
+          title: String(row.title),
+          body: String(row.body),
+          state: String(row.state) as ProjectWorkDecision["state"],
+          ...(row.supersedesDecisionId == null
+            ? {}
+            : {
+                supersedesDecisionId: ProjectWorkDecisionId.make(String(row.supersedesDecisionId)),
+              }),
+          ...(row.rejectionReason == null ? {} : { rejectionReason: String(row.rejectionReason) }),
+          ...(row.rejectedAt == null ? {} : { rejectedAt: String(row.rejectedAt) }),
+          ...(row.stateTransitionAttributionJson == null
+            ? {}
+            : {
+                stateTransitionAttribution: readJson(row.stateTransitionAttributionJson, undefined),
+              }),
+          revision: Number(row.revision),
+          createdAt: String(row.createdAt),
+          updatedAt: String(row.updatedAt),
+          ...(row.attributionJson == null
+            ? {}
+            : { attribution: readJson(row.attributionJson, undefined) }),
+        }) as unknown as ProjectWorkDecision,
+    ),
+  );
+  const comments = yield* sql<
+    Record<string, unknown>
+  >`SELECT comment_id AS commentId, task_id AS taskId, body, created_at AS createdAt, revision, attribution_json AS attributionJson FROM t3_workflow_v2_work_comments WHERE project_id = ${projectId}`;
+  state.comments.push(
+    ...comments.map(
+      (row) =>
+        ({
+          commentId: ProjectWorkCommentId.make(String(row.commentId)),
+          projectId: projectId as ProjectWorkComment["projectId"],
+          ...(row.taskId == null ? {} : { taskId: ProjectWorkTaskId.make(String(row.taskId)) }),
+          body: String(row.body),
+          createdAt: String(row.createdAt),
+          revision: Number(row.revision),
+          ...(row.attributionJson == null
+            ? {}
+            : { attribution: readJson(row.attributionJson, undefined) }),
+        }) as unknown as ProjectWorkComment,
+    ),
+  );
+  const eventRows = yield* sql<
+    Record<string, unknown>
+  >`SELECT payload_json AS payloadJson FROM t3_workflow_v2_work_events WHERE project_id = ${projectId} ORDER BY sequence ASC`;
+  state.history = eventRows.map((row) => {
+    const event = JSON.parse(String(row.payloadJson)) as {
+      readonly eventId: string;
+      readonly type: string;
+      readonly revision: number;
+      readonly occurredAt: string;
+    };
+    return {
+      eventId: EventId.make(event.eventId),
+      type: event.type as never,
+      revision: event.revision,
+      occurredAt: event.occurredAt,
+    };
+  });
+  state.revision = Math.max(
+    0,
+    ...state.history.map((entry) => entry.revision),
+    ...state.activities.map((entry) => entry.revision),
+    ...state.tasks.map((entry) => entry.revision),
+    ...state.attempts.map((entry) => entry.revision),
+  );
+  return state;
+});
 
 export interface ProjectWorkProjectionPersistOptions {
   /** The authoritative event-log sequence represented by this snapshot. */
@@ -440,34 +426,6 @@ export interface ProjectWorkProjectionPersistOptions {
   /** Previous reducer state enables event-scoped normalized/FTS persistence. */
   readonly previousState?: ProjectWorkProjectionState;
 }
-
-/** Fast path for the most common append-only mutation. The reducer checkpoint
- * still contains the complete authoritative state, while normalized rows and
- * FTS receive only the two records introduced by task creation. A full rebuild
- * remains able to derive the identical projection from the event log. */
-export const persistProjectWorkTaskCreated = Effect.fn(
-  "ProjectWorkProjection.persistProjectWorkTaskCreated",
-)(function* (
-  sql: SqlClient.SqlClient,
-  state: ProjectWorkProjectionState,
-  event: Extract<ProjectWorkEvent, { readonly type: "project-work.task.created" }>,
-  lastAppliedSequence: number,
-) {
-  const task = event.task;
-  const activity = state.activities.find((entry) => entry.activityId === String(event.eventId));
-  if (activity === undefined) throw new Error(`Missing activity for event '${event.eventId}'.`);
-  yield* sql`INSERT INTO t3_workflow_v2_work_tasks (task_id, project_id, title, summary, state, specification_json, assignee_json, watchers_json, approval_json, revision, spec_revision, active_attempt_id, failure_kind, blocker_id, created_at, updated_at, completed_at, canceled_at, attribution_json) VALUES (${task.taskId}, ${event.projectId}, ${task.title}, ${task.summary ?? null}, ${task.state}, ${task.specification === undefined ? null : json(task.specification)}, ${task.assignee === undefined ? null : json(task.assignee)}, ${json(task.watchers ?? [])}, ${task.approval === undefined ? null : json(task.approval)}, ${task.revision}, ${task.specRevision}, ${task.activeAttemptId ?? null}, ${task.failureKind ?? null}, ${task.blockerId ?? null}, ${task.createdAt}, ${task.updatedAt}, ${task.completedAt ?? null}, ${task.canceledAt ?? null}, ${task.attribution === undefined ? null : json(task.attribution)})`;
-  yield* sql`INSERT INTO t3_workflow_v2_work_activity (activity_id, project_id, task_id, attempt_id, kind, summary, detail, occurred_at, revision, attribution_json) VALUES (${activity.activityId}, ${event.projectId}, ${activity.taskId ?? null}, ${activity.attemptId ?? null}, ${activity.kind}, ${activity.summary}, ${activity.detail ?? null}, ${activity.occurredAt}, ${activity.revision}, ${activity.attribution === undefined ? null : json(activity.attribution)})`;
-  yield* sql`INSERT INTO t3_workflow_v2_work_search_fts (project_id, record_kind, record_id, title, body, provenance_json, revision) VALUES (${event.projectId}, ${"task"}, ${task.taskId}, ${task.title}, ${(task.summary ?? "") + (task.specification === undefined ? "" : ` ${json(task.specification)}`)}, ${task.attribution === undefined ? json({ taskId: task.taskId, state: task.state }) : json({ ...task.attribution, taskId: task.taskId, state: task.state })}, ${task.revision})`;
-  yield* sql`INSERT INTO t3_workflow_v2_work_search_fts (project_id, record_kind, record_id, title, body, provenance_json, revision) VALUES (${event.projectId}, ${"activity"}, ${activity.activityId}, ${activity.kind}, ${activity.summary + (activity.detail === undefined ? "" : ` ${activity.detail}`)}, ${activity.attribution === undefined ? json({ taskId: activity.taskId ?? null, attemptId: activity.attemptId ?? null }) : json({ ...activity.attribution, taskId: activity.taskId ?? null, attemptId: activity.attemptId ?? null })}, ${activity.revision})`;
-  yield* sql`INSERT INTO t3_workflow_v2_work_projection_state (projector, last_applied_sequence, rebuild_generation, updated_at) VALUES (${"project-work:" + event.projectId}, ${lastAppliedSequence}, 0, ${event.occurredAt}) ON CONFLICT(projector) DO UPDATE SET last_applied_sequence = excluded.last_applied_sequence, updated_at = excluded.updated_at`;
-  // @effect-diagnostics-next-line preferSchemaOverJson:off -- typed reducer state checkpoint.
-  const stateJson = JSON.stringify({
-    ...state,
-    checkpointVersion: PROJECT_WORK_CHECKPOINT_VERSION,
-  });
-  yield* sql`INSERT INTO t3_workflow_v2_work_reducer_checkpoints (project_id, last_sequence, state_json, updated_at) VALUES (${event.projectId}, ${lastAppliedSequence}, ${stateJson}, ${event.occurredAt}) ON CONFLICT(project_id) DO UPDATE SET last_sequence = excluded.last_sequence, state_json = excluded.state_json, updated_at = excluded.updated_at`;
-});
 
 export const persistProjectWorkState = Effect.fn("ProjectWorkProjection.persistProjectWorkState")(
   function* (

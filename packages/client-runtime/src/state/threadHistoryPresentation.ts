@@ -198,7 +198,7 @@ export function savedEffortLabel(selection: ModelSelection | null | undefined): 
  * Joins row fragments in position order. A row cut by the page boundary stays
  * out until its remaining fragments arrive, so a prefix never decodes as garbage.
  */
-export function assembleArchiveRows(
+function assembleArchiveRows(
   fragments: ReadonlyArray<Fragment>,
   complete: boolean,
 ): {

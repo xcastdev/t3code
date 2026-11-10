@@ -1,7 +1,13 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import { describe, expect, it } from "vite-plus/test";
 import { createPolicyEpoch, normalizeOmpMode } from "./policy.ts";
-import { enterNativeCall, captureAuthorization, assertBeforeInvoke } from "./runtimePolicyHooks.ts";
+import {
+  enterNativeCall,
+  captureAuthorization,
+  assertBeforeInvoke,
+  nativeContext,
+  ownedNativeContext,
+} from "./runtimePolicyHooks.ts";
 
 function setup() {
   const settings = {};
@@ -82,6 +88,62 @@ describe("native permission lifetime", () => {
         scope: s.scope,
       }),
     ).toThrow(/changed/);
+  });
+  it("binds agent-loop live channels by identity without cloning them", () => {
+    const s = setup();
+    s.epoch.open();
+    const owner = { cwd: s.scope.cwd, sessionId: s.scope.session };
+    const subject = { name: "eval" };
+    const toolCall = {
+      batchId: "b",
+      index: 0,
+      total: 1,
+      toolCalls: [{ id: "a", name: "eval" }],
+      providerMetadata: { nested: { value: "approved" } },
+      steeringSignal: new AbortController().signal,
+      addAdditionalContext: (_context: string) => {},
+    };
+    const context = { settings: s.settings, toolCall };
+    const allow = { mode: "yolo", decision: { policy: "allow", tier: "exec" } };
+    const authorize = () =>
+      captureAuthorization(
+        enterNativeCall(s.settings, { nativeCallId: "a", kind: "tool", scope: s.scope }),
+        {
+          subject,
+          effectiveInput: {},
+          executionContext: nativeContext(s.settings, owner, context),
+          disposition: "once",
+          decision: allow,
+          resolveDecision: () => allow,
+        },
+      );
+    const invoke = (auth: ReturnType<typeof authorize>) => () =>
+      assertBeforeInvoke(auth, {
+        settings: s.settings,
+        subject,
+        effectiveInput: {},
+        executionContext: nativeContext(s.settings, owner, context),
+        scope: s.scope,
+      });
+    expect(invoke(authorize())).not.toThrow();
+    const owned = ownedNativeContext(context);
+    expect(owned.toolCall).not.toBe(toolCall);
+    expect(owned.toolCall.providerMetadata).not.toBe(toolCall.providerMetadata);
+    expect(owned.toolCall.steeringSignal).toBe(toolCall.steeringSignal);
+    expect(owned.toolCall.addAdditionalContext).toBe(toolCall.addAdditionalContext);
+    const swappedSignal = authorize();
+    toolCall.steeringSignal = new AbortController().signal;
+    expect(invoke(swappedSignal)).toThrow(/changed/);
+    const swappedSink = authorize();
+    toolCall.addAdditionalContext = () => {};
+    expect(invoke(swappedSink)).toThrow(/changed/);
+    const sink = toolCall.addAdditionalContext;
+    for (const forged of ["live:1", "live:2", "live:3", "live:4"]) {
+      toolCall.addAdditionalContext = sink;
+      const auth = authorize();
+      Object.assign(toolCall, { addAdditionalContext: forged });
+      expect(invoke(auth), forged).toThrow(/changed/);
+    }
   });
   it("normalizes persisted Auto to a displayed supervised mode", () => {
     expect(normalizeOmpMode("auto")).toEqual({ mode: "approval-required", native: "always-ask" });

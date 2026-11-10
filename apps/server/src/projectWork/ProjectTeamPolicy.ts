@@ -64,14 +64,6 @@ export const assertProjectTeamOrdinarySuccessor = (state: ProjectWorkState, task
   }
 };
 
-/** Managed history remains a fence after assignment removal or run retirement. */
-export const isGuidedProjectTeamTask = (state: ProjectWorkState, taskId: string) =>
-  (state.foundationRecords ?? []).some(
-    (record) =>
-      (record.kind === "task-membership" && record.taskId === taskId) ||
-      (record.kind === "run-binding" && record.taskId === taskId),
-  );
-
 export const projectTeamSpecificationHash = (state: ProjectWorkState, taskId: string) => {
   const task = state.tasks.find((entry) => entry.taskId === taskId);
   return scopeDigest({
@@ -86,24 +78,6 @@ export const projectTeamSpecificationHash = (state: ProjectWorkState, taskId: st
       }))
       .sort((a, b) => (a.criterionId < b.criterionId ? -1 : a.criterionId > b.criterionId ? 1 : 0)),
   });
-};
-
-export const projectTeamAssignmentRole = (
-  kind: Membership["deliverableKind"],
-  plan?: Pick<Plan, "integrationSources">,
-) => {
-  switch (kind) {
-    case "research":
-      return "investigator";
-    case "plan":
-      return "planner";
-    case "review":
-      return "reviewer";
-    case "code":
-      return plan?.integrationSources === undefined ? "implementer" : "integrator";
-    default:
-      return undefined;
-  }
 };
 
 export const projectTeamPlanHash = (
@@ -131,7 +105,7 @@ export const projectTeamScopeHash = (state: ProjectWorkState, taskId: string, pl
   });
 
 /** The inherited grant fixes both the deliverable and its maximum capabilities. */
-export const projectTeamAssignmentProfile = (
+const projectTeamAssignmentProfile = (
   kind: NonNullable<Gate["assignmentAuthorization"]>["assignmentKind"],
 ) => ({
   deliverableKind: kind === "implementation" ? "code" : kind === "planning" ? "plan" : "review",

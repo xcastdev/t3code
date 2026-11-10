@@ -594,9 +594,6 @@ export const ProjectWorkRepositoryLive = Layer.effect(
   makeProjectWorkRepository,
 );
 
-/** Alias for callers that refer to the command gateway rather than repository. */
-export const ProjectWorkCommandRepositoryLive = ProjectWorkRepositoryLive;
-
 const encodeAdmissionJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 /** Private admission writes share the V2 transaction; hints are published by its owner after commit. */

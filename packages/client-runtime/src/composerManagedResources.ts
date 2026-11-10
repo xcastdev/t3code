@@ -109,15 +109,10 @@ export function managedCommandArgumentRange(
     : { argument: rest.trim(), rangeEnd: end };
 }
 
-/**
- * What a pending managed insertion was started against. Content arrives after
- * an await, so it lands only if nothing here moved: the composer that owns the
- * draft, its resource destination, the provider whose catalog authorizes a
- * skill, the text, the caret and both ends of the selection, and the request
- * epoch (bumped by Escape, dismissal, caret or provider moves, a newer
- * selection and unmount). Selecting text without moving the caret changes only
- * the selection end, so the caret alone is not enough.
- */
+/** What a pending managed insertion started against. Content arrives after an
+ * await and lands only if none of these moved; Escape, dismissal, caret or
+ * provider moves, a newer selection and unmount bump the epoch. The selection
+ * end is compared too because selecting text can leave the caret in place. */
 export interface ComposerInsertionSnapshot {
   readonly epoch: number;
   readonly ownerKey: string;
@@ -144,13 +139,9 @@ export function isComposerInsertionCurrent(
   );
 }
 
-/**
- * The pending-insertion guard both composers share. `begin` invalidates any
- * older pending insertion and captures `read()` now; its `isCurrent` calls
- * `read()` again after the await, so it compares live editor state rather
- * than values from the render that started it. `read` returns null when no
- * insertion is possible.
- */
+/** `begin` invalidates any older pending insertion and captures `read()`;
+ * `isCurrent` calls `read()` again after the await, comparing live editor
+ * state rather than the starting render's values. */
 export function createComposerInsertionGuard() {
   let epoch = 0;
   type Read = () => Omit<ComposerInsertionSnapshot, "epoch"> | null;
@@ -186,7 +177,7 @@ const attribute = (value: string | number) =>
  * up by key, so the verified body travels with the message, labeled with the
  * exact package it came from.
  */
-export function managedSkillInstructionBlock(detail: SkillContentDetail): string {
+function managedSkillInstructionBlock(detail: SkillContentDetail): string {
   const { metadata, content } = detail;
   const assets = content.assetPaths ?? [];
   return [

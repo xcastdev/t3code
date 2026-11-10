@@ -1121,7 +1121,7 @@ export const layerOrchestratorToolkit = toolkitRegistration(
   OrchestratorHandlers.layer,
 ).pipe(Layer.provide(OrchestratorMcpService.layer), Layer.provide(ThreadMetadataMcpService.layer));
 
-export const layerTerminalToolkit = toolkitRegistration(TerminalToolkit, TerminalHandlers.layer);
+const layerTerminalToolkit = toolkitRegistration(TerminalToolkit, TerminalHandlers.layer);
 
 export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer);
 

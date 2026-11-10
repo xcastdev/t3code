@@ -1,6 +1,7 @@
 // Answers stay in the secret store behind one-use refs; orchestration records only request status.
 // Consuming tools keep values out of transcripts, projections, clients and model context.
 // A `file` request instead moves its value to an owner-only file for the agent's own shell.
+// A provider-native masked prompt gets its answer handed live to that prompt and never stored.
 import { pipe } from "effect/Function";
 import {
   CommandId,
@@ -33,6 +34,8 @@ import * as Path from "effect/Path";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+
+import * as ProviderSecretInputs from "@t3tools/provider-core/server/ProviderSecretInputs";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as Metrics from "../observability/Metrics.ts";
@@ -113,6 +116,7 @@ const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+  const liveInputs = yield* ProviderSecretInputs.ProviderSecretInputs;
   // Beside the store's own files so the same owner-only directory and cleanup rules apply.
   const filesDir = store.directory === undefined ? undefined : path.join(store.directory, "files");
 
@@ -143,12 +147,41 @@ const make = Effect.gen(function* () {
       if (run === undefined || ThreadManagementService.isTerminalRunStatus(run.status)) {
         return yield* new SecretRequestError({ reason: "agent_stopped" });
       }
+      const live = yield* liveInputs.lookup(input.threadId, item.id);
+      if ((item.nativeItemRef ?? null) !== null || Option.isSome(live)) {
+        yield* Effect.annotateCurrentSpan({ "secret_request.delivery": "live" });
+        // The provider owns this card and records its outcome; a value that cannot reach
+        // the exact live prompt is dropped, never kept for later.
+        const receiver = Option.getOrUndefined(live);
+        if (
+          receiver === undefined ||
+          receiver.owner.runId !== item.runId ||
+          receiver.owner.nodeId !== item.nodeId ||
+          receiver.owner.providerThreadId !== item.providerThreadId ||
+          !(yield* mayRelease(
+            { threadId: input.threadId, turnItemId: item.id, execution: receiver.owner },
+            "pending",
+          ))
+        ) {
+          return yield* new SecretRequestError({ reason: "agent_stopped" });
+        }
+        if (!(yield* liveInputs.claim(receiver))) {
+          return yield* new SecretRequestError({ reason: "already_answered" });
+        }
+        const delivered = yield* receiver.deliver(
+          input.answer.type === "save"
+            ? { type: "save", secret: Redacted.make(input.answer.secret) }
+            : { type: "decline" },
+        );
+        if (!delivered) return yield* new SecretRequestError({ reason: "agent_stopped" });
+        return;
+      }
       // Create before recording so racing answers cannot overwrite values or show saved before storage.
       // Existing values on pending cards finish earlier saves whose recording failed.
       if (input.answer.type === "save") {
         const encoded = yield* encodeStored({
           projectId: records.thread.projectId,
-          value: input.answer.secret,
+          value: input.answer.secret.trim(),
           savedAt: yield* Clock.currentTimeMillis,
         }).pipe(Effect.orDie);
         yield* store
@@ -205,11 +238,14 @@ const make = Effect.gen(function* () {
     },
   );
 
-  const mayRelease = Effect.fn("SecretRequests.mayRelease")(function* (input: {
-    readonly threadId: ThreadId;
-    readonly turnItemId: string;
-    readonly execution?: SecretRequestExecution;
-  }) {
+  const mayRelease = Effect.fn("SecretRequests.mayRelease")(function* (
+    input: {
+      readonly threadId: ThreadId;
+      readonly turnItemId: string;
+      readonly execution?: SecretRequestExecution;
+    },
+    expectedStatus: "saved" | "pending" = "saved",
+  ) {
     const execution = input.execution;
     if (execution !== undefined) {
       const records = yield* threadManagement
@@ -230,7 +266,7 @@ const make = Effect.gen(function* () {
       );
       if (
         item?.type !== "secret_request" ||
-        item.secretStatus !== "saved" ||
+        item.secretStatus !== expectedStatus ||
         item.runId !== execution.runId ||
         item.nodeId !== execution.nodeId ||
         run === undefined ||
