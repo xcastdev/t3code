@@ -1,4 +1,9 @@
 import {
+  OmpEvalDetailState,
+  makeOmpEvalEnvelope,
+  decodeOmpEvalDetail,
+} from "@t3tools/shared/ompEval";
+import {
   CheckpointId,
   CheckpointRef,
   CheckpointScopeId,
@@ -347,6 +352,25 @@ describe("orchestration V2 wire projection", () => {
     expect(JSON.stringify(projected)).not.toContain("PRIVATE_BODY");
     expect(event.payload.output).toBe(output);
     expect(projectDomainEventForWire(projected)).toEqual(projected);
+    const arrayResult = projectTurnItemForWire({
+      ...base,
+      output: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            threadId: "child-thread",
+            taskId: "child-task",
+            isError: true,
+            text: "PRIVATE_BODY",
+          }),
+        },
+      ],
+    });
+    expect(arrayResult).toMatchObject({
+      output: { threadId: "child-thread", taskId: "child-task", isError: true },
+      outputOmitted: true,
+    });
+    expect(JSON.stringify(arrayResult)).not.toContain("PRIVATE_BODY");
   });
 });
 
@@ -458,5 +482,170 @@ describe("live body deduper", () => {
   it("ships a reply whole when its message arrives after it", () => {
     const first = reply(1, "a");
     expect([first, message(2, "a")].map(makeLiveBodyDeduper())[0]).toBe(first);
+  });
+});
+
+it("preserves OMP final revision and ordered image/artifact metadata in oversized detail", () => {
+  const envelope = {
+    origin: "omp.eval",
+    version: 1,
+    revision: 7,
+    language: "python",
+    status: "completed",
+    title: "Native cell title",
+    phase: "Loading native data",
+  };
+  const item = {
+    ...base,
+    toolName: "eval",
+    nativeItemRef: {
+      driver: ProviderDriverKind.make("omp"),
+      nativeId: "eval-1",
+      strength: "strong" as const,
+    },
+    input: { language: "python", title: "Plot", code: "print(1)\n".repeat(40000) },
+    output: {
+      t3OmpEval: envelope,
+      content: [
+        { type: "text", text: "x".repeat(300000) },
+        { type: "image", mimeType: "image/png", data: "YQ==" },
+      ],
+      details: {
+        stdout: "y".repeat(300000),
+        replies: ["Result published through out://"],
+        cells: [
+          {
+            code: "1",
+            output: "1",
+            status: "complete",
+            views: [
+              { type: "text", text: "tiny structured view" },
+              { type: "text", text: "oversized".repeat(10000) },
+            ],
+          },
+          { views: Array.from({ length: 8 }, () => ({ type: "text", text: "v".repeat(7000) })) },
+        ],
+        artifacts: [{ id: "12", uri: "artifact://12" }],
+      },
+    },
+  };
+  const detail = projectTurnItemForDetail(item);
+  expect(detail).toMatchObject({
+    input: { language: "python", title: "Plot", inputTruncated: true },
+    output: {
+      t3OmpEval: {
+        revision: 7,
+        status: "completed",
+        outputTruncated: true,
+        title: "Native cell title",
+        phase: "Loading native data",
+      },
+      details: {
+        artifacts: [{ id: "12", uri: "artifact://12" }],
+        replies: ["Result published through out://"],
+      },
+    },
+  });
+  if (detail.type !== "dynamic_tool") throw new Error("Unexpected item");
+  expect(toolOutputImages(detail.output)).toHaveLength(1);
+  expect(detail.output).toMatchObject({
+    details: {
+      viewsOmitted: true,
+      cells: [
+        { views: [{ type: "text", text: "tiny structured view" }], viewsOmitted: true },
+        { viewsOmitted: true },
+      ],
+    },
+  });
+  const cells = (detail.output as { details: { cells: { views: unknown[] }[] } }).details.cells;
+  expect(
+    Buffer.byteLength(JSON.stringify(cells.flatMap((cell) => cell.views)), "utf8"),
+  ).toBeLessThanOrEqual(32768);
+  expect(JSON.stringify(detail).length).toBeLessThan(200000);
+  expect(JSON.stringify(detail.output)).not.toContain("YQ==");
+  const hydration = new OmpEvalDetailState();
+  hydration.updateWire({ t3OmpEval: { ...envelope, revision: 6, status: "running" } }, false);
+  const old = hydration.begin();
+  hydration.updateWire(item.output, true);
+  hydration.accept(old, {}, { t3OmpEval: { ...envelope, revision: 6, status: "running" } });
+  expect(hydration.status).toBe("load");
+  const final = hydration.begin();
+  hydration.accept(final, detail.input, detail.output);
+  expect(hydration.status).toBe("settled");
+  expect(hydration.detail).toMatchObject({
+    revision: 7,
+    images: [{ index: 0 }],
+    artifacts: [{ uri: "artifact://12" }],
+  });
+  expect(projectTurnItemForWire(item)).toMatchObject({
+    output: { t3OmpEval: envelope },
+    outputOmitted: true,
+  });
+});
+
+it("keeps foreign or unknown eval-looking output on generic truncation", () => {
+  const output = {
+    t3OmpEval: {
+      origin: "omp.eval",
+      version: 1,
+      revision: 1,
+      status: "completed",
+      language: "python",
+    },
+    content: [{ type: "text", text: "x".repeat(300000) }],
+  };
+  const foreign = {
+    ...base,
+    toolName: "eval",
+    nativeItemRef: {
+      driver: ProviderDriverKind.make("codex"),
+      nativeId: "foreign",
+      strength: "strong" as const,
+    },
+    output,
+  };
+  expect(typeof (projectTurnItemForDetail(foreign) as typeof foreign).output).toBe("string");
+  expect(projectTurnItemForWire(foreign)).not.toMatchObject({
+    output: { t3OmpEval: output.t3OmpEval },
+  });
+});
+
+it("preserves native live image indexes and attachment markers without duplicating payloads", () => {
+  const output = {
+    t3OmpEval: makeOmpEvalEnvelope({
+      revision: 2,
+      attachmentRevision: 1,
+      images: [{ index: 0, mimeType: "image/png" }],
+      status: "running",
+      language: "python",
+    }),
+    content: [{ type: "text", text: "live" }],
+    details: {
+      images: [{ type: "image", mimeType: "image/png", data: "YQ==" }],
+      cells: [{ status: "running" }],
+    },
+  };
+  const item = {
+    ...base,
+    toolName: "eval",
+    nativeItemRef: {
+      driver: ProviderDriverKind.make("omp"),
+      nativeId: "live-image",
+      strength: "strong" as const,
+    },
+    output,
+  };
+  const detail = projectTurnItemForDetail(item);
+  const wire = projectTurnItemForWire(item);
+  if (detail.type !== "dynamic_tool" || wire.type !== "dynamic_tool")
+    throw new Error("Expected eval");
+  expect(toolOutputImages(output)).toEqual([{ mimeType: "image/png", data: "YQ==" }]);
+  expect(toolOutputImages(detail.output)).toEqual([{ mimeType: "image/png" }]);
+  expect(decodeOmpEvalDetail(wire.output, {}, true)?.images).toEqual([
+    { index: 0, mimeType: "image/png" },
+  ]);
+  expect(JSON.stringify([detail, wire])).not.toContain("YQ==");
+  expect(wire.output).toMatchObject({
+    t3OmpEval: { attachmentRevision: 1, images: [{ index: 0, mimeType: "image/png" }] },
   });
 });

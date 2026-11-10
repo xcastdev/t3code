@@ -1,3 +1,4 @@
+import { readOmpEvalEnvelope } from "@t3tools/shared/ompEval";
 import type { AssetResource, OrchestrationV2TurnItem } from "@t3tools/contracts";
 import { toolOutputImageBlocks, toolOutputImages } from "@t3tools/shared/toolOutput";
 import * as DateTime from "effect/DateTime";
@@ -123,11 +124,15 @@ const LIVE_TURN_ITEM_STATUSES: ReadonlySet<OrchestrationV2TurnItem["status"]> = 
 ]);
 
 /**
- * A running item keeps one key, so an open row fetches once while it streams and
- * again when it finishes, not on every update.
+ * Live text shares a key; OMP attachments invalidate it independently before final hydration.
  */
 export function turnItemDetailRevision(item: OrchestrationV2TurnItem): string {
-  return LIVE_TURN_ITEM_STATUSES.has(item.status) ? "live" : DateTime.formatIso(item.updatedAt);
+  if (!LIVE_TURN_ITEM_STATUSES.has(item.status)) return DateTime.formatIso(item.updatedAt);
+  const attachments =
+    item.type === "dynamic_tool" && item.toolName === "eval" && item.nativeItemRef?.driver === "omp"
+      ? readOmpEvalEnvelope(item.output)?.attachmentRevision
+      : undefined;
+  return attachments ? "live:attachments:" + attachments : "live";
 }
 
 export function turnItemNeedsDetailFetch(item: OrchestrationV2TurnItem): boolean {

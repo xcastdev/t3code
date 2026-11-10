@@ -1,3 +1,4 @@
+import { readOmpEvalEnvelope, normalizeOmpEvalImages, type OmpEvalEnvelope } from "./ompEval.ts";
 import {
   isProviderSendTurnSupportedImageMimeType,
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
@@ -33,6 +34,7 @@ interface ResultEnvelope {
 }
 
 interface CompactToolOutput {
+  t3OmpEval?: OmpEvalEnvelope;
   isError?: true;
   threadId?: string;
   messageId?: string;
@@ -111,13 +113,17 @@ function boundedId(value: unknown): string | undefined {
 }
 
 export function compactDynamicToolOutput(value: unknown): CompactToolOutput | undefined {
+  const omp = readOmpEvalEnvelope(value);
   const budget: ResultReadBudget = {
     remainingBytes: MAX_PARSED_BYTES,
     remainingNodes: MAX_ENVELOPE_NODES,
     exceeded: false,
   };
   const result = readResult(value, budget);
-  const output: CompactToolOutput = result.failed ? { isError: true } : {};
+  const output: CompactToolOutput = {
+    ...(result.failed ? { isError: true as const } : {}),
+    ...(omp ? { t3OmpEval: omp } : {}),
+  };
   const data = budget.exceeded ? undefined : result.data;
   if (data !== undefined) {
     for (const key of ["threadId", "messageId", "taskId", "scheduledTaskId"] as const) {
@@ -179,6 +185,8 @@ export function compactDynamicToolOutput(value: unknown): CompactToolOutput | un
     output[MCP_APP_OUTPUT_KEY] = rest;
   }
   if (oversized()) delete output[MCP_APP_OUTPUT_KEY];
+  if (oversized()) delete output.threads;
+  if (oversized()) delete output.htmlRender;
   return Object.keys(output).length === 0 ? undefined : output;
 }
 
@@ -246,7 +254,9 @@ export const MAX_TOOL_OUTPUT_IMAGE_BASE64_LENGTH =
 
 export function toolOutputImageBlocks(value: unknown): ReadonlyArray<unknown> {
   const blocks: unknown[] = [];
-  for (const block of outputBlocks(value)) {
+  for (const block of outputBlocks(
+    readOmpEvalEnvelope(value) ? normalizeOmpEvalImages(value) : value,
+  )) {
     if (readToolOutputImage(block) === null) continue;
     blocks.push(block);
     if (blocks.length === MAX_TOOL_OUTPUT_IMAGES) break;
@@ -260,6 +270,7 @@ export function toolOutputImages(value: unknown): ReadonlyArray<ToolOutputImage>
 }
 
 export function omitToolOutputImageData(value: unknown): unknown {
+  if (readOmpEvalEnvelope(value)) value = normalizeOmpEvalImages(value);
   const omit = (block: unknown) => {
     const image = readToolOutputImage(block);
     return image?.data === undefined ? block : { type: "image", mimeType: image.mimeType };

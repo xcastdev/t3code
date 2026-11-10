@@ -1,3 +1,5 @@
+import { mergeOmpEvalDetail } from "@t3tools/client-runtime/work-log/omp-eval";
+import { OmpEvalDetail } from "./OmpEvalDetail";
 import { Button } from "../../components/ui/Button";
 import { ThreadSubagentGroup } from "./thread-subagent-group";
 import { ProposedPlanCard } from "./ProposedPlanCard";
@@ -932,6 +934,9 @@ const ThreadWorkLogRow = function ThreadWorkLogRow(
       ? { environmentId: props.environmentId, row: row.projectedItem }
       : null,
   );
+  const [retainedOmpDetail, setRetainedOmpDetail] =
+    useState<import("@t3tools/contracts").OrchestrationV2TurnItem>();
+  if (!expanded && retainedOmpDetail !== undefined) setRetainedOmpDetail(undefined);
   const failureItem = row.projectedItem.item;
   if (failureItem.type === "error" && failureItem.status === "failed") {
     const warning = failureItem.failure.class === "usage_limit";
@@ -1014,11 +1019,17 @@ const ThreadWorkLogRow = function ThreadWorkLogRow(
   const reasoning = row.projectedItem.item.type === "reasoning" ? row.projectedItem.item : null;
   const fetchedItem = fetchedDetail.data?.item ?? null;
   const isRead = toolGroupAction(row.workEntry) === "read";
-  const shownItem = fetchedItem ?? row.projectedItem.item;
+  const ompEval = expanded
+    ? mergeOmpEvalDetail(row.projectedItem.item, fetchedItem, retainedOmpDetail)
+    : undefined;
+  if (ompEval?.detailItem && ompEval.detailItem !== retainedOmpDetail) {
+    setRetainedOmpDetail(ompEval.detailItem);
+  }
+  const shownItem = ompEval?.item ?? fetchedItem ?? row.projectedItem.item;
   const call =
-    expanded && !isRead && shownItem.type === "command_execution"
+    expanded && !ompEval && !isRead && shownItem.type === "command_execution"
       ? toolCallLines({ command: shownItem.input })
-      : expanded && !isRead && shownItem.type === "dynamic_tool"
+      : expanded && !ompEval && !isRead && shownItem.type === "dynamic_tool"
         ? toolCallLines({ args: shownItem.input })
         : expanded && shownItem.type === "file_search"
           ? toolCallLines({ args: { pattern: shownItem.pattern } })
@@ -1030,15 +1041,25 @@ const ThreadWorkLogRow = function ThreadWorkLogRow(
       ? shownItem.exitCode
       : null;
   const fullDetail =
-    expanded && !reasoning && !call
+    expanded && !ompEval && !reasoning && !call
       ? fetchedItem && !isRead
         ? formatItemFullDetail(row.projectedItem, fetchedItem)
         : row.getFullDetail()
       : null;
-  const outputImages = expanded && fetchedItem ? turnItemOutputImages(fetchedItem) : [];
+  const outputImages =
+    expanded && ompEval
+      ? ompEval.view.images.map((image) => ({
+          _tag: "tool-output-image" as const,
+          threadId: shownItem.threadId,
+          itemId: shownItem.id,
+          index: image.index,
+        }))
+      : expanded && fetchedItem
+        ? turnItemOutputImages(fetchedItem)
+        : [];
   const viewedImagePath = workEntryViewedImagePath(row.workEntry);
   const fetchedOutput =
-    !expanded || streamsOutput
+    !expanded || streamsOutput || ompEval
       ? null
       : shownItem.type === "file_search" || shownItem.type === "web_search"
         ? turnItemOutputText(shownItem)
@@ -1200,7 +1221,8 @@ const ThreadWorkLogRow = function ThreadWorkLogRow(
       </WorkLogPressable>
 
       {expanded &&
-      (reasoning ||
+      (ompEval ||
+        reasoning ||
         fullDetail ||
         call ||
         fetchedOutput ||
@@ -1237,73 +1259,95 @@ const ThreadWorkLogRow = function ThreadWorkLogRow(
                   environmentId={props.environmentId}
                   resource={resource}
                   alt={null}
+                  resourceRevision={ompEval?.view.attachmentRevision}
                   onPressPreview={props.onPressPreview}
                 />
               </View>
             ))}
           </FilePreviewGallery>
-          <ScrollView
-            nestedScrollEnabled
-            directionalLockEnabled
-            showsVerticalScrollIndicator
-            className="max-h-60"
-            contentContainerStyle={{ paddingRight: 8 }}
-          >
-            {reasoning ? (
-              props.renderReasoning(reasoning.text)
-            ) : call ? (
-              [
-                call.command,
-                ...(call.args ?? []).map(([key, value]) =>
-                  key === "code" &&
-                  shownItem.type === "dynamic_tool" &&
-                  isJavaScriptReplTool(shownItem.toolName) ? (
-                    <View key={key}>
-                      <Text className="font-mono text-2xs leading-normal text-foreground-muted">
-                        {key}
-                      </Text>
-                      <ReplCodeText code={value} theme={props.themeAppearance} />
-                    </View>
-                  ) : (
-                    `${key} ${value}`
-                  ),
-                ),
-                call.argsText,
-              ]
-                .filter((line) => Boolean(line))
-                .map(
-                  (line, index) =>
-                    /* oxlint-disable react/no-array-index-key -- Log lines are stateless positions within this output. */ typeof line ===
-                    "string" ? (
-                      <Text
-                        key={`${index}:${line}`}
-                        selectable
-                        className="font-mono text-2xs leading-normal text-foreground"
-                      >
-                        {line}
-                      </Text>
+          {ompEval ? (
+            <OmpEvalDetail
+              view={ompEval.view}
+              item={shownItem}
+              environmentId={props.environmentId}
+              onPressPreview={props.onPressPreview}
+              hydration={ompEval.hydration}
+              pending={fetchedDetail.isPending}
+              error={
+                fetchedDetail.error ??
+                (row.fetchesDetail && fetchedDetail.data?.item === null
+                  ? "Output is no longer available."
+                  : null)
+              }
+              themeAppearance={props.themeAppearance}
+            />
+          ) : (
+            <ScrollView
+              nestedScrollEnabled
+              directionalLockEnabled
+              showsVerticalScrollIndicator
+              className="max-h-60"
+              contentContainerStyle={{ paddingRight: 8 }}
+            >
+              {reasoning ? (
+                props.renderReasoning(reasoning.text)
+              ) : call ? (
+                [
+                  call.command,
+                  ...(call.args ?? []).map(([key, value]) =>
+                    key === "code" &&
+                    shownItem.type === "dynamic_tool" &&
+                    isJavaScriptReplTool(shownItem.toolName) ? (
+                      <View key={key}>
+                        <Text className="font-mono text-2xs leading-normal text-foreground-muted">
+                          {key}
+                        </Text>
+                        <ReplCodeText code={value} theme={props.themeAppearance} />
+                      </View>
                     ) : (
-                      line
-                    ) /* oxlint-enable react/no-array-index-key */,
-                )
-            ) : fullDetail ? (
-              <Text selectable className="font-mono text-2xs leading-normal text-foreground-muted">
-                {fullDetail}
-              </Text>
-            ) : null}
-            {fetchedOutput ? (
-              <Text
-                selectable
-                className={cn(
-                  "font-mono text-2xs leading-normal text-foreground-muted",
-                  (!call || call.command || call.args || call.argsText) && "mt-1.5",
-                )}
-              >
-                {fetchedOutput}
-              </Text>
-            ) : null}
-            {streamsOutput ? null : exitLine}
-          </ScrollView>
+                      `${key} ${value}`
+                    ),
+                  ),
+                  call.argsText,
+                ]
+                  .filter((line) => Boolean(line))
+                  .map(
+                    (line, index) =>
+                      /* oxlint-disable react/no-array-index-key -- Log lines are stateless positions within this output. */ typeof line ===
+                      "string" ? (
+                        <Text
+                          key={`${index}:${line}`}
+                          selectable
+                          className="font-mono text-2xs leading-normal text-foreground"
+                        >
+                          {line}
+                        </Text>
+                      ) : (
+                        line
+                      ) /* oxlint-enable react/no-array-index-key */,
+                  )
+              ) : fullDetail ? (
+                <Text
+                  selectable
+                  className="font-mono text-2xs leading-normal text-foreground-muted"
+                >
+                  {fullDetail}
+                </Text>
+              ) : null}
+              {fetchedOutput ? (
+                <Text
+                  selectable
+                  className={cn(
+                    "font-mono text-2xs leading-normal text-foreground-muted",
+                    (!call || call.command || call.args || call.argsText) && "mt-1.5",
+                  )}
+                >
+                  {fetchedOutput}
+                </Text>
+              ) : null}
+              {streamsOutput ? null : exitLine}
+            </ScrollView>
+          )}
           {streamsOutput ? (
             <>
               <ThreadCommandOutput

@@ -610,6 +610,10 @@
     "./provider-clients": {
       "types": "./src/providerClients.ts",
       "default": "./src/providerClients.ts"
+    },
+    "./work-log/omp-eval": {
+      "types": "./src/work-log/ompEval.ts",
+      "default": "./src/work-log/ompEval.ts"
     }
   },
   "scripts": {
@@ -625,6 +629,7 @@
     "@t3tools/provider-fx": "workspace:*",
     "@t3tools/provider-grok": "workspace:*",
     "@t3tools/provider-muse": "workspace:*",
+    "@t3tools/provider-omp": "workspace:*",
     "@t3tools/provider-opencode": "workspace:*",
     "@t3tools/provider-pi": "workspace:*",
     "@t3tools/shared": "workspace:*",

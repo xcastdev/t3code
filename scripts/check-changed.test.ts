@@ -431,3 +431,50 @@ it.each(["install", "lint"])("reports a failing %s step with its output", (step)
     NodeFS.existsSync(NodePath.join(project.root, "node_modules/.cache/check-changed.json")),
   ).toBe(false);
 });
+
+it("requires native OMP policy proof for boundary inputs and fails open on unknown changes", () => {
+  const packages = readWorkspace();
+  for (const file of [
+    "packages/provider-omp/src/server/policy.ts",
+    "packages/provider-omp/src/testing/nativePolicyProof.ts",
+    "packages/provider-core/src/server/runtimeInstructions.ts",
+    "packages/shared/src/cliArgs.ts",
+    "packages/contracts/src/provider.ts",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    ".github/actions/setup-ci-deps/action.yml",
+    ".github/scripts/ci-changes.cjs",
+    "scripts/release-smoke.ts",
+    "unknown-build-input",
+  ])
+    expect(decide([file], packages, false).outputs.omp_native_policy, file).toBe(true);
+  expect(decide(null, packages, false).outputs.omp_native_policy).toBe(true);
+  expect(decide([], packages, true).outputs.omp_native_policy).toBe(true);
+  expect(decide(["docs/user/install.md"], packages, false).outputs.omp_native_policy).toBe(false);
+  expect(decide(["apps/web/src/App.tsx"], packages, false).outputs.omp_native_policy).toBe(false);
+
+  const workflow = NodeFS.readFileSync(
+    NodePath.join(import.meta.dirname, "../.github/workflows/ci.yml"),
+    "utf8",
+  );
+  expect(workflow).toMatch(/check:[\s\S]*needs:[\s\S]*omp_native_policy/);
+  const expression = workflow.match(/jq -e '([\s\S]*?)'/)?.[1];
+  expect(expression).toBeDefined();
+  for (const [result, gate, pass] of [
+    ["success", "true", true],
+    ["skipped", "false", true],
+    ["skipped", "true", false],
+    ["skipped", undefined, false],
+    ["failure", "false", false],
+    ["cancelled", "true", false],
+  ] as const) {
+    const check = NodeChildProcess.spawnSync("jq", ["-e", expression!], {
+      input: JSON.stringify({
+        changes: { result: "success", outputs: { omp_native_policy: gate } },
+        omp_native_policy: { result },
+      }),
+      encoding: "utf8",
+    });
+    expect(check.status === 0, `${result}:${gate} ${check.stderr}`).toBe(pass);
+  }
+});

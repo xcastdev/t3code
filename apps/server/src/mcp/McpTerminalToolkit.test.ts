@@ -18,6 +18,7 @@ const handle = { projectId, terminalId: "owned-terminal" };
 
 const harness = (
   options: {
+    readonly providerInstanceId?: ProviderInstanceId;
     readonly runtimeMode?: "full-access" | "approval-required";
     readonly idle?: boolean;
     readonly client?: boolean;
@@ -36,7 +37,7 @@ const harness = (
         : {
             threadId,
             providerSessionId: "session:terminal-tools",
-            providerInstanceId: ProviderInstanceId.make("codex"),
+            providerInstanceId: options.providerInstanceId ?? ProviderInstanceId.make("codex"),
           },
       client: options.client
         ? { sessionId: "client:test", label: "test", access: "read-only" }
@@ -44,12 +45,18 @@ const harness = (
     }),
     Layer.mock(ThreadManagement.ThreadManagementService)({
       getThreadShell: (id) =>
-        Effect.succeed(
-          liveThreadShell(id, {
+        Effect.succeed({
+          ...liveThreadShell(id, {
             ...(options.runtimeMode === undefined ? {} : { runtimeMode: options.runtimeMode }),
             ...(options.idle ? { activeRunId: null } : {}),
           }),
-        ),
+          ...(options.providerInstanceId
+            ? {
+                providerInstanceId: options.providerInstanceId,
+                modelSelection: { instanceId: options.providerInstanceId, model: "default" },
+              }
+            : {}),
+        }),
     }),
     Layer.mock(ProjectTerminalService.ProjectTerminalService)({
       list: () =>
@@ -71,37 +78,51 @@ const harness = (
   return { dependencies, calls };
 };
 
-it.effect("native PTY writes cannot escape a provider's approval-required sandbox", () =>
-  Effect.gen(function* () {
-    const { dependencies, calls } = harness({ runtimeMode: "approval-required" });
-    const toolkit = yield* TerminalToolkit.pipe(
-      Effect.provide(Access.HandlersLayer.layer(Handlers.layer).pipe(Layer.provide(dependencies))),
-    );
-    const result = yield* toolkit
-      .handle("terminal_write", { ...handle, data: "touch owned-file\r" })
-      .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
-    expect(result.at(-1)?.result).toMatchObject({ code: "capability_denied" });
-    expect(calls).toEqual([]);
-    const listed = yield* toolkit
-      .handle("terminal_list", {})
-      .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
-    expect(listed.at(-1)?.result).toMatchObject({ terminals: [] });
-    expect(calls).toEqual(["list"]);
-  }),
+it.effect.each(["codex", "omp"])(
+  "%s native PTY writes cannot escape an approval-required sandbox",
+  (provider) =>
+    Effect.gen(function* () {
+      const { dependencies, calls } = harness({
+        runtimeMode: "approval-required",
+        providerInstanceId: ProviderInstanceId.make(provider),
+      });
+      const toolkit = yield* TerminalToolkit.pipe(
+        Effect.provide(
+          Access.HandlersLayer.layer(Handlers.layer).pipe(Layer.provide(dependencies)),
+        ),
+      );
+      const result = yield* toolkit
+        .handle("terminal_write", { ...handle, data: "touch owned-file\r" })
+        .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
+      expect(result.at(-1)?.result).toMatchObject({ code: "capability_denied" });
+      expect(calls).toEqual([]);
+      const listed = yield* toolkit
+        .handle("terminal_list", {})
+        .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
+      expect(listed.at(-1)?.result).toMatchObject({ terminals: [] });
+      expect(calls).toEqual(["list"]);
+    }),
 );
 
-it.effect("old provider credentials cannot read or control terminals after their run ends", () =>
-  Effect.gen(function* () {
-    const { dependencies, calls } = harness({ idle: true });
-    const toolkit = yield* TerminalToolkit.pipe(
-      Effect.provide(Access.HandlersLayer.layer(Handlers.layer).pipe(Layer.provide(dependencies))),
-    );
-    const result = yield* toolkit
-      .handle("terminal_list", {})
-      .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
-    expect(result.at(-1)?.result).toMatchObject({ code: "parent_not_active" });
-    expect(calls).toEqual([]);
-  }),
+it.effect.each(["codex", "omp"])(
+  "%s old provider credentials cannot read or control terminals after their run ends",
+  (provider) =>
+    Effect.gen(function* () {
+      const { dependencies, calls } = harness({
+        idle: true,
+        providerInstanceId: ProviderInstanceId.make(provider),
+      });
+      const toolkit = yield* TerminalToolkit.pipe(
+        Effect.provide(
+          Access.HandlersLayer.layer(Handlers.layer).pipe(Layer.provide(dependencies)),
+        ),
+      );
+      const result = yield* toolkit
+        .handle("terminal_list", {})
+        .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(dependencies));
+      expect(result.at(-1)?.result).toMatchObject({ code: "parent_not_active" });
+      expect(calls).toEqual([]);
+    }),
 );
 
 it.effect("external read-only clients cannot claim a terminal caller thread", () =>

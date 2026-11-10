@@ -1,3 +1,4 @@
+import { buildOmpInstructions } from "../../packages/provider-omp/src/server/instructions.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -24,6 +25,8 @@ import {
   shellRequest,
   summarize,
   t3SystemAppend,
+  ompRoutingContext,
+  codexCatalog,
   t3SubagentContext,
   withDevices,
 } from "./run.ts";
@@ -3312,4 +3315,88 @@ it.each([
     }),
     [],
   );
+});
+
+const decodeOmpCase = Schema.decodeUnknownSync(McpToolUseCase);
+it("OMP planned cases reject disabled routing and retain foreground eval with actual local context", () => {
+  const cases = NodeFS.readFileSync(new URL("./cases/omp.ndjson", import.meta.url), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => decodeOmpCase(JSON.parse(line)));
+  expect(cases.map((c) => c.id)).toEqual([
+    "omp-pty-background",
+    "omp-delegate-native-disabled",
+    "omp-eval-model-helpers-disabled",
+    "omp-foreground-eval-control",
+  ]);
+  const call = (tool: string, input: unknown, step: number) => ({ tool, input, step });
+  const correct = [
+    [
+      call("terminal_spawn", { command: "pnpm run build:all" }, 0),
+      call(
+        "terminal_subscribe_completion",
+        { projectId: "project-app", terminalId: "terminal-1", mode: "noticeAndWake" },
+        1,
+      ),
+    ],
+    [
+      call("orchestrator_capabilities", {}, 0),
+      call("delegate_task", { task: "Review src/parser.ts" }, 1),
+    ],
+    [
+      call("orchestrator_capabilities", {}, 0),
+      call(
+        "delegate_task",
+        { target: { model: "claude-sonnet-5-5" }, task: "Assess parser patch" },
+        1,
+      ),
+    ],
+    [call("eval", { language: "python", code: "sum([2,3,5])" }, 0)],
+  ];
+  for (const [i, testCase] of cases.entries()) {
+    expect(testCase.setup.ompSimulation).toBe(true);
+    expect(
+      failed(testCase.expect, { calls: correct[i]!, text: "10", stopReason: "end_turn" }),
+    ).toEqual([]);
+    const wrong =
+      i === 3
+        ? [call("delegate_task", { task: "Calculate 10" }, 0)]
+        : [
+            call("eval", { language: "javascript", code: 'await llm.completion("judge")' }, 0),
+            call("Agent", { task: "review" }, 1),
+          ];
+    expect(
+      failed(testCase.expect, { calls: wrong, text: "done", stopReason: "end_turn" }).length,
+    ).toBeGreaterThan(0);
+  }
+});
+
+it("OMP simulated context preserves the actual provider-local append, including an empty baseline", () => {
+  const append = buildOmpInstructions({ model: "gpt-6.1-sol", browser: true, device: false });
+  const context = ompRoutingContext("gpt-6.1-sol", false);
+  expect(context).toContain(`<t3_omp_instructions>${append}</t3_omp_instructions>`);
+  expect(context).toContain("Simulated OMP routing");
+  expect(context).toContain("not an OMP-native harness capture");
+});
+
+it("OMP simulated eval is available through the code-mode bridge without enabling model helpers", async () => {
+  const base = buildBase(template, { model: "gpt-6.1-sol", keepUserInstructions: false });
+  expect(codexCatalog(base).some((tool) => tool.name === "eval")).toBe(false);
+  const catalog = codexCatalog({ ...base, ompSimulation: true });
+  expect(
+    catalog.some((tool) => tool.name === "eval" && tool.description.includes("Input JSON schema")),
+  ).toBe(true);
+  const called: string[] = [];
+  const output = await executeCodex(
+    'text(await tools.eval({language:"python",code:"sum([2,3,5])"}));',
+    catalog,
+    async (name, input) => {
+      called.push(name);
+      expect(input).toMatchObject({ language: "python", code: "sum([2,3,5])" });
+      return { content: [{ type: "text", text: "10" }] };
+    },
+  );
+  expect(called).toEqual(["eval"]);
+  expect(output).toContain("10");
+  expect(catalog.some((tool) => ["completion", "llm", "judge"].includes(tool.name))).toBe(false);
 });

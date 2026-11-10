@@ -1,3 +1,12 @@
+import {
+  readOmpEvalEnvelope,
+  makeOmpEvalEnvelope,
+  boundedOmpEvalInput,
+  boundOmpText,
+  boundOmpEvalViews,
+  boundOmpEvalReplies,
+  ompArtifactReferences,
+} from "@t3tools/shared/ompEval";
 import type {
   CheckpointId,
   MessageId,
@@ -190,7 +199,14 @@ export function projectTurnItemForWire(item: OrchestrationV2TurnItem): Orchestra
       };
     case "dynamic_tool": {
       const { output: rawOutput, ...projected } = item;
-      const output = compactDynamicToolOutput(rawOutput);
+      const previewSource =
+        verifiedOmpEval(item) ||
+        typeof rawOutput !== "object" ||
+        rawOutput === null ||
+        Array.isArray(rawOutput)
+          ? rawOutput
+          : Object.fromEntries(Object.entries(rawOutput).filter(([key]) => key !== "t3OmpEval"));
+      const output = compactDynamicToolOutput(previewSource);
       return {
         ...projected,
         input: summarizeDynamicValue(item.input),
@@ -225,7 +241,90 @@ function boundDynamicValue(value: unknown): unknown {
 }
 
 /** Preserve ordered image markers in truncated output so clients can load images by index. */
-function boundToolOutput(output: unknown): unknown {
+const verifiedOmpEval = (item: OrchestrationV2TurnItem) =>
+  item.type === "dynamic_tool" && item.toolName === "eval" && item.nativeItemRef?.driver === "omp";
+function boundToolOutput(output: unknown, verified = false): unknown {
+  const omp = verified ? readOmpEvalEnvelope(output) : undefined;
+  if (omp && typeof output === "object" && output !== null) {
+    const withMarkers = omitToolOutputImageData(output);
+    const body = withMarkers as Record<string, unknown>;
+    const originalDetails =
+      typeof body.details === "object" && body.details !== null
+        ? (body.details as Record<string, unknown>)
+        : {};
+    const { images: _images, ...withoutImages } = originalDetails;
+    const originalCells = Array.isArray(withoutImages.cells) ? withoutImages.cells : [];
+    const views = boundOmpEvalViews(originalCells);
+    const projectedCells = originalCells
+      .slice(0, 8)
+      .map((cell, index) =>
+        typeof cell === "object" && cell !== null ? { ...cell, ...views.cells[index] } : cell,
+      );
+    const viewsOmitted = views.viewsOmitted || withoutImages.viewsOmitted === true;
+    const omitted = {
+      ...body,
+      details: {
+        ...withoutImages,
+        ...(originalCells.length ? { cells: projectedCells } : {}),
+        ...(viewsOmitted ? { viewsOmitted: true, outputTruncated: true } : {}),
+      },
+      ...(viewsOmitted
+        ? { t3OmpEval: makeOmpEvalEnvelope({ ...omp, outputTruncated: true }) }
+        : {}),
+    };
+    if (Buffer.byteLength(JSON.stringify(omitted), "utf8") <= MAX_ON_DEMAND_BYTES) return omitted;
+    const root = omitted as Record<string, unknown>;
+    const native =
+      typeof root.details === "object" && root.details !== null
+        ? (root.details as Record<string, unknown>)
+        : {};
+    const content = Array.isArray(root.content) ? root.content : [];
+    const text = content
+      .filter(
+        (v): v is { type: "text"; text: string } =>
+          typeof v === "object" && v !== null && v.type === "text" && typeof v.text === "string",
+      )
+      .map((v) => v.text)
+      .join("\n");
+    const boundedArtifacts = ompArtifactReferences(root);
+    const replies = boundOmpEvalReplies(native.replies);
+    const cells = Array.isArray(native.cells)
+      ? native.cells.slice(0, 8).flatMap((cell: unknown) => {
+          if (typeof cell !== "object" || cell === null) return [];
+          const value = cell as Record<string, unknown>;
+          const bounded: Record<string, unknown> = {};
+          for (const key of ["code", "output"])
+            if (typeof value[key] === "string") bounded[key] = boundOmpText(value[key], 4096);
+          for (const key of ["language", "title", "status"])
+            if (typeof value[key] === "string") bounded[key] = boundOmpText(value[key], 256);
+          return [
+            {
+              ...bounded,
+              views: Array.isArray(value.views) ? value.views : [],
+              viewsOmitted: value.viewsOmitted === true,
+              inputTruncated: true,
+              outputTruncated: true,
+            },
+          ];
+        })
+      : [];
+    return {
+      t3OmpEval: makeOmpEvalEnvelope({ ...omp, outputTruncated: true }),
+      content: [
+        { type: "text", text: boundOmpText(text, 65536) },
+        ...toolOutputImages(omitted).map((image) => ({ type: "image", mimeType: image.mimeType })),
+      ],
+      details: {
+        stdout: boundOmpText(typeof native.stdout === "string" ? native.stdout : "", 32768),
+        cells,
+        replies: replies.replies,
+        repliesOmitted: replies.repliesOmitted || native.repliesOmitted === true,
+        viewsOmitted,
+        artifacts: boundedArtifacts,
+        outputTruncated: true,
+      },
+    };
+  }
   const omitted = omitToolOutputImageData(output);
   const bounded = boundDynamicValue(omitted);
   if (typeof bounded !== "string" || typeof omitted === "string") return bounded;
@@ -249,8 +348,11 @@ export function projectTurnItemForDetail(item: OrchestrationV2TurnItem): Orchest
     case "dynamic_tool":
       return {
         ...item,
-        input: boundDynamicValue(item.input),
-        output: boundToolOutput(item.output),
+        input:
+          verifiedOmpEval(item) && readOmpEvalEnvelope(item.output)
+            ? boundedOmpEvalInput(item.input)
+            : boundDynamicValue(item.input),
+        output: boundToolOutput(item.output, verifiedOmpEval(item)),
       };
     case "subagent":
       return {

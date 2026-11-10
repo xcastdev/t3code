@@ -1,3 +1,5 @@
+import { readOmpEvalEnvelope } from "@t3tools/shared/ompEval";
+import { decodeOmpEvalItem } from "./ompEval.ts";
 import {
   isOrchestrationV2WorkActive,
   isToolLifecycleItemType,
@@ -643,4 +645,22 @@ export function liveThoughtLine(markdown: string): string {
   if (heading !== undefined) return text;
   const end = /[.?!]["'”’)]?(?=\s)/.exec(text);
   return end ? text.slice(0, end.index + end[0].length) : text;
+}
+
+export function ompEvalWorkEntryLabel(entry: Pick<WorkLogPresentationEntry, "structuredPayload">) {
+  const item = entry.structuredPayload;
+  const envelope = item?.type === "dynamic_tool" ? readOmpEvalEnvelope(item.output) : undefined;
+  const input = item?.type === "dynamic_tool" ? asRecord(item.input) : null;
+  const view = item
+    ? decodeOmpEvalItem(
+        envelope && item.type === "dynamic_tool"
+          ? {
+              ...item,
+              input: { title: input?.title, language: input?.language },
+              output: { t3OmpEval: envelope },
+            }
+          : item,
+      )
+    : undefined;
+  return view ? [view.title, view.phase].filter(Boolean).join(" · ") : undefined;
 }

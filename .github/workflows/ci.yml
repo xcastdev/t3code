@@ -34,6 +34,7 @@ jobs:
       rust: ${{ steps.detect.outputs.rust }}
       release_smoke: ${{ steps.detect.outputs.release_smoke }}
       mobile_native: ${{ steps.detect.outputs.mobile_native }}
+      omp_native_policy: ${{ steps.detect.outputs.omp_native_policy }}
     steps:
       # Only the package manifests the script reads to build the dependency graph.
       # Depth 2 brings the base commit the change is diffed against.
@@ -560,6 +561,26 @@ jobs:
   # or resharding jobs needs no ruleset change. Add every new job to `needs`.
   # `always()` rather than `!cancelled()`: a skipped job reports success to
   # branch protection, so a cancelled run must still produce a failing check.
+  omp_native_policy:
+    name: Native OMP Policy
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.omp_native_policy != 'false' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-ci-deps
+        with:
+          task-cache-read-token: ${{ secrets.T3_TASK_CACHE_READ_TOKEN }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Prove native policy and evaluator compatibility without inference
+        run: bun --no-env-file packages/provider-omp/src/testing/nativePolicyProof.ts --isolated --python python3
+
   check:
     name: Check
     if: ${{ always() }}
@@ -574,6 +595,7 @@ jobs:
         rust,
         mobile_native_static_analysis,
         release_smoke,
+        omp_native_policy,
       ]
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5

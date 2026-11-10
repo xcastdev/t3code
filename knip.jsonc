@@ -35,12 +35,28 @@
         "prepare-server-compile-cache.cjs",
         "smoke-desktop-app.ts",
         "verify-windows-desktop-artifact.ts",
+        "verify-omp-installed-provider.ts",
       ],
       "ignoreDependencies": ["agent-device", "esbuild"],
       // The `t3` npm package's files: copied into the package, never imported.
       // knip-schemas.test.ts writes a throwaway project to .knip-test-*, which a
       // knip run beside it in check:changed must not report.
       "ignore": ["npm-launcher/**", ".knip-test-*/**"],
+    },
+    "packages/provider-omp": {
+      // Bun loads the guarded assets and native child by path.
+      "entry": [
+        "src/testing/nativePolicyProof.ts",
+        "src/testing/nativePolicyChild.ts",
+        "src/testing/nativeProducts.ts",
+        "src/testing/nativeProductChild.ts",
+        "src/testing/nativeHistory.ts",
+        "src/testing/nativeHistoryChild.ts",
+        "src/testing/bundledAssetFactory.ts",
+        "src/server/runtimeLoader.ts",
+        "src/server/runtimeMain.ts",
+        "src/server/runtimePolicyHooks.ts",
+      ],
     },
     "apps/server": {
       // Vite+ pack entries and the launcher used by installed background services.

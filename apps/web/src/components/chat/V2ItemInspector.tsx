@@ -1,3 +1,5 @@
+import { mergeOmpEvalDetail } from "@t3tools/client-runtime/work-log/omp-eval";
+import { OmpEvalDetail } from "./OmpEvalDetail";
 import type { ToolCallDiffTarget } from "../../diffPanelStore";
 import type { EnvironmentId, OrchestrationV2ProjectedTurnItem } from "@t3tools/contracts";
 import {
@@ -10,7 +12,7 @@ import {
 import { formatDiffCount } from "@t3tools/client-runtime/diff-count";
 import { isJavaScriptReplTool } from "@t3tools/shared/toolActivity";
 import { ExternalLinkIcon } from "lucide-react";
-import { memo, type ReactNode, Suspense, use } from "react";
+import { memo, type ReactNode, Suspense, use, useState } from "react";
 
 import { useRenderedAppearance } from "../../hooks/useTheme";
 import { cn } from "../../lib/utils";
@@ -144,16 +146,24 @@ function useFetchedTurnItem(
     source?.detail,
   );
   const fetchedItem = detail.data?.item;
-  const item = fetchedItem?.type === wireItem.type ? fetchedItem : wireItem;
+  const [retainedOmpDetail, setRetainedOmpDetail] = useState<typeof fetchedItem>();
+  const ompEval = mergeOmpEvalDetail(wireItem, fetchedItem, retainedOmpDetail);
+  if (ompEval?.detailItem && ompEval.detailItem !== retainedOmpDetail) {
+    setRetainedOmpDetail(ompEval.detailItem);
+  }
+  const item = ompEval?.item ?? (fetchedItem?.type === wireItem.type ? fetchedItem : wireItem);
   return {
     item,
+    ompEval,
     output: {
-      output: turnItemOutputText(item),
-      images: turnItemOutputImages(item),
+      output: ompEval ? null : turnItemOutputText(item),
+      images: ompEval ? [] : turnItemOutputImages(item),
       environmentId,
-      pending: item === wireItem && detail.isPending,
-      error:
-        item !== wireItem
+      pending: ompEval ? fetches && detail.isPending : item === wireItem && detail.isPending,
+      error: ompEval
+        ? (detail.error ??
+          (fetches && detail.data?.item === null ? "Output is no longer available." : null))
+        : item !== wireItem
           ? null
           : detail.data?.item === null
             ? "Output is no longer available."
@@ -510,7 +520,17 @@ export const V2ItemInspector = memo(function V2ItemInspector(props: V2ItemInspec
         </ToolDetailCard>
       ) : null}
 
-      {item.type === "dynamic_tool" ? (
+      {fetched.ompEval ? (
+        <OmpEvalDetail
+          view={fetched.ompEval.view}
+          item={item}
+          environmentId={props.environmentId}
+          hydration={fetched.ompEval.hydration}
+          pending={outputState.pending}
+          error={outputState.error}
+          onImageExpand={props.onImageExpand}
+        />
+      ) : item.type === "dynamic_tool" ? (
         <ToolCallBody
           toolName={item.toolName}
           args={item.input}

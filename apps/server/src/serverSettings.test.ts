@@ -1215,18 +1215,33 @@ it.layer(NodeServices.layer)("server settings", (it) => {
         variable: { name: "API_TOKEN", value: "", sensitive: true },
         expected: "",
       },
-    ].map((testCase) => [testCase.label, testCase] as const),
-  )("%s", ([, { variable, expected, duplicate }]) =>
+    ].flatMap((testCase) =>
+      ["codex", "omp"].map(
+        (driver) => [driver + " " + testCase.label, { ...testCase, driver }] as const,
+      ),
+    ),
+  )("%s", ([, { variable, expected, duplicate, driver }]) =>
     Effect.gen(function* () {
-      const instanceId = ProviderInstanceId.make("codex_personal");
+      const instanceId = ProviderInstanceId.make(driver + "_personal");
       const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
       const serverConfig = yield* ServerConfig.ServerConfig;
       const fileSystem = yield* FileSystem.FileSystem;
       yield* fileSystem.writeFileString(
         serverConfig.settingsPath,
-        duplicate
-          ? '{"providerInstances":{"codex_personal":{"driver":"codex","environment":[{"name":"API_TOKEN","value":"inline-test-token","sensitive":true},{"name":"API_TOKEN","value":"last-inline-test-token","sensitive":true}],"config":{}}}}'
-          : '{"providerInstances":{"codex_personal":{"driver":"codex","environment":[{"name":"API_TOKEN","value":"inline-test-token","sensitive":true}],"config":{}}}}',
+        JSON.stringify({
+          providerInstances: {
+            [instanceId]: {
+              driver,
+              environment: [
+                { name: "API_TOKEN", value: "inline-test-token", sensitive: true },
+                ...(duplicate
+                  ? [{ name: "API_TOKEN", value: "last-inline-test-token", sensitive: true }]
+                  : []),
+              ],
+              config: {},
+            },
+          },
+        }),
       );
       const initial = yield* serverSettings.getSettings;
       assert.equal(
@@ -1237,7 +1252,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       const next = yield* serverSettings.updateSettings({
         providerInstances: {
           [instanceId]: {
-            driver: ProviderDriverKind.make("codex"),
+            driver: ProviderDriverKind.make(driver),
             displayName: "Renamed provider",
             environment: duplicate ? [variable, variable] : [variable],
             config: {},

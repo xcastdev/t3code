@@ -37,6 +37,7 @@ const TEST_ONLY_DEPS = {
   // Evals import the server's source to test its real model-facing text.
   "@t3tools/evals": ["t3"],
   "@t3tools/provider-pi": ["@t3tools/client-runtime"],
+  "@t3tools/provider-omp": ["@t3tools/provider-core", "@t3tools/shared", "@t3tools/contracts"],
   "@t3tools/scripts": [
     "@t3tools/desktop",
     "@t3tools/mobile",
@@ -164,6 +165,7 @@ function decide(files, packages, full) {
       test_server: has("t3"),
       rust: everything || rust,
       release_smoke: scriptsChanged,
+      omp_native_policy: everything || has("@t3tools/provider-omp") || scriptsChanged,
       mobile_native: files === null || files.some((file) => MOBILE_NATIVE.test(file)),
     },
   };

@@ -18,7 +18,7 @@ import { MediaActionsMenu } from "../../components/MediaActionsMenu";
 import { PresentationSource } from "../../components/ui/NativePresentation";
 import { useMediaActions } from "../../state/mediaActions";
 import type { MediaActionsSource } from "../../lib/mediaActionsSource";
-import { useAssetUrlState } from "../../state/assets";
+import { useAssetUrlState, useFreshAssetUrl } from "../../state/assets";
 import { assetImageCacheKey } from "../../lib/assetImageSource";
 import {
   MARKDOWN_IMAGE_MAX_WIDTH,
@@ -272,12 +272,39 @@ export function ThreadMarkdownImage(props: {
     { readonly _tag: "attachment" | "media-file" | "draft-workspace-file" | "tool-output-image" }
   >;
   readonly alt: string | null;
+  readonly resourceRevision?: number | undefined;
   readonly srcFragment?: string;
   readonly actionsSource?: MediaActionsSource;
   readonly onPressPreview: (source: FilePreviewSource) => void;
 }) {
   const withGallery = useFilePreviewGallery();
-  const assetUrl = useAssetUrlState(props.environmentId, props.resource);
+  const assetUrl = useAssetUrlState(
+    props.resourceRevision === undefined ? props.environmentId : null,
+    props.resourceRevision === undefined ? props.resource : null,
+  );
+  const fresh = useFreshAssetUrl(
+    props.resourceRevision === undefined ? null : props.environmentId,
+    props.resourceRevision === undefined ? null : props.resource,
+    props.resourceRevision ?? 0,
+  );
+  const url =
+    props.resourceRevision === undefined
+      ? assetUrl._tag === "Success"
+        ? assetUrl.url
+        : null
+      : AsyncResult.isSuccess(fresh)
+        ? fresh.value.url
+        : null;
+  const fileRevision =
+    props.resourceRevision === undefined
+      ? assetUrl._tag === "Success"
+        ? assetUrl.fileRevision
+        : undefined
+      : String(props.resourceRevision);
+  const unavailable =
+    props.resourceRevision === undefined
+      ? assetUrl._tag === "Failure"
+      : AsyncResult.isFailure(fresh);
   const resourceKey =
     props.resource._tag === "attachment"
       ? `attachment:${props.resource.attachmentId}`
@@ -286,21 +313,16 @@ export function ThreadMarkdownImage(props: {
         : `workspace:${props.resource.path}`;
   // The view keeps the first decoded size per key, so a file edited in place needs a
   // new key; a re-signed URL for the same revision must not get one.
-  const sourceKey =
-    assetUrl._tag === "Success" && assetUrl.fileRevision !== undefined
-      ? `${resourceKey}@${assetUrl.fileRevision}`
-      : resourceKey;
+  const sourceKey = fileRevision !== undefined ? `${resourceKey}@${fileRevision}` : resourceKey;
 
   return (
     <ThreadMarkdownImageView
-      uri={assetUrl._tag === "Success" ? assetUrl.url + (props.srcFragment ?? "") : null}
+      uri={url ? url + (props.srcFragment ?? "") : null}
       cacheKey={
-        assetUrl._tag === "Success"
-          ? assetImageCacheKey(props.environmentId, props.resource, assetUrl.fileRevision)
-          : undefined
+        url ? assetImageCacheKey(props.environmentId, props.resource, fileRevision) : undefined
       }
       sourceKey={sourceKey}
-      unavailable={assetUrl._tag === "Failure"}
+      unavailable={unavailable}
       unavailableDetail={
         assetUrl._tag === "Failure" && assetUrl.reason === "missing-file-access"
           ? MISSING_FILE_ACCESS_MESSAGE

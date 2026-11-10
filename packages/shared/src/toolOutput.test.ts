@@ -1,7 +1,9 @@
+import { makeOmpEvalEnvelope } from "./ompEval.ts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   compactDynamicToolOutput,
+  omitToolOutputImageData,
   MAX_TOOL_OUTPUT_IMAGES,
   toolOutputImages,
   toolOutputIndicatesFailure,
@@ -187,6 +189,19 @@ describe("toolOutputImages", () => {
     ]);
     expect(toolOutputImages([mcpImage])).toEqual([{ mimeType: "image/png", data: "AAAA" }]);
     expect(toolOutputImages(mcpImage)).toEqual([{ mimeType: "image/png", data: "AAAA" }]);
+    const native = {
+      t3OmpEval: makeOmpEvalEnvelope({ revision: 1, status: "running", language: "python" }),
+      content: [text, mcpImage],
+      details: { images: [mcpImage, claudeImage] },
+    };
+    expect(toolOutputImages(native)).toEqual([
+      { mimeType: "image/png", data: "AAAA" },
+      { mimeType: "image/jpeg", data: "BBBB" },
+    ]);
+    expect(toolOutputImages(omitToolOutputImageData(native))).toEqual([
+      { mimeType: "image/png" },
+      { mimeType: "image/jpeg" },
+    ]);
   });
 
   it("skips types the server must not serve inline", () => {

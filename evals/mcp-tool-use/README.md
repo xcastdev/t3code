@@ -124,3 +124,19 @@ This API replay measures routing and recovery decisions. Screenshots return prod
 2. From `evals/`, run `pnpm mcp-tool-use:trim-capture <claude|codex> <capture.json> mcp-tool-use/templates/<claude|codex>.json.gz`. It keeps only what `run.ts` reads, and removes user instructions, the user's own skills and agents, account ids, and home paths.
 3. Read the output for user data before you commit it: `zcat <file> | less`.
 4. Run the full eval on the old and new templates, and compare.
+
+## OMP routing cases
+
+`cases/omp.ndjson` contains `omp-pty-background`, `omp-delegate-native-disabled`, `omp-eval-model-helpers-disabled` and the ordinary `omp-foreground-eval-control`. They opt into `setup.ompSimulation` and the Codex-shaped capture used by `gpt-6.1-sol`. The request identifies itself as simulated OMP routing, imports the actual `packages/provider-omp/src/server/instructions.ts` append, and keeps even an empty append explicit. It does not inject Codex's T3 additional context in place of the OMP append. The surrounding captured Codex harness remains; this is not a native OMP capture.
+
+These cases expose the real T3 terminal tool descriptions/schemas and a mocked OMP foreground eval shape. Terminals, child agents, native eval and shell outputs are simulated. The simulated caller's provider is OMP; the model under test is still the selected API model. Case graders reject native task/model-helper workarounds and protect ordinary foreground eval. They do not prove native loader, policy, lifecycle or process enforcement.
+
+From `evals/`, the credential-free setup command is:
+
+```sh
+pnpm mcp-tool-use --model gpt-6.1-sol --case omp-pty-background,omp-delegate-native-disabled,omp-eval-model-helpers-disabled,omp-foreground-eval-control --samples 1 --dry-run --out runs/omp-dry-run
+```
+
+The runner prints one request per case and writes `omp-context.json` under `--out`, containing the template hash, actual instruction source/text hashes, imported append, simulated context and tool inventory. The same construction and manifest run for a paid baseline and candidate. A different context cannot overwrite an existing manifest; use separate output directories.
+
+No scored OMP baseline/candidate is supplied with this setup. The current append remains the unchanged empty baseline. When credentials and the candidate change are authorized, first run this exact case list/model without `--dry-run`, using one sample to check setup and then two samples for the unchanged baseline in separate directories. Only afterward change the actual provider-local append and run the same two-sample cases/model into a fresh candidate directory, using `--baseline runs/omp-baseline/results.jsonl`. Preserve the baseline results and its manifest. Earlier attempts on other MCP cases are not a baseline for these four cases, and dry-run output is not a model result or a score.

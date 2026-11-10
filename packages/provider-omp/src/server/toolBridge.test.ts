@@ -1,0 +1,135 @@
+import { expect, it } from "@effect/vitest";
+import { OmpToolBridge } from "./toolBridge.ts";
+it("replaces catalogs, aborts and closes revoked native calls, discards stale results and preserves output", async () => {
+  const records: Record<string, unknown>[] = [];
+  const started = Promise.withResolvers<AbortSignal>();
+  const release = Promise.withResolvers<unknown>();
+  const bridge = new OmpToolBridge(
+    async (r) => {
+      records.push(r);
+    },
+    async (_name, _args, signal) => {
+      started.resolve(signal);
+      return release.promise;
+    },
+  );
+  const tools = [{ name: "pty", description: "Terminal", inputSchema: { type: "object" } }];
+  await bridge.replace(tools, "session:grant1");
+  const work = bridge.handle({
+    type: "host_tool_call",
+    id: "a",
+    toolName: "pty",
+    toolCallId: "t",
+    arguments: { command: "ls" },
+  });
+  const signal = await started.promise;
+  await bridge.replace([], "session:grant2");
+  expect(signal.aborted).toBe(true);
+  release.resolve({ content: [{ type: "text", text: "secret late data" }] });
+  await work;
+  expect(records.filter((r) => r.type === "host_tool_result")).toEqual([
+    {
+      type: "host_tool_result",
+      id: "a",
+      isError: true,
+      result: { content: [{ type: "text", text: "Tool authorization or catalog changed" }] },
+    },
+  ]);
+  await bridge.handle({ type: "host_tool_call", id: "b", toolName: "pty", arguments: {} });
+  expect(records.at(-1)?.isError).toBe(true);
+});
+it("separates native cancellation, tool errors and sanitized transport failures", async () => {
+  const sent: Record<string, unknown>[] = [];
+  const bridge = new OmpToolBridge(
+    async (r) => {
+      sent.push(r);
+    },
+    async (name) => {
+      if (name === "bad") throw new Error("Bearer secret");
+      return {
+        isError: true,
+        content: [
+          { type: "text", text: "tool failed" },
+          { type: "image", mimeType: "image/png", data: "YQ==" },
+        ],
+      };
+    },
+  );
+  await bridge.replace(
+    [
+      { name: "bad", inputSchema: {} },
+      { name: "ok", inputSchema: {} },
+    ],
+    "g",
+  );
+  await bridge.handle({ type: "host_tool_call", id: "1", toolName: "ok", arguments: {} });
+  expect(sent.at(-1)).toMatchObject({
+    isError: true,
+    result: { content: [{ text: "tool failed" }, { data: "YQ==" }] },
+  });
+  await bridge.handle({ type: "host_tool_call", id: "2", toolName: "bad", arguments: {} });
+  expect(JSON.stringify(sent.at(-1))).not.toContain("secret");
+  await bridge.close();
+  expect(sent.at(-1)).toEqual({ type: "set_host_tools", tools: [] });
+});
+
+it("streams correlated authorized MCP progress before its final HTTP record and preserves the native image result", async () => {
+  const { AuthorizedMcpClient } = await import("./toolBridge.ts");
+  const progress = Promise.withResolvers<unknown>();
+  let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
+  const client = new AuthorizedMcpClient(
+    { endpoint: "https://fixture.test/mcp", authorizationHeader: "Bearer private" },
+    async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer private");
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            stream = controller;
+            controller.enqueue(
+              new TextEncoder().encode(
+                "data: " +
+                  JSON.stringify({
+                    jsonrpc: "2.0",
+                    method: "notifications/progress",
+                    params: {
+                      progressToken: body.params._meta.progressToken,
+                      message: "working 😀",
+                    },
+                  }) +
+                  "\n\n",
+              ),
+            );
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  );
+  const result = client.callTool("tool", {}, new AbortController().signal, async (update) => {
+    progress.resolve(update);
+  });
+  void result.catch((error) => progress.reject(error));
+  expect(await progress.promise).toMatchObject({ content: [{ type: "text", text: "working 😀" }] });
+  stream!.enqueue(
+    new TextEncoder().encode(
+      "data: " +
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { content: [{ type: "image", mimeType: "image/png", data: "YQ==" }] },
+        }) +
+        "\n\n",
+    ),
+  );
+  stream!.close();
+  expect(await result).toMatchObject({ content: [{ type: "image", data: "YQ==" }] });
+});
+it("refuses host catalog names that shadow native execution boundaries", async () => {
+  const bridge = new OmpToolBridge(
+    async () => {},
+    async () => ({}),
+  );
+  for (const name of ["eval", "bash", "read", "edit", "write"])
+    await expect(bridge.replace([{ name, inputSchema: {} }], "g")).rejects.toThrow(/native/i);
+});

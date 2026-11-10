@@ -1,0 +1,9 @@
+{
+  "name": "t3-omp-installed-fixture",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.16.0"
+  },
+  "packageManager": "pnpm@12.14.0"
+}

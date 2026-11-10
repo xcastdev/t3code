@@ -30,6 +30,9 @@ const hashHtml = (html: string) => NodeCrypto.createHash("sha256").update(html).
 export class McpProviderSessions extends Context.Service<
   McpProviderSessions,
   {
+    readonly onChanged?: (
+      listener: (threadId: ThreadId) => Effect.Effect<void>,
+    ) => Effect.Effect<() => void>;
     readonly beginCatalogEndpointInstallation: (config: McpProviderSessionConfig) => Effect.Effect<{
       readonly acknowledge: Effect.Effect<void>;
       readonly invalidate: Effect.Effect<void>;
@@ -97,6 +100,12 @@ const matchingPageIndex = (
 };
 
 const make = Effect.gen(function* () {
+  const changeListeners = new Set<(threadId: ThreadId) => Effect.Effect<void>>();
+  const notifyChanged = Effect.fn("McpProviderSessions.notifyChanged")(function* (
+    threadId: ThreadId,
+  ) {
+    for (const listener of changeListeners) yield* listener(threadId);
+  });
   const catalogInstallations = new Map<ThreadId, symbol>();
   const catalogListeners = new Set<(config: McpProviderSessionConfig) => Effect.Effect<void>>();
   const catalogReceipts = new Map<ThreadId, McpProviderSessionConfig>();
@@ -121,6 +130,14 @@ const make = Effect.gen(function* () {
     },
   );
   return McpProviderSessions.of({
+    onChanged: Effect.fn("McpProviderSessions.onChanged")(function (listener) {
+      return Effect.sync(() => {
+        changeListeners.add(listener);
+        return () => {
+          changeListeners.delete(listener);
+        };
+      });
+    }),
     beginCatalogEndpointInstallation: Effect.fn(
       "McpProviderSessions.beginCatalogEndpointInstallation",
     )(function (config) {
@@ -189,6 +206,7 @@ const make = Effect.gen(function* () {
           }
           return [true, next] as const;
         }).pipe(
+          Effect.tap((swapped) => (swapped ? notifyChanged(expected.threadId) : Effect.void)),
           Effect.tap((swapped) =>
             swapped
               ? Ref.update(htmlRenders, (current) => {
@@ -231,6 +249,7 @@ const make = Effect.gen(function* () {
         });
       }
       yield* Ref.update(sessions, (current) => new Map(current).set(config.threadId, config));
+      yield* notifyChanged(config.threadId);
     }),
     read: Effect.fn("McpProviderSessions.read")(function (threadId) {
       return Ref.get(sessions).pipe(Effect.map((current) => current.get(threadId)));
@@ -255,6 +274,7 @@ const make = Effect.gen(function* () {
             ),
           ),
         ),
+        Effect.andThen(notifyChanged(threadId)),
       );
     }),
     recordHtmlRender: Effect.fn("McpProviderSessions.recordHtmlRender")(

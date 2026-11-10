@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { buildOmpInstructions } from "../../packages/provider-omp/src/server/instructions.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 /**
  * Replays small fake threads on a Claude or Codex model to check T3's MCP tool use. A trimmed
@@ -7,6 +8,7 @@
  */
 import * as NodeChildProcess from "node:child_process";
 import * as NodeUtil from "node:util";
+import * as NodeCrypto from "node:crypto";
 import * as NodeVM from "node:vm";
 import * as NodeZlib from "node:zlib";
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
@@ -47,6 +49,7 @@ import { buildCodexAdditionalContext } from "../../apps/server/src/provider/Code
 import { makeSideChatContext } from "../../apps/server/src/orchestration-v2/ContextHandoffService.ts";
 import { withInlineContext } from "../../apps/server/src/orchestration-v2/ContextHandoffDelivery.ts";
 import { AttachmentToolkit } from "../../apps/server/src/mcp/toolkits/attachment/tools.ts";
+import { TerminalToolkit } from "../../apps/server/src/mcp/toolkits/terminal/tools.ts";
 import { DeviceToolkit } from "../../apps/server/src/mcp/toolkits/device/tools.ts";
 import { EnvironmentToolkit } from "../../apps/server/src/mcp/toolkits/environment/tools.ts";
 import { HtmlToolkit } from "../../apps/server/src/mcp/toolkits/html/tools.ts";
@@ -241,6 +244,8 @@ export const McpToolUseCase = Schema.Struct({
     role: Schema.Literals(["top", "delegated-child", "native-subagent"]),
     /** Runs only on this harness, for cases whose right answer depends on it. */
     harness: Schema.optional(Schema.Literals(["claude", "codex"])),
+    /** Simulated OMP routing on the Codex capture, with the actual OMP-local append. */
+    ompSimulation: Schema.optional(Schema.Boolean),
     /** The Linked environments beta is on, so T3 lists its link tools. */
     linkedEnvironments: Schema.optional(Schema.Boolean),
     /** The view image tool is on with a vision model, so T3 lists `t3_view_image`. */
@@ -388,6 +393,7 @@ const t3SourceTools: ReadonlyArray<Tool.Any> = [
   PullRequestsToolkit,
   PreviewToolkit,
   DeviceToolkit,
+  TerminalToolkit,
   HtmlToolkit,
   ViewImageToolkit,
 ].flatMap((toolkit): ReadonlyArray<Tool.Any> => Object.values(toolkit.tools));
@@ -419,13 +425,18 @@ const hiddenFromSubagents = enabledWhen(McpInvocationContext.hiddenFromSubagents
 const hiddenWhileLinksOff = enabledWhen(McpInvocationContext.hiddenWhileLinksOff);
 // The view image tool starts off, and T3 lists it only while it is on with a vision model.
 const hiddenWhileViewImageOff = enabledWhen(McpInvocationContext.visibleWhileViewImageOn);
+const terminalNames = new Set(
+  Object.values(TerminalToolkit.tools).map((tool) => `${T3_PREFIX}${tool.name}`),
+);
 const visibleT3Tools = (options: {
+  readonly ompSimulation?: boolean;
   readonly subagent?: boolean;
   readonly links?: boolean;
   readonly viewImage?: boolean;
 }) =>
   t3Tools.filter(
     (tool) =>
+      (options.ompSimulation === true || !terminalNames.has(tool.name)) &&
       (options.links === true || !hiddenWhileLinksOff.has(tool.name)) &&
       (options.viewImage === true || !hiddenWhileViewImageOff.has(tool.name)) &&
       !(options.subagent === true && hiddenFromSubagents.has(tool.name)),
@@ -452,6 +463,8 @@ const claudeQueryOptions = (model: Model, device = true) => {
 
 /** Text T3 appends to Claude Code's system prompt. Delegated children get the same text. */
 export const t3SystemAppend = (model: Model, device = true) => {
+  if (process.env.T3_EVAL_INSTRUCTIONS_PROVIDER === "omp")
+    return buildOmpInstructions({ model, browser: true, device });
   const { systemPrompt } = claudeQueryOptions(model, device);
   if (isRecord(systemPrompt) && systemPrompt.type === "preset" && systemPrompt.append) {
     return systemPrompt.append;
@@ -607,8 +620,30 @@ export const buildBase = (
 
 type Base = ReturnType<typeof buildBase> & {
   readonly codex?: typeof ResponsesRequest.Type;
+  readonly ompSimulation?: boolean;
   /** What T3's SubagentStart hooks give a native subagent. */
   readonly subagentContext?: string;
+};
+
+export const ompRoutingContext = (
+  model: Model,
+  device = true,
+) => `<t3_eval_simulation>Simulated OMP routing on a Codex-shaped API capture, not an OMP-native harness capture or native policy proof. Native foreground eval accepts finite JavaScript/Python cells. OMP native task/delegate/background/service/job controls and eval completion/model/judgment helpers are disabled. T3 session MCP tools are available. Eval, terminals, child runs and operating-system tool results are mocked.</t3_eval_simulation>
+<t3_omp_instructions>${buildOmpInstructions({ model, browser: true, device })}</t3_omp_instructions>`;
+const ompEvalSimulationTool: ApiTool = {
+  name: "eval",
+  description:
+    "Simulated OMP foreground JavaScript/Python eval. Calls return case mocks; no code runs in native OMP.",
+  input_schema: {
+    type: "object",
+    properties: {
+      language: { type: "string", enum: ["javascript", "python"] },
+      code: { type: "string" },
+      title: { type: "string" },
+    },
+    required: ["language", "code"],
+    additionalProperties: false,
+  },
 };
 
 /** Keep the captured harness prompt and tools; replace app-owned context and the real user. */
@@ -616,6 +651,7 @@ const buildCodexBase = (
   template: typeof ResponsesRequest.Type,
   options: {
     readonly model: Model;
+    readonly ompSimulation?: boolean;
     readonly keepUserInstructions: boolean;
     readonly effort?: string | undefined;
     readonly subagent?: boolean;
@@ -625,7 +661,9 @@ const buildCodexBase = (
     readonly deviceAccess?: boolean;
   },
 ): Base => {
-  const t3 = visibleT3Tools(options);
+  const ompSimulation =
+    options.ompSimulation === true || process.env.T3_EVAL_INSTRUCTIONS_PROVIDER === "omp";
+  const t3 = visibleT3Tools({ ...options, ompSimulation });
   const contentText = (item: Block) =>
     Array.isArray(item.content)
       ? item.content.map((block: Block) => valueText(block.text)).join("\n")
@@ -661,8 +699,21 @@ const buildCodexBase = (
     { browser: true, device: options.deviceAccess ?? true },
   );
   input.push(
-    ...Object.entries(context).map(([key, entry]) => message(`<${key}>${entry.value}</${key}>`)),
+    ...(ompSimulation
+      ? [message(ompRoutingContext(options.model, options.deviceAccess ?? true))]
+      : Object.entries(context).map(([key, entry]) => message(`<${key}>${entry.value}</${key}>`))),
   );
+  if (ompSimulation)
+    input.push({
+      type: "additional_tools",
+      tools: [
+        {
+          name: "omp_simulation",
+          description: "Mock native OMP surface",
+          tools: [ompEvalSimulationTool],
+        },
+      ],
+    });
   const nativeTools = input
     .flatMap((item) =>
       item.type === "additional_tools" && Array.isArray(item.tools)
@@ -687,6 +738,7 @@ const buildCodexBase = (
     nativeTools,
     t3,
     deferred: [...t3],
+    ompSimulation,
     codex: { ...template, input, reasoning: { ...template.reasoning, effort } },
   };
 };
@@ -1033,7 +1085,8 @@ const t3Default = (sample: Sample, name: string, input: Readonly<Record<string, 
         workState: "working",
         hasPendingChildRuns: false,
         providerInstanceId:
-          target.providerInstanceId ?? (sample.base.codex ? "codex" : "claudeAgent"),
+          target.providerInstanceId ??
+          (sample.base.ompSimulation ? "omp" : sample.base.codex ? "codex" : "claudeAgent"),
         model: target.model ?? sample.base.model,
         summary: null,
         hasPendingQuestion: false,
@@ -1198,12 +1251,21 @@ const capabilities = ({ base }: Sample, value: unknown) =>
     ? {
         ...value,
         inheritedModel: base.model,
-        ...(base.codex
+        ...(base.ompSimulation
           ? {
-              inheritedProviderInstanceId: "codex",
-              inheritedOptions: [{ id: "reasoningEffort", value: base.codex.reasoning.effort }],
+              inheritedProviderInstanceId: "omp",
+              inheritedOptions: [],
+              providers: [
+                ...(Array.isArray(value.providers) ? value.providers : []),
+                { providerInstanceId: "omp", models: [{ id: base.model, options: [] }] },
+              ],
             }
-          : {}),
+          : base.codex
+            ? {
+                inheritedProviderInstanceId: "codex",
+                inheritedOptions: [{ id: "reasoningEffort", value: base.codex.reasoning.effort }],
+              }
+            : {}),
       }
     : value;
 
@@ -1586,7 +1648,15 @@ export const executeCodex = async (
   return valueText(context.__output.join("\n"));
 };
 
-const codexCatalog = (base: Base) => [
+export const codexCatalog = (base: Base) => [
+  ...(base.ompSimulation
+    ? [
+        {
+          name: "eval",
+          description: `${ompEvalSimulationTool.description}\nInput JSON schema: ${JSON.stringify(ompEvalSimulationTool.input_schema)}`,
+        },
+      ]
+    : []),
   ...base.t3.map((tool) => ({
     name: tool.name.replace("mcp__t3-code__", "mcp__t3_code__"),
     description: `${valueText(tool.description)}\nInput JSON schema: ${JSON.stringify(tool.input_schema)}`,
@@ -1863,6 +1933,7 @@ const runSample = Effect.fn("evaluateMcpToolUse.runSample")(function* (
 
 type ResultRow = Pick<McpToolUseCase, "id" | "kind" | "pattern"> & {
   readonly role: string;
+  readonly simulation?: "omp-on-codex";
   readonly pass: boolean;
   /** Set when the sample could not run to the end, even after retries. It is not graded. */
   readonly error?: string;
@@ -1935,6 +2006,11 @@ export const summarize = (
   return [
     "# MCP tool-use eval\n",
     `- ${options.header}`,
+    ...(rows.some((row) => row.simulation === "omp-on-codex")
+      ? [
+          "- OMP cases are simulated routing on a Codex-shaped API capture using the imported provider-local append; native eval, processes and child runs are mocked. Scores do not prove native policy enforcement.",
+        ]
+      : []),
     `- Pass: ${percent(passRate(rows))} of ${finished} samples.`,
     ...(errors.length > 0 ? [errorNote] : []),
     codex
@@ -2067,6 +2143,7 @@ const main = Effect.gen(function* () {
     deviceAccess: boolean,
     links: boolean,
     viewImage: boolean,
+    ompSimulation = false,
   ): Effect.Effect<Base, Schema.SchemaError> =>
     codex
       ? decodeCodexCapture(template).pipe(
@@ -2074,6 +2151,7 @@ const main = Effect.gen(function* () {
             buildCodexBase(capture.request.provider_native, {
               model: flags.model,
               keepUserInstructions,
+              ompSimulation,
               effort: flags.effort,
               subagent: role === "delegated-child",
               links,
@@ -2102,25 +2180,78 @@ const main = Effect.gen(function* () {
         );
   // Codex has no native subagents; its cases with that role run as top-level threads.
   const baseKey = ({ setup }: McpToolUseCase) =>
-    `${codex && setup.role === "native-subagent" ? "top" : setup.role}:${setup.world?.deviceAgentAccess !== false}:${setup.linkedEnvironments === true}:${setup.viewImage === true}`;
+    `${codex && setup.role === "native-subagent" ? "top" : setup.role}:${setup.world?.deviceAgentAccess !== false}:${setup.linkedEnvironments === true}:${setup.viewImage === true}:${setup.ompSimulation === true}`;
   const base = yield* buildFor("top", true, false, false);
-  const bases = new Map<string, Base>([["top:true:false:false", base]]);
+  const bases = new Map<string, Base>([["top:true:false:false:false", base]]);
   for (const testCase of selected) {
     const key = baseKey(testCase);
     if (bases.has(key)) continue;
-    const [role = "top", access, links, viewImage] = key.split(":") as [
+    const [role = "top", access, links, viewImage, ompSimulation] = key.split(":") as [
       McpToolUseCase["setup"]["role"],
+      string,
       string,
       string,
       string,
     ];
     bases.set(
       key,
-      yield* buildFor(role, access === "true", links === "true", viewImage === "true"),
+      yield* buildFor(
+        role,
+        access === "true",
+        links === "true",
+        viewImage === "true",
+        ompSimulation === "true",
+      ),
     );
   }
   const baseFor = (testCase: McpToolUseCase) => bases.get(baseKey(testCase)) ?? base;
   const effort = flags.effort ?? base.codex?.reasoning.effort ?? "high";
+  const ompCases = selected.filter((testCase) => baseFor(testCase).ompSimulation);
+  if (ompCases.length && flags.out) {
+    const sourcePath = path.resolve(
+      import.meta.dirname,
+      "../../packages/provider-omp/src/server/instructions.ts",
+    );
+    const source = yield* fs.readFileString(sourcePath);
+    const hash = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
+    const manifest = {
+      evidence: "simulated-omp-routing",
+      harness: "codex",
+      model: flags.model,
+      effort,
+      template: path.basename(templatePath),
+      templateSha256: hash(template),
+      instructionSource: "packages/provider-omp/src/server/instructions.ts",
+      instructionSourceSha256: hash(source),
+      cases: ompCases.map((testCase) => {
+        const device = testCase.setup.world?.deviceAgentAccess !== false;
+        const append = buildOmpInstructions({ model: flags.model, browser: true, device });
+        return {
+          id: testCase.id,
+          instructionAppend: append,
+          instructionAppendSha256: hash(append),
+          context: ompRoutingContext(flags.model, device),
+          nativeTools: baseFor(testCase).nativeTools.map((tool) => tool.name),
+          codeModeToolsSha256: hash(JSON.stringify(codexCatalog(baseFor(testCase)))),
+          codeModeToolNames: codexCatalog(baseFor(testCase)).map((tool) => tool.name),
+          t3Tools: baseFor(testCase).t3.map((tool) => tool.name),
+        };
+      }),
+    };
+    const manifestPath = path.join(flags.out, "omp-context.json");
+    const encoded = yield* encodeJson(manifest);
+    if (yield* fs.exists(manifestPath)) {
+      const previous = yield* fs.readFileString(manifestPath);
+      if (previous !== encoded + "\n")
+        return yield* Effect.die(
+          new Error(
+            "OMP context differs from existing --out manifest; use a fresh output directory to preserve baseline context.",
+          ),
+        );
+    }
+    yield* fs.makeDirectory(flags.out, { recursive: true });
+    yield* fs.writeFileString(manifestPath, encoded + "\n");
+  }
   if (flags["dry-run"]) {
     // One JSON line per case. Without --case this also checks that every case builds.
     for (const testCase of selected) {
@@ -2167,7 +2298,13 @@ const main = Effect.gen(function* () {
   const inFlight = yield* Semaphore.make(flags.concurrency);
   const runOne = (testCase: McpToolUseCase) => {
     const { id, kind, pattern } = testCase;
-    const identity = { id, kind, pattern, role: testCase.setup.role };
+    const identity = {
+      id,
+      kind,
+      pattern,
+      role: testCase.setup.role,
+      ...(baseFor(testCase).ompSimulation ? { simulation: "omp-on-codex" as const } : {}),
+    };
     const usage = { usage: emptyUsage(), shellUsage: emptyUsage() };
     const privateValues = [config.apiKey, ...Object.values(config.proxy?.headers ?? {})]
       .flatMap((value) => [value, value.replace(/^Bearer /i, "")])
@@ -2240,7 +2377,15 @@ const main = Effect.gen(function* () {
   const summary = summarize(
     rows,
     {
-      header: [header, t3ContextReport(flags.model), ...stopped].join("\n"),
+      header: [
+        header,
+        ...(ompCases.length
+          ? [
+              "OMP cases use the imported provider-local append and simulated OMP context recorded in omp-context.json.",
+            ]
+          : [t3ContextReport(flags.model)]),
+        ...stopped,
+      ].join("\n"),
       shellModel: config.shellModel,
       model: config.model,
     },

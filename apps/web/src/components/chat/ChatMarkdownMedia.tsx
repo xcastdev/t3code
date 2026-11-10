@@ -336,17 +336,19 @@ export const ChatMarkdownAssetImage = memo(function ChatMarkdownAssetImage(props
   readonly fallbackSrc?: string | undefined;
   readonly workspaceRoot?: string | undefined;
   readonly workspaceMutationId?: string | null | undefined;
+  readonly resourceRevision?: string | undefined;
   readonly onImageExpand?: ((preview: ExpandedImagePreview) => void) | undefined;
 }) {
   const resource = props.resource;
   const assetUrl = useAssetUrlState(
     props.environmentId,
     resource,
-    props.workspaceMutationId !== undefined &&
+    props.resourceRevision ??
+      (props.workspaceMutationId !== undefined &&
       props.kind !== "video" &&
       (resource._tag === "media-file" || resource._tag === "workspace-file")
-      ? props.workspaceMutationId
-      : undefined,
+        ? props.workspaceMutationId
+        : undefined),
   );
   const refreshAssetUrl = useAssetUrlRefresh(props.environmentId, resource);
   const path =

@@ -17,7 +17,14 @@ const ASSET_PATH_MAX_LENGTH = 1024;
  */
 export const SOURCE_CONTROL_MEDIA_ASSET = "github-media" as const;
 
+export const ProviderOutputArtifactId = Schema.String.check(Schema.isPattern(/^[0-9]{1,32}$/));
+
 export const AssetResource = Schema.Union([
+  Schema.TaggedStruct("provider-output-artifact", {
+    threadId: ThreadId,
+    turnItemId: TurnItemId,
+    artifactId: ProviderOutputArtifactId,
+  }),
   Schema.TaggedStruct("workspace-file", {
     threadId: ThreadId,
     path: TrimmedNonEmptyString.check(Schema.isMaxLength(ASSET_PATH_MAX_LENGTH)),
@@ -221,9 +228,11 @@ export class AssetWorkspaceAssetNotFoundError extends Schema.TaggedError<AssetWo
   override get message(): string {
     return this.resource._tag === "media-file"
       ? "Media file was not found."
-      : this.resource._tag === "tool-output-image"
-        ? "Tool output image was not found."
-        : "Workspace asset was not found.";
+      : this.resource._tag === "provider-output-artifact"
+        ? "Provider output artifact was not found."
+        : this.resource._tag === "tool-output-image"
+          ? "Tool output image was not found."
+          : "Workspace asset was not found.";
   }
 }
 

@@ -1,3 +1,4 @@
+import { ompEvalWorkEntryLabel } from "@t3tools/client-runtime/work-log/presentation";
 import type {
   ThreadPendingApproval,
   ThreadPendingUserInput,
@@ -253,6 +254,8 @@ function compactWorkEntryText(value: string): string {
 }
 
 export function workEntryRowLabel(entry: WorkLogPresentationEntry, expanded = false): string {
+  const evalLabel = ompEvalWorkEntryLabel(entry);
+  if (evalLabel) return evalLabel;
   if (entry.itemType === "fork") return entry.label;
   if (expanded && entry.itemType === "reasoning")
     return entry.toolLifecycleStatus === "inProgress" ? "Thinking" : "Thought";

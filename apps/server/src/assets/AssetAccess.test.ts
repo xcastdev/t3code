@@ -1,4 +1,8 @@
 // @effect-diagnostics nodeBuiltinImport:off - tests inject swaps at the native open boundary.
+import { ownedOmpSessionDirectory } from "@t3tools/provider-omp/server";
+import { liveThreadShell } from "../mcp/McpToolAccess.testkit.ts";
+import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
+import { makeOmpEvalEnvelope } from "@t3tools/shared/ompEval";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeHttpPlatform from "@effect/platform-node/NodeHttpPlatform";
 import * as NodeFSP from "node:fs/promises";
@@ -9,6 +13,11 @@ import {
   SOURCE_CONTROL_MEDIA_ASSET,
   ThreadId,
   TurnItemId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  ProviderThreadId,
+  ProviderSessionId,
+  type OrchestrationV2ThreadProjection,
 } from "@t3tools/contracts";
 import { PROJECT_FAVICON_FALLBACK_MARKER } from "@t3tools/shared/projectFavicon";
 import { MCP_APP_MAX_HTML_BYTES } from "@t3tools/shared/mcpApp";
@@ -86,6 +95,25 @@ const screenshotItem = {
   updatedAt: DateTime.makeUnsafe("2026-10-05T00:00:01.000Z"),
 };
 
+const ompLiveScreenshotItem = {
+  ...screenshotItem,
+  id: TurnItemId.make("omp-live-image"),
+  toolName: "eval",
+  output: {
+    t3OmpEval: makeOmpEvalEnvelope({ revision: 1, status: "running", language: "python" }),
+    content: [{ type: "text", text: "live" }],
+    details: {
+      images: [
+        {
+          type: "image",
+          mimeType: "image/png",
+          data: Buffer.from(screenshotPng).toString("base64"),
+        },
+      ],
+    },
+  },
+};
+
 const oversizedScreenshotItem = {
   ...screenshotItem,
   id: TurnItemId.make("tool-screenshot-oversized"),
@@ -106,9 +134,11 @@ const layerTest = Layer.mergeAll(
       Effect.succeed(
         itemId === screenshotItem.id
           ? screenshotItem
-          : itemId === oversizedScreenshotItem.id
-            ? oversizedScreenshotItem
-            : null,
+          : itemId === ompLiveScreenshotItem.id
+            ? ompLiveScreenshotItem
+            : itemId === oversizedScreenshotItem.id
+              ? oversizedScreenshotItem
+              : null,
       ),
   }),
   layerConfig,
@@ -121,7 +151,28 @@ const layerTest = Layer.mergeAll(
   ServerSecretStore.layer.pipe(Layer.provide(layerConfig)),
 ).pipe(Layer.provideMerge(NodeServices.layer));
 
+const decodeAssetResource = Schema.decodeUnknownOption(AssetCreateUrlInput);
 describe("AssetAccess", () => {
+  it("validates provider artifact IDs without URI paths or selectors", () => {
+    const resource = {
+      _tag: "provider-output-artifact",
+      threadId: "thread-1",
+      turnItemId: "tool-1",
+    };
+    for (const artifactId of ["0", "12", "12345678901234567890123456789012"])
+      expect(decodeAssetResource({ resource: { ...resource, artifactId } })._tag).toBe("Some");
+    for (const artifactId of [
+      "",
+      "../0",
+      "-1",
+      "%30",
+      "artifact://0",
+      "0:raw:1-9",
+      "0.eval.log",
+      "1".repeat(33),
+    ])
+      expect(decodeAssetResource({ resource: { ...resource, artifactId } })._tag).toBe("None");
+  });
   describe("readMcpAppHtml", () => {
     it.effect("accepts snapshots at the stored HTML byte limit", () =>
       Effect.gen(function* () {
@@ -181,32 +232,258 @@ describe("AssetAccess", () => {
     );
   });
 
-  it.effect("serves an image a tool returned inline from the stored item", () =>
+  it.effect.each([
+    "valid",
+    "detached",
+    "unreferenced",
+    "wrong-thread",
+    "foreign-session",
+    "wrong-instance",
+    "wrong-session",
+    "foreign-journal",
+    "wrong-driver",
+    "missing",
+    "ambiguous",
+    "artifact-symlink",
+    "root-symlink",
+    "replacement",
+    "retired-reference",
+  ] as const)("provider artifact %s stays owned and identity-bound", (scenario) =>
     Effect.gen(function* () {
-      const resource = {
-        _tag: "tool-output-image" as const,
-        threadId: screenshotItem.threadId,
-        itemId: screenshotItem.id,
-        index: 0,
+      const config = yield* ServerConfig.ServerConfig;
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const instanceId = ProviderInstanceId.make("omp-test"),
+        driver = ProviderDriverKind.make("omp"),
+        threadId = screenshotItem.threadId;
+      const providerThreadId = ProviderThreadId.make("omp-provider-thread"),
+        providerSessionId = ProviderSessionId.make("omp-session");
+      const root = ownedOmpSessionDirectory(config.stateDir, instanceId);
+      const journal = path.join(root, "owned.jsonl"),
+        directory = path.join(root, "owned"),
+        file = path.join(directory, "0.eval.log");
+      yield* fs.makeDirectory(directory, { recursive: true });
+      yield* fs.writeFileString(journal, '{"type":"session","id":"owned-native"}\n');
+      yield* fs.writeFileString(file, "Complete native output");
+      const now = yield* DateTime.now;
+      let projection: OrchestrationV2ThreadProjection = {
+        thread: {
+          ...liveThreadShell(threadId),
+          lastVisitedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          archivedAt: null,
+          deletedAt: null,
+          providerInstanceId: instanceId,
+          modelSelection: { instanceId, model: "default" },
+        },
+        runs: [],
+        attempts: [],
+        nodes: [],
+        subagents: [],
+        providerSessions: [
+          {
+            id: providerSessionId,
+            driver,
+            providerInstanceId: instanceId,
+            status: "stopped",
+            cwd: config.cwd,
+            model: null,
+            capabilities: CodexProviderCapabilitiesV2,
+            createdAt: now,
+            updatedAt: now,
+            lastError: null,
+          },
+        ],
+        providerThreads: [
+          {
+            id: providerThreadId,
+            driver,
+            providerInstanceId: instanceId,
+            providerSessionId,
+            appThreadId: threadId,
+            ownerNodeId: null,
+            nativeThreadRef: { driver, nativeId: journal, strength: "strong" },
+            nativeConversationHeadRef: null,
+            status: "not_loaded",
+            firstRunOrdinal: null,
+            lastRunOrdinal: null,
+            handoffIds: [],
+            forkedFrom: null,
+            pendingBackgroundTasks: [],
+            contextUsage: null,
+            nativeMetadata: null,
+            goal: null,
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+        providerTurns: [],
+        runtimeRequests: [],
+        messages: [],
+        plans: [],
+        turnItems: [],
+        checkpointScopes: [],
+        checkpoints: [],
+        contextHandoffs: [],
+        contextTransfers: [],
+        visibleTurnItems: [],
+        updatedAt: now,
       };
-      const result = yield* issueAssetUrl({ resource });
-      expect(result.imageDimensions).toEqual({ width: 390, height: 844 });
-      const suffix = result.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
-      const separator = suffix.indexOf("/");
-      expect(yield* resolveAsset(suffix.slice(0, separator), suffix.slice(separator + 1))).toEqual({
-        kind: "bytes",
-        mimeType: "image/png",
-        bytes: Buffer.from(screenshotPng),
+      let item = {
+        ...screenshotItem,
+        id: TurnItemId.make("omp-artifact"),
+        providerThreadId,
+        nativeItemRef: { driver, nativeId: "native-tool", strength: "strong" as const },
+        toolName: "eval",
+        output: { content: [], details: { meta: { truncation: { artifactId: "0" } } } },
+      };
+      const owner = projection.providerThreads[0]!;
+      const outsider = path.join(config.baseDir, "outside.log");
+      yield* fs.writeFileString(outsider, "Private outside data");
+      if (scenario === "detached")
+        projection = { ...projection, providerThreads: [{ ...owner, providerSessionId: null }] };
+      if (scenario === "unreferenced")
+        item = {
+          ...item,
+          output: { content: [], details: { meta: { truncation: { artifactId: "9" } } } },
+        };
+      if (scenario === "wrong-thread")
+        item = { ...item, threadId: ThreadId.make("another-thread") };
+      if (scenario === "foreign-session")
+        projection = {
+          ...projection,
+          providerThreads: [{ ...owner, appThreadId: ThreadId.make("another-thread") }],
+        };
+      if (scenario === "wrong-instance")
+        projection = {
+          ...projection,
+          providerThreads: [
+            { ...owner, providerInstanceId: ProviderInstanceId.make("other-instance") },
+          ],
+        };
+      if (scenario === "wrong-session")
+        projection = {
+          ...projection,
+          providerThreads: [
+            { ...owner, providerSessionId: ProviderSessionId.make("foreign-session") },
+          ],
+        };
+      if (scenario === "foreign-journal") {
+        const foreign = path.join(config.baseDir, "foreign.jsonl");
+        yield* fs.writeFileString(foreign, '{"type":"session","id":"foreign"}');
+        projection = {
+          ...projection,
+          providerThreads: [
+            { ...owner, nativeThreadRef: { driver, nativeId: foreign, strength: "strong" } },
+          ],
+        };
+      }
+      if (scenario === "wrong-driver")
+        item = {
+          ...item,
+          nativeItemRef: { ...item.nativeItemRef, driver: ProviderDriverKind.make("codex") },
+        };
+      if (scenario === "missing") yield* fs.remove(file);
+      if (scenario === "ambiguous")
+        yield* fs.writeFileString(path.join(directory, "0.read.log"), "Ambiguous output");
+      if (scenario === "artifact-symlink") {
+        yield* fs.remove(file);
+        yield* fs.symlink(outsider, file);
+      }
+      if (scenario === "root-symlink") {
+        const foreign = path.join(config.baseDir, "foreign-artifacts");
+        yield* fs.makeDirectory(foreign);
+        yield* fs.writeFileString(path.join(foreign, "0.eval.log"), "Foreign");
+        yield* fs.remove(directory, { recursive: true });
+        yield* fs.symlink(foreign, directory);
+      }
+      const delegate = yield* Orchestrator.OrchestratorV2;
+      const service = Orchestrator.OrchestratorV2.of({
+        ...delegate,
+        getTurnItem: () => Effect.succeed(item),
+        getThreadRecords: () => Effect.succeed(projection),
       });
-      const missing = yield* issueAssetUrl({ resource: { ...resource, index: 1 } }).pipe(
-        Effect.flip,
-      );
-      expect(missing._tag).toBe("AssetWorkspaceAssetNotFoundError");
-      const oversized = yield* issueAssetUrl({
-        resource: { ...resource, itemId: oversizedScreenshotItem.id },
-      }).pipe(Effect.flip);
-      expect(oversized._tag).toBe("AssetWorkspaceAssetNotFoundError");
-    }).pipe(Effect.provide(layerTest)),
+      const resource = {
+        _tag: "provider-output-artifact" as const,
+        threadId,
+        turnItemId: item.id,
+        artifactId: "0",
+      };
+      yield* Effect.gen(function* () {
+        if (!["valid", "detached", "replacement", "retired-reference"].includes(scenario)) {
+          expect(yield* issueAssetUrl({ resource }).pipe(Effect.flip)).toMatchObject({
+            _tag: "AssetWorkspaceAssetNotFoundError",
+          });
+          return;
+        }
+        const result = yield* issueAssetUrl({ resource });
+        const suffix = result.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length),
+          split = suffix.indexOf("/"),
+          token = suffix.slice(0, split),
+          name = suffix.slice(split + 1);
+        if (scenario === "replacement") {
+          const replacement = path.join(directory, "replacement.log");
+          yield* fs.writeFileString(replacement, "Replaced");
+          yield* fs.rename(replacement, file);
+        }
+        if (scenario === "retired-reference")
+          item = {
+            ...item,
+            output: { content: [], details: { meta: { truncation: { artifactId: "9" } } } },
+          };
+        const resolved = yield* resolveAsset(token, name);
+        if (scenario === "replacement" || scenario === "retired-reference") {
+          expect(resolved).toBeNull();
+          return;
+        }
+        expect(resolved).toMatchObject({
+          kind: "file",
+          mimeType: "application/octet-stream",
+          download: true,
+          fileName: "0.eval.log",
+        });
+        if (resolved?.kind !== "file" || !("file" in resolved) || !resolved.file)
+          throw new Error("Expected validated descriptor");
+        const response = HttpServerResponse.toWeb(yield* assetFileResponse(resolved));
+        expect(response.headers.get("content-disposition")).toContain("attachment;");
+        expect(response.headers.get("content-type")).toBe("application/octet-stream");
+        expect(yield* Effect.promise(() => response.text())).toBe("Complete native output");
+        expect(yield* resolveAsset(token, "other.log")).toBeNull();
+      }).pipe(Effect.provideService(Orchestrator.OrchestratorV2, service));
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each([screenshotItem, ompLiveScreenshotItem])(
+    "serves an image returned by $toolName from the stored item",
+    (item) =>
+      Effect.gen(function* () {
+        const resource = {
+          _tag: "tool-output-image" as const,
+          threadId: item.threadId,
+          itemId: item.id,
+          index: 0,
+        };
+        const result = yield* issueAssetUrl({ resource });
+        expect(result.imageDimensions).toEqual({ width: 390, height: 844 });
+        const suffix = result.relativeUrl.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+        const separator = suffix.indexOf("/");
+        expect(
+          yield* resolveAsset(suffix.slice(0, separator), suffix.slice(separator + 1)),
+        ).toEqual({
+          kind: "bytes",
+          mimeType: "image/png",
+          bytes: Buffer.from(screenshotPng),
+        });
+        const missing = yield* issueAssetUrl({ resource: { ...resource, index: 1 } }).pipe(
+          Effect.flip,
+        );
+        expect(missing._tag).toBe("AssetWorkspaceAssetNotFoundError");
+        const oversized = yield* issueAssetUrl({
+          resource: { ...resource, itemId: oversizedScreenshotItem.id },
+        }).pipe(Effect.flip);
+        expect(oversized._tag).toBe("AssetWorkspaceAssetNotFoundError");
+      }).pipe(Effect.provide(layerTest)),
   );
 
   it.effect("issues exact URLs for media and browser documents outside the workspace", () =>

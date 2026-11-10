@@ -91,7 +91,10 @@ export function AttachmentFilePreview(props: {
     | { environmentId: EnvironmentId; attachmentId: string }
     | {
         environmentId: EnvironmentId;
-        resource: Extract<AssetResource, { _tag: "media-file" | "draft-workspace-file" }>;
+        resource: Extract<
+          AssetResource,
+          { _tag: "media-file" | "draft-workspace-file" | "provider-output-artifact" }
+        >;
       };
   htmlRender?: boolean;
   threadRef?: ScopedThreadRef;
@@ -129,7 +132,7 @@ export function AttachmentFilePreview(props: {
           }
         : null;
   const downloadResource = resource
-    ? resource._tag === "draft-workspace-file"
+    ? resource._tag === "draft-workspace-file" || resource._tag === "provider-output-artifact"
       ? resource
       : { ...resource, disposition: "attachment" as const }
     : null;

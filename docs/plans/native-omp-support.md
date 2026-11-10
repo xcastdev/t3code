@@ -1,5 +1,5 @@
 Github Tracked: false
-Status: planned
+Status: blocked
 Github Issue: none
 
 # Native OMP support
@@ -109,6 +109,7 @@ The relevant payload contains cell `title`, `code`, `language`, `output`, `statu
 ## Decisions and assumptions
 
 - Local work record; GitHub tracking was not requested.
+- Implementation decision approved by the maintainer: add a typed `provider-output-artifact { threadId, turnItemId, artifactId }` asset resource because the assumed native artifact resolver does not exist. Resolve decimal IDs through persisted OMP item/session ownership in the destination environment; bind signed downloads to verified file identity. No caller paths, native registry fallback or arbitrary URI dispatch.
 - Default provider executable is `omp`. Use `/home/user/.local/share/bun/bin/omp` for this machine's verification; never hardcode that user path into shipped defaults.
 - Reuse Pi's proven process ownership, correlation and history patterns where appropriate. Keep OMP's protocol differences explicit rather than creating a broad dialect framework in advance.
 - The selected mechanism is a T3-owned Bun loader and native SDK launcher. Native foreground eval is retained; only the denied helpers and stale/unregistered permission executions are rejected.
@@ -355,13 +356,42 @@ Fresh reviewers should independently challenge (1) loader registration before ev
 
 ### Validation and review status
 
-Spec and plan only. Existing scratch proofs are described above; no product tests, client integration or permission-loader proof are claimed passed. No installed OMP/upstream files or global settings were changed. The selected loader approach is now authorized for the plan; the evaluator rewrite, PTY replacement and upstream API alternatives are removed from the implementation path.
+Implementation is preserved locally and blocked on the remaining acceptance work below. No commit, push or PR was created. The approved artifact-resource addition is implemented; it no longer needs a design decision.
 
-Both requested fresh GPT-6.1-Sol High reviews completed. Their findings were verified against installed OMP and T3 sources and incorporated:
+Implemented: native provider and guarded Bun launcher, exact source recipe, permission epochs and execution-boundary checks, JS/Python helper restrictions, native JSONL transport and owned process supervision, discovery/settings/model/reasoning/commands, authorized host tools, lifecycle/questions/permissions, history/forks/rollback/todos/usage/helpers, bounded eval output and web/mobile presentation, typed output-artifact access, registry/shipping/CI integration and user documentation. The provider is registered with its default disabled. Existing Pi and ACP identities remain independent.
 
-- Runtime: bind authorization to immutable owned input/subject/context snapshots and invoke with isolated arguments; invalidate by session/scope generation at transition entry, including same-identity/equal-policy cwd changes.
-- Delivery: preserve structured revision/artifact/image metadata through >256-KiB detail truncation; wire the native-policy job into Check and change detection with isolated Bun/Python execution; update release-smoke's manifest list and verify the shipped artifact externally; define the T3→OMP mode mapping explicitly.
+Fresh GPT-6.1-Sol High reviews found and drove fixes for permission/executor/delegation/cwd boundaries, process lifecycle, adapter terminal publication, command admission, local completion, phase/title extraction, live images and oversized structured views. Final scoped audit `/tmp/t3-native-omp-final-review.md` found no new reproducible defect in the final image/view/artifact delta. This is not acceptance of all ACs.
 
-The reviewers found viable native insertion points and credible downstream coverage, subject to those corrections and the planned P1 proof. No additional review was started after these plan edits, and no production/native permission-loader test result is implied. The plan is ready to start gated P1 implementation; proceeding past it still requires actual passing native lifecycle tests.
+Observed evidence:
 
-IMPLEMENTATION_STARTS_WITH_P1_NATIVE_POLICY_TESTS
+- P1 native proof against the pinned fixture and supplied installation passed with zero inference; retained/reset JS/Python execution, forbidden helper allocation, native permission and transition cases, private approval/RPC handshake and staged runtime assets are covered. Exact recipe: OMP 18.16.0, Bun 1.4.4, 29 native file fingerprints and 15 mandatory guarded-module acknowledgements.
+- Backend checkpoint: focused 100-test suite and native product/history/policy probes passed. Four checkpoint corrections subsequently passed 18 focused tests plus the oversized-wire case. Final image/view/projection check passed 41 tests; artifact service check passed 18 selected cases and the RPC authorization case. Commands and limits are in `/tmp/t3-native-omp-p3-p5-report.md` and `/tmp/t3-native-omp-artifact-report.md`.
+- Client integration: `vp test run packages/client-runtime/src/work-log/ompEval.test.ts packages/client-runtime/src/work-log/itemDetail.test.ts` passed 7 tests. The dark-config repository browser run of `V2ItemInspector.browser.test.tsx` passed 4 tests. Affected client typechecks/lint passed. See `/tmp/t3-native-omp-artifact-client-report.md`.
+- `node scripts/release-smoke.ts`, `vp run --filter t3 build:bundle`, and `node scripts/verify-omp-installed-provider.ts --server-bin apps/server/dist/bin.mjs --isolated` passed before the final artifact delta. Staged verification used a separately locked OMP fixture outside the checkout, normal settings/RPC, zero inference, unavailable/changed-fingerprint refusals and unchanged installed OMP files. These shipping checks were not repeated after the artifact delta.
+- Four planned P8 routing cases and the actual instruction-import/context seam are implemented. Dry-run generated four requests; three focused tooling tests, typecheck/lint passed. No scored baseline/candidate exists. See `/tmp/t3-native-omp-p8-eval-report.md`.
+- Final `vp run check:changed` completed with exit 1 (`/tmp/t3-native-omp-check-changed-retry.log`): format, lint, dependency Knip, GraphQL, all 40 affected typechecks and React compiler passed. Tests: 1004 passed, one existing mixed-height attachment-preview case failed. A focused control using unchanged HEAD AttachmentFilePreview reproduced exactly the same offset/bound; no tolerance or unrelated implementation changed (`/tmp/t3-native-omp-final-gate-notes.md`). Export-audit Knip also fails on reports across existing repository areas; a full HEAD export-audit control was not run and failures were not suppressed. The gate is not green.
+- Android dev client installed successfully via `vp run mobile:install android emulator-5554`, with its native build succeeding. The app launched through the Device panel/AgentDevice in dark mode. Pairing the isolated backend failed on its environment descriptor at both emulator-host and reversed loopback origins. The descriptor separately validates in Node against ExecutionEnvironmentDescriptor. No native eval-view, artifact viewer or mobile scrolling success is claimed. iOS is unavailable on this Linux host.
+- Browser-panel verification could not start: preview_status explicitly reported that the thread credential lacks preview capability and must not be retried. The test-t3-app skill requires stopping that verification when the panel is unavailable. Repository browser tests are separate evidence. No integrated web screenshot, two-client/reconnect, remote/relay/tunnel or real paid native turn was completed.
+
+Acceptance status:
+
+| Criteria | Evidence / remaining limit |
+| --- | --- |
+| AC-1–AC-2 | Implemented and covered by registry/discovery/staged-install checks; integrated client entry-point operation remains unverified. |
+| AC-3–AC-4 | Focused/native transport, streaming and lifecycle checks pass; live paid-turn/client evidence remains outstanding. |
+| AC-5–AC-6 | Native execution/spawning restrictions and T3 service/bridge checks pass; provider-local routing guidance and real detached-work/client demonstration remain incomplete. |
+| AC-7–AC-8 | Native JS/Python helper/retained/reset/no-allocation and unchanged-install/config proofs pass for the exact supported recipe. |
+| AC-9–AC-10 | Terminal presentation/merge/images/views/artifact service and browser checks pass; integrated visual/device/remote proof remains outstanding. |
+| AC-11 | Modes, ordinary questions and approvals implemented/tested; protected native secret-answer input remains unsupported and explicitly cancelled. |
+| AC-12 | Native history/fork/rollback/artifact/todo/usage proofs and focused tests pass; integrated client conversation evidence remains outstanding. |
+| AC-13 | Environment-owned services/registries/authenticated resources implemented; real local/desktop/remote/relay/tunnel/multi-client legs not established. |
+| AC-14 | Exact recipe/readiness and policy-epoch/final-boundary tests pass; production platform coverage retains the documented limits. |
+
+Remaining blockers / resume point:
+
+1. Required scored instruction baseline/candidate needs working eval credentials/configuration. The actual provider-local append intentionally remains unchanged/empty; saved baseline hash is `291d42d8e346a661d2327b9e9ab586a5a34490ebe4abdaac56c30f06f9a5f396`. Complete baseline before candidate. A private credential request timed out; no model result is invented.
+2. Protected native secret input needs an authorized private answer integration. Existing provider host/question contracts do not expose one; native secret forms currently cancel with a notice. No plaintext persisted-answer fallback was introduced.
+3. Repository gate is failing as described above. Do not claim readiness or broaden into unrelated export/virtual-preview cleanup without a maintainer decision.
+4. Enable Browser-panel capability in a new agent session and resolve native pairing before integrated evidence; then exercise dark eval states, multiple clients/reconnect and the required native/remote/PTY completion legs. Do not infer remote/tunnel operation from the staged loopback check.
+
+Isolated verification state is `.t3`, containing one Replay-derived visual fixture with a synthetic OMP eval item; this is UI fixture data, not a native turn. The dev/Metro processes were launched by the parent with owned PID records `/tmp/t3-omp-dev-detached.pid` and `/tmp/t3-omp-metro-detached.pid`. The Android Device session belongs to this task. Never point these at live T3 userdata or stop unrelated processes.

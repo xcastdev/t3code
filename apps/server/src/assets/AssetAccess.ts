@@ -17,6 +17,7 @@ import {
   ThreadId,
   ToolActivityNativeAppReference,
   TurnItemId,
+  ProviderOutputArtifactId,
 } from "@t3tools/contracts";
 import {
   hostPreviewMimeTypeFromExtension,
@@ -62,6 +63,7 @@ import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
 import { isWithinRoot } from "../workspace/KnownWorkspaces.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
+import { resolveProviderOutputArtifact } from "./ProviderOutputArtifacts.ts";
 import * as NativeAppIconResolver from "./NativeAppIconResolver.ts";
 import { sourceControlDefinitions } from "../sourceControl/sourceControlDefinitions.ts";
 import { extractIcnsPng } from "./icns.ts";
@@ -127,6 +129,13 @@ const AssetClaimsSchema = Schema.Union([
     version: Schema.Literal(1),
     kind: Schema.Literal("media-file-exact"),
     filePath: Schema.String,
+    providerArtifact: Schema.optionalKey(
+      Schema.Struct({
+        threadId: ThreadId,
+        turnItemId: TurnItemId,
+        artifactId: ProviderOutputArtifactId,
+      }),
+    ),
     download: Schema.optionalKey(Schema.Boolean),
     device: Schema.String,
     inode: Schema.String,
@@ -800,6 +809,36 @@ export const issueAssetUrl = Effect.fn("AssetAccess.issueAssetUrl")(function* (i
       }
       break;
     }
+    case "provider-output-artifact": {
+      const resolved = yield* resolveProviderOutputArtifact(input.resource);
+      if (!resolved)
+        return yield* new AssetWorkspaceAssetNotFoundError({ resource: input.resource });
+      // Internal session state is served only after persisted item/session ownership validation.
+      const identity = yield* openMediaFile(resolved.filePath).pipe(
+        Effect.map((file) =>
+          file ? { device: file.info.dev.toString(), inode: file.info.ino.toString() } : null,
+        ),
+        Effect.scoped,
+        Effect.orElseSucceed(() => null),
+      );
+      if (!identity)
+        return yield* new AssetWorkspaceAssetNotFoundError({ resource: input.resource });
+      claims = {
+        version: 1,
+        kind: "media-file-exact",
+        filePath: resolved.filePath,
+        download: true,
+        ...identity,
+        providerArtifact: {
+          threadId: input.resource.threadId,
+          turnItemId: input.resource.turnItemId,
+          artifactId: input.resource.artifactId,
+        },
+        expiresAt,
+      };
+      fileName = resolved.fileName;
+      break;
+    }
     case "tool-output-image": {
       const image = yield* readToolOutputImage(input.resource).pipe(
         Effect.mapError(
@@ -988,15 +1027,24 @@ export const resolveAsset = Effect.fn("AssetAccess.resolveAsset")(function* (
   const path = yield* Path.Path;
   if (claims.kind === "media-file-exact") {
     if (decodedPath !== path.basename(claims.filePath)) return null;
-    const canonicalFile = yield* resolveCanonicalFile(claims.filePath).pipe(
-      Effect.tapError((cause) =>
-        Effect.logError("Failed to resolve canonical media path.", {
-          filePath: claims.filePath,
-          cause,
-        }),
-      ),
-      Effect.orElseSucceed(() => null),
-    );
+    const canonicalFile = claims.providerArtifact
+      ? yield* resolveProviderOutputArtifact({
+          _tag: "provider-output-artifact",
+          ...claims.providerArtifact,
+        }).pipe(
+          Effect.map((value) =>
+            claims.download === true && value?.filePath === claims.filePath ? value.filePath : null,
+          ),
+        )
+      : yield* resolveCanonicalFile(claims.filePath).pipe(
+          Effect.tapError((cause) =>
+            Effect.logError("Failed to resolve canonical media path.", {
+              filePath: claims.filePath,
+              cause,
+            }),
+          ),
+          Effect.orElseSucceed(() => null),
+        );
     if (canonicalFile !== claims.filePath) return null;
     const mimeType = claims.download
       ? "application/octet-stream"
