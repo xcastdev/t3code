@@ -146,10 +146,11 @@ it("refuses host catalog names that shadow native execution boundaries", async (
 });
 it("lists T3 and catalog tools together and sends each call to the server that listed it", async () => {
   const { connectAuthorizedMcpTools } = await import("./toolBridge.ts");
-  const served: Record<string, string> = {
-    "https://fixture.test/mcp": "t3_thread_list",
-    "https://fixture.test/mcp/catalog/s1": "plugin_inspector__headers",
+  const served: Record<string, ReadonlyArray<string>> = {
+    "https://fixture.test/mcp": ["t3_thread_list", "t3_thread_send"],
+    "https://fixture.test/mcp/catalog/s1": ["plugin_inspector__headers"],
   };
+  const readOnly = new Set(["t3_thread_list", "plugin_inspector__headers"]);
   const calls: string[] = [];
   const authorized = await connectAuthorizedMcpTools(
     {
@@ -164,7 +165,13 @@ it("lists T3 and catalog tools together and sends each call to the server that l
         body.method === "initialize"
           ? { protocolVersion: "2025-06-18" }
           : body.method === "tools/list"
-            ? { tools: [{ name: served[String(url)], inputSchema: { type: "object" } }] }
+            ? {
+                tools: served[String(url)]!.map((name) => ({
+                  name,
+                  inputSchema: { type: "object" },
+                  annotations: { readOnlyHint: readOnly.has(name) },
+                })),
+              }
             : { content: [{ type: "text", text: String(url) }] };
       if (body.method === "tools/call") calls.push(`${body.params.name}@${String(url)}`);
       if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
@@ -173,9 +180,11 @@ it("lists T3 and catalog tools together and sends each call to the server that l
   );
   expect(authorized.tools.map((tool) => tool.name)).toEqual([
     "t3_thread_list",
+    "t3_thread_send",
     "plugin_inspector__headers",
   ]);
-  expect([...authorized.t3ToolNames]).toEqual(["t3_thread_list"]);
+  expect([...authorized.t3ToolNames]).toEqual(["t3_thread_list", "t3_thread_send"]);
+  expect([...authorized.readOnlyT3ToolNames]).toEqual(["t3_thread_list"]);
   const signal = new AbortController().signal;
   await authorized.callTool("t3_thread_list", {}, signal);
   await authorized.callTool("plugin_inspector__headers", {}, signal);

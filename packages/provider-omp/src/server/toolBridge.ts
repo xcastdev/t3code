@@ -2,6 +2,7 @@ export interface CatalogTool {
   readonly name: string;
   readonly description?: string;
   readonly inputSchema: Record<string, unknown>;
+  readonly readOnly?: boolean;
 }
 type RecordFrame = { type: string; [key: string]: unknown };
 type Send = (record: RecordFrame) => Promise<unknown>;
@@ -192,6 +193,8 @@ export interface AuthorizedMcpTools {
   readonly tools: readonly CatalogTool[];
   /** Tools listed by T3's own endpoint, whose authority does not depend on the catalog. */
   readonly t3ToolNames: ReadonlySet<string>;
+  /** T3 tools annotated read-only; catalog servers' annotations are not trusted. */
+  readonly readOnlyT3ToolNames: ReadonlySet<string>;
   callTool(
     name: string,
     args: Record<string, unknown>,
@@ -210,6 +213,7 @@ export async function connectAuthorizedMcpTools(
     endpoints.push(config.catalogEndpoint);
   const tools: CatalogTool[] = [];
   const t3ToolNames = new Set<string>();
+  const readOnlyT3ToolNames = new Set<string>();
   const routes = new Map<string, AuthorizedMcpClient>();
   for (const endpoint of endpoints) {
     const client = new AuthorizedMcpClient(
@@ -220,13 +224,17 @@ export async function connectAuthorizedMcpTools(
     for (const tool of await client.listTools(signal)) {
       if (routes.has(tool.name)) throw new Error("Invalid or duplicate MCP catalog tool");
       routes.set(tool.name, client);
-      if (endpoint === config.endpoint) t3ToolNames.add(tool.name);
+      if (endpoint === config.endpoint) {
+        t3ToolNames.add(tool.name);
+        if (tool.readOnly) readOnlyT3ToolNames.add(tool.name);
+      }
       tools.push(tool);
     }
   }
   return {
     tools,
     t3ToolNames,
+    readOnlyT3ToolNames,
     callTool: async (name, args, callSignal, onProgress) => {
       const client = routes.get(name);
       if (!client) throw new Error("Tool unavailable for this authorized catalog");
@@ -374,6 +382,9 @@ export class AuthorizedMcpClient {
           name: tool.name,
           inputSchema: tool.inputSchema,
           ...(typeof tool.description === "string" ? { description: tool.description } : {}),
+          ...(object(tool.annotations) && tool.annotations.readOnlyHint === true
+            ? { readOnly: true }
+            : {}),
         });
       }
       if (tools.length > 4096) throw new Error("MCP catalog budget exceeded");

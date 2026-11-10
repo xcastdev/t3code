@@ -1269,6 +1269,17 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
             Effect.gen(function* () {
               if (captured !== generation) return;
               if (control.type !== "approval_request") return;
+              const tool = control.payload.origin.tool;
+              // Matches Pi: T3's read-only tools run without a prompt in every permission mode.
+              if (tool !== undefined && endpoint?.readOnlyT3ToolNames.has(tool))
+                return yield* current.sendControl({
+                  v: 1,
+                  type: "approval_answer",
+                  providerSession: control.providerSession,
+                  epoch: control.epoch,
+                  id: control.id,
+                  answer: "once",
+                });
               const requestId = yield* ids.allocate
                 .runtimeRequest({
                   driver: OMP_DRIVER,

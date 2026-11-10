@@ -167,7 +167,10 @@ export async function startNativeRuntime(root: string, config: RuntimeConfig) {
     const auth = currentAuthorization();
     if (auth.providerSession !== config.providerSession)
       throw new Error("OMP approval provider session mismatch");
-    const answer = await broker!.request(prompt, { nativeCallId: auth.nativeCallId });
+    const answer = await broker!.request(prompt, {
+      nativeCallId: auth.nativeCallId,
+      ...(auth.tool ? { tool: auth.tool } : {}),
+    });
     boundary.epoch.assert();
     return answer;
   };

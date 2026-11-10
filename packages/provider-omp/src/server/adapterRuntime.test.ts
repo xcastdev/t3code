@@ -12,7 +12,9 @@ import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
 import * as TestClock from "effect/testing/TestClock";
+import { vi } from "vite-plus/test";
 import {
+  EnvironmentId,
   MessageId,
   ProjectId,
   ThreadId,
@@ -839,4 +841,123 @@ it.effect.each(["normal", "dead transport", "stop transport", "history unavailab
       });
       expect(rolled.messages?.map((message) => message.text)).toEqual(["Inherited parent context"]);
     }).pipe(Effect.scoped, Effect.provide(services)),
+);
+
+it.effect("answers T3's read-only host tools itself and prompts for every other approval", () =>
+  Effect.gen(function* () {
+    const readOnly = new Set(["task_status"]);
+    using _fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      const result =
+        body.method === "initialize"
+          ? { protocolVersion: "2025-06-18" }
+          : {
+              tools: ["task_status", "delegate_task"].map((name) => ({
+                name,
+                description: name,
+                inputSchema: { type: "object" },
+                annotations: { readOnlyHint: readOnly.has(name) },
+              })),
+            };
+      return Response.json({ jsonrpc: "2.0", id: body.id, result });
+    });
+    const instanceId = ProviderInstanceId.make("omp-test");
+    const threadId = ThreadId.make("t");
+    const catalogs = yield* Catalogs.McpProviderSessions;
+    yield* catalogs.set({
+      environmentId: EnvironmentId.make("env"),
+      threadId,
+      providerSessionId: "s",
+      providerInstanceId: instanceId,
+      endpoint: "https://fixture.test/mcp",
+      authorizationHeader: "Bearer fixture",
+      browserToolsAvailable: false,
+    });
+    const controls = yield* Queue.unbounded<ControlEnvelope, OmpRpcError>();
+    const answers = yield* Queue.unbounded<ControlEnvelope>();
+    const events = yield* Queue.unbounded<OmpRpcRecord, OmpRpcError>();
+    const adapter = yield* makeOmpAdapterV2(
+      {
+        instanceId,
+        settings: { enabled: false, binaryPath: "omp", launchArgs: "", customModels: [] },
+        environment: {},
+      },
+      (options: OmpSessionOptions) =>
+        Effect.succeed({
+          send: () => Effect.void,
+          request: (r: OmpRpcRecord) =>
+            Effect.succeed(
+              (
+                {
+                  get_state: {
+                    sessionId: "native",
+                    model: { id: "base", provider: "p" },
+                    sessionFile: options.config.sessionDir + "/native.jsonl",
+                    isSettled: true,
+                    systemPrompt: [options.config.instructions],
+                  },
+                  get_entries: { entries: [], leafId: null },
+                  get_available_models: { models: [{ id: "base", provider: "p", name: "Base" }] },
+                  get_available_thinking_levels: { levels: ["off"] },
+                  get_available_commands: { commands: [] },
+                } as Record<string, unknown>
+              )[r.type] ?? {},
+            ),
+          events,
+          controls,
+          sendControl: (frame: ControlEnvelope) => Queue.offer(answers, frame).pipe(Effect.asVoid),
+          providerSession: "private",
+          policyEpoch: "epoch",
+          exited: Effect.never,
+          terminate: Effect.void,
+          shutdown: () => Effect.void,
+          diagnostics: () => ({ stderrBytes: 0 }),
+        }),
+    );
+    const runtime = yield* adapter.openSession({
+      threadId,
+      providerSessionId: ProviderSessionId.make("s"),
+      modelSelection: { instanceId, model: "default" },
+      runtimePolicy: {
+        cwd: "/workspace",
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+      },
+    });
+    const published = yield* Queue.unbounded<string>();
+    yield* runtime.events.pipe(
+      Stream.runForEach((e) =>
+        e.type === "runtime_request.updated"
+          ? Queue.offer(published, e.runtimeRequest.nativeRequestRef?.nativeId ?? "")
+          : Effect.void,
+      ),
+      Effect.forkScoped,
+    );
+    const approvalRequest = (id: string, tool: string) =>
+      Queue.offer(controls, {
+        v: 1,
+        type: "approval_request",
+        providerSession: "private",
+        epoch: "epoch",
+        id,
+        payload: {
+          prompt: { full: "Tool permission", compact: "Permission" },
+          origin: { nativeCallId: id, tool },
+        },
+      });
+    yield* approvalRequest("read-only", "task_status");
+    expect(yield* Queue.take(answers)).toMatchObject({
+      type: "approval_answer",
+      id: "read-only",
+      answer: "once",
+    });
+    yield* approvalRequest("mutating", "delegate_task");
+    yield* approvalRequest("native", "bash");
+    expect([yield* Queue.take(published), yield* Queue.take(published)]).toEqual([
+      "mutating",
+      "native",
+    ]);
+    expect(yield* Queue.size(answers)).toBe(0);
+  }).pipe(Effect.scoped, Effect.provide(services)),
 );

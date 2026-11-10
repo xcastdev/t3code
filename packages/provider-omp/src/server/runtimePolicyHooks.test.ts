@@ -7,6 +7,8 @@ import {
   assertBeforeInvoke,
   nativeContext,
   ownedNativeContext,
+  currentAuthorization,
+  withAuthorization,
 } from "./runtimePolicyHooks.ts";
 
 function setup() {
@@ -144,6 +146,39 @@ describe("native permission lifetime", () => {
       Object.assign(toolCall, { addAdditionalContext: forged });
       expect(invoke(auth), forged).toThrow(/changed/);
     }
+  });
+  it("reports the approved tool, resolving xd:// device dispatch to its target only", () => {
+    const s = setup();
+    s.epoch.open();
+    const exec = { mode: "always-ask", decision: { policy: "prompt", tier: "exec" } };
+    const approvedTool = (name: string, input: unknown) =>
+      withAuthorization(
+        captureAuthorization(
+          enterNativeCall(s.settings, { nativeCallId: "a", kind: "tool", scope: s.scope }),
+          {
+            subject: { name },
+            effectiveInput: input,
+            executionContext: {},
+            disposition: "pending",
+            decision: exec,
+            resolveDecision: () => exec,
+          },
+        ),
+        () => currentAuthorization().tool,
+      );
+    expect(approvedTool("t3_thread_list", {})).toBe("t3_thread_list");
+    expect(approvedTool("write", { path: "xd://t3_thread_list", content: "{}" })).toBe(
+      "t3_thread_list",
+    );
+    for (const path of [
+      "notes.md",
+      "xd://",
+      "xd://t3_thread_list/x",
+      "[xd://t3_thread_list#AB]",
+      "xd://" + "a".repeat(129),
+    ])
+      expect(approvedTool("write", { path, content: "{}" }), path).toBe("write");
+    expect(approvedTool("a".repeat(129), {})).toBeUndefined();
   });
   it("normalizes persisted Auto to a displayed supervised mode", () => {
     expect(normalizeOmpMode("auto")).toEqual({ mode: "approval-required", native: "always-ask" });

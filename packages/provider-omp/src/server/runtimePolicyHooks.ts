@@ -618,16 +618,27 @@ export function invokeNativeDelegation<TResult>(
 export function withAuthorization<T>(auth: Authorization, f: () => T): T {
   return requestContext.run(auth, f);
 }
+// The tool a call runs: its own name, or the device a `write xd://<tool>` dispatches to.
+function approvedTool(subject: object, input: unknown) {
+  const name = (subject as { name?: unknown }).name;
+  // Longer names are left out, so the host shows a prompt instead of rejecting the frame.
+  if (typeof name !== "string" || !name || name.length > 128) return undefined;
+  if (name !== "write") return name;
+  const path = typeof input === "object" && input !== null && "path" in input ? input.path : null;
+  return (typeof path === "string" && /^xd:\/\/([A-Za-z0-9_.-]{1,128})$/.exec(path)?.[1]) || name;
+}
 export function currentAuthorization() {
   const auth = requestContext.getStore();
   const state = auth && authorizations.get(auth);
   if (!state) throw new Error("OMP approval without registered authorization");
   assertLiveEpoch(state.call.epoch, state.call.settings);
+  const tool = approvedTool(state.subject, state.input);
   return Object.freeze({
     providerSession: state.call.epoch.scope.providerSession,
     nativeCallId: state.call.call.nativeCallId,
     epoch: state.call.epoch.id,
     session: state.call.epoch.scope.session,
+    ...(tool ? { tool } : {}),
   });
 }
 

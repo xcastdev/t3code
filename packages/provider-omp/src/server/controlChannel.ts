@@ -17,7 +17,10 @@ export type ControlEnvelope = ControlBase &
   (
     | {
         type: "approval_request";
-        payload: { prompt: { full: string; compact: string }; origin: { nativeCallId: string } };
+        payload: {
+          prompt: { full: string; compact: string };
+          origin: { nativeCallId: string; tool?: string };
+        };
       }
     | { type: "approval_answer"; answer: "once" | "deny" }
     | {
@@ -56,7 +59,11 @@ export function decodeControlEnvelope(
       !record(v.payload.origin) ||
       ![v.payload.prompt.full, v.payload.prompt.compact, v.payload.origin.nativeCallId].every(
         (x) => typeof x === "string" && x.length > 0 && x.length < 64 * 1024,
-      )
+      ) ||
+      (v.payload.origin.tool !== undefined &&
+        (typeof v.payload.origin.tool !== "string" ||
+          v.payload.origin.tool.length === 0 ||
+          v.payload.origin.tool.length > 256))
     )
       return { ok: false };
   }
@@ -90,7 +97,10 @@ export class ApprovalBroker {
     this.epoch = epoch;
     this.send = send;
   }
-  request(prompt: { full: string; compact: string }, origin: { nativeCallId: string }) {
+  request(
+    prompt: { full: string; compact: string },
+    origin: { nativeCallId: string; tool?: string },
+  ) {
     if (this.closed) return Promise.resolve("deny" as const);
     const id = NodeCrypto.randomUUID();
     return new Promise<"once" | "deny">((resolve) => {
