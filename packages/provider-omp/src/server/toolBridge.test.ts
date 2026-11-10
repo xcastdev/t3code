@@ -144,3 +144,43 @@ it("refuses host catalog names that shadow native execution boundaries", async (
   for (const name of ["eval", "bash", "read", "edit", "write"])
     await expect(bridge.replace([{ name, inputSchema: {} }], "g")).rejects.toThrow(/native/i);
 });
+it("lists T3 and catalog tools together and sends each call to the server that listed it", async () => {
+  const { connectAuthorizedMcpTools } = await import("./toolBridge.ts");
+  const served: Record<string, string> = {
+    "https://fixture.test/mcp": "t3_thread_list",
+    "https://fixture.test/mcp/catalog/s1": "plugin_inspector__headers",
+  };
+  const calls: string[] = [];
+  const authorized = await connectAuthorizedMcpTools(
+    {
+      endpoint: "https://fixture.test/mcp",
+      catalogEndpoint: "https://fixture.test/mcp/catalog/s1",
+      authorizationHeader: "Bearer private",
+    },
+    new AbortController().signal,
+    async (url, init) => {
+      const body = JSON.parse(String(init?.body));
+      const result =
+        body.method === "initialize"
+          ? { protocolVersion: "2025-06-18" }
+          : body.method === "tools/list"
+            ? { tools: [{ name: served[String(url)], inputSchema: { type: "object" } }] }
+            : { content: [{ type: "text", text: String(url) }] };
+      if (body.method === "tools/call") calls.push(`${body.params.name}@${String(url)}`);
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      return Response.json({ jsonrpc: "2.0", id: body.id, result });
+    },
+  );
+  expect(authorized.tools.map((tool) => tool.name)).toEqual([
+    "t3_thread_list",
+    "plugin_inspector__headers",
+  ]);
+  const signal = new AbortController().signal;
+  await authorized.callTool("t3_thread_list", {}, signal);
+  await authorized.callTool("plugin_inspector__headers", {}, signal);
+  expect(calls).toEqual([
+    "t3_thread_list@https://fixture.test/mcp",
+    "plugin_inspector__headers@https://fixture.test/mcp/catalog/s1",
+  ]);
+  await expect(authorized.callTool("unlisted", {}, signal)).rejects.toThrow(/unavailable/);
+});

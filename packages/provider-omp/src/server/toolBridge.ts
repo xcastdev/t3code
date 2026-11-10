@@ -172,6 +172,47 @@ export interface OmpMcpEndpoint {
   readonly endpoint: string;
   readonly authorizationHeader: string;
 }
+export interface AuthorizedMcpTools {
+  readonly tools: readonly CatalogTool[];
+  callTool(
+    name: string,
+    args: Record<string, unknown>,
+    signal: AbortSignal,
+    onProgress?: Progress,
+  ): Promise<unknown>;
+}
+/** T3's own tools live on `endpoint`, catalog servers and plugins on `catalogEndpoint`. */
+export async function connectAuthorizedMcpTools(
+  config: OmpMcpEndpoint & { readonly catalogEndpoint?: string | undefined },
+  signal: AbortSignal,
+  fetcher: typeof fetch = fetch,
+): Promise<AuthorizedMcpTools> {
+  const endpoints = [config.endpoint];
+  if (config.catalogEndpoint && config.catalogEndpoint !== config.endpoint)
+    endpoints.push(config.catalogEndpoint);
+  const tools: CatalogTool[] = [];
+  const routes = new Map<string, AuthorizedMcpClient>();
+  for (const endpoint of endpoints) {
+    const client = new AuthorizedMcpClient(
+      { endpoint, authorizationHeader: config.authorizationHeader },
+      fetcher,
+    );
+    await client.connect(signal);
+    for (const tool of await client.listTools(signal)) {
+      if (routes.has(tool.name)) throw new Error("Invalid or duplicate MCP catalog tool");
+      routes.set(tool.name, client);
+      tools.push(tool);
+    }
+  }
+  return {
+    tools,
+    callTool: async (name, args, callSignal, onProgress) => {
+      const client = routes.get(name);
+      if (!client) throw new Error("Tool unavailable for this authorized catalog");
+      return client.callTool(name, args, callSignal, onProgress);
+    },
+  };
+}
 /** Each client owns its negotiated HTTP session; credentials never enter native tool definitions. */
 export class AuthorizedMcpClient {
   private next = 0;

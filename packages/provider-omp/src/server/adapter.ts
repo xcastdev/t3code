@@ -53,7 +53,7 @@ import { OmpToolItems, nativeObject, nativeText } from "./toolItems.ts";
 import { ownedOmpSessionDirectory, ompTokenUsage } from "./usage.ts";
 import { OmpHistory, historyMessages, nativeMessageBaseKey } from "./history.ts";
 import { ompQuestions, ompAnswer } from "./questions.ts";
-import { AuthorizedMcpClient, OmpToolBridge } from "./toolBridge.ts";
+import { type AuthorizedMcpTools, connectAuthorizedMcpTools, OmpToolBridge } from "./toolBridge.ts";
 import { buildOmpInstructions } from "./instructions.ts";
 export const OMP_DRIVER = ProviderDriverKind.make("omp");
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
@@ -905,7 +905,7 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
           return result;
         },
       );
-      let endpoint: AuthorizedMcpClient | undefined;
+      let endpoint: AuthorizedMcpTools | undefined;
       let installedConfig: McpProviderSessionConfig | undefined;
       let catalogGeneration = 0;
       const syncCatalog = Effect.fn("OmpAdapter.syncCatalog")(function* () {
@@ -923,22 +923,13 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
             config.threadId !== input.threadId
           )
             return yield* protocol("MCP catalog ownership mismatch");
-          const execution = new AuthorizedMcpClient(config);
-          const inventory = new AuthorizedMcpClient({
-            ...config,
-            endpoint: config.catalogEndpoint ?? config.endpoint,
-          });
-          const tools = yield* Effect.tryPromise({
-            try: async (signal) => {
-              await execution.connect(signal);
-              await inventory.connect(signal);
-              return inventory.listTools(signal);
-            },
+          const authorized = yield* Effect.tryPromise({
+            try: (signal) => connectAuthorizedMcpTools(config, signal),
             catch: (cause) => protocol("Authorized MCP discovery failed", cause),
           });
-          endpoint = execution;
+          endpoint = authorized;
           yield* Effect.tryPromise({
-            try: () => bridge.replace(tools, identity),
+            try: () => bridge.replace(authorized.tools, identity),
             catch: (cause) => protocol("OMP native host tool installation failed", cause),
           });
           yield* catalogs.acknowledgeCatalogEndpoint(config);
