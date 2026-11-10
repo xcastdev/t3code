@@ -20,14 +20,22 @@ export class OmpToolBridge {
   private generation = 0;
   private identity = "";
   private closed = false;
-  private readonly pending = new Map<string, { controller: AbortController; generation: number }>();
+  private readonly pending = new Map<
+    string,
+    { controller: AbortController; generation: number; toolName: string }
+  >();
   private readonly send: Send;
   private readonly call: Call;
   constructor(send: Send, call: Call) {
     this.send = send;
     this.call = call;
   }
-  async replace(tools: readonly CatalogTool[], identity: string) {
+  /** Pending calls to tools in `keep` survive the swap; their authority did not change. */
+  async replace(
+    tools: readonly CatalogTool[],
+    identity: string,
+    keep: ReadonlySet<string> = new Set(),
+  ) {
     if (this.closed && tools.length) throw new Error("OMP tool bridge closed");
     const next = new Map<string, CatalogTool>();
     for (const tool of tools) {
@@ -60,7 +68,7 @@ export class OmpToolBridge {
     this.generation++;
     this.identity = identity;
     this.tools = next;
-    await this.cancelPending();
+    await this.cancelPending(keep);
     await this.send({
       type: "set_host_tools",
       tools: [...next.values()].map((t) => ({
@@ -100,7 +108,11 @@ export class OmpToolBridge {
       });
       return;
     }
-    const owned = { controller: new AbortController(), generation: this.generation };
+    const owned = {
+      controller: new AbortController(),
+      generation: this.generation,
+      toolName: frame.toolName,
+    };
     this.pending.set(id, owned);
     let result: unknown;
     let isError = false;
@@ -150,9 +162,13 @@ export class OmpToolBridge {
       ...(isError ? { isError: true } : {}),
     });
   }
-  async cancelPending() {
+  async cancelPending(keep: ReadonlySet<string> = new Set()) {
     this.generation++;
     for (const [id, call] of this.pending) {
+      if (keep.has(call.toolName)) {
+        call.generation = this.generation;
+        continue;
+      }
       this.pending.delete(id);
       call.controller.abort();
       await this.send({
@@ -174,6 +190,8 @@ export interface OmpMcpEndpoint {
 }
 export interface AuthorizedMcpTools {
   readonly tools: readonly CatalogTool[];
+  /** Tools listed by T3's own endpoint, whose authority does not depend on the catalog. */
+  readonly t3ToolNames: ReadonlySet<string>;
   callTool(
     name: string,
     args: Record<string, unknown>,
@@ -191,6 +209,7 @@ export async function connectAuthorizedMcpTools(
   if (config.catalogEndpoint && config.catalogEndpoint !== config.endpoint)
     endpoints.push(config.catalogEndpoint);
   const tools: CatalogTool[] = [];
+  const t3ToolNames = new Set<string>();
   const routes = new Map<string, AuthorizedMcpClient>();
   for (const endpoint of endpoints) {
     const client = new AuthorizedMcpClient(
@@ -201,11 +220,13 @@ export async function connectAuthorizedMcpTools(
     for (const tool of await client.listTools(signal)) {
       if (routes.has(tool.name)) throw new Error("Invalid or duplicate MCP catalog tool");
       routes.set(tool.name, client);
+      if (endpoint === config.endpoint) t3ToolNames.add(tool.name);
       tools.push(tool);
     }
   }
   return {
     tools,
+    t3ToolNames,
     callTool: async (name, args, callSignal, onProgress) => {
       const client = routes.get(name);
       if (!client) throw new Error("Tool unavailable for this authorized catalog");

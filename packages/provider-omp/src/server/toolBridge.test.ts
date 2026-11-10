@@ -175,6 +175,7 @@ it("lists T3 and catalog tools together and sends each call to the server that l
     "t3_thread_list",
     "plugin_inspector__headers",
   ]);
+  expect([...authorized.t3ToolNames]).toEqual(["t3_thread_list"]);
   const signal = new AbortController().signal;
   await authorized.callTool("t3_thread_list", {}, signal);
   await authorized.callTool("plugin_inspector__headers", {}, signal);
@@ -183,4 +184,52 @@ it("lists T3 and catalog tools together and sends each call to the server that l
     "plugin_inspector__headers@https://fixture.test/mcp/catalog/s1",
   ]);
   await expect(authorized.callTool("unlisted", {}, signal)).rejects.toThrow(/unavailable/);
+});
+it("keeps pending calls to kept tools across a catalog swap and cancels the rest", async () => {
+  const records: Record<string, unknown>[] = [];
+  const signals = new Map<string, AbortSignal>();
+  const started = { t3: Promise.withResolvers<void>(), catalog: Promise.withResolvers<void>() };
+  const release = Promise.withResolvers<unknown>();
+  const bridge = new OmpToolBridge(
+    async (r) => {
+      records.push(r);
+    },
+    async (name, _args, signal) => {
+      signals.set(name, signal);
+      started[name === "t3_thread_wait" ? "t3" : "catalog"].resolve();
+      return release.promise;
+    },
+  );
+  const t3 = { name: "t3_thread_wait", inputSchema: {} };
+  const catalog = { name: "docs__search", inputSchema: {} };
+  await bridge.replace([t3, catalog], "g1");
+  const t3Call = bridge.handle({
+    type: "host_tool_call",
+    id: "a",
+    toolName: t3.name,
+    arguments: {},
+  });
+  const catalogCall = bridge.handle({
+    type: "host_tool_call",
+    id: "b",
+    toolName: catalog.name,
+    arguments: {},
+  });
+  await Promise.all([started.t3.promise, started.catalog.promise]);
+  const keep = new Set([t3.name]);
+  await bridge.replace([], "", keep);
+  await bridge.replace([t3, catalog], "g2", keep);
+  expect(signals.get(t3.name)?.aborted).toBe(false);
+  expect(signals.get(catalog.name)?.aborted).toBe(true);
+  release.resolve({ content: [{ type: "text", text: "done" }] });
+  await Promise.all([t3Call, catalogCall]);
+  expect(records.filter((r) => r.type === "host_tool_result")).toEqual([
+    {
+      type: "host_tool_result",
+      id: "b",
+      isError: true,
+      result: { content: [{ type: "text", text: "Tool authorization or catalog changed" }] },
+    },
+    { type: "host_tool_result", id: "a", result: { content: [{ type: "text", text: "done" }] } },
+  ]);
 });

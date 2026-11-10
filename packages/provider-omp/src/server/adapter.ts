@@ -58,6 +58,16 @@ import { buildOmpInstructions } from "./instructions.ts";
 export const OMP_DRIVER = ProviderDriverKind.make("omp");
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const ref = (nativeId: string) => ({ driver: OMP_DRIVER, nativeId, strength: "strong" as const });
+// A catalog edit only bumps catalogRevision; calls to T3's own endpoint keep their authority.
+const sameT3Authority = (
+  a: McpProviderSessionConfig | undefined,
+  b: McpProviderSessionConfig | undefined,
+) => {
+  if (!a || !b) return false;
+  const { catalogRevision: _a, ...left } = a;
+  const { catalogRevision: _b, ...right } = b;
+  return NodeUtil.isDeepStrictEqual(left, right);
+};
 const protocol = (detail: string, cause?: unknown) =>
   new Adapter.ProviderAdapterProtocolError({
     driver: OMP_DRIVER,
@@ -895,12 +905,14 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
           if (!endpoint) throw new Error("MCP authorization absent");
           const captured = installedConfig;
           const client = endpoint;
+          const authorized = client.t3ToolNames.has(name)
+            ? (latest: McpProviderSessionConfig | undefined) => sameT3Authority(captured, latest)
+            : (latest: McpProviderSessionConfig | undefined) =>
+                NodeUtil.isDeepStrictEqual(captured, latest);
           const result = await client.callTool(name, args, signal, async (partial) => {
-            if (NodeUtil.isDeepStrictEqual(captured, await run(catalogs.read(input.threadId))))
-              await update(partial);
+            if (authorized(await run(catalogs.read(input.threadId)))) await update(partial);
           });
-          const latest = await run(catalogs.read(input.threadId));
-          if (!NodeUtil.isDeepStrictEqual(captured, latest))
+          if (!authorized(await run(catalogs.read(input.threadId))))
             throw new Error("MCP catalog authorization changed");
           return result;
         },
@@ -908,34 +920,39 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
       let endpoint: AuthorizedMcpTools | undefined;
       let installedConfig: McpProviderSessionConfig | undefined;
       let catalogGeneration = 0;
-      const syncCatalog = Effect.fn("OmpAdapter.syncCatalog")(function* () {
-        const config = yield* catalogs.read(input.threadId);
-        if (NodeUtil.isDeepStrictEqual(config, installedConfig)) return;
-        const identity = `${input.providerSessionId}:${++catalogGeneration}`;
-        yield* Effect.tryPromise({
-          try: () => bridge.replace([], ""),
-          catch: (cause) => protocol("Cannot revoke old OMP catalog", cause),
-        });
-        endpoint = undefined;
-        if (config) {
-          if (
-            config.providerInstanceId !== options.instanceId ||
-            config.threadId !== input.threadId
-          )
-            return yield* protocol("MCP catalog ownership mismatch");
-          const authorized = yield* Effect.tryPromise({
-            try: (signal) => connectAuthorizedMcpTools(config, signal),
-            catch: (cause) => protocol("Authorized MCP discovery failed", cause),
-          });
-          endpoint = authorized;
+      const syncCatalog = Effect.fn("OmpAdapter.syncCatalog")(
+        function* () {
+          const config = yield* catalogs.read(input.threadId);
+          if (NodeUtil.isDeepStrictEqual(config, installedConfig)) return;
+          const identity = `${input.providerSessionId}:${++catalogGeneration}`;
+          const keep =
+            endpoint && sameT3Authority(installedConfig, config) ? endpoint.t3ToolNames : undefined;
           yield* Effect.tryPromise({
-            try: () => bridge.replace(authorized.tools, identity),
-            catch: (cause) => protocol("OMP native host tool installation failed", cause),
+            try: () => bridge.replace([], "", keep),
+            catch: (cause) => protocol("Cannot revoke old OMP catalog", cause),
           });
-          yield* catalogs.acknowledgeCatalogEndpoint(config);
-        }
-        installedConfig = config;
-      });
+          endpoint = undefined;
+          if (config) {
+            if (
+              config.providerInstanceId !== options.instanceId ||
+              config.threadId !== input.threadId
+            )
+              return yield* protocol("MCP catalog ownership mismatch");
+            const authorized = yield* Effect.tryPromise({
+              try: (signal) => connectAuthorizedMcpTools(config, signal),
+              catch: (cause) => protocol("Authorized MCP discovery failed", cause),
+            });
+            endpoint = authorized;
+            yield* Effect.tryPromise({
+              try: () => bridge.replace(authorized.tools, identity, keep),
+              catch: (cause) => protocol("OMP native host tool installation failed", cause),
+            });
+            yield* catalogs.acknowledgeCatalogEndpoint(config);
+          }
+          installedConfig = config;
+        },
+        Effect.onError(() => Effect.tryPromise(() => bridge.cancelPending()).pipe(Effect.ignore)),
+      );
       if (!catalogs.onChanged)
         return yield* protocol("OMP requires catalog revocation notifications");
       const changes = yield* Queue.unbounded<void>();
