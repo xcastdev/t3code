@@ -41,6 +41,7 @@ import {
   type ScopedThreadRef,
   type ThreadContextRecord,
   type EnvironmentContextRecord,
+  type PluginReferenceContextRecord,
   type ThreadId,
   type ThreadLinkedPullRequest,
   type RunId,
@@ -134,6 +135,24 @@ export function agentControlledBrowserCloseConfirmation(
     `Close ${activeBrowserCount} browsers while the agent is using them?`,
     "The agent is actively controlling these browsers. Closing them may interrupt the current browser actions.",
   ].join("\n");
+}
+
+/**
+ * The thread whose open but empty right panel a narrow layout shows as the launcher overlay, if
+ * any. It waits for the user in that thread, so a saved open panel stays hidden through a reload,
+ * resize, or thread switch; a surface seen there returns to the overlay when its last tab closes.
+ * `narrow` ignores the maximized flag, which a closing last tab clears.
+ */
+export function nextCompactLauncherThreadKey(input: {
+  readonly current: string | null;
+  readonly threadKey: string | null;
+  readonly narrow: boolean;
+  readonly panelOpen: boolean;
+  readonly surfaceShown: boolean;
+}): string | null {
+  if (!input.narrow || !input.panelOpen || input.threadKey === null) return null;
+  if (input.surfaceShown) return input.threadKey;
+  return input.current === input.threadKey ? input.current : null;
 }
 
 export function shouldRenderPreviewMiniPlayer(
@@ -1175,6 +1194,7 @@ export interface PlanFollowUpComposerSnapshot {
   readonly previewAnnotations: ReadonlyArray<PreviewAnnotationPayload>;
   readonly threadContexts: ReadonlyArray<ThreadContextRecord>;
   readonly environmentContexts: ReadonlyArray<EnvironmentContextRecord>;
+  readonly pluginReferences: ReadonlyArray<PluginReferenceContextRecord>;
 }
 
 // A draft typed while the send was in flight is newer and stays. Composer refs and the cursor
@@ -1190,6 +1210,7 @@ export function restorePlanFollowUpComposer(input: {
   readonly writePreviewAnnotations: (annotations: ReadonlyArray<PreviewAnnotationPayload>) => void;
   readonly writeThreadContexts: (records: ReadonlyArray<ThreadContextRecord>) => void;
   readonly writeEnvironmentContexts: (records: ReadonlyArray<EnvironmentContextRecord>) => void;
+  readonly writePluginReferences: (records: ReadonlyArray<PluginReferenceContextRecord>) => void;
   readonly resetCursor: (options: {
     cursor: number;
     prompt: string;
@@ -1204,6 +1225,7 @@ export function restorePlanFollowUpComposer(input: {
   input.writePreviewAnnotations(input.snapshot.previewAnnotations);
   input.writeThreadContexts(input.snapshot.threadContexts);
   input.writeEnvironmentContexts(input.snapshot.environmentContexts);
+  input.writePluginReferences(input.snapshot.pluginReferences);
   if (!input.routeIsCurrent) return;
   input.resetCursor({
     cursor: collapseExpandedComposerCursor(input.snapshot.prompt, input.snapshot.prompt.length),
@@ -1365,6 +1387,7 @@ export interface ComposerSendContents {
   readonly reviewComments: ReadonlyArray<ReviewCommentContext>;
   readonly threadContexts: ReadonlyArray<ThreadContextRecord>;
   readonly environmentContexts: ReadonlyArray<EnvironmentContextRecord>;
+  readonly pluginReferences: ReadonlyArray<PluginReferenceContextRecord>;
 }
 
 /**
@@ -1385,6 +1408,7 @@ export function snapshotComposerSend(contents: ComposerSendContents) {
     reviewComments: [...contents.reviewComments],
     threadContexts: [...contents.threadContexts],
     environmentContexts: [...contents.environmentContexts],
+    pluginReferences: [...contents.pluginReferences],
     messageText: contents.terminalContexts
       .filter((context) => !terminalContexts.includes(context))
       .reduce(

@@ -37,6 +37,33 @@ const CODEX_NO_PLUGIN_ARGS = [
   "--config",
   "features.apps=false",
 ] as const;
+// `web_search="live"` is what top-level `codex --search` sets; `codex exec` has no such flag.
+// Fetched pages may carry instructions, so the search loses default-on tools, user hooks, skill
+// text and the checkout's AGENTS.md (checked against codex 0.166 requests). apply_patch and
+// request_user_input have no switch; the read-only sandbox refuses writes and exec has no user.
+const CODEX_WEB_SEARCH_ARGS = [
+  "--config",
+  'web_search="live"',
+  ...[
+    "shell_tool",
+    "unified_exec",
+    "view_image",
+    "image_generation",
+    "goals",
+    "multi_agent",
+    "code_mode_host",
+    "browser_use",
+    "in_app_browser",
+    "computer_use",
+    "browser_use_external",
+    "tool_suggest",
+    "hooks",
+  ].flatMap((feature) => ["--config", `features.${feature}=false`]),
+  "--config",
+  "skills.include_instructions=false",
+  "--config",
+  "project_doc_max_bytes=0",
+];
 const CodexMcpServers = Schema.fromJsonString(
   Schema.Array(Schema.Struct({ name: Schema.String, enabled: Schema.Boolean })),
 );
@@ -218,6 +245,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
     modelSelection,
     attachments,
     imageFiles,
+    webSearch,
     investigate,
   }: TextGenerationOperations.Request<S>): Effect.fn.Return<
     S["Type"],
@@ -288,6 +316,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
           // A user's MCP server could act on the text-generation prompt.
           ...CODEX_NO_PLUGIN_ARGS,
           ...(mcpServersOff ? ["--config", mcpServersOff] : []),
+          ...(webSearch ? CODEX_WEB_SEARCH_ARGS : []),
           "--ephemeral",
           "--skip-git-repo-check",
           "-s",
@@ -358,7 +387,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
     return yield* Effect.gen(function* () {
       yield* runCodexCommand().pipe(
         Effect.scoped,
-        Effect.timeoutOption(investigate?.timeoutMs ?? CODEX_TIMEOUT_MS),
+        Effect.timeoutOption(investigate?.timeoutMs ?? webSearch?.timeoutMs ?? CODEX_TIMEOUT_MS),
         Effect.flatMap(
           Option.match({
             onNone: () =>
@@ -401,5 +430,6 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
 
   return TextGenerationOperations.fromRunner("CodexTextGeneration", runCodexJson, {
     viewsImages: true,
+    searchesWeb: true,
   });
 });

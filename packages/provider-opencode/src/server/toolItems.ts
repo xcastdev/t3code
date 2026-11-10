@@ -1,6 +1,7 @@
-import type { OrchestrationV2TurnItem } from "@t3tools/contracts";
+import { isOrchestrationV2WorkActive, type OrchestrationV2TurnItem } from "@t3tools/contracts";
 import { resolveT3McpToolId } from "@t3tools/shared/t3McpToolPresentation";
 import { formatReadToolLabel, formatSearchToolLabel } from "@t3tools/shared/toolActivity";
+import { t3WebSearchTurnItem } from "@t3tools/shared/toolOutput";
 
 // Search results stay on the timeline wire, so keep their text a preview.
 const SEARCH_PREVIEW_MAX_CHARS = 8_000;
@@ -39,6 +40,50 @@ function openCodeToolProjectionKind(
     return "file_search";
   }
   return "dynamic_tool";
+}
+
+const T3_WEB_SEARCH_TOOL = "t3_web_search";
+const CODE_MODE_TOOL_REFERENCE = /\btools\s*[.[]/g;
+const CODE_MODE_ITERATION = /\b(?:for|while)\b|\.(?:map|flatMap|forEach)\s*\(/;
+const CODE_MODE_QUERY_ARGUMENT = String.raw`\s*\(\s*\{\s*query\s*:\s*(?:"([^"\\\n]*)"|'([^'\\\n]*)')\s*[,}]`;
+
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * OpenCode Code Mode's `execute` tool runs agent JS. Present it as a web search only when it
+ * makes one T3 web search call, with a literal query, through this thread's T3 server.
+ */
+function codeModeT3WebSearchQuery(server: string, input: unknown): string | undefined {
+  const code = recordString(input, "code");
+  if (
+    code === undefined ||
+    code.match(CODE_MODE_TOOL_REFERENCE)?.length !== 1 ||
+    CODE_MODE_ITERATION.test(code)
+  ) {
+    return undefined;
+  }
+  const name = escapeRegExp(server);
+  const reference = String.raw`\btools\s*\[\s*(?:"${name}"|'${name}')\s*\]\s*\.\s*${T3_WEB_SEARCH_TOOL}\b`;
+  const alias = new RegExp(
+    String.raw`\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*${reference}\s*;`,
+  ).exec(code)?.[1];
+  const callee = alias === undefined ? reference : String.raw`(?<![\w$.])${escapeRegExp(alias)}`;
+  if (alias !== undefined && code.match(new RegExp(`${callee}\\s*\\(`, "g"))?.length !== 1) {
+    return undefined;
+  }
+  const call = new RegExp(callee + CODE_MODE_QUERY_ARGUMENT).exec(code);
+  return call === null ? undefined : (call[1] ?? call[2]);
+}
+
+function t3WebSearchQuery(
+  toolName: string,
+  input: unknown,
+  t3McpServer: string | undefined,
+): string | undefined {
+  if (t3McpServer === undefined) return undefined;
+  if (toolName === `${t3McpServer}_${T3_WEB_SEARCH_TOOL}`)
+    return recordString(input, "query") ?? "";
+  return toolName === "execute" ? codeModeT3WebSearchQuery(t3McpServer, input) : undefined;
 }
 
 function recordString(input: unknown, ...keys: ReadonlyArray<string>): string | undefined {
@@ -88,9 +133,16 @@ export function openCodeToolTurnItem(
     readonly input: Record<string, unknown>;
     readonly output: string | undefined;
     readonly completedMetadata: unknown;
+    /** This thread's OpenCode 2 T3 server; its tools are named `<server>_<tool>`. */
+    readonly t3McpServer?: string | undefined;
   },
 ): OrchestrationV2TurnItem {
   const { input, output } = tool;
+  // Like asT3WebSearchTurnItem: a running search stays dynamic_tool so Stop and settlement end it.
+  const webSearchQuery = isOrchestrationV2WorkActive(base.status)
+    ? undefined
+    : t3WebSearchQuery(tool.name, input, tool.t3McpServer);
+  if (webSearchQuery !== undefined) return t3WebSearchTurnItem(base, webSearchQuery, output);
   switch (openCodeToolProjectionKind(tool.name)) {
     case "command_execution": {
       const exitCode = recordNumber(tool.completedMetadata, "exit", "exitCode");

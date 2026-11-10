@@ -22,6 +22,7 @@ import {
   DEFAULT_MODEL,
   DEFAULT_MODEL_BY_PROVIDER,
   EnvironmentId,
+  PluginId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -98,6 +99,7 @@ import { insertInlineContextReference } from "./lib/composerContextReferences";
 import {
   buildMessageContext,
   environmentContextRecord,
+  pluginReferenceContextRecord,
   terminalContextReference,
 } from "./lib/composerContextRecords";
 import { threadContextRecord } from "@t3tools/shared/composerContextReferences";
@@ -814,6 +816,37 @@ describe("composerDraftStore environment contexts", () => {
     store.addEnvironmentContexts(threadRef, [vps]);
     store.setEnvironmentContexts(threadRef, []);
     expect(draftFor(threadId, TEST_ENVIRONMENT_ID)).toBeUndefined();
+  });
+
+  it("keeps an attached plugin reference through persistence and sends it", () => {
+    const capture = pluginReferenceContextRecord({
+      environmentId: TEST_ENVIRONMENT_ID,
+      pluginId: PluginId.make("request-inspector"),
+      pluginName: "Request Inspector",
+      label: "POST /login 500",
+      locator: { requestId: "42" },
+      snapshot: "HTTP/1.1 500",
+    });
+    const store = useComposerDraftStore.getState();
+    store.addPluginReferences(threadRef, [capture]);
+    store.addPluginReferences(threadRef, [{ ...capture, snapshot: "again" }]);
+    const merge = useComposerDraftStore.persist.getOptions().merge!;
+    const restored = merge(
+      JSON.parse(
+        JSON.stringify(partializeComposerDraftStoreState(useComposerDraftStore.getState())),
+      ),
+      useComposerDraftStore.getInitialState(),
+    ).draftsByThreadKey[scopedThreadKey(threadRef)];
+    expect(restored?.pluginReferences).toEqual([capture]);
+    expect(restored?.prompt).toContain(`(t3-context://v1/plugin-reference/${capture.contextId})`);
+    expect(
+      buildMessageContext({
+        terminalContexts: [],
+        reviewComments: [],
+        previewAnnotations: [],
+        pluginReferences: restored?.pluginReferences ?? [],
+      })?.records,
+    ).toEqual([capture]);
   });
 });
 

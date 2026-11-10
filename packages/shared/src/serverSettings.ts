@@ -604,6 +604,9 @@ export function applyServerSettingsPatch(
     ...(patch.visionModelSelection !== undefined
       ? { visionModelSelection: patch.visionModelSelection }
       : {}),
+    ...(patch.webSearchModelSelection !== undefined
+      ? { webSearchModelSelection: patch.webSearchModelSelection }
+      : {}),
     ...(automaticGitFetchInterval !== undefined ? { automaticGitFetchInterval } : {}),
     ...(providerHealthRefreshInterval !== undefined ? { providerHealthRefreshInterval } : {}),
   };

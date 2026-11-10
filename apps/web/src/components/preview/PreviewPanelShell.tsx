@@ -20,7 +20,7 @@ interface PreviewPanelShellProps {
   workspaceLabel?: string;
   mode: PreviewPanelMode;
   maximized?: boolean;
-  /** Inline only: a fixed-width launcher rail instead of the resizable panel. */
+  /** The surface launcher: a fixed-width rail inline, or the sheet's own sidebar-styled list. */
   rail?: boolean;
   inlineSize?: PreviewPanelInlineSize;
   open?: boolean;
@@ -128,7 +128,8 @@ function PreviewPanelShellFrame(
       data-workspace-focus-key={props.workspaceFocusKey}
       data-workspace-unavailable={collapsible && !open ? "true" : undefined}
       className={cn(
-        "relative flex h-full min-h-0 min-w-0 max-w-full flex-col self-stretch bg-background",
+        "relative flex h-full min-h-0 min-w-0 max-w-full flex-col self-stretch",
+        !(props.mode === "sheet" && props.rail === true) && "bg-background",
         isInline
           ? maximized
             ? // Maximizing meets the sidebar border or window edge; omit the duplicate border.

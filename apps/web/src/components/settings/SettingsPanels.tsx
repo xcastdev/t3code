@@ -43,6 +43,7 @@ import {
 } from "../../components/desktopUpdate.logic";
 import { ProviderModelPicker } from "../chat/ProviderModelPicker";
 import { ViewImageToolSection } from "./ViewImageToolSettings";
+import { WebSearchToolSection } from "./WebSearchToolSettings";
 import { TraitsPicker } from "../chat/TraitsPicker";
 import { isElectron } from "../../env";
 import { buildHostedChannelSelectionUrl, type HostedAppChannel } from "../../hostedPairing";
@@ -2107,6 +2108,7 @@ export function ThreadsSettingsPanel() {
         </AdvancedSettings>
       </SettingsSection>
       <ViewImageToolSection />
+      <WebSearchToolSection />
     </SettingsPageContainer>
   );
 }

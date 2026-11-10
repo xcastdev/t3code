@@ -58,6 +58,7 @@ const SETTINGS_SEARCH_TERMS = {
   ],
   SettingsFollowUp: ["follow-ups", "queue", "steer", "while the agent is running"],
   SettingsArchive: ["archive", "archived", "restore", "unarchive"],
+  SettingsPlugins: ["extensions", "install plugin", "panels", "backend", "t3plugin"],
   SettingsProviderAccounts: [
     "provider accounts",
     "codex",

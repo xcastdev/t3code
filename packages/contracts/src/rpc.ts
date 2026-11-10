@@ -124,6 +124,8 @@ import {
   McpCatalogOAuthStatusResult,
   McpCatalogSecretPrepareInput,
   McpCatalogSecretPrepareResult,
+  McpCatalogTestConnectionInput,
+  McpCatalogTestConnectionResult,
   McpCatalogReadInput,
   McpCatalogReadResult,
   McpCatalogWriteInput,
@@ -166,6 +168,24 @@ import {
   McpAppToolInfoInput,
   McpAppUpdateModelContextInput,
 } from "./mcpApps.ts";
+import {
+  PluginConfig,
+  PluginConfigureInput,
+  PluginIdInput,
+  PluginInstallInput,
+  PluginInstallRecord,
+  PluginLogs,
+  PluginLogsInput,
+  PluginOperationCallInput,
+  PluginRegistrySnapshot,
+  PluginRequestError,
+  PluginResolvedReference,
+  PluginResolveReferenceInput,
+  PluginSetEnabledInput,
+  PluginSubscribeInput,
+  PluginSubscriptionEvent,
+  PluginUpdateInput,
+} from "./plugins.ts";
 import {
   PeerLink,
   PeerLinkCreateInput,
@@ -587,6 +607,7 @@ export const WS_METHODS = {
   mcpCatalogSessionForThread: "mcpCatalog.sessionForThread",
   mcpCatalogOAuthStatus: "mcpCatalog.oauthStatus",
   mcpCatalogSecretPrepare: "mcpCatalog.secretPrepare",
+  mcpCatalogTestConnection: "mcpCatalog.testConnection",
   mcpCatalogRead: "mcpCatalog.read",
   mcpCatalogWrite: "mcpCatalog.write",
   mcpCatalogSessionGet: "mcpCatalog.sessionGet",
@@ -645,6 +666,24 @@ export const WS_METHODS = {
   mcpAppsToolInfo: "mcpApps.toolInfo",
   mcpAppsReadResource: "mcpApps.readResource",
   mcpAppsUpdateModelContext: "mcpApps.updateModelContext",
+
+  pluginsList: "plugins.list",
+  pluginsSubscribeRegistry: "plugins.subscribeRegistry",
+  pluginsInstall: "plugins.install",
+  pluginsUpdate: "plugins.update",
+  pluginsUninstall: "plugins.uninstall",
+  pluginsDeleteData: "plugins.deleteData",
+  pluginsSetEnabled: "plugins.setEnabled",
+  pluginsStart: "plugins.start",
+  pluginsStop: "plugins.stop",
+  pluginsRestart: "plugins.restart",
+  pluginsConfigure: "plugins.configure",
+  pluginsReadConfig: "plugins.readConfig",
+  pluginsLogs: "plugins.logs",
+  pluginsQuery: "plugins.query",
+  pluginsMutate: "plugins.mutate",
+  pluginsSubscribe: "plugins.subscribe",
+  pluginsResolveReference: "plugins.resolveReference",
 
   providerUploadFeedback: "provider.uploadFeedback",
   providerAuthStart: "provider.auth.start",
@@ -1700,6 +1739,109 @@ const WsMcpAppsReadResourceRpc = Rpc.make(WS_METHODS.mcpAppsReadResource, {
   error: Schema.Union([McpAppRequestError, EnvironmentAuthorizationError]),
 });
 
+const PluginRpcError = Schema.Union([PluginRequestError, EnvironmentAuthorizationError]);
+
+const WsPluginsListRpc = Rpc.make(WS_METHODS.pluginsList, {
+  payload: Schema.Struct({}),
+  success: PluginRegistrySnapshot,
+  error: EnvironmentAuthorizationError,
+});
+
+const WsPluginsSubscribeRegistryRpc = Rpc.make(WS_METHODS.pluginsSubscribeRegistry, {
+  payload: Schema.Struct({}),
+  success: PluginRegistrySnapshot,
+  error: EnvironmentAuthorizationError,
+  stream: true,
+});
+
+const WsPluginsInstallRpc = Rpc.make(WS_METHODS.pluginsInstall, {
+  payload: PluginInstallInput,
+  success: PluginInstallRecord,
+  error: PluginRpcError,
+});
+
+const WsPluginsUpdateRpc = Rpc.make(WS_METHODS.pluginsUpdate, {
+  payload: PluginUpdateInput,
+  success: PluginInstallRecord,
+  error: PluginRpcError,
+});
+
+const WsPluginsUninstallRpc = Rpc.make(WS_METHODS.pluginsUninstall, {
+  payload: PluginIdInput,
+  error: PluginRpcError,
+});
+
+const WsPluginsDeleteDataRpc = Rpc.make(WS_METHODS.pluginsDeleteData, {
+  payload: PluginIdInput,
+  error: PluginRpcError,
+});
+
+const WsPluginsSetEnabledRpc = Rpc.make(WS_METHODS.pluginsSetEnabled, {
+  payload: PluginSetEnabledInput,
+  success: PluginInstallRecord,
+  error: PluginRpcError,
+});
+
+const WsPluginsStartRpc = Rpc.make(WS_METHODS.pluginsStart, {
+  payload: PluginIdInput,
+  success: PluginInstallRecord,
+  error: PluginRpcError,
+});
+
+const WsPluginsStopRpc = Rpc.make(WS_METHODS.pluginsStop, {
+  payload: PluginIdInput,
+  success: PluginInstallRecord,
+  error: PluginRpcError,
+});
+
+const WsPluginsRestartRpc = Rpc.make(WS_METHODS.pluginsRestart, {
+  payload: PluginIdInput,
+  success: PluginInstallRecord,
+  error: PluginRpcError,
+});
+
+const WsPluginsConfigureRpc = Rpc.make(WS_METHODS.pluginsConfigure, {
+  payload: PluginConfigureInput,
+  error: PluginRpcError,
+});
+
+const WsPluginsReadConfigRpc = Rpc.make(WS_METHODS.pluginsReadConfig, {
+  payload: PluginIdInput,
+  success: PluginConfig,
+  error: PluginRpcError,
+});
+
+const WsPluginsLogsRpc = Rpc.make(WS_METHODS.pluginsLogs, {
+  payload: PluginLogsInput,
+  success: PluginLogs,
+  error: PluginRpcError,
+});
+
+const WsPluginsQueryRpc = Rpc.make(WS_METHODS.pluginsQuery, {
+  payload: PluginOperationCallInput,
+  success: Schema.Unknown,
+  error: PluginRpcError,
+});
+
+const WsPluginsMutateRpc = Rpc.make(WS_METHODS.pluginsMutate, {
+  payload: PluginOperationCallInput,
+  success: Schema.Unknown,
+  error: PluginRpcError,
+});
+
+const WsPluginsSubscribeRpc = Rpc.make(WS_METHODS.pluginsSubscribe, {
+  payload: PluginSubscribeInput,
+  success: PluginSubscriptionEvent,
+  error: PluginRpcError,
+  stream: true,
+});
+
+const WsPluginsResolveReferenceRpc = Rpc.make(WS_METHODS.pluginsResolveReference, {
+  payload: PluginResolveReferenceInput,
+  success: PluginResolvedReference,
+  error: PluginRpcError,
+});
+
 const WsProviderUploadFeedbackRpc = Rpc.make(WS_METHODS.providerUploadFeedback, {
   payload: ProviderUploadFeedbackInput,
   success: ProviderUploadFeedbackResult,
@@ -2346,6 +2488,11 @@ const WsMcpCatalogSecretPrepareRpc = Rpc.make(WS_METHODS.mcpCatalogSecretPrepare
   success: McpCatalogSecretPrepareResult,
   error: catalogRpcError,
 });
+const WsMcpCatalogTestConnectionRpc = Rpc.make(WS_METHODS.mcpCatalogTestConnection, {
+  payload: McpCatalogTestConnectionInput,
+  success: McpCatalogTestConnectionResult,
+  error: catalogRpcError,
+});
 const WsMcpCatalogReadRpc = Rpc.make(WS_METHODS.mcpCatalogRead, {
   payload: McpCatalogReadInput,
   success: McpCatalogReadResult,
@@ -2848,6 +2995,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsMcpCatalogSessionForThreadRpc,
   WsMcpCatalogOAuthStatusRpc,
   WsMcpCatalogSecretPrepareRpc,
+  WsMcpCatalogTestConnectionRpc,
   WsMcpCatalogReadRpc,
   WsMcpCatalogWriteRpc,
   WsMcpCatalogSessionGetRpc,
@@ -2940,6 +3088,23 @@ export const WsRpcGroup = RpcGroup.make(
   WsMcpAppsToolInfoRpc,
   WsMcpAppsReadResourceRpc,
   WsMcpAppsUpdateModelContextRpc,
+  WsPluginsListRpc,
+  WsPluginsSubscribeRegistryRpc,
+  WsPluginsInstallRpc,
+  WsPluginsUpdateRpc,
+  WsPluginsUninstallRpc,
+  WsPluginsDeleteDataRpc,
+  WsPluginsSetEnabledRpc,
+  WsPluginsStartRpc,
+  WsPluginsStopRpc,
+  WsPluginsRestartRpc,
+  WsPluginsConfigureRpc,
+  WsPluginsReadConfigRpc,
+  WsPluginsLogsRpc,
+  WsPluginsQueryRpc,
+  WsPluginsMutateRpc,
+  WsPluginsSubscribeRpc,
+  WsPluginsResolveReferenceRpc,
   WsProviderUploadFeedbackRpc,
   WsSubscribeVcsStatusRpc,
   WsSubscribeWorktreeSetupRpc,

@@ -3,11 +3,13 @@ import {
   ArrowRightIcon,
   ChartNoAxesColumnIcon,
   ListTodoIcon,
+  PuzzleIcon,
   SettingsIcon,
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { memo } from "react";
-import { Link, useLocation, useNavigate } from "@tanstack/react-router";
+import { Link, useLocation, useNavigate, useRouter } from "@tanstack/react-router";
+import { listPluginPanelTargets } from "@t3tools/client-runtime/plugins/commands";
 
 import { useAtomValue } from "@effect/atom-react";
 import { useEnvironmentIdentificationMode } from "../../hooks/useSettings";
@@ -38,6 +40,18 @@ import {
   useSidebar,
 } from "../ui/sidebar";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import {
+  Menu,
+  MenuGroup,
+  MenuGroupLabel,
+  MenuItem,
+  MenuItemLabel,
+  MenuPopup,
+  MenuSeparator,
+  MenuTrigger,
+} from "../ui/menu";
+import { openPluginPanel } from "../../plugins/openPluginPanel";
+import { useEnabledPluginInstalls } from "../../plugins/pluginInstalls";
 import type { SidebarView } from "./SidebarThreadHeader";
 import { readPullRequestListPreferences } from "../pullRequest/pullRequestListPreferences";
 import { isSidebarUtilityPage, useNavigateToMainApp } from "./mainAppLocation";
@@ -257,6 +271,61 @@ function SidebarWorkItem(props: { readonly onClick: () => void }) {
   );
 }
 
+/** Every panel this device and each connected environment offers, grouped by where it runs. */
+function SidebarPluginsItem(props: { readonly onNavigate: () => void }) {
+  const router = useRouter();
+  const panels = listPluginPanelTargets(useEnabledPluginInstalls()).filter(
+    (target) => target.kind === "panel",
+  );
+  const scopes = [...new Set(panels.map((target) => target.scope))];
+  return (
+    <SidebarMenuItem className="shrink-0">
+      <Menu>
+        <Tooltip>
+          <TooltipTrigger
+            render={<MenuTrigger render={<SidebarMenuButton aria-label="Plugins" size="icon" />} />}
+          >
+            <PuzzleIcon />
+          </TooltipTrigger>
+          <TooltipPopup side="top">Plugins</TooltipPopup>
+        </Tooltip>
+        <MenuPopup side="top" align="start">
+          {scopes.map((scope) => {
+            const inScope = panels.filter((target) => target.scope === scope);
+            return (
+              <MenuGroup key={scope}>
+                <MenuGroupLabel>{inScope[0]?.scopeLabel}</MenuGroupLabel>
+                {inScope.map((target) => (
+                  <MenuItem
+                    key={target.key}
+                    onClick={() => {
+                      props.onNavigate();
+                      openPluginPanel(router, target.key);
+                    }}
+                  >
+                    <MenuItemLabel>{target.title}</MenuItemLabel>
+                  </MenuItem>
+                ))}
+              </MenuGroup>
+            );
+          })}
+          {scopes.length > 0 ? <MenuSeparator /> : null}
+          <MenuItem
+            onClick={() => {
+              props.onNavigate();
+              void router.navigate({ to: "/settings/plugins" });
+            }}
+          >
+            <MenuItemLabel>
+              {scopes.length > 0 ? "Manage plugins" : "Install a plugin"}
+            </MenuItemLabel>
+          </MenuItem>
+        </MenuPopup>
+      </Menu>
+    </SidebarMenuItem>
+  );
+}
+
 const SidebarUtilityMenu = memo(function SidebarUtilityMenu(props: {
   readonly view: SidebarView | undefined;
 }) {
@@ -332,6 +401,7 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu(props: {
               onClick={handleUsageClick}
             />
           ) : null}
+          <SidebarPluginsItem onNavigate={closeMobileSidebar} />
         </>
       )}
       <SidebarThreadUndoNotice />

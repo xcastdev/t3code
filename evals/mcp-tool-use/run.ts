@@ -7,6 +7,7 @@ import { buildOmpInstructions } from "../../packages/provider-omp/src/server/ins
  * README.md for how to run it and add cases.
  */
 import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
 import * as NodeUtil from "node:util";
 import * as NodeCrypto from "node:crypto";
 import * as NodeVM from "node:vm";
@@ -15,10 +16,14 @@ import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   ComposerContextRecord,
+  DEFAULT_RUNTIME_MODE,
   DeviceOperationError,
   DeviceSummary,
   OrchestratorMcpTaskRole,
+  PluginRequestError,
+  PluginRequestErrorReason,
   ProviderInstanceId,
+  RuntimeMode,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -27,6 +32,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Result from "effect/Result";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
@@ -44,7 +50,19 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
+import {
+  decodePluginManifest,
+  parsePluginToolName,
+  pluginAgentTools,
+} from "@t3tools/shared/pluginManifest";
 import { formatThreadLink } from "@t3tools/shared/threadLinks";
+import { PLUGIN_MUTATION_REFUSED_MESSAGE } from "../../apps/server/src/mcp/McpCatalogGateway.ts";
+import {
+  noDefaultProxyDetail,
+  PROXY_DETAILS,
+  REPLAY_DETAILS,
+  sensitiveHeaderDetail,
+} from "../../packages/plugin-request-inspector/backend/refusals.ts";
 import { buildCodexAdditionalContext } from "../../apps/server/src/provider/CodexDeveloperInstructions.ts";
 import { makeSideChatContext } from "../../apps/server/src/orchestration-v2/ContextHandoffService.ts";
 import { withInlineContext } from "../../apps/server/src/orchestration-v2/ContextHandoffDelivery.ts";
@@ -63,6 +81,7 @@ import {
 } from "../../apps/server/src/mcp/toolkits/pullRequests/tools.ts";
 import { ThreadToolkit } from "../../apps/server/src/mcp/toolkits/thread/tools.ts";
 import { ViewImageToolkit } from "../../apps/server/src/mcp/toolkits/viewImage/tools.ts";
+import { WebSearchToolkit } from "../../apps/server/src/mcp/toolkits/webSearch/tools.ts";
 import { WorktreeToolkit } from "../../apps/server/src/mcp/toolkits/worktree/tools.ts";
 import {
   CLAUDE_PROVIDER,
@@ -144,6 +163,91 @@ export type SampleRun = {
 
 const Rest = [Schema.Record(Schema.String, Schema.Unknown)] as const;
 
+/** Plugins a case can install, by id: the package that holds the manifest, and its refusal texts. */
+const PLUGINS = {
+  "request-inspector": {
+    dir: "plugin-request-inspector",
+    details: { ...REPLAY_DETAILS, ...PROXY_DETAILS },
+    detailFns: { noDefaultProxy: noDefaultProxyDetail, sensitiveHeader: sensitiveHeaderDetail },
+  },
+} as const;
+type PluginName = keyof typeof PLUGINS;
+const PLUGIN_NAMES = Object.keys(PLUGINS) as Array<PluginName>;
+// The catalog gateway serves plugin tools; providers name its MCP server `t3_catalog`.
+const CATALOG_PREFIX = "mcp__t3_catalog__";
+const pluginManifests = new Map(
+  PLUGIN_NAMES.map((id) => {
+    const file = new URL(`../../packages/${PLUGINS[id].dir}/t3-plugin.json`, import.meta.url);
+    const decoded = decodePluginManifest(JSON.parse(NodeFS.readFileSync(file, "utf8")));
+    if (Result.isFailure(decoded)) throw new Error(`${id}: ${decoded.failure}`);
+    return [id, decoded.success] as const;
+  }),
+);
+/** The tools the catalog gateway lists for these installed, enabled plugins. */
+const pluginTools = (ids: ReadonlyArray<PluginName>): ReadonlyArray<ApiTool> =>
+  ids.flatMap((id) =>
+    pluginAgentTools(pluginManifests.get(id)!).map((tool) => ({
+      name: `${CATALOG_PREFIX}${tool.name}`,
+      description: tool.description,
+      input_schema: tool.inputSchema,
+    })),
+  );
+
+/**
+ * A plugin tool result that is T3's PluginRequestError. `detailKey` names one of the plugin's own
+ * refusal texts, such as the inspector's `expired`, so cases never copy them. A key in the
+ * plugin's `detailFns`, such as `noDefaultProxy`, builds its text from `detailArg`.
+ */
+const PluginErrorMock = Schema.TaggedStruct("PluginRequestError", {
+  reason: PluginRequestErrorReason,
+  detail: Schema.optional(Schema.String),
+  detailKey: Schema.optional(Schema.String),
+  detailArg: Schema.optional(Schema.Unknown),
+});
+const isPluginErrorMock = Schema.is(PluginErrorMock);
+// The MCP SDK sends a thrown tool handler error as a JSON-RPC error; clients show its McpError.
+const mcpErrorText = (message: string) => `MCP error -32603: ${message}`;
+const pluginErrorText = (pluginId: PluginName, mock: typeof PluginErrorMock.Type) => {
+  const details: Readonly<Record<string, string>> = PLUGINS[pluginId].details;
+  const detailFns: Readonly<Record<string, (arg: never) => string>> = PLUGINS[pluginId].detailFns;
+  const key = mock.detailKey;
+  const detailFn = key === undefined ? undefined : detailFns[key];
+  const detail =
+    key === undefined
+      ? mock.detail
+      : detailFn === undefined
+        ? details[key]
+        : detailFn(mock.detailArg as never);
+  if (mock.detailKey !== undefined && detail === undefined) {
+    throw new Error(`${pluginId} has no refusal text ${mock.detailKey}.`);
+  }
+  const error = new PluginRequestError({
+    reason: mock.reason,
+    ...(detail === undefined ? {} : { detail }),
+  });
+  return mcpErrorText(error.message);
+};
+/**
+ * The error T3 gives a plugin tool call, if any: the gateway refuses a mutating operation outside
+ * a full-access thread, and a PluginRequestError mock fails as the plugin's error.
+ */
+export const pluginFailure = (
+  runtimeMode: RuntimeMode,
+  name: string,
+  mock: unknown,
+): string | undefined => {
+  const parsed = parsePluginToolName(name);
+  const pluginId = PLUGIN_NAMES.find((id) => id === parsed?.pluginId);
+  if (parsed === undefined || pluginId === undefined) return undefined;
+  const operation = pluginManifests
+    .get(pluginId)
+    ?.backend?.operations.find((candidate) => candidate.name === parsed.operation);
+  if (operation?.mutates === true && runtimeMode !== "full-access") {
+    return mcpErrorText(PLUGIN_MUTATION_REFUSED_MESSAGE);
+  }
+  return isPluginErrorMock(mock) ? pluginErrorText(pluginId, mock) : undefined;
+};
+
 const PriorToolCall = Schema.Struct({
   tool: Schema.String,
   input: Schema.Unknown,
@@ -167,6 +271,10 @@ const McpToolUseExpect = Schema.Struct({
   calls: Schema.optional(Schema.Array(McpToolUseCall)),
   /** No call may match any entry. */
   callsMustNot: Schema.optional(Schema.Array(McpToolUseCall)),
+  /** Each group needs one call that matches any of its entries. */
+  callsAny: Schema.optional(Schema.Array(Schema.Array(McpToolUseCall))),
+  /** Every call of each entry's tool matches its `args`. */
+  everyCall: Schema.optional(Schema.Array(McpToolUseCall)),
   notCalls: Schema.optional(Schema.Array(Schema.String)),
   /** First calls of these tools happen in this order. */
   order: Schema.optional(Schema.Array(Schema.String)),
@@ -256,6 +364,15 @@ export const McpToolUseCase = Schema.Struct({
     linkedEnvironments: Schema.optional(Schema.Boolean),
     /** The view image tool is on with a vision model, so T3 lists `t3_view_image`. */
     viewImage: Schema.optional(Schema.Boolean),
+    /**
+     * The web search tool is on with a model, so T3 lists `t3_web_search`. Claude's own web tools
+     * are gone, as on the harnesses T3 lists it for.
+     */
+    webSearch: Schema.optional(Schema.Boolean),
+    /** Plugins installed and enabled in the environment, whose agent tools T3's catalog lists. */
+    plugins: Schema.optional(Schema.Array(Schema.Literals(PLUGIN_NAMES))),
+    /** The thread's runtime mode. Defaults to T3's default, full access. */
+    runtimeMode: Schema.optional(RuntimeMode),
     /** delegate_task `role` for a delegated child. T3 builds the child's first message from it. */
     delegateRole: Schema.optional(OrchestratorMcpTaskRole),
     context: Schema.optional(Schema.String),
@@ -272,6 +389,8 @@ export const McpToolUseCase = Schema.Struct({
     /**
      * Canned tool results by bare name, T3 or native. `"default"` uses the runner's result. For a
      * device tool, a T3 `DeviceError` (`{"_tag": ..., "cause": null}`) fails it inside T3.
+     * `{"_tag": "ByArgs", "cases": [{"args", "result"}], "otherwise"}` picks the first case whose
+     * `args` match the call as `expect` args do, else `otherwise`.
      */
     mocks: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
     /** Regexes on one part of a shell command. A match wins over the shell simulator. */
@@ -356,11 +475,15 @@ const toolResult = (id: string, content: unknown): Block => ({
 });
 const texts = (content: typeof Content.Type) =>
   typeof content === "string" ? [content] : content.flatMap((block) => block.text ?? []);
-const isT3Name = (name: string) => name.startsWith(T3_PREFIX) || name.startsWith("mcp__t3_code__");
+const T3_PREFIXES = [T3_PREFIX, "mcp__t3_code__", CATALOG_PREFIX];
+const isT3Name = (name: string) => T3_PREFIXES.some((prefix) => name.startsWith(prefix));
 const hasTool = (tools: ReadonlyArray<ApiTool>, name: string) =>
   tools.some((tool) => tool.name === name);
 
-/** Grading name: T3 tools lose their MCP prefix, native tools keep the part after the last `_`. */
+/**
+ * Grading name: T3 and plugin tools lose their MCP prefix, native tools keep the part after the
+ * last `_`.
+ */
 const CODEX_NAMES: Readonly<Record<string, string>> = {
   exec_command: "Bash",
   shell_command: "Bash",
@@ -372,8 +495,9 @@ const CODEX_NAMES: Readonly<Record<string, string>> = {
 };
 export const normalizeToolName = (name: string) => {
   const bare = name.slice(name.lastIndexOf(".") + 1);
-  return isT3Name(bare)
-    ? bare.slice(T3_PREFIX.length)
+  const prefix = T3_PREFIXES.find((candidate) => bare.startsWith(candidate));
+  return prefix !== undefined
+    ? bare.slice(prefix.length)
     : (CODEX_NAMES[bare] ?? bare.slice(bare.lastIndexOf("_") + 1));
 };
 export const normalizeToolInput = (name: string, input: unknown) => {
@@ -402,6 +526,7 @@ const t3SourceTools: ReadonlyArray<Tool.Any> = [
   TerminalToolkit,
   HtmlToolkit,
   ViewImageToolkit,
+  WebSearchToolkit,
 ].flatMap((toolkit): ReadonlyArray<Tool.Any> => Object.values(toolkit.tools));
 // McpHttpServer decodes arguments with each tool's JSON codec, which drops undeclared keys.
 const t3InputDecoders = new Map(
@@ -434,19 +559,27 @@ const hiddenWhileViewImageOff = enabledWhen(McpInvocationContext.visibleWhileVie
 const terminalNames = new Set(
   Object.values(TerminalToolkit.tools).map((tool) => `${T3_PREFIX}${tool.name}`),
 );
+// T3 lists web search only while it is on, to harnesses with no web search of their own.
+const hiddenWhileWebSearchOff = enabledWhen(McpInvocationContext.visibleWhileWebSearchOn);
+const NATIVE_WEB_TOOLS: ReadonlySet<string> = new Set(["WebSearch", "WebFetch"]);
 const visibleT3Tools = (options: {
   readonly ompSimulation?: boolean;
   readonly subagent?: boolean;
   readonly links?: boolean;
   readonly viewImage?: boolean;
-}) =>
-  t3Tools.filter(
+  readonly webSearch?: boolean;
+  readonly plugins?: ReadonlyArray<PluginName>;
+}) => [
+  ...t3Tools.filter(
     (tool) =>
       (options.ompSimulation === true || !terminalNames.has(tool.name)) &&
       (options.links === true || !hiddenWhileLinksOff.has(tool.name)) &&
       (options.viewImage === true || !hiddenWhileViewImageOff.has(tool.name)) &&
+      (options.webSearch === true || !hiddenWhileWebSearchOff.has(tool.name)) &&
       !(options.subagent === true && hiddenFromSubagents.has(tool.name)),
-  );
+  ),
+  ...pluginTools(options.plugins ?? []),
+];
 
 /**
  * T3's Claude Code options for an eval thread: its system prompt append and its hooks. `device` says
@@ -555,6 +688,8 @@ export const buildBase = (
     readonly subagent?: boolean;
     readonly links?: boolean;
     readonly viewImage?: boolean;
+    readonly webSearch?: boolean;
+    readonly plugins?: ReadonlyArray<PluginName>;
     /** A native subagent starts from its task: T3 appends nothing to its system prompt. */
     readonly nativeSubagent?: boolean;
     /** false: the thread has no agent device access, so T3's text leaves devices out. */
@@ -574,7 +709,12 @@ export const buildBase = (
   if (systemTexts.filter((value) => value.includes(RUNTIME_MARKER)).length !== 1 || !deferredList) {
     throw new Error(`The template needs one ${RUNTIME_MARKER} block and a deferred tool list.`);
   }
-  const nativeDeferred = deferredList.split("\n").filter((name) => name && !isT3Name(name));
+  const nativeDeferred = deferredList
+    .split("\n")
+    .filter(
+      (name) =>
+        name && !isT3Name(name) && !(options.webSearch === true && NATIVE_WEB_TOOLS.has(name)),
+    );
   const names = [...nativeDeferred, ...t3.map((tool) => tool.name)].toSorted().join("\n");
   const { model } = options;
   const append = options.nativeSubagent ? "" : t3SystemAppend(model, options.deviceAccess);
@@ -617,7 +757,10 @@ export const buildBase = (
       platform: /Platform: (\w+)/.exec(joined)?.[1] ?? "linux",
       date: /Today's date is ([\d-]+)/.exec(reminders.join("\n"))?.[1],
     },
-    nativeTools: template.tools.filter((tool) => !isT3Name(tool.name)),
+    nativeTools: template.tools.filter(
+      (tool) =>
+        !isT3Name(tool.name) && !(options.webSearch === true && NATIVE_WEB_TOOLS.has(tool.name)),
+    ),
     /** Tools ToolSearch loads: T3 tools from source, and native tools the template only names. */
     t3,
     deferred: [...t3, ...nativeDeferred.map((name) => ({ name, ...nativeSchema(name) }))],
@@ -663,6 +806,8 @@ const buildCodexBase = (
     readonly subagent?: boolean;
     readonly links?: boolean;
     readonly viewImage?: boolean;
+    readonly webSearch?: boolean;
+    readonly plugins?: ReadonlyArray<PluginName>;
     /** false: the thread has no agent device access, so T3's text leaves devices out. */
     readonly deviceAccess?: boolean;
   },
@@ -918,6 +1063,8 @@ const gitStatus = ({ setup }: McpToolUseCase) => {
   ].join("\n");
 };
 
+const runtimeMode = ({ setup }: McpToolUseCase) => setup.runtimeMode ?? DEFAULT_RUNTIME_MODE;
+
 const findTool = (base: Base, bare: string) =>
   [...base.nativeTools, ...base.deferred].find((tool) => normalizeToolName(tool.name) === bare) ??
   (base.codex ? { name: bare } : undefined);
@@ -979,7 +1126,13 @@ export const buildMessages = (sample: Sample) => {
         normalizeToolName(tool.name) === "orchestrator_capabilities"
           ? capabilities(sample, result)
           : (sample.priorResults.get(prior) ?? result);
-      push("user", toolResult(id, replayed));
+      const failure = pluginFailure(runtimeMode(testCase), normalizeToolName(name), result);
+      push(
+        "user",
+        failure === undefined
+          ? toolResult(id, replayed)
+          : { ...toolResult(id, failure), is_error: true },
+      );
     }
     if (turn.text) push(turn.role, text(turn.text));
   }
@@ -1455,7 +1608,11 @@ const answerToolCall = Effect.fn("evaluateMcpToolUse.answerToolCall")(function* 
     if (found.length === 0) return toolResult(call.id, "No matching deferred tools found");
     return loadTools(tools, call.id, found);
   }
-  const mock = testCase.setup.mocks?.[name];
+  const mock = resolveMock(testCase.setup.mocks?.[name], input);
+  const refused = isT3Name(call.name)
+    ? pluginFailure(runtimeMode(testCase), name, mock)
+    : undefined;
+  if (refused !== undefined) return failed(refused);
   // T3 answers device calls from the world. A mock that is a T3 device error fails inside T3.
   const failure = deviceFailure(mock);
   const fromWorld = mock === undefined || mock === "default" || failure !== undefined;
@@ -1519,6 +1676,17 @@ const matches = (expected: unknown, actual: unknown): boolean => {
   return Object.entries(expected).every(([path, value]) => matches(value, at(path)));
 };
 
+const ByArgsMock = Schema.TaggedStruct("ByArgs", {
+  cases: Schema.Array(Schema.Struct({ args: Schema.Unknown, result: Schema.Unknown })),
+  otherwise: Schema.Unknown,
+});
+const isByArgsMock = Schema.is(ByArgsMock);
+/** A case's mock for one call: a ByArgs mock answers by the call's args. */
+export const resolveMock = (mock: unknown, input: unknown): unknown =>
+  isByArgsMock(mock)
+    ? (mock.cases.find((entry) => matches(entry.args, input)) ?? { result: mock.otherwise }).result
+    : mock;
+
 /** delegate_task takes `target.options` as an object or `[{id, value}]`. Grade both as an object. */
 const withOptionsObject = (input: unknown) => {
   if (!isRecord(input) || !isRecord(input.target) || !Array.isArray(input.target.options)) {
@@ -1543,6 +1711,12 @@ export const gradeSample = (expect: McpToolUseCase["expect"], run: SampleRun) =>
   const label = ({ tool, args }: McpToolUseCall) => (args ? `${tool} ${valueText(args)}` : tool);
   for (const call of expect.calls ?? []) add(`calls ${label(call)}`, found(call));
   for (const call of expect.callsMustNot ?? []) add(`callsMustNot ${label(call)}`, !found(call));
+  for (const group of expect.callsAny ?? [])
+    add(`callsAny ${group.map(label).join(" | ")}`, group.some(found));
+  for (const { tool, args = {} } of expect.everyCall ?? []) {
+    const every = calls.every((call) => call.tool !== tool || matches(args, call.input));
+    add(`everyCall ${label({ tool, args })}`, every);
+  }
   for (const tool of expect.notCalls ?? []) add(`notCalls ${tool}`, count(tool) === 0);
   if (expect.order !== undefined) {
     const firsts = expect.order.map((tool) => calls.findIndex((call) => call.tool === tool));
@@ -1580,7 +1754,7 @@ export const gradeSample = (expect: McpToolUseCase["expect"], run: SampleRun) =>
 };
 
 // Checks that can only go from pass to fail as a sample goes on.
-const SETTLED = /^(notCalls|callsMustNot|shellMustNot|maxCalls|textMustNot) /;
+const SETTLED = /^(notCalls|callsMustNot|everyCall|shellMustNot|maxCalls|textMustNot) /;
 /** True once the sample has failed for good, so the rest of it cannot change the result. */
 export const failedEarly = (expect: McpToolUseCase["expect"], run: SampleRun) =>
   gradeSample(expect, run).some((check) => !check.pass && SETTLED.test(check.check));
@@ -2154,6 +2328,8 @@ const main = Effect.gen(function* () {
     deviceAccess: boolean,
     links: boolean,
     viewImage: boolean,
+    webSearch: boolean,
+    plugins: ReadonlyArray<PluginName>,
     ompSimulation = false,
   ): Effect.Effect<Base, Schema.SchemaError> =>
     codex
@@ -2167,6 +2343,8 @@ const main = Effect.gen(function* () {
               subagent: role === "delegated-child",
               links,
               viewImage,
+              webSearch,
+              plugins,
               deviceAccess,
             }),
           ),
@@ -2180,6 +2358,8 @@ const main = Effect.gen(function* () {
               nativeSubagent: role === "native-subagent",
               links,
               viewImage,
+              webSearch,
+              plugins,
               deviceAccess,
             });
             return role === "native-subagent"
@@ -2191,14 +2371,15 @@ const main = Effect.gen(function* () {
         );
   // Codex has no native subagents; its cases with that role run as top-level threads.
   const baseKey = ({ setup }: McpToolUseCase) =>
-    `${codex && setup.role === "native-subagent" ? "top" : setup.role}:${setup.world?.deviceAgentAccess !== false}:${setup.linkedEnvironments === true}:${setup.viewImage === true}:${setup.ompSimulation === true}`;
-  const base = yield* buildFor("top", true, false, false);
-  const bases = new Map<string, Base>([["top:true:false:false:false", base]]);
+    `${codex && setup.role === "native-subagent" ? "top" : setup.role}:${setup.world?.deviceAgentAccess !== false}:${setup.linkedEnvironments === true}:${setup.viewImage === true}:${setup.webSearch === true}:${setup.ompSimulation === true}:${(setup.plugins ?? []).join(",")}`;
+  const base = yield* buildFor("top", true, false, false, false, []);
+  const bases = new Map<string, Base>([["top:true:false:false:false:false:", base]]);
   for (const testCase of selected) {
     const key = baseKey(testCase);
     if (bases.has(key)) continue;
-    const [role = "top", access, links, viewImage, ompSimulation] = key.split(":") as [
+    const [role = "top", access, links, viewImage, webSearch, ompSimulation] = key.split(":") as [
       McpToolUseCase["setup"]["role"],
+      string,
       string,
       string,
       string,
@@ -2211,6 +2392,8 @@ const main = Effect.gen(function* () {
         access === "true",
         links === "true",
         viewImage === "true",
+        webSearch === "true",
+        testCase.setup.plugins ?? [],
         ompSimulation === "true",
       ),
     );

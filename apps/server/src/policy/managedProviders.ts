@@ -396,6 +396,9 @@ export function makeManagedProviders(
       visionModelSelection: allowedSelection(settings, settings.visionModelSelection)
         ? settings.visionModelSelection
         : null,
+      webSearchModelSelection: allowedSelection(settings, settings.webSearchModelSelection)
+        ? settings.webSearchModelSelection
+        : null,
     };
     cache.set(settings, result);
     return result;

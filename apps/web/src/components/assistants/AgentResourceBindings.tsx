@@ -1,9 +1,11 @@
 import { assistantHomeTarget } from "@t3tools/client-runtime/state/assistants";
-import type {
-  AssistantHomeBinding,
-  AssistantResourceSelection,
-  ClientSettings,
-  ProviderInstanceId,
+import {
+  ASSISTANT_TOOL_LIMIT,
+  assistantSelectedToolCount,
+  type AssistantHomeBinding,
+  type AssistantResourceSelection,
+  type ClientSettings,
+  type ProviderInstanceId,
 } from "@t3tools/contracts";
 import { useNavigate } from "@tanstack/react-router";
 
@@ -11,6 +13,7 @@ import { useClientSettings } from "../../hooks/useSettings";
 import { buildSidebarProjectSnapshots } from "../../sidebarProjectGrouping";
 import { useProjects } from "../../state/entities";
 import { usePrimaryEnvironmentId } from "../../state/environments";
+import { pluginEnvironment } from "../../state/plugins";
 import { useEnvironmentQuery } from "../../state/query";
 import {
   managedTextEnvironment,
@@ -25,6 +28,7 @@ import { Input } from "../ui/input";
 import { WorkEmpty, WorkMeta, WorkRow } from "../work/WorkLayout";
 import {
   setAssistantMcpTools,
+  setAssistantPluginOperations,
   toggleAssistantInstruction,
   toggleAssistantSkill,
 } from "@t3tools/client-runtime/assistant-presentation";
@@ -96,6 +100,9 @@ export function AgentResourceBindings({
     }),
   );
   const mcp = useMcpCatalogView({ ...target, providerInstanceId });
+  const pluginRegistry = useEnvironmentQuery(
+    pluginEnvironment.registry({ environmentId: target.environmentId, input: {} }),
+  );
   const settingsSearch = useAgentResourceSettingsSearch(binding);
 
   const managedSkills = (skills.data?.entries ?? []).flatMap((entry) =>
@@ -111,6 +118,17 @@ export function AgentResourceBindings({
   const missingInstructions = value.instructions.filter(
     (selected) => !instructions.some((entry) => entry.id === selected.resourceId),
   );
+  const pluginTools = (pluginRegistry.data?.installed ?? []).flatMap((record) => {
+    const operations = (record.manifest.backend?.operations ?? []).filter((op) => op.agent);
+    return operations.length === 0 ? [] : [{ record, operations }];
+  });
+  const missingPlugins =
+    pluginRegistry.data === null
+      ? []
+      : (value.plugins ?? []).filter(
+          (selected) => !pluginTools.some(({ record }) => record.pluginId === selected.pluginId),
+        );
+  const atToolLimit = assistantSelectedToolCount(value) >= ASSISTANT_TOOL_LIMIT;
 
   return (
     <>
@@ -292,6 +310,70 @@ export function AgentResourceBindings({
             />
           ))
         )}
+      </WorkRow>
+
+      <WorkRow>
+        <p className="text-sm font-medium">Plugin tools</p>
+        <WorkMeta>
+          Operations of plugins installed in this environment that the agent may call.
+        </WorkMeta>
+        {atToolLimit ? <WorkMeta>{ASSISTANT_TOOL_LIMIT} tools max</WorkMeta> : null}
+        {pluginRegistry.data === null ? (
+          <WorkMeta>
+            {pluginRegistry.error ? "Plugins aren't available." : "Loading plugins…"}
+          </WorkMeta>
+        ) : pluginTools.length === 0 && missingPlugins.length === 0 ? (
+          <WorkMeta>No installed plugin offers agent tools here.</WorkMeta>
+        ) : (
+          pluginTools.map(({ record, operations }) => {
+            const selected =
+              value.plugins?.find((entry) => entry.pluginId === record.pluginId)?.operations ?? [];
+            return (
+              <div key={record.pluginId} className="flex flex-col gap-1">
+                <div className="flex items-center gap-2">
+                  <span className="truncate text-sm">{record.name}</span>
+                  {record.enabled ? null : <WorkMeta>Disabled</WorkMeta>}
+                </div>
+                {operations.map((operation) => (
+                  <label key={operation.name} className="flex min-w-0 items-center gap-2 text-sm">
+                    <Checkbox
+                      checked={selected.includes(operation.name)}
+                      disabled={disabled || (atToolLimit && !selected.includes(operation.name))}
+                      onCheckedChange={() =>
+                        onChange(
+                          setAssistantPluginOperations(
+                            value,
+                            record.pluginId,
+                            operations
+                              .map((candidate) => candidate.name)
+                              .filter(
+                                (name) => selected.includes(name) !== (name === operation.name),
+                              ),
+                          ),
+                        )
+                      }
+                    />
+                    <span className="truncate">{operation.title}</span>
+                    {operation.mutates ? <WorkMeta>Changes state</WorkMeta> : null}
+                  </label>
+                ))}
+              </div>
+            );
+          })
+        )}
+        {missingPlugins.map((entry) => (
+          <div key={entry.pluginId} className="flex items-center justify-between gap-2">
+            <WorkMeta>Unavailable plugin</WorkMeta>
+            <Button
+              size="xs"
+              variant="ghost-destructive"
+              disabled={disabled}
+              onClick={() => onChange(setAssistantPluginOperations(value, entry.pluginId, []))}
+            >
+              Remove
+            </Button>
+          </div>
+        ))}
       </WorkRow>
     </>
   );

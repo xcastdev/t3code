@@ -6,6 +6,7 @@ import {
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
   PROVIDER_SEND_TURN_SUPPORTED_IMAGE_MIME_TYPES,
 } from "./chatAttachment.ts";
+import { PluginContributionId, PluginId } from "./plugins.ts";
 import { ProjectFaviconPath } from "./project.ts";
 import { ToolActivityNativeAppReference } from "./providerRuntime.ts";
 
@@ -65,6 +66,12 @@ export const AssetResource = Schema.Union([
   Schema.TaggedStruct(SOURCE_CONTROL_MEDIA_ASSET, {
     cwd: TrimmedNonEmptyString.check(Schema.isMaxLength(ASSET_PATH_MAX_LENGTH)),
     url: TrimmedNonEmptyString.check(Schema.isMaxLength(2048)),
+  }),
+  // The version is signed into the URL and keys client URL caches, so an update needs a new URL.
+  Schema.TaggedStruct("plugin-panel", {
+    pluginId: PluginId,
+    panelId: PluginContributionId,
+    version: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
   }),
 ]);
 export type AssetResource = typeof AssetResource.Type;
@@ -232,7 +239,9 @@ export class AssetWorkspaceAssetNotFoundError extends Schema.TaggedError<AssetWo
         ? "Provider output artifact was not found."
         : this.resource._tag === "tool-output-image"
           ? "Tool output image was not found."
-          : "Workspace asset was not found.";
+          : this.resource._tag === "plugin-panel"
+            ? "Plugin panel was not found."
+            : "Workspace asset was not found.";
   }
 }
 

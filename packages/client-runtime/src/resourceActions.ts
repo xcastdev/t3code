@@ -338,21 +338,32 @@ export function effectiveMcpCatalogDefinitions(input: {
   readonly own: ReadonlyArray<McpCatalogDefinition>;
   readonly overrides: ReadonlyArray<McpCatalogOverride>;
 }): ReadonlyArray<McpCatalogDefinition> {
+  const applyOverride = (definition: McpCatalogDefinition): McpCatalogDefinition => {
+    const override = input.overrides.find(
+      (candidate) => candidate.targetId === definition.logicalServerId,
+    );
+    if (override === undefined) return definition;
+    const providersOverridden =
+      override.providerInstanceIds !== undefined || override.allProviders !== undefined;
+    return {
+      ...definition,
+      name: override.name ?? definition.name,
+      enabled: override.enabled ?? definition.enabled,
+      providerInstanceIds: override.providerInstanceIds ?? definition.providerInstanceIds,
+      allProviders: providersOverridden ? override.allProviders === true : definition.allProviders,
+      transport: override.transport ?? definition.transport,
+    };
+  };
+  // A session's own copy of an inherited server shares its id, stands in for it, and is what
+  // the session's overrides target.
+  const own = new Map(input.own.map((definition) => [definition.logicalServerId, definition]));
+  const inheritedIds = new Set(input.inherited.map((definition) => definition.logicalServerId));
   return [
-    ...input.inherited.map((definition) => {
-      const override = input.overrides.find(
-        (candidate) => candidate.targetId === definition.logicalServerId,
-      );
-      return override === undefined
-        ? definition
-        : {
-            ...definition,
-            name: override.name ?? definition.name,
-            enabled: override.enabled ?? definition.enabled,
-            providerInstanceIds: override.providerInstanceIds ?? definition.providerInstanceIds,
-            transport: override.transport ?? definition.transport,
-          };
-    }),
-    ...input.own,
+    ...input.inherited.map((definition) =>
+      applyOverride(own.get(definition.logicalServerId) ?? definition),
+    ),
+    ...input.own
+      .filter((definition) => !inheritedIds.has(definition.logicalServerId))
+      .map(applyOverride),
   ];
 }

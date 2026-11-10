@@ -1,0 +1,19 @@
+{
+  "name": "@t3tools/plugin-request-inspector",
+  "version": "0.2.13",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vp test run --config ../../vite.config.ts --exclude \"integration/**\"",
+    "test:mitmproxy": "node integration/run.ts",
+    "pack": "node scripts/pack.ts"
+  },
+  "devDependencies": {
+    "@t3tools/contracts": "workspace:*",
+    "@t3tools/plugin-sdk": "workspace:*",
+    "@types/node": "catalog:",
+    "highlight.js": "11.11.1",
+    "vite-plus": "catalog:"
+  }
+}

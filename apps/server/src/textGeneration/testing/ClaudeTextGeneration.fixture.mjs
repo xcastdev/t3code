@@ -13,8 +13,17 @@ if (permissionIndex === -1 || argv[permissionIndex + 1] !== "dontAsk") {
   fail("text generation must deny permission prompts", 12);
 }
 const toolsIndex = argv.indexOf("--tools");
-if (toolsIndex === -1 || argv[toolsIndex + 1] !== "") {
-  fail("text generation must receive an explicit empty tool set", 6);
+// Web search is the one operation that gets tools: Claude's web tools and nothing else.
+if (toolsIndex === -1 || !["", "WebSearch,WebFetch"].includes(argv[toolsIndex + 1])) {
+  fail("text generation must receive an explicit empty or web-only tool set", 6);
+}
+if (
+  argv[toolsIndex + 1] === "WebSearch,WebFetch" &&
+  (process.env.CLAUDE_CODE_DISABLE_CLAUDE_MDS !== "1" ||
+    process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY !== "1" ||
+    argv[argv.indexOf("--disallowedTools") + 1] !== "mcp__*")
+) {
+  fail("web search must load no CLAUDE.md or memory and deny MCP tools", 17);
 }
 if (argv.includes("--dangerously-skip-permissions")) {
   fail("text generation must not bypass permissions", 7);

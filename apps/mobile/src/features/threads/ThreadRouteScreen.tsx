@@ -1,5 +1,6 @@
 import * as Dialog from "../../components/ui/Dialog";
 import { useRememberThreadProject } from "./useRememberThreadProject";
+import { useRecordRecentPluginChat } from "../plugins/recentChat";
 import { useOpenPullRequest } from "../../native/useOpenPullRequest";
 import { makeTurnCommandMetadata } from "../../lib/commandMetadata";
 import { buildProjectThreadStartTurnInput } from "../../lib/projectThreadStartTurn";
@@ -365,6 +366,7 @@ function ThreadRouteContent(
     selectedEnvironmentConnection,
   } = useThreadSelection();
   useRememberThreadProject(selectedThreadProject);
+  useRecordRecentPluginChat(selectedThread?.environmentId ?? null, selectedThread?.id ?? null);
   const canOperateThread = useEnvironmentScope(
     selectedThread?.environmentId ?? null,
     AuthOrchestrationOperateScope,

@@ -1,4 +1,9 @@
-import { type ThreadId, OrchestrationV2InstructionSnapshot } from "@t3tools/contracts";
+import {
+  type AssistantResourceSelection,
+  type ThreadId,
+  OrchestrationV2InstructionSnapshot,
+} from "@t3tools/contracts";
+import { pluginToolPolicyKey } from "@t3tools/shared/pluginManifest";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -6,6 +11,16 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import { AssistantRecord } from "./AssistantRepository.ts";
 import { assistantThreadIsCurrent } from "./AssistantThreadAuthority.ts";
+
+/** Policy keys for selected catalog tools (`<definitionId>:<tool>`) and plugin operations. */
+export const assistantToolIds = (resources: AssistantResourceSelection): ReadonlyArray<string> => [
+  ...resources.mcpTools.flatMap((entry) =>
+    entry.toolNames.map((name) => `${entry.definitionId}:${name}`),
+  ),
+  ...(resources.plugins ?? []).flatMap((entry) =>
+    entry.operations.map((operation) => pluginToolPolicyKey(entry.pluginId, operation)),
+  ),
+];
 
 export class AssistantNativeResources extends Context.Service<
   AssistantNativeResources,
@@ -47,9 +62,7 @@ const make = Effect.gen(function* () {
         if (admitted === undefined) return [];
         const snapshot = (yield* decodeSnapshot(admitted.configuration_json)).snapshot;
         const current = new Set(
-          record.detail.configuration.configuration.resources.mcpTools.flatMap((entry) =>
-            entry.toolNames.map((name) => `${entry.definitionId}:${name}`),
-          ),
+          assistantToolIds(record.detail.configuration.configuration.resources),
         );
         return snapshot.toolIds.filter((id) => current.has(id));
       },

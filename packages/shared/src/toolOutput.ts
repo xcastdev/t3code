@@ -1,7 +1,9 @@
 import { readOmpEvalEnvelope, normalizeOmpEvalImages, type OmpEvalEnvelope } from "./ompEval.ts";
 import {
+  isOrchestrationV2WorkActive,
   isProviderSendTurnSupportedImageMimeType,
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
+  type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
 import * as Predicate from "effect/Predicate";
 
@@ -206,6 +208,177 @@ export function mcpAppFromToolItem(item: {
 }): McpAppReference | undefined {
   const app = compactDynamicToolOutput(item.output)?.[MCP_APP_OUTPUT_KEY];
   return app !== undefined && item.toolName === `${app.server}.${app.tool}` ? app : undefined;
+}
+
+// Exact names adapters give our own server's tool: Claude, Cursor, and Pi; Codex and ACP; OpenCode 1.x.
+// OpenCode 2 names a per-thread server, so its adapter converts those calls itself.
+const T3_WEB_SEARCH_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "mcp__t3-code__t3_web_search",
+  "mcp__t3_code__t3_web_search",
+  "t3-code.t3_web_search",
+  "t3-code-direct.t3_web_search",
+  "t3-code_t3_web_search",
+]);
+const MAX_WEB_SEARCH_PARSE_BYTES = 262_144;
+const MAX_WEB_SEARCH_ITEM_BYTES = 16_384;
+const MAX_WEB_SEARCH_SOURCES = 20;
+const MAX_WEB_SEARCH_TITLE_CHARS = 300;
+const MAX_WEB_SEARCH_URL_CHARS = 2_048;
+const MAX_WEB_SEARCH_QUERY_CHARS = 1_000;
+const MAX_WEB_SEARCH_TEXT_CHARS = 8_000;
+const MAX_WEB_SEARCH_TEXT_BYTES = 8_192;
+
+type WebSearchTurnItem = Extract<OrchestrationV2TurnItem, { readonly type: "web_search" }>;
+type WebSearchResult = NonNullable<WebSearchTurnItem["results"]>[number];
+type DynamicToolTurnItem = Extract<OrchestrationV2TurnItem, { readonly type: "dynamic_tool" }>;
+type WebSearchTurnItemBase = Omit<
+  DynamicToolTurnItem,
+  "type" | "toolName" | "input" | "output" | "outputOmitted" | "viewedImagePath"
+>;
+
+function trimmedText(value: unknown, maxChars: number): string | undefined {
+  const text = typeof value === "string" ? value.trim() : "";
+  return text === "" ? undefined : text.slice(0, maxChars);
+}
+
+function rawOutputText(value: unknown, depth = 0): string | undefined {
+  if (depth > MAX_ENVELOPE_DEPTH || value === undefined || value === null) return undefined;
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    const parts = value
+      .slice(0, MAX_CONTENT_BLOCKS)
+      .map((block) => rawOutputText(Predicate.isObject(block) ? block.text : block, depth + 1))
+      .filter((part) => part !== undefined);
+    return parts.length === 0 ? undefined : parts.join("\n");
+  }
+  if (Predicate.isObject(value) && value.content !== undefined) {
+    return rawOutputText(value.content, depth + 1);
+  }
+  try {
+    return JSON.stringify(value)?.slice(0, MAX_WEB_SEARCH_TEXT_CHARS);
+  } catch {
+    return undefined;
+  }
+}
+
+function fitBytes(
+  text: string,
+  maxBytes: number,
+): { readonly text: string; readonly bytes: number } {
+  let fitted = text;
+  let bytes = encoder.encode(fitted).byteLength;
+  while (bytes > maxBytes) {
+    fitted = fitted.slice(0, Math.floor((fitted.length * maxBytes) / bytes) - 1);
+    bytes = encoder.encode(fitted).byteLength;
+  }
+  return { text: fitted, bytes };
+}
+
+function webSearchSource(source: unknown): WebSearchResult | undefined {
+  if (!Predicate.isObject(source) || typeof source.url !== "string") return undefined;
+  const url = source.url.trim();
+  if (url.length > MAX_WEB_SEARCH_URL_CHARS || !/^https?:\/\//i.test(url)) return undefined;
+  const title = trimmedText(source.title, MAX_WEB_SEARCH_TITLE_CHARS);
+  return title === undefined ? { url } : { title, url };
+}
+
+/** T3's web search tool is stored as the native web search it stands in for. */
+export function t3WebSearchTurnItem(
+  base: WebSearchTurnItemBase,
+  query: string | undefined,
+  output: unknown,
+): WebSearchTurnItem {
+  const { toolSurface: _surface, toolIcon: _icon, toolSource: _source, ...item } = base;
+  const result = readResult(output, {
+    remainingBytes: MAX_WEB_SEARCH_PARSE_BYTES,
+    remainingNodes: MAX_ENVELOPE_NODES,
+    exceeded: false,
+  });
+  const data = result.data ?? {};
+  const failed = result.failed || item.status === "failed";
+  const answer = failed ? undefined : trimmedText(data.answer, MAX_WEB_SEARCH_TEXT_CHARS);
+  const sources =
+    failed || !Array.isArray(data.sources)
+      ? []
+      : data.sources.slice(0, 100).flatMap((source) => webSearchSource(source) ?? []);
+  const fallback =
+    answer !== undefined || sources.length > 0
+      ? undefined
+      : trimmedText(
+          (failed ? (data.message ?? data.error) : undefined) ?? rawOutputText(output),
+          MAX_WEB_SEARCH_TEXT_CHARS,
+        );
+  const snippet = answer ?? fallback;
+  const fitted = snippet === undefined ? undefined : fitBytes(snippet, MAX_WEB_SEARCH_TEXT_BYTES);
+  const results: WebSearchResult[] =
+    fitted === undefined
+      ? []
+      : [
+          {
+            title: answer !== undefined ? "Answer" : failed ? "Error" : "Output",
+            snippet: fitted.text,
+          },
+        ];
+  let bytes = fitted?.bytes ?? 0;
+  for (const source of sources.slice(0, MAX_WEB_SEARCH_SOURCES)) {
+    bytes += encoder.encode(`${source.title ?? ""}${source.url ?? ""}`).byteLength;
+    if (bytes > MAX_WEB_SEARCH_ITEM_BYTES) break;
+    results.push(source);
+  }
+  const trimmedQuery = trimmedText(query, MAX_WEB_SEARCH_QUERY_CHARS);
+  return {
+    ...item,
+    status: result.failed && item.status === "completed" ? "failed" : item.status,
+    title: null,
+    type: "web_search",
+    ...(trimmedQuery === undefined ? {} : { patterns: [trimmedQuery] }),
+    ...(results.length === 0 ? {} : { results }),
+  };
+}
+
+function convertT3WebSearchTurnItem(
+  item: DynamicToolTurnItem,
+  trustOutput: boolean,
+): WebSearchTurnItem {
+  const {
+    type: _type,
+    toolName: _toolName,
+    input,
+    output,
+    outputOmitted: _omitted,
+    viewedImagePath: _viewed,
+    ...base
+  } = item;
+  const query = Predicate.isObject(input) ? input.query : undefined;
+  return t3WebSearchTurnItem(
+    base,
+    typeof query === "string" ? query : undefined,
+    trustOutput ? output : undefined,
+  );
+}
+
+/** Converts only ended calls: a running one stays dynamic_tool, which Stop and settlement end. */
+export function asT3WebSearchTurnItem(item: OrchestrationV2TurnItem): OrchestrationV2TurnItem {
+  if (
+    item.type !== "dynamic_tool" ||
+    isOrchestrationV2WorkActive(item.status) ||
+    !T3_WEB_SEARCH_TOOL_NAMES.has(item.toolName ?? "")
+  ) {
+    return item;
+  }
+  return convertT3WebSearchTurnItem(item, true);
+}
+
+/**
+ * Clients show a T3 web search call as a web search in every state, so the row does not change
+ * look when it ends; Stop and recovery end calls without converting them. Output from a name
+ * other than our own server's (OpenCode 2 names one per thread) is not shown as sources.
+ */
+export function t3WebSearchDisplayItem(item: OrchestrationV2TurnItem): OrchestrationV2TurnItem {
+  if (item.type !== "dynamic_tool" || resolveT3McpToolId(item.toolName) !== "t3_web_search") {
+    return item;
+  }
+  return convertT3WebSearchTurnItem(item, T3_WEB_SEARCH_TOOL_NAMES.has(item.toolName ?? ""));
 }
 
 /** Some providers report completion even when command output describes a failure. */

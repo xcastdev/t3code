@@ -31,6 +31,7 @@ import {
   type RunId,
   RuntimeMode,
   ThreadId,
+  NATIVE_WEB_SEARCH_DRIVERS,
 } from "@t3tools/contracts";
 
 import packageJson from "../../package.json" with { type: "json" };
@@ -89,6 +90,9 @@ import {
 import * as ViewImageHandlers from "./toolkits/viewImage/handlers.ts";
 import { ViewImageToolkit } from "./toolkits/viewImage/tools.ts";
 import * as ViewImageMcpService from "./ViewImageMcpService.ts";
+import * as WebSearchHandlers from "./toolkits/webSearch/handlers.ts";
+import { WebSearchToolkit } from "./toolkits/webSearch/tools.ts";
+import * as WebSearchMcpService from "./WebSearchMcpService.ts";
 import * as HtmlHandlers from "./toolkits/html/handlers.ts";
 import { HtmlPreviewTool, HtmlPreviewToolkit, HtmlRenderToolkit } from "./toolkits/html/tools.ts";
 
@@ -211,13 +215,27 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
   const clients = yield* Effect.serviceOption(McpClientAuthenticator);
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const runtimeModeCeiling = serverSettings.managedPolicy?.limits?.maxRuntimeMode;
-  const settingFlags = serverSettings.getSettings.pipe(
-    Effect.map((settings) => ({
-      linkedEnvironments: settings.linkedEnvironmentsEnabled,
-      viewImage: settings.viewImageToolEnabled && settings.visionModelSelection !== null,
-    })),
-    Effect.orElseSucceed(() => ({ linkedEnvironments: false, viewImage: false })),
-  );
+  const settingFlags = (thread: McpInvocationContext.McpThreadCaller | undefined) =>
+    serverSettings.getSettings.pipe(
+      Effect.map((settings) => ({
+        linkedEnvironments: settings.linkedEnvironmentsEnabled,
+        viewImage: settings.viewImageToolEnabled && settings.visionModelSelection !== null,
+        webSearch:
+          settings.webSearchToolEnabled &&
+          settings.webSearchModelSelection !== null &&
+          thread !== undefined &&
+          // A default instance id is its driver.
+          !NATIVE_WEB_SEARCH_DRIVERS.has(
+            settings.providerInstances[thread.providerInstanceId]?.driver ??
+              thread.providerInstanceId,
+          ),
+      })),
+      Effect.orElseSucceed(() => ({
+        linkedEnvironments: false,
+        viewImage: false,
+        webSearch: false,
+      })),
+    );
   return Effect.fn("McpHttpServer.authenticateRequest")(function* (httpEffect) {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const authorization = request.headers.authorization;
@@ -247,7 +265,7 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
     const asked = withModeLimit(invocation, request);
     if (asked === undefined) return invalidModeLimit;
     const limited = McpInvocationContext.withRuntimeModeCeiling(asked, runtimeModeCeiling);
-    const flags = yield* settingFlags;
+    const flags = yield* settingFlags(limited.thread);
     if (limited.client?.linked === true && !flags.linkedEnvironments) return linkedEnvironmentsOff;
     return yield* httpEffect.pipe(
       Effect.provideService(McpInvocationContext.McpInvocationContext, { ...limited, ...flags }),
@@ -1148,6 +1166,10 @@ const layerViewImageToolkit = toolkitRegistration(ViewImageToolkit, ViewImageHan
   Layer.provide(ViewImageMcpService.layer),
 );
 
+const layerWebSearchToolkit = toolkitRegistration(WebSearchToolkit, WebSearchHandlers.layer).pipe(
+  Layer.provide(WebSearchMcpService.layer),
+);
+
 export const layerAttachmentToolkit = toolkitRegistration(
   AttachmentToolkit,
   AttachmentHandlers.layer,
@@ -1200,6 +1222,7 @@ export const layerTools = Layer.mergeAll(
   layerDeviceToolkit,
   layerHtmlToolkit,
   layerViewImageToolkit,
+  layerWebSearchToolkit,
 );
 
 export const layer = layerTools.pipe(Layer.provideMerge(layerMcpTransport));

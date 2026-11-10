@@ -29,6 +29,7 @@ import {
   THREAD_JUMP_KEYBINDING_COMMANDS,
 } from "@t3tools/contracts";
 import { filterFilesystemBrowseEntries } from "@t3tools/client-runtime/state/filesystem";
+import type { PluginPanelKey, PluginPanelTarget } from "@t3tools/client-runtime/plugins/commands";
 import { type ReactNode } from "react";
 import { formatRelativeTimeLabel } from "../timestampFormat";
 import { type Project, type SidebarThreadSummary, type Thread } from "../types";
@@ -365,6 +366,26 @@ export function buildCommandPaletteProjectMetadata(input: {
   }
 
   return { searchTerms, environmentLabels: [...environmentLabels] };
+}
+
+/** One item per plugin panel and command, each naming where it runs and opening that exact panel. */
+export function buildPluginPanelItems(input: {
+  readonly targets: ReadonlyArray<PluginPanelTarget>;
+  readonly icon: ReactNode;
+  readonly open: (key: PluginPanelKey) => void;
+}): CommandPaletteActionItem[] {
+  return input.targets.map((target) => ({
+    kind: "action",
+    value: `plugin:${target.kind}:${target.key}:${target.commandId ?? ""}`,
+    searchTerms: [target.title, target.pluginName, target.scopeLabel],
+    title: `${target.title} · ${target.scopeLabel}`,
+    description: target.pluginName,
+    icon: input.icon,
+    ...(target.commandId === undefined
+      ? {}
+      : { shortcutCommand: `plugin.${target.pluginId}.${target.commandId}` as const }),
+    run: async () => input.open(target.key),
+  }));
 }
 
 export function buildProjectActionItems(input: {

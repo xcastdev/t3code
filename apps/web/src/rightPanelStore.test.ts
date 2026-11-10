@@ -501,6 +501,12 @@ describe("rightPanelStore", () => {
     expect(selectThreadRightPanelState(byThreadKey, refA).maximized).toBe(true);
     expect(selectThreadRightPanelState(byThreadKey, refB).maximized).toBeUndefined();
     expect(store.getUserActionRevision(refA)).toBe(revision);
+
+    // An emptied panel is the launcher rail, which cannot be maximized.
+    store.closeAllSurfaces(refA);
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).maximized,
+    ).toBeUndefined();
   });
 
   it("restores a saved maximized panel during migration", () => {
@@ -567,6 +573,31 @@ describe("rightPanelStore", () => {
     expect(migrated.byThreadKey["env-1:thread-A"]?.surfaces.map((surface) => surface.id)).toEqual([
       "work:tasks",
     ]);
+  });
+
+  it("persisted plugin surfaces in thread state are dropped on load", () => {
+    const migrated = migratePersistedRightPanelState({
+      byThreadKey: {
+        "env-1:thread-A": {
+          isOpen: true,
+          activeSurfaceId: "plugin:env-1:inspector:requests",
+          surfaces: [
+            { id: "diff", kind: "diff" },
+            {
+              id: "plugin:env-1:inspector:requests",
+              kind: "plugin",
+              panelKey: "env-1:inspector:requests",
+              title: "Requests",
+            },
+          ],
+        },
+      },
+    });
+    expect(migrated.byThreadKey["env-1:thread-A"]).toEqual({
+      isOpen: true,
+      activeSurfaceId: "diff",
+      surfaces: [{ id: "diff", kind: "diff" }],
+    });
   });
 
   it("drops the legacy singleton terminal surface during migration", () => {

@@ -1,4 +1,5 @@
 import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
+import { parsePluginPanelKey, type PluginPanelKey } from "@t3tools/client-runtime/plugins/commands";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
   threadRuntimeIsActive,
@@ -37,7 +38,6 @@ import { horizontalListSortingStrategy, SortableContext, useSortable } from "@dn
 import { CSS } from "@dnd-kit/utilities";
 import {
   Smartphone,
-  ChevronDown,
   ChevronLeft,
   ChevronRight,
   BookOpen,
@@ -55,6 +55,7 @@ import {
 import { WORK_SECTION_LABELS, WORK_SECTIONS, type WorkSection } from "../routes/-workSearch";
 import { Volume2, VolumeOff } from "lucide";
 import {
+  createElement,
   Fragment,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
@@ -82,6 +83,7 @@ import {
   Menu,
   MenuItem,
   MenuPopup,
+  MenuSeparator,
   MenuShortcut,
   MenuSub,
   MenuSubPopup,
@@ -89,7 +91,16 @@ import {
   MenuTrigger,
 } from "~/components/ui/menu";
 import { useBrowserDefaults } from "~/browser/browserDefaults";
+import { pluginPanelIcon } from "~/plugins/pluginIcons";
+import { usePluginPanelInstall } from "~/plugins/pluginInstalls";
 import { ScrollArea } from "~/components/ui/scroll-area";
+import { Separator } from "~/components/ui/separator";
+import {
+  SidebarGroup,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+} from "~/components/ui/sidebar";
 import { PanelTabCloseButton } from "~/components/ui/panel-tab-close-button";
 import { faviconUrlForOrigin } from "@t3tools/shared/favicon";
 import { useTheme } from "~/hooks/useTheme";
@@ -165,7 +176,17 @@ export interface RightPanelTabsProps {
   /** Overrides the default reason while side chats are available but cannot start. */
   sideChatDisabledReason?: string | null;
   pullRequestStatusSeeds?: Readonly<Record<string, PullRequestTabStatusSeed>>;
+  /** Pinned plugin panels that can dock here, after the built-in surfaces. */
+  pluginActions?: ReadonlyArray<PluginSurfaceAction>;
   children: ReactNode;
+}
+
+export interface PluginSurfaceAction {
+  readonly panelKey: PluginPanelKey;
+  readonly label: string;
+  readonly icon: (props: { className?: string }) => ReactNode;
+  readonly onClick: () => void;
+  readonly onUnpin: () => void;
 }
 
 export interface PullRequestTabStatus {
@@ -278,7 +299,10 @@ export function surfaceShortcutActionForKey<
   if (event.metaKey || event.ctrlKey || event.altKey) return null;
   const key = surfaceShortcutKey(event);
   return (
-    actions.find((action) => action.available && action.shortcut.toLowerCase() === key) ?? null
+    actions.find(
+      (action) =>
+        action.available && action.shortcut !== "" && action.shortcut.toLowerCase() === key,
+    ) ?? null
   );
 }
 
@@ -323,8 +347,12 @@ function SurfaceMenuItem(props: {
   return <DisabledReasonTooltip reason={props.disabledReason} trigger={item} />;
 }
 
+// Plugin actions use panel keys as ids, which never collide with this.
+const BROWSER_ACTION_ID = "browser";
+
 function RightPanelEmptyState(props: {
-  layout: "rail" | "list";
+  layout: SurfaceLauncherLayout;
+  layoutControls?: ReactNode;
   onAddBrowser: () => void;
   onAddBrowserInProfile: (profileId: string) => void;
   browserProfiles: ReadonlyArray<{ readonly id: string; readonly name: string }>;
@@ -346,10 +374,9 @@ function RightPanelEmptyState(props: {
   sideChatAvailable: boolean;
   sideChatDisabledReason: string | null;
   workAttention?: WorkAttentionKeys | undefined;
+  pluginActions: ReadonlyArray<PluginSurfaceAction>;
 }) {
-  const [highlight, setHighlight] = useState(-1);
-
-  const actions = [
+  const builtInActions = [
     ...(props.onAddSideChat
       ? [
           {
@@ -433,6 +460,7 @@ function RightPanelEmptyState(props: {
       onClick: () => props.onAddWork?.("knowledge"),
     },
     {
+      id: BROWSER_ACTION_ID,
       label: "Browser",
       group: "workspace",
       icon: Globe2,
@@ -452,12 +480,23 @@ function RightPanelEmptyState(props: {
       onClick: props.onAddDevice,
     },
   ] as const;
-
-  type SurfaceAction = (typeof actions)[number];
+  const actions: ReadonlyArray<RailSurfaceAction> = [
+    ...builtInActions,
+    ...props.pluginActions.map((action): RailSurfaceAction => ({
+      id: action.panelKey,
+      label: action.label,
+      group: "plugins",
+      description: "Right-click to unpin.",
+      icon: action.icon,
+      shortcut: "",
+      available: true,
+      disabledReason: "",
+      onClick: action.onClick,
+      onUnpin: action.onUnpin,
+    })),
+  ];
 
   const availableActions = actions.filter((action) => action.available);
-  const highlightIndex =
-    availableActions.length === 0 ? -1 : Math.min(highlight, availableActions.length - 1);
 
   const handleShortcut = useEffectEvent((event: KeyboardEvent) => {
     const action = surfaceShortcutActionForKey(availableActions, event);
@@ -476,156 +515,27 @@ function RightPanelEmptyState(props: {
     return () => window.removeEventListener("keydown", handler, true);
   }, []);
 
-  const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
-    if (availableActions.length === 0) return;
-    if (event.key === "ArrowDown" || event.key === "ArrowRight") {
-      event.preventDefault();
-      setHighlight((highlightIndex + 1) % availableActions.length);
-      return;
-    }
-    if (event.key === "ArrowUp" || event.key === "ArrowLeft") {
-      event.preventDefault();
-      setHighlight(
-        highlightIndex === -1
-          ? availableActions.length - 1
-          : (highlightIndex - 1 + availableActions.length) % availableActions.length,
-      );
-      return;
-    }
-    if (event.key === "Enter") {
-      if (event.target !== event.currentTarget) return;
-      const action = availableActions[highlightIndex];
-      if (!action) return;
-      event.preventDefault();
-      action.onClick();
-    }
-  };
-
-  const isHighlighted = (action: SurfaceAction) =>
-    highlightIndex !== -1 && availableActions[highlightIndex] === action;
-
-  const actionIcon = (action: SurfaceAction, iconClassName = "size-4") => {
-    const Icon = action.icon;
-    return (
-      <AttentionIcon attention={"attention" in action ? action.attention : NO_ATTENTION}>
-        <Icon className={iconClassName} />
-      </AttentionIcon>
-    );
-  };
-
-  if (props.layout === "rail") {
-    return (
-      <RightPanelSurfaceRail
-        actions={actions}
-        launcherKeys={availableActions.map((action) => action.shortcut).join("")}
-        browserProfiles={props.browserProfiles}
-        onAddBrowserInProfile={props.onAddBrowserInProfile}
-      />
-    );
-  }
-
   return (
-    <div
-      data-workspace-focus-default
-      tabIndex={0}
-      onKeyDown={handleKeyDown}
-      aria-label="Open a surface"
-      data-surface-launcher-keys={availableActions.map((action) => action.shortcut).join("")}
-      className={cn(
-        "scrollbar-gutter-both flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-6 outline-none",
-        "pb-(--workspace-topbar-height)",
-      )}
-    >
-      <div className="w-full max-w-xs py-6">
-        <h3 className="mb-3 text-center font-medium text-foreground text-sm">Open a surface</h3>
-        <div className="flex flex-col gap-0.5">
-          {actions.map((action) =>
-            action.available ? (
-              <div
-                key={action.label}
-                className="group relative"
-                onMouseEnter={() => setHighlight(availableActions.indexOf(action))}
-                onMouseLeave={() =>
-                  setHighlight((current) =>
-                    current === availableActions.indexOf(action) ? -1 : current,
-                  )
-                }
-              >
-                <button
-                  type="button"
-                  onClick={action.onClick}
-                  className={cn(
-                    "flex h-8 w-full cursor-pointer items-center gap-2.5 rounded-(--control-radius) px-2.5 text-left text-sm transition-colors group-hover:bg-accent/60",
-                    isHighlighted(action) && "bg-accent/60",
-                  )}
-                >
-                  {actionIcon(action, "size-4")}
-                  <span
-                    className={cn(
-                      "min-w-0 flex-1 truncate",
-                      action.label === "Browser" && props.browserProfiles.length > 1 && "pr-7",
-                    )}
-                  >
-                    {action.label}
-                  </span>
-                  <Kbd>{action.shortcut}</Kbd>
-                </button>
-                {action.label === "Browser" && props.browserProfiles.length > 1 ? (
-                  <Menu>
-                    <MenuTrigger
-                      render={
-                        <Button
-                          aria-label="Open browser in a profile"
-                          className="absolute top-1/2 right-8 -translate-y-1/2"
-                          size="icon-xs"
-                          variant="ghost-muted"
-                        />
-                      }
-                    >
-                      <ChevronDown className="size-3.5" />
-                    </MenuTrigger>
-                    <MenuPopup align="end" side="bottom" sideOffset={6} className="max-w-56">
-                      {props.browserProfiles.map((profile) => (
-                        <MenuItem
-                          key={profile.id}
-                          onClick={() => props.onAddBrowserInProfile(profile.id)}
-                        >
-                          <span className="min-w-0 truncate">{profile.name}</span>
-                        </MenuItem>
-                      ))}
-                    </MenuPopup>
-                  </Menu>
-                ) : null}
-              </div>
-            ) : (
-              <DisabledReasonTooltip
-                key={action.label}
-                reason={action.disabledReason}
-                trigger={
-                  <div
-                    tabIndex={0}
-                    aria-disabled="true"
-                    className="flex h-8 w-full cursor-default items-center gap-2.5 rounded-(--control-radius) px-2.5 text-left text-sm opacity-50"
-                  >
-                    {actionIcon(action, "size-4")}
-                    <span className="min-w-0 flex-1 truncate">{action.label}</span>
-                    <Kbd>{action.shortcut}</Kbd>
-                  </div>
-                }
-              />
-            ),
-          )}
-        </div>
-      </div>
-    </div>
+    <RightPanelSurfaceLauncher
+      layout={props.layout}
+      layoutControls={props.layoutControls}
+      actions={actions}
+      launcherKeys={availableActions.map((action) => action.shortcut).join("")}
+      browserProfiles={props.browserProfiles}
+      onAddBrowserInProfile={props.onAddBrowserInProfile}
+    />
   );
 }
 
+/** The slim icon rail beside the chat, or the labeled list a small screen shows in an overlay. */
+type SurfaceLauncherLayout = "rail" | "list";
+
 const RAIL_ACTION_SELECTOR = "[data-rail-action]:not([aria-disabled='true'])";
-const RAIL_FIRST_ACTION_SELECTOR = `[data-surface-launcher-keys] ${RAIL_ACTION_SELECTOR}`;
+export const RAIL_FIRST_ACTION_SELECTOR = `[data-surface-launcher-keys] ${RAIL_ACTION_SELECTOR}`;
 
 interface RailSurfaceAction {
+  /** Distinguishes actions that share a label, such as one plugin's panel in two scopes. */
+  readonly id?: string;
   readonly label: string;
   readonly group: string;
   readonly description?: string;
@@ -635,13 +545,29 @@ interface RailSurfaceAction {
   readonly disabledReason: string;
   readonly onClick: () => void;
   readonly attention?: ReadonlyArray<string>;
+  readonly onUnpin?: () => void;
 }
+
+const showUnpinMenu = async (event: ReactMouseEvent, onUnpin: () => void) => {
+  event.preventDefault();
+  const api = readLocalApi();
+  if (!api) return;
+  const action = await api.contextMenu.show([{ id: "unpin", label: "Unpin" }], {
+    x: event.clientX,
+    y: event.clientY,
+  });
+  if (action === "unpin") onUnpin();
+};
+
+const unpinOnContextMenu = (onUnpin: (() => void) | undefined) =>
+  onUnpin ? (event: ReactMouseEvent) => void showUnpinMenu(event, onUnpin) : undefined;
 
 type WorkAttentionKeys = {
   readonly overview: ReadonlyArray<string>;
   readonly tasks: ReadonlyArray<string>;
 };
 const NO_ATTENTION: ReadonlyArray<string> = [];
+const NO_PLUGIN_ACTIONS: ReadonlyArray<PluginSurfaceAction> = [];
 
 /** An icon with a red dot while something it opens waits on the user. */
 function AttentionIcon(props: {
@@ -659,7 +585,20 @@ function AttentionIcon(props: {
   );
 }
 
-function RightPanelSurfaceRail(props: {
+/** Runs of adjacent actions that share a group, in order. */
+function actionGroups(actions: readonly RailSurfaceAction[]): RailSurfaceAction[][] {
+  const groups: RailSurfaceAction[][] = [];
+  for (const action of actions) {
+    const last = groups.at(-1);
+    if (last && last[0]?.group === action.group) last.push(action);
+    else groups.push([action]);
+  }
+  return groups;
+}
+
+function RightPanelSurfaceLauncher(props: {
+  layout: SurfaceLauncherLayout;
+  layoutControls?: ReactNode;
   actions: readonly RailSurfaceAction[];
   launcherKeys: string;
   browserProfiles: ReadonlyArray<{ readonly id: string; readonly name: string }>;
@@ -668,6 +607,7 @@ function RightPanelSurfaceRail(props: {
   const browserButtonRef = useRef<HTMLButtonElement>(null);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const hasProfileChoice = props.browserProfiles.length > 1;
+  const list = props.layout === "list";
 
   const handleKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
@@ -688,12 +628,83 @@ function RightPanelSurfaceRail(props: {
     items[next]?.focus();
   };
 
+  const renderAction = (action: RailSurfaceAction) => {
+    const Icon = action.icon;
+    const browserMenu = action.id === BROWSER_ACTION_ID && action.available && hasProfileChoice;
+    const buttonProps = {
+      ref: browserMenu ? browserButtonRef : undefined,
+      "data-rail-action": true,
+      "aria-keyshortcuts": action.available && action.shortcut ? action.shortcut : undefined,
+      "aria-disabled": action.available ? undefined : true,
+      onClick: action.available ? action.onClick : undefined,
+      onContextMenu: browserMenu
+        ? (event: ReactMouseEvent) => {
+            event.preventDefault();
+            setProfileMenuOpen(true);
+          }
+        : unpinOnContextMenu(action.onUnpin),
+    };
+    if (list) {
+      const reason = action.available ? null : action.disabledReason;
+      return (
+        <SidebarMenuButton {...buttonProps} size={reason ? "lg" : "default"}>
+          <AttentionIcon attention={action.attention}>
+            <Icon className="size-4" />
+          </AttentionIcon>
+          {reason ? (
+            <span className="flex min-w-0 flex-1 flex-col">
+              <span className="truncate">{action.label}</span>
+              <span className="truncate font-normal text-xs">{reason}</span>
+            </span>
+          ) : (
+            <span className="min-w-0 flex-1 truncate">{action.label}</span>
+          )}
+          {action.available && action.shortcut ? <Kbd>{action.shortcut}</Kbd> : null}
+        </SidebarMenuButton>
+      );
+    }
+    const hint = !action.available
+      ? action.disabledReason
+      : browserMenu
+        ? "Right-click to choose a profile."
+        : action.description;
+    return (
+      <Tooltip disabled={browserMenu && profileMenuOpen}>
+        <TooltipTrigger
+          render={
+            <Button {...buttonProps} aria-label={action.label} size="icon" variant="ghost-muted" />
+          }
+        >
+          <AttentionIcon attention={action.attention}>
+            <Icon className="size-5.5" />
+          </AttentionIcon>
+        </TooltipTrigger>
+        <TooltipPopup side="left" sideOffset={8} variant="soft">
+          <div className="flex flex-col gap-0.5 py-0.5">
+            <span className="flex items-center justify-between gap-3">
+              <span className="font-medium text-foreground">{action.label}</span>
+              {action.available && action.shortcut ? <Kbd>{action.shortcut}</Kbd> : null}
+            </span>
+            {hint ? <span className="text-muted-foreground">{hint}</span> : null}
+          </div>
+        </TooltipPopup>
+      </Tooltip>
+    );
+  };
+
   return (
     <>
-      <div
-        aria-hidden
-        className={cn("h-(--workspace-topbar-height) shrink-0", isElectron && "drag-region")}
-      />
+      {list ? (
+        <div className="flex h-(--workspace-topbar-height) shrink-0 items-center gap-2 pr-3 pl-4.5">
+          <span className="min-w-0 flex-1 truncate font-medium text-sm">Open a surface</span>
+          {props.layoutControls}
+        </div>
+      ) : (
+        <div
+          aria-hidden
+          className={cn("h-(--workspace-topbar-height) shrink-0", isElectron && "drag-region")}
+        />
+      )}
       <TooltipProvider delay={100} closeDelay={0} timeout={400}>
         <nav
           data-workspace-focus-default
@@ -701,61 +712,37 @@ function RightPanelSurfaceRail(props: {
           onKeyDown={handleKeyDown}
           aria-label="Open a surface"
           data-surface-launcher-keys={props.launcherKeys}
-          className="flex min-h-0 flex-1 flex-col items-center gap-1.5 overflow-y-auto py-1.5 outline-none [scrollbar-width:none]"
+          className="flex min-h-0 flex-1 flex-col outline-none"
         >
-          {props.actions.map((action, index) => {
-            const Icon = action.icon;
-            const browserMenu = action.label === "Browser" && action.available && hasProfileChoice;
-            const hint = !action.available
-              ? action.disabledReason
-              : browserMenu
-                ? "Right-click to choose a profile."
-                : action.description;
-            return (
-              <Fragment key={action.label}>
-                {index > 0 && props.actions[index - 1]?.group !== action.group ? (
-                  <div aria-hidden className="my-1.5 h-px w-4 shrink-0 bg-border" />
-                ) : null}
-                <Tooltip disabled={browserMenu && profileMenuOpen}>
-                  <TooltipTrigger
-                    render={
-                      <Button
-                        ref={browserMenu ? browserButtonRef : undefined}
-                        data-rail-action
-                        aria-label={action.label}
-                        aria-keyshortcuts={action.available ? action.shortcut : undefined}
-                        aria-disabled={action.available ? undefined : true}
-                        onClick={action.available ? action.onClick : undefined}
-                        onContextMenu={
-                          browserMenu
-                            ? (event) => {
-                                event.preventDefault();
-                                setProfileMenuOpen(true);
-                              }
-                            : undefined
-                        }
-                        size="icon"
-                        variant="ghost-muted"
-                      />
-                    }
-                  >
-                    <AttentionIcon attention={action.attention}>
-                      <Icon className="size-5.5" />
-                    </AttentionIcon>
-                  </TooltipTrigger>
-                  <TooltipPopup side="left" sideOffset={8} variant="soft">
-                    <div className="flex flex-col gap-0.5 py-0.5">
-                      <span className="flex items-center justify-between gap-3">
-                        <span className="font-medium text-foreground">{action.label}</span>
-                        {action.available ? <Kbd>{action.shortcut}</Kbd> : null}
-                      </span>
-                      {hint ? <span className="text-muted-foreground">{hint}</span> : null}
-                    </div>
-                  </TooltipPopup>
-                </Tooltip>
-              </Fragment>
-            );
-          })}
+          <ScrollArea scrollFade hideScrollbars viewportTabIndex={-1}>
+            {list ? (
+              <SidebarGroup>
+                {actionGroups(props.actions).map((group, index) => (
+                  <Fragment key={group[0]?.group}>
+                    {index > 0 ? <Separator className="my-1" /> : null}
+                    <SidebarMenu>
+                      {group.map((action) => (
+                        <SidebarMenuItem key={action.id ?? action.label}>
+                          {renderAction(action)}
+                        </SidebarMenuItem>
+                      ))}
+                    </SidebarMenu>
+                  </Fragment>
+                ))}
+              </SidebarGroup>
+            ) : (
+              <div className="flex flex-col items-center gap-1.5 py-1.5">
+                {props.actions.map((action, index) => (
+                  <Fragment key={action.id ?? action.label}>
+                    {index > 0 && props.actions[index - 1]?.group !== action.group ? (
+                      <div aria-hidden className="my-1.5 h-px w-4 shrink-0 bg-border" />
+                    ) : null}
+                    {renderAction(action)}
+                  </Fragment>
+                ))}
+              </div>
+            )}
+          </ScrollArea>
         </nav>
       </TooltipProvider>
       {hasProfileChoice ? (
@@ -763,8 +750,8 @@ function RightPanelSurfaceRail(props: {
           <MenuPopup
             anchor={browserButtonRef}
             align="start"
-            side="left"
-            sideOffset={8}
+            side={list ? "bottom" : "left"}
+            sideOffset={list ? 4 : 8}
             className="max-w-56"
           >
             {props.browserProfiles.map((profile) => (
@@ -812,6 +799,8 @@ function surfaceTitle(
       return surface.title ?? surface.target?.name ?? "Device";
     case "side-chat":
       return "Side chat";
+    case "plugin":
+      return surface.title;
     case "preview": {
       const snapshot = surface.resourceId ? sessions[surface.resourceId] : null;
       if (!snapshot || snapshot.navStatus._tag === "Idle") return "Browser";
@@ -908,6 +897,8 @@ function SurfaceIcon({
       return <SquareCheckBig className="size-3 shrink-0" />;
     case "side-chat":
       return <SideChatTabIcon environmentId={environmentId} threadId={surface.threadId} />;
+    case "plugin":
+      return <PluginSurfaceIcon panelKey={surface.panelKey} />;
     case "device":
       return surface.target?.platform === "ios" ? (
         <AppleIcon className="size-3 shrink-0" />
@@ -917,6 +908,17 @@ function SurfaceIcon({
         <Smartphone className="size-3 shrink-0" />
       );
   }
+}
+
+function PluginSurfaceIcon(props: { panelKey: PluginPanelKey }) {
+  const install = usePluginPanelInstall(props.panelKey);
+  const panelId = parsePluginPanelKey(props.panelKey)?.panelId;
+  const name =
+    install.kind === "client" || install.kind === "environment"
+      ? install.record.manifest.ui?.panels.find((panel) => panel.id === panelId)?.icon
+      : undefined;
+  // pluginPanelIcon returns module-level icons, so the element type is stable across renders.
+  return createElement(pluginPanelIcon(name), { className: "size-3 shrink-0" });
 }
 
 /** What a side chat tab's dot shows and its title's accessible name says. */
@@ -1252,7 +1254,7 @@ function RightPanelTab(
 export function RightPanelTabs(props: RightPanelTabsProps) {
   const focusedSurface = props.surfaces.find((surface) => surface.id === props.activeSurfaceId);
   const ownsDesktopTitleBar = isElectron && props.mode === "inline";
-  const railLayout = props.mode === "inline" && !props.maximized && props.activeSurfaceId === null;
+  const railLayout = props.activeSurfaceId === null;
   const browserProfiles = useBrowserDefaults().profiles;
   const { resolvedTheme } = useTheme();
   const tabListRef = useRef<HTMLDivElement>(null);
@@ -1321,6 +1323,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
     });
   };
 
+  const pluginActions = props.pluginActions ?? NO_PLUGIN_ACTIONS;
   const addSurfaceActions = [
     ...(props.onAddSideChat
       ? [
@@ -1595,7 +1598,11 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                     <RightPanelTab
                       key={surface.id}
                       surface={surface}
-                      dragDisabled={!props.onMoveSurface || renamingDevice === surface.id}
+                      dragDisabled={
+                        !props.onMoveSurface ||
+                        renamingDevice === surface.id ||
+                        surface.kind === "plugin"
+                      }
                       active={surface.id === props.activeSurfaceId}
                       pending={props.pendingSurfaceIds.has(surface.id)}
                       title={surfaceTitle(surface, props.previewSessions, props.terminalLabelsById)}
@@ -1731,6 +1738,16 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                         </SurfaceMenuItem>
                       );
                     })}
+                    {pluginActions.length > 0 ? <MenuSeparator /> : null}
+                    {pluginActions.map((action) => {
+                      const Icon = action.icon;
+                      return (
+                        <MenuItem key={action.panelKey} onClick={action.onClick}>
+                          <Icon />
+                          {action.label}
+                        </MenuItem>
+                      );
+                    })}
                   </MenuPopup>
                 </Menu>
               ) : null}
@@ -1795,7 +1812,8 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       <div className="flex min-h-0 flex-1 flex-col" data-right-panel-surface-content>
         {props.activeSurfaceId === null ? (
           <RightPanelEmptyState
-            layout={railLayout ? "rail" : "list"}
+            layout={props.mode === "sheet" ? "list" : "rail"}
+            layoutControls={props.layoutControls}
             onAddBrowser={props.onAddBrowser}
             onAddBrowserInProfile={props.onAddBrowserInProfile}
             browserProfiles={browserProfiles}
@@ -1814,6 +1832,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             sideChatAvailable={props.sideChatAvailable === true}
             sideChatDisabledReason={props.sideChatDisabledReason ?? null}
             workAttention={props.workAttention}
+            pluginActions={pluginActions}
           />
         ) : (
           props.children

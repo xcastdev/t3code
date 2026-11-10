@@ -1,6 +1,7 @@
 import { createMemoryHistory } from "@tanstack/react-router";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
-import { ThreadId } from "@t3tools/contracts";
+import { pluginPanelKey } from "@t3tools/client-runtime/plugins/commands";
+import { PluginId, ThreadId } from "@t3tools/contracts";
 import { DEFAULT_CLIENT_SETTINGS } from "@t3tools/contracts/settings";
 import type * as Context from "effect/Context";
 import { expect, it, vi } from "vite-plus/test";
@@ -12,6 +13,7 @@ import { AppRoot } from "~/AppRoot";
 import "~/components/ChatView";
 import { DraftId, useComposerDraftStore } from "~/composerDraftStore";
 import { __setClientSettingsForTests } from "~/hooks/useSettings";
+import { usePluginPanelStore } from "~/pluginPanelStore";
 import { getRouter } from "~/router";
 import {
   ENVIRONMENT_ID,
@@ -64,4 +66,31 @@ it("a new draft does not load its reserved thread before the server lists it", a
     .filter((url) => url.includes(`/api/orchestration/threads/${threadId}/`));
   // A 404 here marks the thread deleted, and the view never loads it once the send creates it.
   expect(threadRequests).toEqual([]);
+});
+
+it("mounts with a docked plugin panel without looping renders", async () => {
+  using _environment = installFakeEnvironment([]);
+  __setClientSettingsForTests({
+    ...DEFAULT_CLIENT_SETTINGS,
+    onboardingCompletedAt: "2026-01-01T00:00:00.000Z",
+  });
+  const draftId = DraftId.make("draft-plugin-dock");
+  useComposerDraftStore
+    .getState()
+    .setProjectDraftThreadId(scopeProjectRef(ENVIRONMENT_ID, PROJECT_ID), draftId, {
+      threadId: ThreadId.make("thread-plugin-dock"),
+    });
+  usePluginPanelStore.setState({ byEnvironment: {} });
+  usePluginPanelStore
+    .getState()
+    .open(pluginPanelKey("client", PluginId.make("converter"), "converter"), ENVIRONMENT_ID);
+
+  const router = getRouter(createMemoryHistory({ initialEntries: [`/draft/${draftId}`] }));
+  await router.load();
+  await using _app = await render(<AppRoot router={router} />, {
+    // AppRoot brings its own router.
+    router: false,
+  });
+  await expect.element(page.getByTestId("composer-editor")).toBeVisible();
+  await expect.element(page.getByText("This plugin is not installed")).toBeVisible();
 });

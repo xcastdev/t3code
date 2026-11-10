@@ -9,6 +9,7 @@ import {
   EnvironmentId,
   McpDefinitionId,
   MessageId,
+  PluginId,
   ProjectId,
   ProviderInstanceId,
   RunId,
@@ -20,6 +21,7 @@ import {
 import { expect, it } from "vite-plus/test";
 
 import {
+  assistantConfigurationError,
   assistantDraftState,
   assistantRunStatus,
   assistantStatus,
@@ -30,6 +32,7 @@ import {
   routineFireStatus,
   routineTimingLabel,
   setAssistantMcpTools,
+  setAssistantPluginOperations,
   type AssistantRoutineFire,
 } from "./assistantPresentation.ts";
 
@@ -223,6 +226,32 @@ it("treats an empty tool list as removing the server, not granting every tool", 
   const selected = setAssistantMcpTools(empty, definitionId, "search, read search\n");
   expect(selected.mcpTools).toEqual([{ definitionId, toolNames: ["search", "read"] }]);
   expect(setAssistantMcpTools(selected, definitionId, "  ").mcpTools).toEqual([]);
+});
+
+it("removes the plugins key when no plugin operation stays selected", () => {
+  const pluginId = PluginId.make("echo");
+  const empty = { mcpTools: [], skills: [], instructions: [] };
+  const selected = setAssistantPluginOperations(empty, pluginId, ["ping", "pong"]);
+  expect(selected.plugins).toEqual([{ pluginId, operations: ["ping", "pong"] }]);
+  expect(setAssistantPluginOperations(selected, pluginId, [])).toEqual(empty);
+  const configuration = defaultAssistantConfiguration("Helper", {
+    instanceId: ProviderInstanceId.make("codex"),
+    model: "gpt-5",
+  });
+  const operations = (count: number) => Array.from({ length: count }, (_, index) => `op${index}`);
+  const withMcp = setAssistantMcpTools(empty, McpDefinitionId.make("github"), "a, b");
+  expect(
+    assistantConfigurationError({
+      ...configuration,
+      resources: setAssistantPluginOperations(withMcp, pluginId, operations(62)),
+    }),
+  ).toBeNull();
+  expect(
+    assistantConfigurationError({
+      ...configuration,
+      resources: setAssistantPluginOperations(withMcp, pluginId, operations(63)),
+    }),
+  ).toBe("Choose at most 64 tools; 65 are selected.");
 });
 
 it("keeps a stale configuration draft visible instead of rebasing it", () => {

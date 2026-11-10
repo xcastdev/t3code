@@ -117,6 +117,20 @@ export interface ImageDescriptionResult {
   readonly description: string;
 }
 
+export interface WebSearchInput {
+  /** A fresh, empty directory the caller owns, outside any checkout or shared temp folder. */
+  readonly cwd: string;
+  readonly query: string;
+  /** What to find out or how to answer. */
+  readonly instructions?: string | undefined;
+  readonly modelSelection: ModelSelection;
+}
+
+export interface WebSearchResult {
+  readonly answer: string;
+  readonly sources: ReadonlyArray<{ readonly title: string; readonly url: string }>;
+}
+
 export interface ProviderTextGeneration {
   readonly extractMemoryFacts: (
     input: MemoryExtractionInput,
@@ -146,4 +160,9 @@ export interface ProviderTextGeneration {
   readonly describeImage: (
     input: ImageDescriptionInput,
   ) => Effect.Effect<ImageDescriptionResult, TextGenerationError>;
+
+  /** Only drivers in `WEB_SEARCH_MODEL_DRIVERS` search the web; the rest fail. */
+  readonly webSearch: (
+    input: WebSearchInput,
+  ) => Effect.Effect<WebSearchResult, TextGenerationError>;
 }

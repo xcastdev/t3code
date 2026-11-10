@@ -83,6 +83,7 @@ describe("command permissions", () => {
         for (const method of [
           WS_METHODS.mcpCatalogWrite,
           WS_METHODS.mcpCatalogSecretPrepare,
+          WS_METHODS.mcpCatalogTestConnection,
           WS_METHODS.mcpCatalogSessionReset,
           WS_METHODS.mcpCatalogOAuthBegin,
           WS_METHODS.mcpCatalogOAuthContinue,

@@ -33,6 +33,7 @@ import {
 import * as Haptics from "expo-haptics";
 import { KeyboardAwareLegendList } from "@legendapp/list/keyboard";
 import { useViewabilityAmount, type LegendListRef } from "@legendapp/list/react-native";
+import { useAtomValue } from "@effect/atom-react";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import type { HandoffEndpoints } from "@t3tools/client-runtime/handoff";
 import {
@@ -55,6 +56,7 @@ import {
   type EnvironmentId,
   type MessageId,
   type OrchestrationV2ProjectedTurnItem,
+  type PluginInstallRecord,
   type RunId,
   type ScheduledTaskId,
   type ScopedThreadRef,
@@ -62,6 +64,7 @@ import {
 import { renderAssistantCitationsAsText } from "@t3tools/shared/assistantCitations";
 import { encodeComposerContextFragment } from "@t3tools/shared/composerContextClipboard";
 import { parseThreadLinkHref } from "@t3tools/shared/threadLinks";
+import { AsyncResult, Atom } from "effect/reactivity";
 import { PROMPT_LINK_MAX_PROMPT_LENGTH } from "@t3tools/shared/promptLinks";
 import {
   parseComposerContextHref,
@@ -259,7 +262,11 @@ import {
 import { useThreadSelection } from "../../state/use-thread-selection";
 import { useEnvironmentQuery } from "../../state/query";
 import { serverEnvironment } from "../../state/server";
-import { composerDocumentAttachmentRecord } from "../../lib/composerContext";
+import {
+  composerDocumentAttachmentRecord,
+  unavailablePluginReferenceIds,
+} from "../../lib/composerContext";
+import { pluginEnvironment } from "../../state/plugins";
 import * as Option from "effect/Option";
 import { appAtomRegistry } from "../../state/atom-registry";
 import { environmentThreadShells, threadEnvironment } from "../../state/threads";
@@ -2368,6 +2375,28 @@ type UserMessageContentProps = {
   readonly renderImage: MarkdownImageRenderer;
 };
 
+const pluginInstallsAtom = Atom.family((environmentId: EnvironmentId) =>
+  Atom.make((get): ReadonlyArray<PluginInstallRecord> | null => {
+    const registry = get(pluginEnvironment.registry({ environmentId, input: {} }));
+    if (AsyncResult.isSuccess(registry)) return registry.value.installed;
+    return AsyncResult.isFailure(registry) ? [] : null;
+  }),
+);
+const NO_PLUGIN_INSTALLS = Atom.make<ReadonlyArray<PluginInstallRecord> | null>(null);
+
+/** Reads the plugin registry only for messages that carry plugin references. */
+function useUnavailablePluginReferences(
+  environmentId: EnvironmentId,
+  context: OrchestrationMessageContext | undefined,
+): ReadonlySet<string> {
+  const hasPluginReferences =
+    context?.records.some((record) => record.kind === "plugin-reference") ?? false;
+  const installed = useAtomValue(
+    hasPluginReferences ? pluginInstallsAtom(environmentId) : NO_PLUGIN_INSTALLS,
+  );
+  return unavailablePluginReferenceIds(context?.records, environmentId, installed);
+}
+
 function UserMessageContent(props: UserMessageContentProps) {
   const [selected, setSelected] = useState<{ contextId: string; label: string } | null>(null);
   const navigation = useNavigation();
@@ -2375,9 +2404,18 @@ function UserMessageContent(props: UserMessageContentProps) {
   const { selectedThread } = useThreadSelection();
   const liveText = useLiveThreadLinkLabels(props.text, props.environmentId);
   const threadIcons = useThreadChipIcons(props.environmentId, liveText, props.context?.records);
+  const unavailablePlugins = useUnavailablePluginReferences(props.environmentId, props.context);
+  const chipRecords = props.context?.records.filter(
+    (record) => !unavailablePlugins.has(record.contextId),
+  );
   const text = replaceComposerContextReferences(liveText, (ref) => {
     const available = props.context?.records.some((record) => record.contextId === ref.contextId);
-    return `[${ref.label}${available ? "" : " (unavailable)"}](t3-context://v1/${ref.kind}/${ref.contextId})`;
+    const suffix = unavailablePlugins.has(ref.contextId)
+      ? " (Plugin unavailable)"
+      : available
+        ? ""
+        : " (unavailable)";
+    return `[${ref.label}${suffix}](t3-context://v1/${ref.kind}/${ref.contextId})`;
   });
   const onLinkPress = (href: string) => {
     const reference = parseComposerContextHref(href);
@@ -2459,7 +2497,7 @@ function UserMessageContent(props: UserMessageContentProps) {
           },
           linkCustomization: (href) =>
             withChipIcon(
-              enrichedContextLinkCustomization(href, props.context?.records ?? []) ??
+              enrichedContextLinkCustomization(href, chipRecords ?? []) ??
                 props.linkHandlers.linkCustomization?.(href),
               threadIcons.get(href),
             ),

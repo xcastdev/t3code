@@ -38,7 +38,7 @@ describe("fallbackTextGenerationModelSelection", () => {
     ).toEqual({ instanceId: "opencode", model: "opencode/big-pickle" });
   });
 
-  it.each(["fallbackModelSelection", "visionModelSelection"] as const)(
+  it.each(["fallbackModelSelection", "visionModelSelection", "webSearchModelSelection"] as const)(
     "replaces and clears %s without carrying model options",
     (key) => {
       const selection = { instanceId: ProviderInstanceId.make("codex"), model: "new" };

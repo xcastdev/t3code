@@ -93,6 +93,16 @@ describe("RPC authorization scopes", () => {
     }
   });
 
+  it.each([
+    [WS_METHODS.pluginsInstall, AuthEnvironmentMaintainScope],
+    [WS_METHODS.pluginsMutate, AuthOrchestrationOperateScope],
+    [WS_METHODS.pluginsLogs, AuthDiagnosticsReadScope],
+    // A stdio test spawns a host command, the same power as saving one.
+    [WS_METHODS.mcpCatalogTestConnection, AuthSettingsWriteScope],
+  ] as const)("%s requires %s", (method, scope) => {
+    expect(requiredScopeForRpcMethod(method)).toBe(scope);
+  });
+
   it("rejects unknown RPC method names", () => {
     for (const method of ["server.notRegistered", "toString", "constructor"]) {
       expect(() => requiredScopeForRpcMethod(method)).toThrow(

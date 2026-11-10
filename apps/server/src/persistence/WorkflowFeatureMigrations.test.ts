@@ -65,6 +65,7 @@ it.effect("production fresh boot initializes upstream before the independent fea
       { migration_id: 17, name: "ThreadHistoryArchive" },
       { migration_id: 18, name: "ExternalNotifications" },
       { migration_id: 19, name: "AssistantRoutines" },
+      { migration_id: 20, name: "McpCatalogAliases" },
     ]);
   }).pipe(Effect.provide(Sqlite.layerMemory)),
 );
@@ -119,6 +120,7 @@ it.effect(
         [17, "ThreadHistoryArchive"],
         [18, "ExternalNotifications"],
         [19, "AssistantRoutines"],
+        [20, "McpCatalogAliases"],
         [Math.max(...workflowFeatureMigrations.map((migration) => migration.id)) + 1, "Fixture"],
       ]);
       assert.deepStrictEqual(yield* runWorkflowFeatureMigrations(manifest), []);

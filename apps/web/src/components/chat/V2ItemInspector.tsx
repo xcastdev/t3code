@@ -217,6 +217,17 @@ function ToolOutput(props: ToolOutputState & { readonly codePath?: string | unde
   );
 }
 
+/** Providers can repeat a search result, so identical entries get their occurrence in the key. */
+function keyedByOccurrence<T>(values: ReadonlyArray<T>) {
+  const seen = new Map<string, number>();
+  return values.map((value) => {
+    const identity = JSON.stringify(value);
+    const occurrence = seen.get(identity) ?? 0;
+    seen.set(identity, occurrence + 1);
+    return { key: `${identity}#${occurrence}`, value };
+  });
+}
+
 /**
  * A tool call whose input the row already knows, such as the files a read opened, with the
  * output fetched from the environment. A read's output highlights for its file's type.
@@ -487,10 +498,10 @@ export const V2ItemInspector = memo(function V2ItemInspector(props: V2ItemInspec
           <ToolDetailPane label="Output">
             {item.results?.length ? (
               <ul className="space-y-1.5 font-sans">
-                {item.results.map((result) => {
+                {keyedByOccurrence(item.results).map(({ key, value: result }) => {
                   const safeHref = resolveExternalWebLinkHref(result.url);
                   return (
-                    <li key={JSON.stringify(result)}>
+                    <li key={key}>
                       {safeHref ? (
                         <a
                           href={safeHref}

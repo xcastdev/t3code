@@ -1,6 +1,10 @@
 import { useAtomValue } from "@effect/atom-react";
 import { uuidv4 } from "../../lib/uuid";
-import { useNavigation } from "@react-navigation/native";
+import { StackActions, useNavigation } from "@react-navigation/native";
+import {
+  listPluginPanelTargets,
+  parsePluginPanelKey,
+} from "@t3tools/client-runtime/plugins/commands";
 import {
   claimThreadOpen,
   nextShownOrder,
@@ -71,6 +75,7 @@ import { parseActiveThreadPath, type HardwareKeyboardCommand } from "./hardwareK
 import { threadJumpIndex } from "./threadKeyboardShortcuts";
 import { PullRequestGlyph } from "../pull-requests/pullRequestGlyphs";
 import { openSettings } from "../settings/settings-navigation";
+import { useEnabledPluginInstalls } from "../plugins/pluginInstalls";
 import { useSelectWorkspaceTab } from "../workspace/useSelectWorkspaceTab";
 import { useSelectWorkspaceDetail } from "../workspace/useSelectWorkspaceDetail";
 
@@ -283,6 +288,7 @@ export function CommandPalette(props: {
     useAtomValue(serverEnvironment.prepareTriage.permissionAtom(triageEnvironmentId)) &&
     triageEnvironmentId !== null &&
     serverConfigs.get(triageEnvironmentId)?.environment.capabilities.triage === true;
+  const pluginInstalls = useEnabledPluginInstalls();
   const contentMatchByKey = new Map(
     search.matches
       .filter((match) => match.source === "user" || match.source === "assistant")
@@ -356,6 +362,33 @@ export function CommandPalette(props: {
         detail: `On ${savedConnectionsById[triageEnvironmentId]?.environmentLabel ?? "this machine"}`,
         searchTerms: ["triage", "bug", "issue", "report", "broken", "debug", "help", "support"],
         run: () => void startTriage(triageEnvironmentId),
+      });
+    }
+    actions.push({
+      key: "plugins",
+      kind: "action",
+      title: "Plugins",
+      searchTerms: ["extensions", "install plugin", "panels"],
+      run: () => openSettings(navigation, "SettingsPlugins"),
+    });
+    // Each install is its own row, so the same plugin in two scopes opens the one picked.
+    for (const target of listPluginPanelTargets(pluginInstalls)) {
+      const panelId = parsePluginPanelKey(target.key)?.panelId;
+      if (panelId === undefined) continue;
+      actions.push({
+        key: `plugin:${target.kind}:${target.key}${target.commandId ? `:${target.commandId}` : ""}`,
+        kind: "action",
+        title: target.title,
+        detail: `${target.pluginName} · ${target.scopeLabel}`,
+        searchTerms: [target.pluginName, target.scopeLabel, "plugin"],
+        run: () =>
+          navigation.dispatch(
+            StackActions.push("PluginPanel", {
+              scope: target.scope,
+              pluginId: target.pluginId,
+              panelId,
+            }),
+          ),
       });
     }
     const projectByKey = new Map(
@@ -461,6 +494,7 @@ export function CommandPalette(props: {
     );
     return [...actions, ...projectItems, ...threadItems];
   }, [
+    pluginInstalls,
     selectTab,
     activeThread,
     activeThreadRef,

@@ -11,6 +11,7 @@ import { projectMemoryProcessingMigration } from "./ProjectMemoryProcessingMigra
 import { managedSkillsMigration } from "./ManagedSkillsMigration.ts";
 import { projectTerminalMigration } from "./ProjectTerminalMigration.ts";
 import { mcpCatalogMigration } from "./McpCatalogMigration.ts";
+import { mcpCatalogAliasMigration } from "./McpCatalogAliasMigration.ts";
 import { providerInstructionMigration } from "./ProviderInstructionMigration.ts";
 import { projectWorkRunAdmissionMigration } from "./ProjectWorkRunAdmissionMigration.ts";
 import { projectIssueMigration } from "./ProjectIssueMigration.ts";
@@ -61,6 +62,7 @@ export const workflowFeatureMigrations: ReadonlyArray<WorkflowFeatureMigration> 
   threadHistoryArchiveMigration,
   externalNotificationMigration,
   assistantRoutineMigration,
+  mcpCatalogAliasMigration,
 ];
 
 export const isWorkflowFeatureName = (name: string) =>

@@ -243,6 +243,13 @@ describe("MessagesTimeline work rows", () => {
       expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBeLessThan(2),
     );
     expect(viewport.scrollTop).toBeGreaterThan(0);
+    // The list ignores pointer events until its initial scroll settles, and a click
+    // that misses its target makes Playwright scroll the viewport to retry.
+    await vi.waitFor(() => {
+      const rect = heading.element().getBoundingClientRect();
+      const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+      expect(heading.element().contains(hit)).toBe(true);
+    });
     const top = heading.element().getBoundingClientRect().top;
     const height = viewport.scrollHeight;
     using _timers = fakeTimers();
@@ -1515,6 +1522,11 @@ describe("collapsed thoughts", () => {
 
     await line.click();
     await expect.element(screen.getByText("The tests cover the default case.")).toBeVisible();
+    await screen.getByRole("button", { name: "Thought (×2)", exact: true }).click();
+    await expect.element(line).toBeVisible();
+    await expect
+      .element(screen.getByText("The tests cover the default case."))
+      .not.toBeInTheDocument();
   });
 });
 

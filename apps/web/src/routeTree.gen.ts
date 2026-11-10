@@ -33,6 +33,7 @@ import { Route as ChatSettingsScheduledTasksRouteImport } from './routes/_chat.s
 import { Route as ChatSettingsResourcesRouteImport } from './routes/_chat.settings.resources'
 import { Route as ChatSettingsProvidersRouteImport } from './routes/_chat.settings.providers'
 import { Route as ChatSettingsProjectsRouteImport } from './routes/_chat.settings.projects'
+import { Route as ChatSettingsPluginsRouteImport } from './routes/_chat.settings.plugins'
 import { Route as ChatSettingsOpenSourceLicensesRouteImport } from './routes/_chat.settings.open-source-licenses'
 import { Route as ChatSettingsMaintenanceRouteImport } from './routes/_chat.settings.maintenance'
 import { Route as ChatSettingsLabsRouteImport } from './routes/_chat.settings.labs'
@@ -55,6 +56,7 @@ import { Route as ChatEnvironmentIdThreadIdRouteImport } from './routes/_chat.$e
 import { Route as ChatWorkEnvironmentIdProjectIdRouteImport } from './routes/_chat.work.$environmentId.$projectId'
 import { Route as ChatTerminalsEnvironmentIdProjectIdRouteImport } from './routes/_chat.terminals.$environmentId.$projectId'
 import { Route as ChatAgentsEnvironmentIdAssistantIdRouteImport } from './routes/_chat.agents.$environmentId.$assistantId'
+import { Route as ChatPluginsScopePluginIdPanelIdRouteImport } from './routes/_chat.plugins.$scope.$pluginId.$panelId'
 
 const WelcomeRoute = WelcomeRouteImport.update({
   id: '/welcome',
@@ -177,6 +179,11 @@ const ChatSettingsProjectsRoute = ChatSettingsProjectsRouteImport.update({
   path: '/projects',
   getParentRoute: () => ChatSettingsRoute,
 } as any)
+const ChatSettingsPluginsRoute = ChatSettingsPluginsRouteImport.update({
+  id: '/plugins',
+  path: '/plugins',
+  getParentRoute: () => ChatSettingsRoute,
+} as any)
 const ChatSettingsOpenSourceLicensesRoute =
   ChatSettingsOpenSourceLicensesRouteImport.update({
     id: '/open-source-licenses',
@@ -293,6 +300,12 @@ const ChatAgentsEnvironmentIdAssistantIdRoute =
     path: '/agents/$environmentId/$assistantId',
     getParentRoute: () => ChatRoute,
   } as any)
+const ChatPluginsScopePluginIdPanelIdRoute =
+  ChatPluginsScopePluginIdPanelIdRouteImport.update({
+    id: '/plugins/$scope/$pluginId/$panelId',
+    path: '/plugins/$scope/$pluginId/$panelId',
+    getParentRoute: () => ChatRoute,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof ChatIndexRoute
@@ -325,6 +338,7 @@ export interface FileRoutesByFullPath {
   '/settings/labs': typeof ChatSettingsLabsRoute
   '/settings/maintenance': typeof ChatSettingsMaintenanceRoute
   '/settings/open-source-licenses': typeof ChatSettingsOpenSourceLicensesRoute
+  '/settings/plugins': typeof ChatSettingsPluginsRoute
   '/settings/projects': typeof ChatSettingsProjectsRoute
   '/settings/providers': typeof ChatSettingsProvidersRoute
   '/settings/resources': typeof ChatSettingsResourcesRoute
@@ -340,6 +354,7 @@ export interface FileRoutesByFullPath {
   '/agents/$environmentId/$assistantId': typeof ChatAgentsEnvironmentIdAssistantIdRoute
   '/terminals/$environmentId/$projectId': typeof ChatTerminalsEnvironmentIdProjectIdRoute
   '/work/$environmentId/$projectId': typeof ChatWorkEnvironmentIdProjectIdRoute
+  '/plugins/$scope/$pluginId/$panelId': typeof ChatPluginsScopePluginIdPanelIdRoute
 }
 export interface FileRoutesByTo {
   '/connect': typeof ConnectRoute
@@ -372,6 +387,7 @@ export interface FileRoutesByTo {
   '/settings/labs': typeof ChatSettingsLabsRoute
   '/settings/maintenance': typeof ChatSettingsMaintenanceRoute
   '/settings/open-source-licenses': typeof ChatSettingsOpenSourceLicensesRoute
+  '/settings/plugins': typeof ChatSettingsPluginsRoute
   '/settings/projects': typeof ChatSettingsProjectsRoute
   '/settings/providers': typeof ChatSettingsProvidersRoute
   '/settings/resources': typeof ChatSettingsResourcesRoute
@@ -387,6 +403,7 @@ export interface FileRoutesByTo {
   '/agents/$environmentId/$assistantId': typeof ChatAgentsEnvironmentIdAssistantIdRoute
   '/terminals/$environmentId/$projectId': typeof ChatTerminalsEnvironmentIdProjectIdRoute
   '/work/$environmentId/$projectId': typeof ChatWorkEnvironmentIdProjectIdRoute
+  '/plugins/$scope/$pluginId/$panelId': typeof ChatPluginsScopePluginIdPanelIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -421,6 +438,7 @@ export interface FileRoutesById {
   '/_chat/settings/labs': typeof ChatSettingsLabsRoute
   '/_chat/settings/maintenance': typeof ChatSettingsMaintenanceRoute
   '/_chat/settings/open-source-licenses': typeof ChatSettingsOpenSourceLicensesRoute
+  '/_chat/settings/plugins': typeof ChatSettingsPluginsRoute
   '/_chat/settings/projects': typeof ChatSettingsProjectsRoute
   '/_chat/settings/providers': typeof ChatSettingsProvidersRoute
   '/_chat/settings/resources': typeof ChatSettingsResourcesRoute
@@ -436,6 +454,7 @@ export interface FileRoutesById {
   '/_chat/agents/$environmentId/$assistantId': typeof ChatAgentsEnvironmentIdAssistantIdRoute
   '/_chat/terminals/$environmentId/$projectId': typeof ChatTerminalsEnvironmentIdProjectIdRoute
   '/_chat/work/$environmentId/$projectId': typeof ChatWorkEnvironmentIdProjectIdRoute
+  '/_chat/plugins/$scope/$pluginId/$panelId': typeof ChatPluginsScopePluginIdPanelIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -470,6 +489,7 @@ export interface FileRouteTypes {
     | '/settings/labs'
     | '/settings/maintenance'
     | '/settings/open-source-licenses'
+    | '/settings/plugins'
     | '/settings/projects'
     | '/settings/providers'
     | '/settings/resources'
@@ -485,6 +505,7 @@ export interface FileRouteTypes {
     | '/agents/$environmentId/$assistantId'
     | '/terminals/$environmentId/$projectId'
     | '/work/$environmentId/$projectId'
+    | '/plugins/$scope/$pluginId/$panelId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/connect'
@@ -517,6 +538,7 @@ export interface FileRouteTypes {
     | '/settings/labs'
     | '/settings/maintenance'
     | '/settings/open-source-licenses'
+    | '/settings/plugins'
     | '/settings/projects'
     | '/settings/providers'
     | '/settings/resources'
@@ -532,6 +554,7 @@ export interface FileRouteTypes {
     | '/agents/$environmentId/$assistantId'
     | '/terminals/$environmentId/$projectId'
     | '/work/$environmentId/$projectId'
+    | '/plugins/$scope/$pluginId/$panelId'
   id:
     | '__root__'
     | '/_chat'
@@ -565,6 +588,7 @@ export interface FileRouteTypes {
     | '/_chat/settings/labs'
     | '/_chat/settings/maintenance'
     | '/_chat/settings/open-source-licenses'
+    | '/_chat/settings/plugins'
     | '/_chat/settings/projects'
     | '/_chat/settings/providers'
     | '/_chat/settings/resources'
@@ -580,6 +604,7 @@ export interface FileRouteTypes {
     | '/_chat/agents/$environmentId/$assistantId'
     | '/_chat/terminals/$environmentId/$projectId'
     | '/_chat/work/$environmentId/$projectId'
+    | '/_chat/plugins/$scope/$pluginId/$panelId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -762,6 +787,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ChatSettingsProjectsRouteImport
       parentRoute: typeof ChatSettingsRoute
     }
+    '/_chat/settings/plugins': {
+      id: '/_chat/settings/plugins'
+      path: '/plugins'
+      fullPath: '/settings/plugins'
+      preLoaderRoute: typeof ChatSettingsPluginsRouteImport
+      parentRoute: typeof ChatSettingsRoute
+    }
     '/_chat/settings/open-source-licenses': {
       id: '/_chat/settings/open-source-licenses'
       path: '/open-source-licenses'
@@ -916,6 +948,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ChatAgentsEnvironmentIdAssistantIdRouteImport
       parentRoute: typeof ChatRoute
     }
+    '/_chat/plugins/$scope/$pluginId/$panelId': {
+      id: '/_chat/plugins/$scope/$pluginId/$panelId'
+      path: '/plugins/$scope/$pluginId/$panelId'
+      fullPath: '/plugins/$scope/$pluginId/$panelId'
+      preLoaderRoute: typeof ChatPluginsScopePluginIdPanelIdRouteImport
+      parentRoute: typeof ChatRoute
+    }
   }
 }
 
@@ -937,6 +976,7 @@ interface ChatSettingsRouteChildren {
   ChatSettingsLabsRoute: typeof ChatSettingsLabsRoute
   ChatSettingsMaintenanceRoute: typeof ChatSettingsMaintenanceRoute
   ChatSettingsOpenSourceLicensesRoute: typeof ChatSettingsOpenSourceLicensesRoute
+  ChatSettingsPluginsRoute: typeof ChatSettingsPluginsRoute
   ChatSettingsProjectsRoute: typeof ChatSettingsProjectsRoute
   ChatSettingsProvidersRoute: typeof ChatSettingsProvidersRoute
   ChatSettingsResourcesRoute: typeof ChatSettingsResourcesRoute
@@ -967,6 +1007,7 @@ const ChatSettingsRouteChildren: ChatSettingsRouteChildren = {
   ChatSettingsLabsRoute: ChatSettingsLabsRoute,
   ChatSettingsMaintenanceRoute: ChatSettingsMaintenanceRoute,
   ChatSettingsOpenSourceLicensesRoute: ChatSettingsOpenSourceLicensesRoute,
+  ChatSettingsPluginsRoute: ChatSettingsPluginsRoute,
   ChatSettingsProjectsRoute: ChatSettingsProjectsRoute,
   ChatSettingsProvidersRoute: ChatSettingsProvidersRoute,
   ChatSettingsResourcesRoute: ChatSettingsResourcesRoute,
@@ -996,6 +1037,7 @@ interface ChatRouteChildren {
   ChatAgentsEnvironmentIdAssistantIdRoute: typeof ChatAgentsEnvironmentIdAssistantIdRoute
   ChatTerminalsEnvironmentIdProjectIdRoute: typeof ChatTerminalsEnvironmentIdProjectIdRoute
   ChatWorkEnvironmentIdProjectIdRoute: typeof ChatWorkEnvironmentIdProjectIdRoute
+  ChatPluginsScopePluginIdPanelIdRoute: typeof ChatPluginsScopePluginIdPanelIdRoute
 }
 
 const ChatRouteChildren: ChatRouteChildren = {
@@ -1013,6 +1055,7 @@ const ChatRouteChildren: ChatRouteChildren = {
   ChatTerminalsEnvironmentIdProjectIdRoute:
     ChatTerminalsEnvironmentIdProjectIdRoute,
   ChatWorkEnvironmentIdProjectIdRoute: ChatWorkEnvironmentIdProjectIdRoute,
+  ChatPluginsScopePluginIdPanelIdRoute: ChatPluginsScopePluginIdPanelIdRoute,
 }
 
 const ChatRouteWithChildren = ChatRoute._addFileChildren(ChatRouteChildren)

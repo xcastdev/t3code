@@ -1,6 +1,7 @@
 import type { ThreadStructure, ThreadStructureRuntime } from "@t3tools/client-runtime/state/shell";
 import { resolveThreadWorkingStartedAt } from "@t3tools/client-runtime/state/models";
 import {
+  isOrchestrationV2WorkActive,
   type AssetResource,
   type OrchestrationV2Checkpoint,
   type OrchestrationV2ExecutionNode,
@@ -26,7 +27,11 @@ import {
 import type { HtmlRenderReference } from "@t3tools/shared/htmlRender";
 import { turnItemDetailRevision } from "@t3tools/client-runtime/work-log/item-detail";
 import type { McpAppReference } from "@t3tools/shared/mcpApp";
-import { htmlRenderFromToolItem, mcpAppFromToolItem } from "@t3tools/shared/toolOutput";
+import {
+  htmlRenderFromToolItem,
+  mcpAppFromToolItem,
+  t3WebSearchDisplayItem,
+} from "@t3tools/shared/toolOutput";
 import {
   contextCompactionLabel,
   workEntryIndicatesToolFailure,
@@ -398,7 +403,7 @@ export function providerErrorPresentation(
 }
 
 function projectedWorkEntry(row: OrchestrationV2ProjectedTurnItem): WorkLogEntry {
-  const { item } = row;
+  const item = t3WebSearchDisplayItem(row.item);
   const title = item.title?.trim() || null;
   const common = {
     id: item.id,
@@ -464,7 +469,9 @@ function projectedWorkEntry(row: OrchestrationV2ProjectedTurnItem): WorkLogEntry
     case "web_search":
       return {
         ...common,
-        label: title ?? "Searched the web",
+        label:
+          title ??
+          (isOrchestrationV2WorkActive(item.status) ? "Searching the web" : "Searched the web"),
         ...(item.patterns?.length ? { detail: item.patterns.join(", ") } : {}),
         toolTitle: title ?? "Web search",
         toolData: item,

@@ -12,6 +12,7 @@ import {
 } from "./baseSchemas.ts";
 import {
   McpServerId,
+  McpCatalogTestTransportInput,
   McpCatalogTransportInput,
   ProjectMcpTransport,
   ProjectMcpTransportDraft,
@@ -54,6 +55,8 @@ export const McpCatalogDefinition = Schema.Struct({
   providerInstanceIds: Schema.Array(ProviderInstanceId).check(
     Schema.isMaxLength(MCP_CATALOG_PROVIDER_LIMIT),
   ),
+  /** Every provider instance, including ones added later; `providerInstanceIds` is then ignored. */
+  allProviders: Schema.optional(Schema.Boolean),
   revision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
 });
 export type McpCatalogDefinition = typeof McpCatalogDefinition.Type;
@@ -70,6 +73,8 @@ export const McpCatalogDefinitionDraft = Schema.Struct({
   providerInstanceIds: Schema.Array(ProviderInstanceId).check(
     Schema.isMaxLength(MCP_CATALOG_PROVIDER_LIMIT),
   ),
+  /** Every provider instance, including ones added later; `providerInstanceIds` is then ignored. */
+  allProviders: Schema.optional(Schema.Boolean),
 });
 export type McpCatalogDefinitionDraft = typeof McpCatalogDefinitionDraft.Type;
 
@@ -83,6 +88,8 @@ const McpCatalogOverrideFields = Schema.Struct({
   providerInstanceIds: Schema.optional(
     Schema.Array(ProviderInstanceId).check(Schema.isMaxLength(MCP_CATALOG_PROVIDER_LIMIT)),
   ),
+  /** Overrides the provider selection together with `providerInstanceIds`. */
+  allProviders: Schema.optional(Schema.Boolean),
   transport: Schema.optional(ProjectMcpTransport),
   transportDefinitionId: Schema.optional(McpDefinitionId),
 });
@@ -97,6 +104,8 @@ const McpCatalogOverrideDraftFields = Schema.Struct({
   providerInstanceIds: Schema.optional(
     Schema.Array(ProviderInstanceId).check(Schema.isMaxLength(MCP_CATALOG_PROVIDER_LIMIT)),
   ),
+  /** Overrides the provider selection together with `providerInstanceIds`. */
+  allProviders: Schema.optional(Schema.Boolean),
   transport: Schema.optional(ProjectMcpTransportDraft),
   /** Accepted for clients that already send the persisted shape, but replaced
    * by a server-generated id whenever a draft transport is submitted. */
@@ -516,6 +525,8 @@ export const McpCatalogDefinitionInput = Schema.Struct({
   providerInstanceIds: Schema.Array(ProviderInstanceId).check(
     Schema.isMaxLength(MCP_CATALOG_PROVIDER_LIMIT),
   ),
+  /** Every provider instance, including ones added later; `providerInstanceIds` is then ignored. */
+  allProviders: Schema.optional(Schema.Boolean),
 });
 export const McpCatalogOverrideInputDraft = Schema.Struct({
   ...McpCatalogOverrideDraftFields.fields,
@@ -569,3 +580,34 @@ export const McpCatalogSecretPrepareInput = Schema.Struct({
 });
 export type McpCatalogSecretPrepareInput = typeof McpCatalogSecretPrepareInput.Type;
 export const McpCatalogSecretPrepareResult = Schema.Struct({ secretRef: SecretRef });
+export const McpCatalogTestConnectionInput = Schema.Struct({
+  scope: McpCatalogScope,
+  scopeId: TrimmedNonEmptyString,
+  /** The saved definition being edited, whose stored credentials and OAuth the test may use. */
+  existing: Schema.optional(
+    Schema.Struct({ logicalServerId: McpServerId, definitionId: McpDefinitionId }),
+  ),
+  transport: McpCatalogTestTransportInput,
+});
+export type McpCatalogTestConnectionInput = typeof McpCatalogTestConnectionInput.Type;
+export const McpCatalogTestConnectionResult = Schema.Struct({
+  serverInfo: Schema.optional(
+    Schema.Struct({
+      name: Schema.String,
+      version: Schema.String,
+      title: Schema.optional(Schema.String),
+    }),
+  ),
+  tools: Schema.Array(
+    Schema.Struct({
+      name: Schema.String,
+      title: Schema.optional(Schema.String),
+      description: Schema.optional(Schema.String),
+    }),
+  ),
+  /** Tools the server listed beyond the ones returned. */
+  omittedToolCount: Schema.optional(Schema.Int.check(Schema.isGreaterThan(0))),
+  /** The server had more tool pages than the test reads, so the count is a lower bound. */
+  truncated: Schema.optional(Schema.Literal(true)),
+});
+export type McpCatalogTestConnectionResult = typeof McpCatalogTestConnectionResult.Type;

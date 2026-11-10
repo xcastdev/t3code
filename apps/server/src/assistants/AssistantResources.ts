@@ -13,6 +13,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as SqlClient from "effect/sql/SqlClient";
 import { assistantConversationIsCurrent } from "./AssistantThreadAuthority.ts";
+import { assistantToolIds } from "./AssistantNativeResources.ts";
 import { AssistantError, type AssistantRecord } from "./AssistantRepository.ts";
 import { ResourceInstructionComposition } from "../orchestration-v2/ResourceInstructionComposition.ts";
 import { ManagedTextResourceCatalogService } from "../managedTextResources/ManagedTextResourceCatalogService.ts";
@@ -136,9 +137,7 @@ const make = Effect.gen(function* () {
             memoryContextHash: assistantMemoryContextHash(memory.text),
             memoryEpoch: memory.memoryEpoch,
             roleInstructions: bodies.filter(Boolean).join("\n\n"),
-            toolIds: configuration.resources.mcpTools.flatMap((value) =>
-              value.toolNames.map((name) => `${value.definitionId}:${name}`),
-            ),
+            toolIds: assistantToolIds(configuration.resources),
             skillIds: [],
           };
         }
@@ -149,9 +148,7 @@ const make = Effect.gen(function* () {
           providerInstanceId: configuration.modelSelection.instanceId,
           configuration: {
             skillIds: skillKeys,
-            toolIds: configuration.resources.mcpTools.flatMap((value) =>
-              value.toolNames.map((name) => `${value.definitionId}:${name}`),
-            ),
+            toolIds: assistantToolIds(configuration.resources),
             runtimeVersion: `assistant:${revision}`,
           },
           roleRevisionId: binding.assistantId,

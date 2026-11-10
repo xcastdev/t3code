@@ -1,5 +1,5 @@
 import { assert, it } from "@effect/vitest";
-import { CommandId, McpDefinitionId, ThreadId } from "@t3tools/contracts";
+import { CommandId, McpDefinitionId, PluginId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -71,5 +71,69 @@ it.effect("native tools require both retained run selection and current assistan
     assert.deepEqual(yield* policy.tools(binding.canonicalThreadId, "native"), []);
     yield* sql`UPDATE t3_workflow_v2_assistants SET payload_json='broken'`;
     assert.deepEqual(yield* policy.tools(binding.canonicalThreadId, "native"), []);
+  }).pipe(Effect.provide(layer.pipe(Layer.provideMerge(repository)))),
+);
+
+const seedAdmittedPluginRun = Effect.fn("testAssistantNativeResources.seedAdmittedPluginRun")(
+  function* (toolIds: ReadonlyArray<string>) {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT,project_id TEXT,deleted_at TEXT,archived_at TEXT,payload_json TEXT)`;
+    yield* sql`CREATE TABLE orchestration_v2_projection_runs(run_id TEXT,thread_id TEXT,provider_thread_id TEXT,status TEXT,ordinal INTEGER)`;
+    yield* sql`CREATE TABLE orchestration_v2_projection_provider_threads(provider_thread_id TEXT,thread_id TEXT,provider_session_id TEXT)`;
+    yield* sql`CREATE TABLE projection_projects(project_id TEXT,workspace_root TEXT,deleted_at TEXT)`;
+    const repo = yield* AssistantRepository;
+    const record = yield* repo.create({
+      ...input,
+      configuration: {
+        ...configuration,
+        resources: {
+          ...configuration.resources,
+          plugins: [{ pluginId: PluginId.make("echo"), operations: ["ping", "pong"] }],
+        },
+      },
+    });
+    const binding = record.detail.summary.binding;
+    yield* repo.setProvisioning(binding, { state: "ready", binding }, "/owned");
+    yield* sql`INSERT INTO projection_projects VALUES(${binding.backingProjectId},'/owned',NULL)`;
+    yield* sql`INSERT INTO orchestration_v2_projection_threads VALUES(${binding.canonicalThreadId},${binding.backingProjectId},NULL,NULL,'{}')`;
+    yield* sql`INSERT INTO t3_workflow_v2_assistant_admissions VALUES(${binding.canonicalThreadId},'run',${binding.assistantId},0,${encode({ snapshot: { configurationHash: "config", resourceRevision: "resources", memoryEpoch: 0, roleInstructions: "rules", toolIds, skillIds: [] } })},'2026-01-01')`;
+    yield* sql`INSERT INTO orchestration_v2_projection_runs VALUES('run',${binding.canonicalThreadId},'provider-thread','running',1)`;
+    yield* sql`INSERT INTO orchestration_v2_projection_provider_threads VALUES('provider-thread',${binding.canonicalThreadId},'native')`;
+    return { repo, record, binding };
+  },
+);
+
+it.effect("returns selected plugin keys that are present in the admitted snapshot", () =>
+  Effect.gen(function* () {
+    const { binding } = yield* seedAdmittedPluginRun(["plugin:echo:ping"]);
+    const policy = yield* AssistantNativeResources;
+    assert.deepEqual(yield* policy.tools(binding.canonicalThreadId, "native"), [
+      "plugin:echo:ping",
+    ]);
+  }).pipe(Effect.provide(layer.pipe(Layer.provideMerge(repository)))),
+);
+
+it.effect("drops a plugin key that was deselected after admission", () =>
+  Effect.gen(function* () {
+    const { repo, record, binding } = yield* seedAdmittedPluginRun([
+      "plugin:echo:ping",
+      "plugin:echo:pong",
+    ]);
+    yield* repo.updateConfiguration({
+      ...binding,
+      commandId: CommandId.make("deselect-pong"),
+      expectedRevision: record.detail.configuration.revision,
+      configuration: {
+        ...configuration,
+        resources: {
+          ...configuration.resources,
+          plugins: [{ pluginId: PluginId.make("echo"), operations: ["ping"] }],
+        },
+      },
+    });
+    const policy = yield* AssistantNativeResources;
+    assert.deepEqual(yield* policy.tools(binding.canonicalThreadId, "native"), [
+      "plugin:echo:ping",
+    ]);
   }).pipe(Effect.provide(layer.pipe(Layer.provideMerge(repository)))),
 );

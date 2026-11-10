@@ -17,6 +17,7 @@ import { type ThreadPanelPresentation } from "../../rightPanelLayout";
 import {
   selectActiveRightPanel,
   selectThreadPanelOpen,
+  selectThreadRightPanelState,
   type RightPanelSurface,
   useRightPanelStore,
 } from "../../rightPanelStore";
@@ -63,6 +64,8 @@ interface RightPanelActionsInput {
   readonly explicitDiffOpenRef: { current: ScopedThreadRef | null };
   readonly onDiffPanelOpen: (() => void) | undefined;
   readonly closeRightPanelSurface: (surface: RightPanelSurface) => void;
+  /** The user asked to show the panel, which may already be open but hidden on a compact layout. */
+  readonly onOpenRightPanel: () => void;
 }
 
 /**
@@ -96,6 +99,7 @@ export function useRightPanelActions(input: RightPanelActionsInput) {
     activeProjectCwd,
     explicitDiffOpenRef,
     onDiffPanelOpen,
+    onOpenRightPanel,
   } = input;
 
   const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: false });
@@ -233,7 +237,11 @@ export function useRightPanelActions(input: RightPanelActionsInput) {
       closePreviewPanel();
       return;
     }
-    useRightPanelStore.getState().toggleVisibility(activeThreadRef);
+    onOpenRightPanel();
+    const store = useRightPanelStore.getState();
+    if (!selectThreadRightPanelState(store.byThreadKey, activeThreadRef).isOpen) {
+      store.toggleVisibility(activeThreadRef);
+    }
     focusActivePanelTerminal(activeThreadRef);
   };
   const toggleRightPanelStable = useStableCallback(toggleRightPanel);

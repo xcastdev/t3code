@@ -6,6 +6,7 @@ import {
   type McpCatalogDefinition,
   type McpCatalogReadResult,
   type McpCatalogSnapshot,
+  type McpCatalogTestConnectionResult,
   type McpCatalogTransportInput,
   type ProjectMcpOAuthStatus,
   type ProviderInstanceId,
@@ -54,6 +55,7 @@ import {
   mcpOverrideFieldsFromRow,
   mcpOverrideInput,
   mcpOverridePatchFromFields,
+  mcpTestTransportInputFromForm,
   mcpTransportInputFromForm,
   prepareMcpFormSecrets,
   withNewCredentialValues,
@@ -90,6 +92,8 @@ type McpDialog =
   | { readonly kind: "override"; readonly baseline: McpWriteBaseline; readonly row: McpCatalogRow };
 
 type ProviderOption = { id: ProviderInstanceId; label: string; enabled: boolean };
+
+const MCP_TEST_KEY = "editor-test";
 
 function useProviderOptions(target: ResourceSettingsTarget): ReadonlyArray<ProviderOption> {
   const config = useAtomValue(serverEnvironment.configValueAtom(target.environmentId));
@@ -193,6 +197,7 @@ export function McpCatalogSettings({
   const canWrite = useAtomValue(mcpCatalogEnvironment.write.permissionAtom(environmentId));
   const canOAuth = useAtomValue(mcpCatalogEnvironment.oauthBegin.permissionAtom(environmentId));
   const canReset = useAtomValue(mcpCatalogEnvironment.sessionReset.permissionAtom(environmentId));
+  const canTest = useAtomValue(mcpCatalogEnvironment.testConnection.permissionAtom(environmentId));
   const providers = useProviderOptions(target);
   const providerLabel = (id: ProviderInstanceId) =>
     providers.find((provider) => provider.id === id)?.label ?? id;
@@ -302,6 +307,36 @@ export function McpCatalogSettings({
     if (ok) setDialog(null);
   };
 
+  /** Connects with the form's unsaved connection; typed values are used once and not stored. */
+  const testDefinition = async (
+    current: Extract<McpDialog, { kind: "create" | "edit" }>,
+    form: McpServerForm,
+    testRunner: ResourceCommandRunner,
+  ) => {
+    const transport = mcpTestTransportInputFromForm(form);
+    if (!transport.ok) {
+      testRunner.reportFailure(MCP_TEST_KEY, transport.error);
+      return null;
+    }
+    const result = await testRunner.run(MCP_TEST_KEY, mcpCatalogEnvironment.testConnection, {
+      environmentId,
+      input: {
+        scope: current.baseline.scope,
+        scopeId: current.baseline.scopeId,
+        ...(current.kind === "edit"
+          ? {
+              existing: {
+                logicalServerId: current.definition.logicalServerId,
+                definitionId: current.definition.definitionId,
+              },
+            }
+          : {}),
+        transport: transport.value,
+      },
+    });
+    return result.ok ? result.value : null;
+  };
+
   const saveOverride = async (
     current: Extract<McpDialog, { kind: "override" }>,
     form: McpOverrideForm,
@@ -332,7 +367,8 @@ export function McpCatalogSettings({
       transport === null &&
       patch.name === null &&
       patch.enabled === null &&
-      patch.providerInstanceIds === null
+      patch.providerInstanceIds === null &&
+      patch.allProviders === null
     ) {
       const ok =
         current.row.override === null ||
@@ -539,6 +575,9 @@ export function McpCatalogSettings({
                 conflict={dialogConflict}
                 onReload={reloadDialog}
                 onSave={(form) => void saveDefinition(dialog, form)}
+                onTest={
+                  canTest ? (form, testRunner) => testDefinition(dialog, form, testRunner) : null
+                }
                 onClose={() => setDialog(null)}
               />
             )}
@@ -692,9 +731,11 @@ function McpServerRow({
         <>
           <span className="block truncate">{location}</span>
           <span className="block">
-            {row.providerInstanceIds.length === 0
-              ? "Not assigned to any provider, so no session receives it."
-              : `For ${row.providerInstanceIds.map(providerLabel).join(", ")}`}
+            {row.allProviders
+              ? "For all providers, including ones added later"
+              : row.providerInstanceIds.length === 0
+                ? "Not assigned to any provider, so no session receives it."
+                : `For ${row.providerInstanceIds.map(providerLabel).join(", ")}`}
           </span>
           {runner.pendingKey === key ? (
             <span className="inline-flex items-center gap-1.5">
@@ -877,32 +918,87 @@ function McpOAuthControls({
   );
 }
 
+interface ProviderSelection {
+  /**
+   * Every provider, including ones added later. Turning it on also selects every current
+   * provider in `ids`, so a client or server that predates `all` delivers to those instead of none.
+   * The checklist restores the earlier subset if it is turned off in the same dialog.
+   */
+  readonly all: boolean;
+  readonly ids: ReadonlyArray<ProviderInstanceId>;
+}
+
 function ProviderChecklist({
   providers,
-  selected,
+  selection,
   onChange,
 }: {
   providers: ReadonlyArray<{ id: ProviderInstanceId; label: string; enabled: boolean }>;
-  selected: ReadonlyArray<ProviderInstanceId>;
-  onChange: (next: ReadonlyArray<ProviderInstanceId>) => void;
+  selection: ProviderSelection;
+  onChange: (next: ProviderSelection) => void;
 }) {
+  const { all, ids: selected } = selection;
+  // Turning "All providers" on checks every row; this brings back the subset it replaced.
+  const [subsetBeforeAll, setSubsetBeforeAll] = useState<ReadonlyArray<ProviderInstanceId> | null>(
+    null,
+  );
   const known = new Set(providers.map((provider) => provider.id));
   const unknown = selected.filter((id) => !known.has(id));
+  const allSelected = all || providers.every((provider) => selected.includes(provider.id));
   return (
     <fieldset className="space-y-1.5 text-sm">
-      <legend className="mb-1.5">Providers</legend>
+      <legend className="mb-1.5 flex w-full items-center justify-between gap-2">
+        Providers
+        {providers.length > 0 ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="compact"
+            onClick={() =>
+              onChange(
+                allSelected
+                  ? { all: false, ids: [] }
+                  : { all, ids: [...unknown, ...providers.map((provider) => provider.id)] },
+              )
+            }
+          >
+            {allSelected ? "Deselect all" : "Select all"}
+          </Button>
+        ) : null}
+      </legend>
       <div className="divide-y divide-border/60 rounded-lg border border-input">
+        <label className="flex cursor-pointer items-center gap-3 px-3 py-2">
+          <Checkbox
+            checked={all}
+            onCheckedChange={(checked) => {
+              if (checked === true) {
+                setSubsetBeforeAll(selected);
+                onChange({ all: true, ids: providers.map((provider) => provider.id) });
+              } else {
+                onChange({ all: false, ids: subsetBeforeAll ?? selected });
+              }
+            }}
+          />
+          <span className="min-w-0 flex-1 truncate text-xs">All providers</span>
+          <span className="text-xs text-muted-foreground">Includes providers added later</span>
+        </label>
         {[...providers, ...unknown.map((id) => ({ id, label: id, enabled: false }))].map(
           (provider) => (
-            <label key={provider.id} className="flex cursor-pointer items-center gap-3 px-3 py-2">
+            <label
+              key={provider.id}
+              className={`flex items-center gap-3 px-3 py-2 ${all ? "" : "cursor-pointer"}`}
+            >
               <Checkbox
-                checked={selected.includes(provider.id)}
+                checked={all || selected.includes(provider.id)}
+                disabled={all}
                 onCheckedChange={(checked) =>
-                  onChange(
-                    checked === true
-                      ? [...selected.filter((id) => id !== provider.id), provider.id]
-                      : selected.filter((id) => id !== provider.id),
-                  )
+                  onChange({
+                    all,
+                    ids:
+                      checked === true
+                        ? [...selected.filter((id) => id !== provider.id), provider.id]
+                        : selected.filter((id) => id !== provider.id),
+                  })
                 }
               />
               <span className="min-w-0 flex-1 truncate text-xs">{provider.label}</span>
@@ -915,7 +1011,7 @@ function ProviderChecklist({
           ),
         )}
       </div>
-      {selected.length === 0 ? (
+      {!all && selected.length === 0 ? (
         <p className="text-xs text-muted-foreground">
           With no provider selected, no session receives it.
         </p>
@@ -1052,14 +1148,21 @@ function McpOverrideEditor({
         />
         <ProviderChecklist
           providers={providers}
-          selected={fields.providerInstanceIds ?? row.definition.providerInstanceIds}
-          onChange={(providerInstanceIds) => update({ providerInstanceIds })}
+          selection={
+            fields.providerInstanceIds === null && fields.allProviders === null
+              ? {
+                  all: row.definition.allProviders === true,
+                  ids: row.definition.providerInstanceIds,
+                }
+              : { all: fields.allProviders === true, ids: fields.providerInstanceIds ?? [] }
+          }
+          onChange={({ all, ids }) => update({ providerInstanceIds: ids, allProviders: all })}
         />
         <McpInheritedFieldHint
-          overridden={fields.providerInstanceIds !== null}
+          overridden={fields.providerInstanceIds !== null || fields.allProviders !== null}
           inherited="the definition's providers"
           subject="Providers"
-          onFollow={() => update({ providerInstanceIds: null })}
+          onFollow={() => update({ providerInstanceIds: null, allProviders: null })}
         />
         <label className="flex items-center justify-between gap-3 text-sm">
           <span>Use a different connection in {scopeLabel}</span>
@@ -1375,7 +1478,7 @@ function McpTransportFields({
         </>
       )}
       <ResourceHint>
-        Secret values are sent once, privately, when you save, and are never shown again. Stored
+        Secret values are sent privately when you test or save, and are never shown again. Stored
         secrets stay as they are unless replaced.
       </ResourceHint>
     </>
@@ -1390,6 +1493,7 @@ function McpServerEditor({
   conflict,
   onReload,
   onSave,
+  onTest,
   onClose,
 }: {
   initial: McpServerForm;
@@ -1399,9 +1503,24 @@ function McpServerEditor({
   conflict: string | null;
   onReload: () => void;
   onSave: (form: McpServerForm) => void;
+  onTest:
+    | ((
+        form: McpServerForm,
+        testRunner: ResourceCommandRunner,
+      ) => Promise<McpCatalogTestConnectionResult | null>)
+    | null;
   onClose: () => void;
 }) {
   const [form, setForm] = useState(initial);
+  // Owned by this editor so a test outliving it never blocks or reports into the section.
+  const testRunner = useResourceCommand();
+  const [test, setTest] = useState<{
+    readonly form: McpServerForm;
+    readonly result: McpCatalogTestConnectionResult | null;
+  } | null>(null);
+  const testing = testRunner.busy;
+  // A result or failure describes the exact form it tested; any edit hides it.
+  const testCurrent = test !== null && test.form === form;
   const update = (patch: Partial<McpServerForm>) =>
     setForm((current) => ({ ...current, ...patch }));
   return (
@@ -1437,13 +1556,31 @@ function McpServerEditor({
         </div>
         <ProviderChecklist
           providers={providers}
-          selected={form.providerInstanceIds}
-          onChange={(providerInstanceIds) => update({ providerInstanceIds })}
+          selection={{ all: form.allProviders, ids: form.providerInstanceIds }}
+          onChange={({ all, ids }) => update({ providerInstanceIds: ids, allProviders: all })}
         />
         <McpTransportFields form={form} onChange={setForm} />
+        {testCurrent && test.result !== null ? <McpTestResult result={test.result} /> : null}
+        <ResourceFailure message={testCurrent ? testRunner.failureFor(MCP_TEST_KEY) : null} />
         <ResourceFailure message={runner.failureFor("editor")} />
       </DialogPanel>
       <DialogFooter>
+        {onTest !== null ? (
+          <Button
+            type="button"
+            variant="outline"
+            disabled={testing}
+            onClick={async () => {
+              const tested = form;
+              setTest({ form: tested, result: null });
+              const result = await onTest(tested, testRunner);
+              setTest((current) => (current?.form === tested ? { form: tested, result } : current));
+            }}
+          >
+            {testing ? <Spinner className="size-3.5" /> : null}
+            {testing ? "Testing…" : "Test"}
+          </Button>
+        ) : null}
         <Button type="button" variant="ghost" onClick={onClose} disabled={runner.busy}>
           Cancel
         </Button>
@@ -1453,6 +1590,41 @@ function McpServerEditor({
         </Button>
       </DialogFooter>
     </form>
+  );
+}
+
+function McpTestResult({ result }: { result: McpCatalogTestConnectionResult }) {
+  const server = result.serverInfo;
+  const total = result.tools.length + (result.omittedToolCount ?? 0);
+  const plus = result.truncated ? "+" : "";
+  const count = `${total}${plus} ${total === 1 && !plus ? "tool" : "tools"}`;
+  return (
+    <div role="status" className="space-y-1.5 rounded-md border p-2.5 text-sm">
+      <p>
+        Connected
+        {server === undefined ? "" : ` to ${server.title ?? server.name} ${server.version}`}
+        <span className="text-muted-foreground"> · {count}</span>
+      </p>
+      {result.tools.length > 0 ? (
+        <ul className="max-h-48 space-y-1 overflow-y-auto text-xs">
+          {result.tools.map((tool) => (
+            <li key={tool.name} className="min-w-0">
+              <span className="font-mono">{tool.name}</span>
+              {tool.description ? (
+                <span className="block truncate text-muted-foreground">{tool.description}</span>
+              ) : null}
+            </li>
+          ))}
+          {result.omittedToolCount === undefined && !result.truncated ? null : (
+            <li className="text-muted-foreground">
+              and{" "}
+              {result.omittedToolCount === undefined ? "" : `${result.omittedToolCount}${plus} `}
+              more
+            </li>
+          )}
+        </ul>
+      ) : null}
+    </div>
   );
 }
 

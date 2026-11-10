@@ -10,6 +10,8 @@ import {
   type McpCatalogDefinition,
   type McpCatalogOverride,
   type McpCatalogSnapshot,
+  type McpCatalogTestCredentialInput,
+  type McpCatalogTestTransportInput,
   type McpCatalogTransportInput,
   type ProjectMcpCredentialId,
   type ProjectMcpCredentialRef,
@@ -18,6 +20,7 @@ import {
   type ProviderInstanceId,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 
 export {
@@ -74,6 +77,8 @@ export interface McpServerForm {
   readonly name: string;
   readonly enabled: boolean;
   readonly providerInstanceIds: ReadonlyArray<ProviderInstanceId>;
+  /** Every provider, including ones added later. */
+  readonly allProviders: boolean;
   readonly transport: "streamable-http" | "legacy-sse" | "stdio";
   readonly url: string;
   readonly headers: ReadonlyArray<McpNamedCredential>;
@@ -89,6 +94,7 @@ export const EMPTY_MCP_SERVER_FORM: McpServerForm = {
   name: "",
   enabled: true,
   providerInstanceIds: [],
+  allProviders: false,
   transport: "streamable-http",
   url: "",
   headers: [],
@@ -106,7 +112,10 @@ const stored = (ref: ProjectMcpCredentialRef): McpCredentialField => ({
 });
 
 export function mcpFormFromDefinition(
-  definition: Pick<McpCatalogDefinition, "name" | "enabled" | "providerInstanceIds"> & {
+  definition: Pick<
+    McpCatalogDefinition,
+    "name" | "enabled" | "providerInstanceIds" | "allProviders"
+  > & {
     readonly transport: ProjectMcpTransport;
   },
 ): McpServerForm {
@@ -116,6 +125,7 @@ export function mcpFormFromDefinition(
     name: definition.name,
     enabled: definition.enabled,
     providerInstanceIds: definition.providerInstanceIds,
+    allProviders: definition.allProviders === true,
   };
   if (transport.type === "stdio") {
     return {
@@ -189,6 +199,59 @@ function credentialInput(
 export function mcpTransportInputFromForm(
   form: McpServerForm,
 ): FormResult<McpCatalogTransportInput> {
+  return transportFromForm(form, credentialInput);
+}
+
+/** A connection test sends typed values directly; it never consumes one-use references. */
+export function mcpTestTransportInputFromForm(
+  form: McpServerForm,
+): FormResult<McpCatalogTestTransportInput> {
+  return transportFromForm(form, (field, label): FormResult<McpCatalogTestCredentialInput> => {
+    const name = decodeCredentialName(field.name.trim());
+    if (name._tag === "None") return { ok: false, error: `${label} needs a credential name.` };
+    if (field.kind === "stored") return { ok: true, value: { id: field.id, name: name.value } };
+    if (field.kind === "new-secret" && field.value.length > 0)
+      return { ok: true, value: { name: name.value, secret: Redacted.make(field.value) } };
+    return { ok: false, error: `Enter the secret for ${label}.` };
+  });
+}
+
+type FormTransport<C> =
+  | {
+      readonly type: "stdio";
+      readonly command: string;
+      readonly args: ReadonlyArray<string>;
+      readonly cwd?: string;
+      readonly env: ReadonlyArray<{
+        readonly name: ProjectMcpEnvironmentVariableName;
+        readonly credential: C;
+      }>;
+    }
+  | {
+      readonly type: "streamable-http" | "legacy-sse";
+      readonly url: string;
+      readonly headers: ReadonlyArray<{
+        readonly name: ProjectMcpHeaderName;
+        readonly credential: C;
+      }>;
+      readonly authorization:
+        | { readonly type: "none" }
+        | {
+            readonly type: "oauth";
+            readonly registration:
+              | { readonly type: "automatic" }
+              | {
+                  readonly type: "pre-registered";
+                  readonly clientId: string;
+                  readonly clientSecret?: C;
+                };
+          };
+    };
+
+function transportFromForm<C>(
+  form: McpServerForm,
+  credentialInput: (field: McpCredentialField, label: string) => FormResult<C>,
+): FormResult<FormTransport<C>> {
   if (form.transport === "stdio") {
     const command = decodeNonEmpty(form.command.trim());
     if (command._tag === "None")
@@ -296,6 +359,7 @@ export function mcpDefinitionInputFromForm(form: McpServerForm) {
       name: name.value,
       enabled: form.enabled,
       providerInstanceIds: [...form.providerInstanceIds],
+      allProviders: form.allProviders,
       transport: transport.value,
     },
   };
@@ -309,6 +373,7 @@ export interface McpCatalogRow {
   readonly enabled: boolean;
   readonly name: string;
   readonly providerInstanceIds: ReadonlyArray<ProviderInstanceId>;
+  readonly allProviders: boolean;
   /** The connection this destination uses: its override's, else the definition's. */
   readonly transport: ProjectMcpTransport;
   /** Identifies `transport`; OAuth grants belong to it. */
@@ -324,32 +389,36 @@ export function mcpCatalogRows(input: {
   readonly own: ReadonlyArray<McpCatalogDefinition>;
   readonly overrides: ReadonlyArray<McpCatalogOverride>;
 }): ReadonlyArray<McpCatalogRow> {
-  const overrideFor = (definition: McpCatalogDefinition) =>
-    input.overrides.find((override) => override.targetId === definition.logicalServerId) ?? null;
-  return [
-    ...input.inherited.map((definition) => {
-      const override = overrideFor(definition);
-      return {
-        definition,
-        override,
-        inherited: true,
-        enabled: override?.enabled ?? definition.enabled,
-        name: override?.name ?? definition.name,
-        providerInstanceIds: override?.providerInstanceIds ?? definition.providerInstanceIds,
-        transport: override?.transport ?? definition.transport,
-        transportDefinitionId: override?.transportDefinitionId ?? definition.definitionId,
-      };
-    }),
-    ...input.own.map((definition) => ({
+  const row = (definition: McpCatalogDefinition, inherited: boolean): McpCatalogRow => {
+    const override =
+      input.overrides.find((candidate) => candidate.targetId === definition.logicalServerId) ??
+      null;
+    return {
       definition,
-      override: null,
-      inherited: false,
-      enabled: definition.enabled,
-      name: definition.name,
-      providerInstanceIds: definition.providerInstanceIds,
-      transport: definition.transport,
-      transportDefinitionId: definition.definitionId,
-    })),
+      override,
+      inherited,
+      enabled: override?.enabled ?? definition.enabled,
+      name: override?.name ?? definition.name,
+      providerInstanceIds: override?.providerInstanceIds ?? definition.providerInstanceIds,
+      allProviders:
+        override?.providerInstanceIds !== undefined || override?.allProviders !== undefined
+          ? override.allProviders === true
+          : definition.allProviders === true,
+      transport: override?.transport ?? definition.transport,
+      transportDefinitionId: override?.transportDefinitionId ?? definition.definitionId,
+    };
+  };
+  // A session holds its own copy of each inherited server under the same id, and its overrides
+  // target that copy, so the copy stands in for the inherited row.
+  const own = new Map(input.own.map((definition) => [definition.logicalServerId, definition]));
+  const inheritedIds = new Set(input.inherited.map((definition) => definition.logicalServerId));
+  return [
+    ...input.inherited.map((definition) =>
+      row(own.get(definition.logicalServerId) ?? definition, true),
+    ),
+    ...input.own
+      .filter((definition) => !inheritedIds.has(definition.logicalServerId))
+      .map((definition) => row(definition, false)),
   ];
 }
 
@@ -362,6 +431,7 @@ export function effectiveMcpDefinitions(
     name: row.name as McpCatalogDefinition["name"],
     enabled: row.enabled,
     providerInstanceIds: row.providerInstanceIds,
+    allProviders: row.allProviders,
     transport: row.transport,
   }));
 }
@@ -371,7 +441,13 @@ function mcpTransportInputFromPersisted(
   transport: ProjectMcpTransport,
 ): FormResult<McpCatalogTransportInput> {
   return mcpTransportInputFromForm(
-    mcpFormFromDefinition({ name: "", enabled: true, providerInstanceIds: [], transport }),
+    mcpFormFromDefinition({
+      name: "",
+      enabled: true,
+      providerInstanceIds: [],
+      allProviders: false,
+      transport,
+    }),
   );
 }
 
@@ -442,6 +518,8 @@ export interface McpOverridePatch {
   readonly enabled?: boolean | null;
   /** A pinned provider selection, or null to follow the definition's again. */
   readonly providerInstanceIds?: ReadonlyArray<ProviderInstanceId> | null;
+  /** Pinned with `providerInstanceIds`; null follows the definition's again. */
+  readonly allProviders?: boolean | null;
   /** A new name, or null to follow the definition's name again. */
   readonly name?: string | null;
   /** A replacement connection, or null to use the definition's again. */
@@ -471,6 +549,8 @@ export function mcpOverrideInput(input: {
     patch.providerInstanceIds === undefined
       ? previous?.providerInstanceIds
       : (patch.providerInstanceIds ?? undefined);
+  const allProviders =
+    patch.allProviders === undefined ? previous?.allProviders : (patch.allProviders ?? undefined);
   let transport: McpCatalogTransportInput | undefined;
   if (patch.transport !== undefined) transport = patch.transport ?? undefined;
   else if (previous?.transport !== undefined) {
@@ -490,6 +570,7 @@ export function mcpOverrideInput(input: {
       ...(providerInstanceIds === undefined
         ? {}
         : { providerInstanceIds: [...providerInstanceIds] }),
+      ...(allProviders === undefined ? {} : { allProviders }),
       ...(transport === undefined
         ? {}
         : {
@@ -510,6 +591,7 @@ export interface McpOverrideFields {
   readonly name: string;
   readonly enabled: boolean | null;
   readonly providerInstanceIds: ReadonlyArray<ProviderInstanceId> | null;
+  readonly allProviders: boolean | null;
 }
 
 export function mcpOverrideFieldsFromRow(row: McpCatalogRow): McpOverrideFields {
@@ -517,6 +599,9 @@ export function mcpOverrideFieldsFromRow(row: McpCatalogRow): McpOverrideFields 
     name: row.override?.name ?? "",
     enabled: row.override?.enabled ?? null,
     providerInstanceIds: row.override?.providerInstanceIds ?? null,
+    allProviders:
+      row.override?.allProviders ??
+      (row.override?.providerInstanceIds === undefined ? null : false),
   };
 }
 
@@ -533,6 +618,7 @@ export function mcpOverridePatchFromFields(
     name: name.length === 0 ? null : name,
     enabled: fields.enabled,
     providerInstanceIds: fields.providerInstanceIds,
+    allProviders: fields.allProviders,
   };
 }
 
@@ -557,18 +643,17 @@ export function mcpApplicationSummary(snapshot: McpCatalogSnapshot): {
   readonly tone: "success" | "warning" | "error" | "info";
 } {
   if (snapshot.disposedAt !== undefined) return { label: "Session ended", tone: "info" };
-  const revisions = `desired r${snapshot.desiredRevision}, applied r${snapshot.appliedRevision}`;
   const application = snapshot.application;
   if (
     application?.status === "restart-required" &&
     application.revision === snapshot.desiredRevision
   )
-    return { label: `Restart required (${revisions}): ${application.reason}`, tone: "warning" };
+    return { label: `Restart required: ${application.reason}`, tone: "warning" };
   if (application?.status === "failed" && application.revision === snapshot.desiredRevision)
-    return { label: `Delivery failed (${revisions}): ${application.reason}`, tone: "error" };
+    return { label: `Delivery failed: ${application.reason}`, tone: "error" };
   if (application?.status === "applied" && snapshot.appliedRevision === snapshot.desiredRevision)
-    return { label: `Applied (${revisions})`, tone: "success" };
-  return { label: `Waiting for delivery (${revisions})`, tone: "info" };
+    return { label: "Applied", tone: "success" };
+  return { label: "Waiting for delivery", tone: "info" };
 }
 
 export type InventoryKindFilter = "all" | "mcp" | "skill" | "command" | "snippet";

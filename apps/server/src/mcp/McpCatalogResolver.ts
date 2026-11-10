@@ -38,12 +38,18 @@ export interface ResolveSessionCatalogInput {
 
 export type CatalogValidationDefinition = Pick<
   McpCatalogDefinition,
-  "logicalServerId" | "scope" | "scopeId" | "name" | "enabled" | "providerInstanceIds"
+  | "logicalServerId"
+  | "scope"
+  | "scopeId"
+  | "name"
+  | "enabled"
+  | "providerInstanceIds"
+  | "allProviders"
 >;
 
 export type CatalogValidationOverride = Pick<
   McpCatalogOverride,
-  "targetId" | "enabled" | "name" | "providerInstanceIds"
+  "targetId" | "enabled" | "name" | "providerInstanceIds" | "allProviders"
 >;
 
 export interface ValidateEffectiveCatalogInput {
@@ -54,6 +60,22 @@ export interface ValidateEffectiveCatalogInput {
 
 const foldName = (name: string): string => name.toLocaleLowerCase();
 
+/** An override that names providers replaces the whole selection, the all-providers flag included. */
+const providerSelection = (
+  override: Pick<McpCatalogOverride, "providerInstanceIds" | "allProviders">,
+) =>
+  override.providerInstanceIds === undefined && override.allProviders === undefined
+    ? {}
+    : {
+        ...(override.providerInstanceIds === undefined
+          ? {}
+          : { providerInstanceIds: override.providerInstanceIds }),
+        allProviders: override.allProviders === true,
+      };
+
+/** Stands in for providers no definition names, so all-provider definitions are still validated. */
+const ANY_PROVIDER = "*" as ProviderInstanceId;
+
 const applyOverride = (
   definition: McpCatalogDefinition,
   override: McpCatalogOverride,
@@ -61,9 +83,7 @@ const applyOverride = (
   ...definition,
   ...(override.enabled === undefined ? {} : { enabled: override.enabled }),
   ...(override.name === undefined ? {} : { name: override.name }),
-  ...(override.providerInstanceIds === undefined
-    ? {}
-    : { providerInstanceIds: override.providerInstanceIds }),
+  ...providerSelection(override),
   ...(override.transport === undefined
     ? {}
     : {
@@ -90,7 +110,9 @@ const selectForProvider = <A extends CatalogValidationDefinition>(
 ): ReadonlyArray<A> =>
   definitions.filter(
     (definition) =>
-      definition.enabled && definition.providerInstanceIds.includes(providerInstanceId),
+      definition.enabled &&
+      (definition.allProviders === true ||
+        definition.providerInstanceIds.includes(providerInstanceId)),
   );
 
 const conflictsFor = (
@@ -111,6 +133,9 @@ const conflictsFor = (
 export const validateEffectiveCatalog = (input: ValidateEffectiveCatalogInput): void => {
   const providerInstanceIds = input.providerInstanceIds ?? [
     ...new Set(input.definitions.flatMap((definition) => definition.providerInstanceIds)),
+    ...(input.definitions.some((definition) => definition.allProviders === true)
+      ? [ANY_PROVIDER]
+      : []),
   ];
   for (const providerInstanceId of providerInstanceIds) {
     const conflicts = conflictsFor(input.definitions, providerInstanceId);

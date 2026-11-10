@@ -83,6 +83,35 @@ describe("MCP app asset responses", () => {
       }).pipe(Effect.provide(layerFileResponse)),
   );
 
+  it.effect("serves plugin panels with a strict CSP ahead of the host bootstraps", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-plugin-panel-" });
+      const file = path.join(directory, "main.html");
+      const html = "<!DOCTYPE html><html><body><script>connect()</script></body></html>";
+      yield* fs.writeFileString(file, html);
+      const response = HttpServerResponse.toWeb(
+        yield* assetFileResponse({
+          path: file,
+          mimeType: "text/html",
+          renderIntent: "plugin-panel",
+        }),
+      );
+      const meta = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">`;
+      const expected = injectMcpAppCookieBootstrap(
+        injectMcpAppThemeBootstrap(`<!DOCTYPE html>${meta}${html.slice("<!DOCTYPE html>".length)}`),
+      );
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-security-policy")).toBe(
+        "sandbox allow-scripts allow-forms allow-popups allow-downloads",
+      );
+      const body = yield* Effect.promise(() => response.text());
+      expect(body).toBe(expected);
+      expect(body.indexOf(meta)).toBeLessThan(body.indexOf("<script>"));
+    }).pipe(Effect.provide(layerFileResponse)),
+  );
+
   it.effect("rejects oversized captures before transforming them", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

@@ -113,7 +113,7 @@ export interface McpAppHost {
   readonly dispose: () => void;
 }
 
-function jsonBytes(value: unknown): number {
+export function jsonBytes(value: unknown): number {
   try {
     return encoder.encode(JSON.stringify(value) ?? "").byteLength;
   } catch {

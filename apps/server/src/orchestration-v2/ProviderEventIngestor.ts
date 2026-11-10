@@ -27,6 +27,7 @@ import * as SqlError from "effect/sql/SqlError";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import { isTemporaryWorktreeBranch } from "@t3tools/shared/git";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
+import { asT3WebSearchTurnItem } from "@t3tools/shared/toolOutput";
 import {
   ProviderTurnAnalytics,
   type ProviderTurnAnalyticsContext,
@@ -575,7 +576,7 @@ export const layer: Layer.Layer<
                   type: "turn-item.updated",
                   threadId: input.event.turnItem.threadId,
                   payload: boundFileChangeForStorage(
-                    stripUnservedToolOutputImageBytes(input.event.turnItem),
+                    stripUnservedToolOutputImageBytes(asT3WebSearchTurnItem(input.event.turnItem)),
                   ),
                   runId: input.event.turnItem.runId,
                   nodeId: input.event.turnItem.nodeId,

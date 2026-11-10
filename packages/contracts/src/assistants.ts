@@ -19,6 +19,7 @@ import { ManagedTextResourceId, ManagedTextResourceRevision } from "./managedTex
 import { McpDefinitionId } from "./mcpCatalog.ts";
 import { AssistantId } from "./memoryOwner.ts";
 import { ModelSelection } from "./modelSelection.ts";
+import { PluginId, PluginOperationName } from "./plugins.ts";
 import { ProjectTeamAvatar } from "./projectTeams.ts";
 import { ProviderInteractionMode, RuntimeMode } from "./providerPolicy.ts";
 import { ManagedSkillId, SkillRevisionRef } from "./skills.ts";
@@ -51,6 +52,15 @@ export const AssistantResourceSelection = Schema.Struct({
   instructions: Schema.Array(
     Schema.Struct({ resourceId: ManagedTextResourceId, revision: ManagedTextResourceRevision }),
   ).check(Schema.isMaxLength(100)),
+  // Absent rather than empty, so configurations without plugins keep their canonical hash.
+  plugins: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        pluginId: PluginId,
+        operations: Schema.Array(PluginOperationName).check(Schema.isMaxLength(64)),
+      }),
+    ).check(Schema.isMaxLength(50)),
+  ),
 });
 export type AssistantResourceSelection = typeof AssistantResourceSelection.Type;
 
@@ -82,6 +92,26 @@ export const AssistantConfiguration = Schema.Struct({
   memory: AssistantMemoryPolicy,
 });
 export type AssistantConfiguration = typeof AssistantConfiguration.Type;
+
+/** Matches the cap on a run snapshot's `toolIds`, which lists every selected MCP tool and plugin operation. */
+export const ASSISTANT_TOOL_LIMIT = 64;
+
+export const assistantSelectedToolCount = (resources: AssistantResourceSelection): number =>
+  resources.mcpTools.reduce((count, entry) => count + entry.toolNames.length, 0) +
+  (resources.plugins ?? []).reduce((count, entry) => count + entry.operations.length, 0);
+
+// Enforced on writes only: stored configurations saved before the cap must still decode.
+const AssistantConfigurationInput = AssistantConfiguration.check(
+  Schema.makeFilter((configuration) => {
+    const count = assistantSelectedToolCount(configuration.resources);
+    return count <= ASSISTANT_TOOL_LIMIT
+      ? undefined
+      : {
+          path: ["resources"],
+          issue: `An agent can use at most ${ASSISTANT_TOOL_LIMIT} tools; this selects ${count}.`,
+        };
+  }),
+);
 
 export const AssistantConfigurationSnapshot = Schema.Struct({
   environmentId: EnvironmentId,
@@ -221,7 +251,7 @@ export type AssistantDetail = typeof AssistantDetail.Type;
 export const AssistantCreateInput = Schema.Struct({
   environmentId: EnvironmentId,
   commandId: CommandId,
-  configuration: AssistantConfiguration,
+  configuration: AssistantConfigurationInput,
 });
 export type AssistantCreateInput = typeof AssistantCreateInput.Type;
 
@@ -235,7 +265,7 @@ export const AssistantUpdateConfigurationInput = Schema.Struct({
   ...AssistantGetInput.fields,
   commandId: CommandId,
   expectedRevision: AssistantConfigurationRevision,
-  configuration: AssistantConfiguration,
+  configuration: AssistantConfigurationInput,
 });
 export type AssistantUpdateConfigurationInput = typeof AssistantUpdateConfigurationInput.Type;
 

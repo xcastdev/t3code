@@ -11,6 +11,7 @@ import {
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
 import { GUEST_MESSAGE_MAX_LENGTH, GUEST_NAME_MAX_LENGTH } from "./guestShare.ts";
+import { PluginId } from "./plugins.ts";
 
 /** Image and file records reference `ChatAttachment` ids, never bytes. */
 
@@ -25,6 +26,7 @@ export const COMPOSER_CONTEXT_KINDS = [
   "skill",
   "thread",
   "environment",
+  "plugin-reference",
 ] as const;
 export type KnownComposerContextKind = (typeof COMPOSER_CONTEXT_KINDS)[number];
 
@@ -224,6 +226,24 @@ export const EnvironmentContextRecord = Schema.Struct({
 });
 export type EnvironmentContextRecord = typeof EnvironmentContextRecord.Type;
 
+export const COMPOSER_CONTEXT_PLUGIN_SNAPSHOT_MAX_CHARS = 8_000;
+
+export const PluginReferenceContextRecord = Schema.Struct({
+  ...recordBase,
+  kind: Schema.Literal("plugin-reference"),
+  referenceVersion: Schema.Literal(1),
+  environmentId: EnvironmentId,
+  pluginId: PluginId,
+  pluginName: TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+  locator: Schema.Record(
+    TrimmedNonEmptyString.check(Schema.isMaxLength(64)),
+    BoundedString(256),
+  ).check(Schema.isMaxProperties(8)),
+  snapshot: BoundedString(COMPOSER_CONTEXT_PLUGIN_SNAPSHOT_MAX_CHARS),
+  snapshotTruncated: Schema.Boolean,
+});
+export type PluginReferenceContextRecord = typeof PluginReferenceContextRecord.Type;
+
 const isJson = Schema.is(Schema.Json);
 
 /** Excludes known discriminators so malformed known records fail their own schema. */
@@ -255,6 +275,7 @@ export const KnownComposerContextRecord = Schema.Union([
   SkillContextRecord,
   ThreadContextRecord,
   EnvironmentContextRecord,
+  PluginReferenceContextRecord,
 ]);
 export type KnownComposerContextRecord = typeof KnownComposerContextRecord.Type;
 

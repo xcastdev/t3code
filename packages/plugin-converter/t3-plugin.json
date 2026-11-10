@@ -1,0 +1,14 @@
+{
+  "manifestVersion": 1,
+  "id": "converter",
+  "name": "Converter",
+  "version": "0.1.0",
+  "hostApi": "1.0",
+  "author": "T3 Tools",
+  "description": "Format and minify JSON, and encode or decode Base64 and URL text, then insert the result into chat.",
+  "ui": {
+    "panels": [{ "id": "converter", "title": "Converter", "entry": "ui/converter.html" }],
+    "commands": [{ "id": "open", "title": "Open Converter", "opens": { "panel": "converter" } }]
+  },
+  "capabilities": ["chat.attach"]
+}

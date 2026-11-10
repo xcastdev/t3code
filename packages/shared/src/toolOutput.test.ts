@@ -1,7 +1,11 @@
+import { ThreadId, TurnItemId, type OrchestrationV2TurnItem } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import { makeOmpEvalEnvelope } from "./ompEval.ts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  asT3WebSearchTurnItem,
+  t3WebSearchDisplayItem,
   compactDynamicToolOutput,
   omitToolOutputImageData,
   MAX_TOOL_OUTPUT_IMAGES,
@@ -217,5 +221,161 @@ describe("toolOutputImages", () => {
   it("stops after the first few images", () => {
     const images = toolOutputImages(Array.from({ length: 10_000 }, () => mcpImage));
     expect(images).toHaveLength(MAX_TOOL_OUTPUT_IMAGES);
+  });
+});
+
+describe("asT3WebSearchTurnItem", () => {
+  const toolCall = (toolName: string, output: unknown): OrchestrationV2TurnItem => ({
+    id: TurnItemId.make("item"),
+    threadId: ThreadId.make("thread"),
+    runId: null,
+    nodeId: null,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal: 0,
+    status: "completed",
+    title: "Web search",
+    startedAt: null,
+    completedAt: null,
+    updatedAt: DateTime.makeUnsafe(0),
+    type: "dynamic_tool",
+    toolName,
+    input: { query: " latest Node.js ", instructions: "Cite nodejs.org" },
+    output,
+  });
+  const result = {
+    answer: "Node.js 26.1.0",
+    sources: [
+      { title: "Releases", url: "https://nodejs.org/en/about/previous-releases" },
+      { title: "No link", url: " " },
+    ],
+  };
+
+  it("stores each provider's T3 web search call as a native web search", () => {
+    for (const [toolName, output] of [
+      ["mcp__t3-code__t3_web_search", [{ type: "text", text: JSON.stringify(result) }]],
+      ["t3-code.t3_web_search", result],
+      ["t3-code_t3_web_search", JSON.stringify(result)],
+      [
+        "t3-code-direct.t3_web_search",
+        { content: [{ type: "text", text: JSON.stringify(result) }] },
+      ],
+    ] as const) {
+      const { updatedAt: _updatedAt, ...item } = asT3WebSearchTurnItem(toolCall(toolName, output));
+      expect(item).toEqual({
+        id: "item",
+        threadId: "thread",
+        runId: null,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 0,
+        status: "completed",
+        title: null,
+        startedAt: null,
+        completedAt: null,
+        type: "web_search",
+        patterns: ["latest Node.js"],
+        results: [
+          { title: "Answer", snippet: "Node.js 26.1.0" },
+          { title: "Releases", url: "https://nodejs.org/en/about/previous-releases" },
+        ],
+      });
+    }
+  });
+
+  it("marks a returned failure and leaves other tools alone", () => {
+    const failed = asT3WebSearchTurnItem(
+      toolCall("t3-code.t3_web_search", {
+        isError: true,
+        content: [{ type: "text", text: '{"message":"Web search is off"}' }],
+      }),
+    );
+    expect(failed.status).toBe("failed");
+    expect(failed.type === "web_search" ? failed.results : null).toEqual([
+      { title: "Error", snippet: "Web search is off" },
+    ]);
+    for (const toolName of [
+      "mcp__t3-code__t3_thread_read",
+      "t3_web_search",
+      "mcp__other__t3_web_search",
+      "other.t3_web_search",
+      "t3-code-other_thread_t3_web_search",
+    ]) {
+      const other = toolCall(toolName, result);
+      expect(asT3WebSearchTurnItem(other), toolName).toBe(other);
+    }
+    const running = { ...toolCall("t3-code.t3_web_search", undefined), status: "running" as const };
+    expect(asT3WebSearchTurnItem(running)).toBe(running);
+  });
+
+  it("shows running, stopped, and per-thread calls as web searches", () => {
+    const answer = [{ title: "Answer", snippet: "Node.js 26.1.0" }];
+    for (const [toolName, status, output, results] of [
+      ["t3-code.t3_web_search", "running", undefined, undefined],
+      ["mcp__t3-code__t3_web_search", "cancelled", result, answer],
+      ["t3-code-thread_1_t3_web_search", "running", undefined, undefined],
+      ["t3-code-thread_1_t3_web_search", "interrupted", result, undefined],
+    ] as const) {
+      const item = t3WebSearchDisplayItem({ ...toolCall(toolName, output), status });
+      expect(item, toolName).toMatchObject({
+        type: "web_search",
+        status,
+        patterns: ["latest Node.js"],
+      });
+      expect(item.type === "web_search" ? item.results?.slice(0, 1) : null, toolName).toEqual(
+        results,
+      );
+    }
+    const other = toolCall("mcp__other__t3_web_search", result);
+    expect(t3WebSearchDisplayItem(other)).toBe(other);
+  });
+
+  it("keeps unparsed output and non-execution, bounded for the timeline", () => {
+    const timedOut = asT3WebSearchTurnItem({
+      ...toolCall("mcp__t3-code__t3_web_search", "MCP error -32001: Request timed out"),
+      status: "failed",
+      toolNonExecutionKind: "denied",
+    });
+    expect(timedOut).toMatchObject({
+      type: "web_search",
+      status: "failed",
+      toolNonExecutionKind: "denied",
+      results: [{ title: "Error", snippet: "MCP error -32001: Request timed out" }],
+    });
+    const prose = asT3WebSearchTurnItem(toolCall("t3-code.t3_web_search", "Node.js 26.1.0"));
+    expect(prose.type === "web_search" ? prose.results : null).toEqual([
+      { title: "Output", snippet: "Node.js 26.1.0" },
+    ]);
+
+    const oversized = asT3WebSearchTurnItem(
+      toolCall("t3-code.t3_web_search", {
+        structuredContent: {
+          answer: "x".repeat(70_000),
+          sources: [
+            { title: "Script", url: "javascript:alert(1)" },
+            { title: "Long", url: `https://example.com/${"u".repeat(3_000)}` },
+            ...Array.from({ length: 60 }, (_, index) => ({
+              title: "t".repeat(9_000),
+              url: `https://example.com/${index}`,
+            })),
+          ],
+        },
+      }),
+    );
+    const results = oversized.type === "web_search" ? (oversized.results ?? []) : [];
+    expect(results[0]?.snippet?.length).toBeLessThanOrEqual(8_192);
+    expect(results.length).toBeGreaterThan(1);
+    expect(results.length).toBeLessThanOrEqual(21);
+    expect(results.slice(1).every((entry) => entry.title?.length === 300)).toBe(true);
+    expect(results.slice(1).every((entry) => entry.url?.startsWith("https://example.com/"))).toBe(
+      true,
+    );
+    expect(results.some((entry) => entry.url?.includes("uuu"))).toBe(false);
+    expect(JSON.stringify(oversized).length).toBeLessThanOrEqual(17_000);
   });
 });

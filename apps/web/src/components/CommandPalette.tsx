@@ -51,7 +51,10 @@ import {
   PRIMARY_LOCAL_ENVIRONMENT_ID,
   resolveEnvironmentMachineKind,
 } from "@t3tools/contracts";
-import { useLocation, useNavigate } from "@tanstack/react-router";
+import { useLocation, useNavigate, useRouter } from "@tanstack/react-router";
+import { listPluginPanelTargets } from "@t3tools/client-runtime/plugins/commands";
+import { openPluginPanel } from "../plugins/openPluginPanel";
+import { useEnabledPluginInstalls } from "../plugins/pluginInstalls";
 import {
   GitBranchIcon,
   ArrowLeftIcon,
@@ -79,6 +82,7 @@ import {
   SquarePenIcon,
   TextSearchIcon,
   UserPlusIcon,
+  PuzzleIcon,
 } from "lucide-react";
 import { openThreadFind } from "./chat/threadFindStore";
 import {
@@ -191,6 +195,7 @@ import {
   ADDON_ICON_CLASS,
   browseInputEndPaddingClass,
   buildBrowseGroups,
+  buildPluginPanelItems,
   buildRootGroups,
   buildLinkedThreadActionItems,
   buildCommandPaletteRows,
@@ -414,7 +419,9 @@ function OpenCommandPaletteDialog(props: {
   readonly initialContext: CommandPaletteReturnContext | undefined;
 }) {
   const navigate = useNavigate();
+  const router = useRouter();
   const pathname = useLocation({ select: (location) => location.pathname });
+  const pluginInstalls = useEnabledPluginInstalls();
   const { openChildSearch, setOpen } = props;
   // Keyed by palette session: the intent and restored search only seed this
   // mount, and closing must not change what the closing palette shows.
@@ -1850,6 +1857,14 @@ function OpenCommandPaletteDialog(props: {
         },
       });
   }
+
+  actionItems.push(
+    ...buildPluginPanelItems({
+      targets: listPluginPanelTargets(pluginInstalls),
+      icon: <PuzzleIcon className={ITEM_ICON_CLASS} />,
+      open: (key) => openPluginPanel(router, key),
+    }),
+  );
 
   const rootGroups = buildRootGroups({ actionItems, recentThreadItems });
   // Every setting goes to the palette's own matcher, so settings get the same

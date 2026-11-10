@@ -7,6 +7,8 @@ import {
   type AssistantSelection,
 } from "./state/assistants.ts";
 import {
+  ASSISTANT_TOOL_LIMIT,
+  assistantSelectedToolCount,
   MIN_SCHEDULED_TASK_INTERVAL_MS,
   type AssistantConfiguration,
   type AssistantDetail,
@@ -19,6 +21,7 @@ import {
   type ManagedTextResourceId,
   type ManagedTextResourceRevision,
   type McpDefinitionId,
+  type PluginId,
   type ScheduledTaskUpsertSchedule,
   type SkillRevisionRef,
 } from "@t3tools/contracts";
@@ -307,6 +310,9 @@ export function assistantConfigurationError(configuration: AssistantConfiguratio
     (indexing.destination.trim().length === 0 || indexing.embeddingDestination.trim().length === 0)
   )
     return "Name both external indexing destinations, or turn external indexing off.";
+  const tools = assistantSelectedToolCount(configuration.resources);
+  if (tools > ASSISTANT_TOOL_LIMIT)
+    return `Choose at most ${ASSISTANT_TOOL_LIMIT} tools; ${tools} are selected.`;
   return null;
 }
 
@@ -367,6 +373,21 @@ export function setAssistantMcpTools(
     ...resources,
     mcpTools: toolNames.length === 0 ? others : [...others, { definitionId, toolNames }],
   };
+}
+
+/** Drops the `plugins` key when nothing is selected, so the configuration hash stays unchanged. */
+export function setAssistantPluginOperations(
+  resources: AssistantResourceSelection,
+  pluginId: PluginId,
+  operations: ReadonlyArray<string>,
+): AssistantResourceSelection {
+  const { plugins = [], ...rest } = resources;
+  const others = plugins.filter((entry) => entry.pluginId !== pluginId);
+  const next =
+    operations.length === 0
+      ? others
+      : [...others, { pluginId, operations: [...new Set(operations)] }];
+  return next.length === 0 ? rest : { ...rest, plugins: next };
 }
 
 export type AssistantDraftState =

@@ -1,0 +1,86 @@
+{
+  "manifestVersion": 1,
+  "id": "echo",
+  "name": "Echo",
+  "version": "0.1.0",
+  "hostApi": "1.0",
+  "author": "T3 Tools",
+  "description": "Test fixture that exercises the plugin worker protocol.",
+  "ui": {
+    "panels": [{ "id": "echo", "title": "Echo", "entry": "ui/echo.html" }],
+    "commands": [{ "id": "open", "title": "Open Echo", "opens": { "panel": "echo" } }]
+  },
+  "backend": {
+    "entry": "backend/index.cjs",
+    "operations": [
+      {
+        "name": "ping",
+        "title": "Ping",
+        "description": "Returns the message it was given and who called it.",
+        "inputSchema": { "type": "object", "properties": { "message": { "type": "string" } } },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "pong",
+        "title": "Pong",
+        "description": "Increments the pong counter and publishes it on the ticks topic.",
+        "inputSchema": { "type": "object", "properties": {} },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "spawn_child",
+        "title": "Spawn child",
+        "description": "Spawns a sleeping child process and returns its pid. An untracked child outlives onStop.",
+        "inputSchema": { "type": "object", "properties": { "untracked": { "type": "boolean" } } },
+        "mutates": true,
+        "agent": false
+      },
+      {
+        "name": "log",
+        "title": "Log",
+        "description": "Writes the requested number of numbered lines to the worker log.",
+        "inputSchema": {
+          "type": "object",
+          "properties": { "lines": { "type": "integer", "minimum": 0 } },
+          "required": ["lines"]
+        },
+        "mutates": false,
+        "agent": false
+      },
+      {
+        "name": "crash",
+        "title": "Crash",
+        "description": "Exits the worker process with code 3 without answering.",
+        "inputSchema": { "type": "object", "properties": {} },
+        "mutates": true,
+        "agent": false
+      },
+      {
+        "name": "big",
+        "title": "Big result",
+        "description": "Returns a result whose data field has the requested number of characters.",
+        "inputSchema": {
+          "type": "object",
+          "properties": { "bytes": { "type": "integer", "minimum": 0 } },
+          "required": ["bytes"]
+        },
+        "mutates": false,
+        "agent": false
+      },
+      {
+        "name": "asset",
+        "title": "Asset",
+        "description": "Materializes the embedded hello.txt and returns its path and text.",
+        "inputSchema": { "type": "object", "properties": {} },
+        "mutates": false,
+        "agent": false
+      }
+    ],
+    "topics": [{ "name": "ticks" }],
+    "resources": [{ "name": "status", "title": "Echo status", "operation": "ping" }],
+    "prerequisites": []
+  },
+  "capabilities": ["chat.attach"]
+}

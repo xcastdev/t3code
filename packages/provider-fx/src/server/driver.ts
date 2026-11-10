@@ -59,6 +59,7 @@ const unsupportedTextGeneration: ProviderTextGeneration = (() => {
     generateThreadTitle: () => unsupported("generateThreadTitle"),
     generateReviewGuide: () => unsupported("generateReviewGuide"),
     describeImage: () => unsupported("describeImage"),
+    webSearch: () => unsupported("webSearch"),
   };
 })();
 

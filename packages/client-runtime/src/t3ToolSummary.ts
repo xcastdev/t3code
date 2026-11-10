@@ -478,6 +478,9 @@ export function summarizeT3ToolCalls(
     case "capabilities":
       label = phrase("Checked", "check", `orchestration capabilities ${times}`);
       break;
+    case "web-search":
+      label = phrase("Searched", "search", selected.length === 1 ? "the web" : `the web ${times}`);
+      break;
   }
   return { label, failedCount };
 }

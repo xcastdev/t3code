@@ -118,6 +118,18 @@ const knownRecords: Record<(typeof COMPOSER_CONTEXT_KINDS)[number], Record<strin
     label: "vps",
     environmentId: "environment-vps",
   },
+  "plugin-reference": {
+    ...base,
+    kind: "plugin-reference",
+    label: "GET /api/users",
+    referenceVersion: 1,
+    environmentId: "environment-1",
+    pluginId: "request-inspector",
+    pluginName: "Request Inspector",
+    locator: { captureId: "cap_1", requestId: "req_1" },
+    snapshot: "GET /api/users -> 500",
+    snapshotTruncated: false,
+  },
 };
 
 describe("ComposerContextRecord", () => {
@@ -135,6 +147,22 @@ describe("ComposerContextRecord", () => {
       label: "Future",
       payload: { anything: [1, 2, 3] },
     });
+  });
+
+  it("decodes a plugin-reference record and rejects 9 locator keys", () => {
+    const reference = knownRecords["plugin-reference"];
+    expect(Option.getOrThrow(decodeRecord(reference))).toEqual(reference);
+    const locator = Object.fromEntries(
+      Array.from({ length: 9 }, (_, index) => [`key${index}`, "v"]),
+    );
+    expect(Option.isNone(decodeRecord({ ...reference, locator }))).toBe(true);
+    expect(
+      Option.isNone(decodeRecord({ ...reference, locator: { captureId: "x".repeat(257) } })),
+    ).toBe(true);
+    expect(Option.isNone(decodeRecord({ ...reference, snapshot: "x".repeat(8_001) }))).toBe(true);
+    expect(Option.isNone(decodeRecord({ ...reference, payload: {}, snapshot: undefined }))).toBe(
+      true,
+    );
   });
 
   it("does not let a malformed known kind slide through as unknown", () => {

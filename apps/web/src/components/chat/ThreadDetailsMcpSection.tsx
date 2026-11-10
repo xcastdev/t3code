@@ -146,7 +146,7 @@ export default function ThreadDetailsMcpSection(props: {
         <p className="px-2.5 pt-1 text-2xs text-muted-foreground">
           Servers can be switched for this thread once it has run.
         </p>
-      ) : delivery ? (
+      ) : delivery && (delivery.tone === "warning" || delivery.tone === "error") ? (
         <p className="px-2.5 pt-1 text-2xs text-muted-foreground">{delivery.label}</p>
       ) : null}
     </ThreadDetailsSection>

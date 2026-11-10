@@ -22,6 +22,7 @@ const OpenCodeTextGenerationOperation = Schema.Literals([
   "generateThreadTitle",
   "generateReviewGuide",
   "describeImage",
+  "webSearch",
 ]);
 
 const openCodeTextGenerationErrorContext = {

@@ -113,6 +113,7 @@ export const fixture = (
         generatePrContent: unused,
         generateReviewGuide: unused,
         describeImage: unused,
+        webSearch: unused,
         extractMemoryFacts: extract,
       }),
     ),

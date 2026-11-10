@@ -67,6 +67,10 @@ Yes. Add another provider instance in Settings and give it its own keys and endp
 
 Yes. Turn on **View image tool** in **Settings → Threads → Image viewing** and choose a Codex or OpenCode vision model. New agent sessions get a `t3_view_image` tool: the agent says what to look for and names an image file in its workspace, and the vision model's description comes back to it. PNG, JPEG, WebP and GIF files up to 10 MiB work. Each call is a request to the vision model's provider.
 
+## My agent has no web search. Can it still look things up online?
+
+Yes. Turn on **Web search tool** in **Settings → Threads → Web search** and choose a Claude or Codex search model. New agent sessions get a tool that hands the query to that model, which searches with its own web search and returns an answer with sources. Claude, Codex, Cursor, Grok and OMP agents have their own web search, so they don't get the tool. Each search is a request to the search model's provider.
+
 ## Does T3 Code support local models?
 
 No. T3 Code is a serious developer tool. Locally runnable models are not capable of meaningful engineering work.

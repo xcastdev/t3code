@@ -26,6 +26,7 @@ export type SettingsPath =
   | "/settings/snap-shot"
   | "/settings/providers"
   | "/settings/resources"
+  | "/settings/plugins"
   | "/settings/threads"
   | "/settings/browser"
   | "/settings/devices"
@@ -97,6 +98,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
   "/settings/snap-shot": "SnapShots",
   "/settings/providers": "Providers",
   "/settings/resources": "Resources",
+  "/settings/plugins": "Plugins",
   "/settings/threads": "Threads",
   "/settings/browser": "Browser",
   "/settings/devices": "Devices",
@@ -133,6 +135,7 @@ export const SETTINGS_NAV_GROUPS: ReadonlyArray<{
     paths: [
       "/settings/providers",
       "/settings/resources",
+      "/settings/plugins",
       "/settings/threads",
       "/settings/browser",
       "/settings/devices",
@@ -749,6 +752,18 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["image viewing describe screenshot picture codex opencode"],
   },
   {
+    id: "web-search-tool",
+    title: "Web search tool",
+    to: "/settings/threads",
+    searchTerms: ["internet browse lookup online agents without built-in web search"],
+  },
+  {
+    id: "search-model",
+    title: "Search model",
+    to: "/settings/threads",
+    searchTerms: ["web search internet lookup claude codex"],
+  },
+  {
     id: "thread-title-instructions",
     title: "Thread title instructions",
     to: "/settings/threads",
@@ -1037,6 +1052,20 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["slash command snippet template $ARGUMENTS reusable prompt text"],
   },
   {
+    id: "plugins-device",
+    title: "On this device",
+    to: "/settings/plugins",
+    searchTerms: ["plugins install panel extension client converter enable disable uninstall"],
+  },
+  {
+    id: "plugins-environment",
+    title: "Environment plugins",
+    to: "/settings/plugins",
+    searchTerms: [
+      "plugins install backend trust author upload start stop restart logs configure secrets update uninstall delete data",
+    ],
+  },
+  {
     id: "automatic-pull",
     title: "Automatically pull",
     to: "/settings/source-control",
@@ -1303,6 +1332,7 @@ const SETTINGS_CATEGORY_SCOPES: Readonly<Record<SettingsPath, SettingsSearchScop
   "/settings/keybindings": null,
   "/settings/providers": null,
   "/settings/resources": null,
+  "/settings/plugins": null,
   "/settings/threads": null,
   "/settings/browser": null,
   "/settings/devices": null,

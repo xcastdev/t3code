@@ -50,7 +50,11 @@ export type PendingBackgroundWorkTask = OrchestrationV2PendingBackgroundTask;
 export function turnItemUpdateCanEndBackgroundWork(
   item: Pick<OrchestrationV2TurnItem, "type" | "status">,
 ): boolean {
-  return BACKGROUND_TURN_ITEM_TYPES.has(item.type) && !isOrchestrationV2WorkActive(item.status);
+  // A T3 web search runs as dynamic_tool and ends stored as web_search.
+  return (
+    (BACKGROUND_TURN_ITEM_TYPES.has(item.type) || item.type === "web_search") &&
+    !isOrchestrationV2WorkActive(item.status)
+  );
 }
 
 export function deriveBlockedOnThreadWait(input: {

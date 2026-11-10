@@ -146,6 +146,7 @@ const fixture = (
           generateThreadTitle: unused,
           generateReviewGuide: unused,
           describeImage: unused,
+          webSearch: unused,
           extractMemoryFacts: options.extract ?? (() => Effect.succeed(facts)),
         }),
       ),

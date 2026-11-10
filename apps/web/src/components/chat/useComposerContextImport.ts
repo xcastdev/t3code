@@ -123,6 +123,9 @@ export function useComposerContextImport(input: {
   const addComposerDraftEnvironmentContexts = useComposerDraftStore(
     (store) => store.addEnvironmentContexts,
   );
+  const addComposerDraftPluginReferences = useComposerDraftStore(
+    (store) => store.addPluginReferences,
+  );
   const createAssetUrl = useAtomQueryRunner(assetEnvironment.createUrl, { reportFailure: false });
   const loadThreadTranscript = useAtomCommand(orchestrationEnvironment.threadTranscript, {
     reportFailure: false,
@@ -337,7 +340,9 @@ export function useComposerContextImport(input: {
                     ? existing.record.id
                     : undefined,
                 })
-              : existing?.kind === "thread" || existing?.kind === "environment"
+              : existing?.kind === "thread" ||
+                  existing?.kind === "environment" ||
+                  existing?.kind === "plugin-reference"
                 ? existing.record
                 : existing
                   ? (uploadedContextRecordFromDraft(existing) ?? undefined)
@@ -409,6 +414,15 @@ export function useComposerContextImport(input: {
           // but not in an answer to an agent's question, which carries no machines.
           if (questionAttachmentTarget !== null) break;
           addComposerDraftEnvironmentContexts(composerDraftTarget, [record], {
+            appendReference: false,
+          });
+          rewritten.set(record.contextId, record.contextId);
+          break;
+        }
+        case "plugin-reference": {
+          // A capture lives on its plugin's machine, so only that machine's threads take it.
+          if (questionAttachmentTarget !== null || record.environmentId !== environmentId) break;
+          addComposerDraftPluginReferences(composerDraftTarget, [record], {
             appendReference: false,
           });
           rewritten.set(record.contextId, record.contextId);

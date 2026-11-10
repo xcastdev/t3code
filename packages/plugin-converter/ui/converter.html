@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Converter</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: var(--color-background-primary, #0f0f10);
+        --surface: var(--color-background-secondary, #18181b);
+        --muted: var(--color-background-tertiary, #232327);
+        --text: var(--color-text-primary, #ededef);
+        --text-muted: var(--color-text-secondary, #9a9aa3);
+        --border: var(--color-border-primary, #2c2c31);
+        --input-border: var(--color-border-secondary, #34343a);
+        --danger: var(--color-text-danger, #f87171);
+        --ring: var(--color-ring-primary, #6b8afd);
+        --radius: var(--border-radius-md, 8px);
+        --sans: var(--font-sans, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif);
+        --mono: var(--font-mono, ui-monospace, "SF Mono", Menlo, Consolas, monospace);
+      }
+      :root[data-theme="light"] {
+        color-scheme: light;
+        --bg: var(--color-background-primary, #ffffff);
+        --surface: var(--color-background-secondary, #f7f7f8);
+        --muted: var(--color-background-tertiary, #efeff1);
+        --text: var(--color-text-primary, #18181b);
+        --text-muted: var(--color-text-secondary, #6b6b73);
+        --border: var(--color-border-primary, #e4e4e7);
+        --input-border: var(--color-border-secondary, #d4d4d8);
+        --danger: var(--color-text-danger, #dc2626);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        padding: 12px;
+        background: var(--bg);
+        color: var(--text);
+        font: 13px/1.4 var(--sans);
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+      }
+      .spacer {
+        flex: 1;
+      }
+      .tabs {
+        display: inline-flex;
+        padding: 2px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        background: var(--surface);
+      }
+      .tabs button {
+        border: 0;
+        background: transparent;
+        color: var(--text-muted);
+      }
+      .tabs button[aria-selected="true"] {
+        background: var(--muted);
+        color: var(--text);
+      }
+      button {
+        height: 28px;
+        padding: 0 10px;
+        border: 1px solid var(--input-border);
+        border-radius: calc(var(--radius) - 2px);
+        background: var(--surface);
+        color: var(--text);
+        font: inherit;
+        cursor: pointer;
+      }
+      button:hover:not(:disabled) {
+        background: var(--muted);
+      }
+      button:disabled {
+        cursor: default;
+        opacity: 0.5;
+      }
+      button:focus-visible,
+      textarea:focus-visible {
+        outline: 2px solid var(--ring);
+        outline-offset: 1px;
+      }
+      button.primary {
+        border-color: transparent;
+        background: var(--text);
+        color: var(--bg);
+      }
+      button.primary:hover:not(:disabled) {
+        background: var(--text);
+        opacity: 0.9;
+      }
+      label {
+        color: var(--text-muted);
+        font-size: 12px;
+      }
+      .field {
+        display: flex;
+        flex: 1;
+        flex-direction: column;
+        gap: 4px;
+        min-height: 0;
+      }
+      textarea {
+        flex: 1;
+        min-height: 80px;
+        width: 100%;
+        padding: 8px 10px;
+        border: 1px solid var(--input-border);
+        border-radius: var(--radius);
+        background: var(--surface);
+        color: var(--text);
+        font: 12px/1.5 var(--mono);
+        resize: none;
+      }
+      textarea[readonly] {
+        background: var(--bg);
+      }
+      #error {
+        min-height: 1.4em;
+        color: var(--danger);
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="row">
+      <div class="tabs" role="tablist" aria-label="Format">
+        <button type="button" role="tab" data-mode="json" aria-selected="true">JSON</button>
+        <button type="button" role="tab" data-mode="base64" aria-selected="false">Base64</button>
+        <button type="button" role="tab" data-mode="url" aria-selected="false">URL</button>
+      </div>
+      <span class="spacer"></span>
+      <button type="button" id="action-a">Format</button>
+      <button type="button" id="action-b">Minify</button>
+    </div>
+    <div class="field">
+      <label for="input">Input</label>
+      <textarea id="input" spellcheck="false" placeholder="Paste text to convert"></textarea>
+    </div>
+    <div class="field">
+      <label for="output">Output</label>
+      <textarea id="output" spellcheck="false" readonly></textarea>
+    </div>
+    <div class="row">
+      <span id="error" role="status"></span>
+      <span class="spacer"></span>
+      <button type="button" id="copy" disabled>Copy</button>
+      <button type="button" id="insert" class="primary" disabled>Insert into chat</button>
+    </div>
+  </body>
+</html>

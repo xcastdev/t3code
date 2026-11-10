@@ -507,6 +507,10 @@
       "types": "./src/mcpApp.ts",
       "import": "./src/mcpApp.ts"
     },
+    "./pluginManifest": {
+      "types": "./src/pluginManifest.ts",
+      "import": "./src/pluginManifest.ts"
+    },
     "./atomicWrite": {
       "types": "./src/atomicWrite.ts",
       "import": "./src/atomicWrite.ts"

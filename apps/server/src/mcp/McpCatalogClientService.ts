@@ -4,6 +4,8 @@ import {
   McpDefinitionId,
   McpServerId,
   ProjectId,
+  ProjectMcpCredentialId,
+  ProjectMcpTransport as ProjectMcpTransportSchema,
   type AuthSessionId,
   type McpCatalogCredentialInput,
   type McpCatalogSecretPrepareInput,
@@ -12,6 +14,9 @@ import {
   type McpCatalogReadInput,
   type McpCatalogSessionMutationInput,
   type McpCatalogSessionRequest,
+  type McpCatalogTestConnectionInput,
+  type McpCatalogTestCredentialInput,
+  type McpCatalogTestTransportInput,
   type McpCatalogTransportInput,
   type McpCatalogWriteInput,
   type ProjectMcpCredentialDraft,
@@ -25,6 +30,8 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import * as Option from "effect/Option";
+import * as Redacted from "effect/Redacted";
+import * as Schema from "effect/Schema";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as AuthSessions from "../persistence/AuthSessions.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
@@ -34,14 +41,28 @@ import { catalogBaselineForProject } from "./McpCatalogResolver.ts";
 import { hasCatalogTransportIdentityChange } from "./McpCatalogDefinitionIdentity.ts";
 import * as Secrets from "./ProjectMcpSecretStore.ts";
 import * as OAuth from "./ProjectMcpOAuth.ts";
+import {
+  PROJECT_MCP_HANDSHAKE_TIMEOUT_MS,
+  connectProjectMcp,
+  describeProjectMcpFailure,
+} from "./ProjectMcpConnection.ts";
+import { makeProjectMcpTransport } from "./ProjectMcpTransport.ts";
 
 const failure = () =>
   new McpCatalogOperationError({ message: "MCP catalog operation could not be completed." });
 
+const testFailure = (message: string) => new McpCatalogOperationError({ message });
+const decodeTestTransport = Schema.decodeUnknownEffect(ProjectMcpTransportSchema);
+const TEST_TOOL_PAGE_LIMIT = 20;
+const TEST_TOOL_LIMIT = 200;
+const TEST_TEXT_LIMIT = 500;
+const clip = (text: string) =>
+  text.length > TEST_TEXT_LIMIT ? `${text.slice(0, TEST_TEXT_LIMIT - 1)}…` : text;
+
 const mapTransport = Effect.fn("McpCatalogClientService.mapTransport")(function* (
-  transport: McpCatalogTransportInput | ProjectMcpTransportDraft,
+  transport: McpCatalogTransportInput | McpCatalogTestTransportInput | ProjectMcpTransportDraft,
   credential: (
-    input: McpCatalogCredentialInput | ProjectMcpCredentialDraft,
+    input: McpCatalogCredentialInput | McpCatalogTestCredentialInput | ProjectMcpCredentialDraft,
   ) => Effect.Effect<ProjectMcpCredentialDraft, McpCatalogOperationError>,
 ): Effect.fn.Return<ProjectMcpTransportDraft, McpCatalogOperationError> {
   if (transport.type === "stdio")
@@ -148,6 +169,153 @@ const make = Effect.gen(function* () {
         .pipe(Effect.mapError(failure)),
     };
   });
+  const testConnection = Effect.fn("McpCatalogClientService.testConnection")(
+    function* (input: McpCatalogTestConnectionInput, sessionId: AuthSessionId) {
+      const actor = yield* actorFor(sessionId);
+      const state = yield* catalog.readForWrite(
+        { scope: input.scope, scopeId: input.scopeId },
+        actor,
+      );
+      const existing = input.existing;
+      const previous =
+        existing === undefined
+          ? undefined
+          : state.definitions.find(
+              (item) =>
+                item.logicalServerId === existing.logicalServerId &&
+                item.definitionId === existing.definitionId,
+            );
+      if (existing !== undefined && previous === undefined)
+        return yield* testFailure("This server changed elsewhere. Reload it and test again.");
+      const owner =
+        previous === undefined
+          ? undefined
+          : Secrets.credentialOwnerIdForDefinition(previous.logicalServerId, previous.definitionId);
+      // Typed values get throwaway ids so the transport can resolve them in memory only.
+      const values = new Map<string, string>();
+      const draft = yield* mapTransport(input.transport, (credential) =>
+        Effect.gen(function* () {
+          if ("secret" in credential && credential.secret !== undefined) {
+            const id = ProjectMcpCredentialId.make(yield* crypto.randomUUIDv4().pipe(Effect.orDie));
+            values.set(id, Redacted.value(credential.secret));
+            return { name: credential.name, id };
+          }
+          const id = credential.id;
+          if (id === undefined || owner === undefined)
+            return yield* testFailure(`Enter the secret for ${credential.name} before testing.`);
+          values.set(
+            id,
+            yield* secrets
+              .resolve(owner, id)
+              .pipe(
+                Effect.mapError(() =>
+                  testFailure(
+                    `The stored secret for ${credential.name} is unavailable. Enter it again.`,
+                  ),
+                ),
+              ),
+          );
+          return { name: credential.name, id };
+        }),
+      );
+      const transport = yield* decodeTestTransport(draft).pipe(
+        Effect.mapError(() => testFailure("This connection isn't valid.")),
+      );
+      let oauthProvider: Effect.Success<ReturnType<typeof oauth.providerFor>> | undefined;
+      if (transport.type !== "stdio" && transport.authorization.type === "oauth") {
+        if (
+          previous === undefined ||
+          owner === undefined ||
+          hasCatalogTransportIdentityChange(previous.transport, draft)
+        )
+          return yield* testFailure("Save the server and connect OAuth before testing it.");
+        const binding = yield* OAuth.resolveServerBinding(
+          { id: owner, transport: previous.transport },
+          secrets.resolve,
+        ).pipe(Effect.mapError(failure));
+        if (binding === undefined) return yield* failure();
+        const status = yield* oauth.status(owner, binding).pipe(Effect.mapError(failure));
+        if (status !== "connected")
+          return yield* testFailure("Connect OAuth for this server before testing it.");
+        const lease = yield* secrets.acquireOAuthStateLease(owner).pipe(Effect.mapError(failure));
+        oauthProvider = yield* oauth
+          .providerFor(owner, binding, lease)
+          .pipe(Effect.mapError(failure));
+      }
+      const describe = (cause: unknown) =>
+        testFailure(describeProjectMcpFailure(cause, transport, values.values()));
+      const client = yield* Effect.acquireRelease(
+        Effect.tryPromise({
+          try: () =>
+            connectProjectMcp(
+              makeProjectMcpTransport({
+                serverId: owner ?? McpServerId.make("test"),
+                transport,
+                resolveSecret: (ref) => values.get(ref),
+                ...(oauthProvider ? { oauthProvider } : {}),
+              }),
+            ),
+          catch: describe,
+        }),
+        (value) =>
+          Effect.promise(() => value.close().catch(() => undefined)).pipe(
+            Effect.interruptible,
+            Effect.timeoutOption("5 seconds"),
+          ),
+      );
+      const tools: Array<{ name: string; title?: string; description?: string }> = [];
+      const seen = new Set<string>();
+      const listed = new Set<string>();
+      let omittedToolCount = 0;
+      let cursor: string | undefined;
+      for (let page = 0; page < TEST_TOOL_PAGE_LIMIT; page++) {
+        const result = yield* Effect.tryPromise({
+          try: () =>
+            client.listTools(cursor === undefined ? {} : { cursor }, {
+              timeout: PROJECT_MCP_HANDSHAKE_TIMEOUT_MS,
+            }),
+          catch: describe,
+        });
+        for (const tool of result.tools) {
+          if (seen.has(tool.name)) continue;
+          seen.add(tool.name);
+          // Clipped names key the result list, so a distinct tool that clips to a listed name is omitted.
+          const name = clip(tool.name);
+          if (tools.length === TEST_TOOL_LIMIT || listed.has(name)) omittedToolCount += 1;
+          else {
+            listed.add(name);
+            tools.push({
+              name,
+              ...(tool.title === undefined ? {} : { title: clip(tool.title) }),
+              ...(tool.description === undefined ? {} : { description: clip(tool.description) }),
+            });
+          }
+        }
+        cursor = result.nextCursor;
+        if (cursor === undefined) break;
+      }
+      const info = client.getServerVersion();
+      return {
+        ...(info === undefined
+          ? {}
+          : {
+              serverInfo: {
+                name: info.name,
+                version: info.version,
+                ...(info.title === undefined ? {} : { title: info.title }),
+              },
+            }),
+        tools,
+        ...(omittedToolCount === 0 ? {} : { omittedToolCount }),
+        ...(cursor === undefined ? {} : { truncated: true as const }),
+      };
+    },
+    Effect.scoped,
+    Effect.timeoutOrElse({
+      duration: "30 seconds",
+      orElse: () => Effect.fail(testFailure("The test didn't finish within 30 seconds.")),
+    }),
+  );
   const write = Effect.fn("McpCatalogClientService.write")(function* (
     input: McpCatalogWriteInput,
     sessionId: AuthSessionId,
@@ -416,6 +584,7 @@ const make = Effect.gen(function* () {
     sessionForThread,
     sessionSubscribeForThread,
     secretPrepare,
+    testConnection,
     sessionReset,
     oauthStatus,
     oauthBegin,

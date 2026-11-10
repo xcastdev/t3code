@@ -1,0 +1,38 @@
+{
+  "name": "@t3tools/plugin-sdk",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./ui": {
+      "types": "./src/ui.ts",
+      "default": "./src/ui.ts"
+    },
+    "./backend": {
+      "types": "./src/backend.ts",
+      "default": "./src/backend.ts"
+    },
+    "./pack": {
+      "types": "./src/pack.ts",
+      "default": "./src/pack.ts"
+    },
+    "./testing": {
+      "types": "./src/testing.ts",
+      "default": "./src/testing.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vp test run --config ../../vite.config.ts --dir ."
+  },
+  "dependencies": {
+    "@t3tools/contracts": "workspace:*",
+    "@t3tools/shared": "workspace:*",
+    "effect": "catalog:",
+    "esbuild": "0.28.2",
+    "jszip": "3.10.1"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "vite-plus": "catalog:"
+  }
+}

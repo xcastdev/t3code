@@ -1390,6 +1390,10 @@ export const ServerSettings = Schema.Struct({
   visionModelSelection: Schema.NullOr(ModelSelection).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
+  webSearchToolEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  webSearchModelSelection: Schema.NullOr(ModelSelection).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
 
   pullRequestMergeMethod: Schema.NullOr(PullRequestMergeMethod).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
@@ -1743,6 +1747,8 @@ export const ServerSettingsPatch = Schema.Struct({
   reviewGuideInstructions: Schema.optionalKey(TrimmedString),
   viewImageToolEnabled: Schema.optionalKey(Schema.Boolean),
   visionModelSelection: Schema.optionalKey(Schema.NullOr(ModelSelection)),
+  webSearchToolEnabled: Schema.optionalKey(Schema.Boolean),
+  webSearchModelSelection: Schema.optionalKey(Schema.NullOr(ModelSelection)),
   pullRequestMergeMethod: Schema.optionalKey(Schema.NullOr(PullRequestMergeMethod)),
   observability: Schema.optionalKey(
     Schema.Struct({

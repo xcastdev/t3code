@@ -120,6 +120,73 @@ describe("assistant contracts", () => {
     ).toThrow();
   });
 
+  it("decodes a stored assistant configuration without plugins", () => {
+    const stored = decodeAssistantCreateInput({
+      environmentId: "environment-1",
+      commandId: "command-1",
+      configuration,
+    });
+    expect(stored.configuration.resources).not.toHaveProperty("plugins");
+    const selected = decodeAssistantCreateInput({
+      environmentId: "environment-1",
+      commandId: "command-1",
+      configuration: {
+        ...configuration,
+        resources: {
+          ...configuration.resources,
+          plugins: [{ pluginId: "echo", operations: ["ping"] }],
+        },
+      },
+    });
+    expect(selected.configuration.resources.plugins).toEqual([
+      { pluginId: "echo", operations: ["ping"] },
+    ]);
+  });
+
+  it("caps written tool selections at the run snapshot's tool limit but still reads stored ones", () => {
+    const names = (count: number, prefix: string) =>
+      Array.from({ length: count }, (_, index) => `${prefix}${index}`);
+    const withTools = (mcp: number, plugin: number) => ({
+      ...configuration,
+      resources: {
+        ...configuration.resources,
+        mcpTools: [{ definitionId: "github", toolNames: names(mcp, "tool") }],
+        plugins: [{ pluginId: "echo", operations: names(plugin, "op") }],
+      },
+    });
+    const create = (value: unknown) =>
+      decodeAssistantCreateInput({
+        environmentId: "environment-1",
+        commandId: "command-1",
+        configuration: value,
+      });
+    expect(create(withTools(32, 32)).configuration.resources.plugins?.[0]?.operations).toHaveLength(
+      32,
+    );
+    expect(() => create(withTools(32, 33))).toThrow("at most 64 tools; this selects 65");
+    expect(() =>
+      decodeAssistantUpdateConfigurationInput({
+        environmentId: "environment-1",
+        assistantId: "assistant-1",
+        commandId: "command-2",
+        expectedRevision: 3,
+        configuration: withTools(65, 0),
+      }),
+    ).toThrow("at most 64 tools");
+    const stored = decodeAssistantDetail({
+      summary,
+      configuration: {
+        environmentId: "environment-1",
+        assistantId: "assistant-1",
+        revision: 3,
+        configuration: withTools(40, 40),
+        createdAt: summary.createdAt,
+      },
+      provisioning: { state: "ready", binding },
+    });
+    expect(stored.configuration.configuration.resources.mcpTools[0]?.toolNames).toHaveLength(40);
+  });
+
   it("retains identity across unknown read states but rejects malformed known provisioning", () => {
     const decode = decodeAssistantDetail;
     const detail = {

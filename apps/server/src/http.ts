@@ -5,7 +5,11 @@ import {
   EnvironmentHttpApi,
 } from "@t3tools/contracts";
 import { isDevProxiedPath } from "@t3tools/shared/devProxy";
-import { injectMcpAppCookieBootstrap, injectMcpAppThemeBootstrap } from "@t3tools/shared/mcpApp";
+import {
+  injectMcpAppCookieBootstrap,
+  injectMcpAppCsp,
+  injectMcpAppThemeBootstrap,
+} from "@t3tools/shared/mcpApp";
 import { decodeOtlpTraceRecords } from "@t3tools/shared/observability";
 import * as ByteSize from "effect/ByteSize";
 import * as Data from "effect/Data";
@@ -165,7 +169,7 @@ export const assetFileResponse = Effect.fn("assetFileResponse")(function* (
     readonly fileName?: string;
     readonly mimeType?: string;
     readonly file?: OpenMediaFile;
-    readonly renderIntent?: "mcp-app";
+    readonly renderIntent?: "mcp-app" | "plugin-panel";
   },
   rangeHeader?: string,
   ifRangeHeader?: string,
@@ -173,16 +177,23 @@ export const assetFileResponse = Effect.fn("assetFileResponse")(function* (
 ) {
   const headers = assetResponseHeaders(asset.path, asset);
   if (
-    asset.renderIntent === "mcp-app" &&
+    asset.renderIntent !== undefined &&
     !asset.download &&
     headers["Content-Type"] === "text/html; charset=utf-8"
   ) {
     const bytes = yield* readMcpAppHtml(asset.path);
     if (bytes === null) {
-      return HttpServerResponse.text("MCP app is too large to preview.", { status: 413 });
+      return HttpServerResponse.text(
+        asset.renderIntent === "plugin-panel"
+          ? "Plugin panel is too large to preview."
+          : "MCP app is too large to preview.",
+        { status: 413 },
+      );
     }
+    const html = new TextDecoder().decode(bytes);
     const body = pipe(
-      new TextDecoder().decode(bytes),
+      // Panels reach the host only through the bridge, so they get the no-origins MCP app CSP.
+      asset.renderIntent === "plugin-panel" ? injectMcpAppCsp(html, undefined) : html,
       injectMcpAppThemeBootstrap,
       injectMcpAppCookieBootstrap,
       (html) => new TextEncoder().encode(html),

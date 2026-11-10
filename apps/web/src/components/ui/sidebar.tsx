@@ -303,15 +303,13 @@ function Sidebar({
         <Sheet onOpenChange={setOpenMobile} open={openMobile}>
           <SheetPopup
             ref={setMobileSheetElement}
-            className={cn(
-              "w-(--sidebar-width) max-w-none bg-sidebar surface-grain p-0 text-sidebar-foreground",
-              className,
-            )}
+            className={cn("w-(--sidebar-width) max-w-none p-0", className)}
             data-mobile="true"
             data-sidebar="sidebar"
             data-slot="sidebar"
             showCloseButton={false}
             side={side}
+            variant="sidebar"
             style={
               {
                 "--sidebar-width": SIDEBAR_WIDTH_MOBILE,

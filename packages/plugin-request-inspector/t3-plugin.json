@@ -1,0 +1,1315 @@
+{
+  "manifestVersion": 1,
+  "id": "request-inspector",
+  "name": "Request Inspector",
+  "version": "0.2.13",
+  "hostApi": "1.1",
+  "author": "T3 Tools",
+  "description": "Runs local mitmproxy proxies, records the HTTP traffic you route through them, and lets you search, export, decode, and replay it.",
+  "ui": {
+    "panels": [
+      {
+        "id": "inspector",
+        "title": "Request Inspector",
+        "entry": "ui/inspector.html",
+        "icon": "network"
+      }
+    ],
+    "commands": [
+      {
+        "id": "open",
+        "title": "Open Request Inspector",
+        "opens": {
+          "panel": "inspector"
+        }
+      }
+    ]
+  },
+  "backend": {
+    "entry": "backend/index.cjs",
+    "operations": [
+      {
+        "name": "list_proxies",
+        "title": "List proxies",
+        "description": "Lists every proxy with its state (stopped, starting, running, failed), listen address, mode, host lists, open recording, and links. callerLink says how this thread reaches a proxy: thread, project, parentThread, or rootThread. A thread or project can link several proxies. defaultProxyId is the proxy that calls without proxyId use: this thread's most recently linked proxy, else this project's, or null when nothing is linked to either. A subagent with no link of its own should pass the proxyId of the proxy marked parentThread instead of creating or linking one. Call this first when you are unsure which proxy to use.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "create_proxy",
+        "title": "Create proxy",
+        "description": "Creates a stopped proxy. link defaults to this thread when there is one, else this project; pass \"none\" to link nothing. Linking adds to the proxies already linked there and makes the new proxy the default. options: listenPort \"auto\" (the default) picks a free port; mode regular is a normal HTTP(S) proxy, socks5 listens as SOCKS5, upstream forwards to another HTTP(S) proxy (optional auth, never returned). passthroughHosts are tunnelled without TLS interception and recorded only as host, SNI, and byte counts; ignoredHosts are forwarded and not recorded. Patterns are example.com, *.example.com, optionally with :port. Call start_proxy next.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "options": {
+              "type": "object",
+              "properties": {
+                "listenHost": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 255
+                },
+                "listenPort": {
+                  "oneOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 65535
+                    },
+                    {
+                      "type": "string",
+                      "enum": ["auto"]
+                    }
+                  ]
+                },
+                "mode": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "type": "string",
+                          "enum": ["regular", "socks5"]
+                        }
+                      },
+                      "additionalProperties": false,
+                      "required": ["kind"]
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "type": "string",
+                          "enum": ["upstream"]
+                        },
+                        "url": {
+                          "type": "string",
+                          "maxLength": 300
+                        },
+                        "auth": {
+                          "oneOf": [
+                            {
+                              "type": "null"
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "username": {
+                                  "type": "string",
+                                  "minLength": 1,
+                                  "maxLength": 256
+                                },
+                                "password": {
+                                  "type": "string",
+                                  "maxLength": 256
+                                }
+                              },
+                              "additionalProperties": false,
+                              "required": ["username", "password"]
+                            }
+                          ]
+                        }
+                      },
+                      "additionalProperties": false,
+                      "required": ["kind", "url"]
+                    }
+                  ]
+                },
+                "passthroughHosts": {
+                  "type": "array",
+                  "maxItems": 256,
+                  "items": {
+                    "type": "string",
+                    "maxLength": 255
+                  }
+                },
+                "ignoredHosts": {
+                  "type": "array",
+                  "maxItems": 256,
+                  "items": {
+                    "type": "string",
+                    "maxLength": 255
+                  }
+                }
+              },
+              "additionalProperties": false
+            },
+            "link": {
+              "type": "string",
+              "enum": ["thread", "project", "none"]
+            }
+          },
+          "additionalProperties": false
+        },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "update_proxy",
+        "title": "Update proxy",
+        "description": "Changes a proxy's name or options. Only the fields you pass change; mode replaces the whole mode. Stored upstream credentials are kept when mode keeps the same upstream url and omits auth; mode.auth null, a different url without auth, or a mode other than upstream clears them. passthroughHosts and ignoredHosts apply to the next connection of a running proxy. Listen host, port, mode, and upstream apply on the next start: restartRequired is true until then. restart: true restarts a running proxy now and keeps its open recording.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "proxyId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "options": {
+              "type": "object",
+              "properties": {
+                "listenHost": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 255
+                },
+                "listenPort": {
+                  "oneOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 65535
+                    },
+                    {
+                      "type": "string",
+                      "enum": ["auto"]
+                    }
+                  ]
+                },
+                "mode": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "type": "string",
+                          "enum": ["regular", "socks5"]
+                        }
+                      },
+                      "additionalProperties": false,
+                      "required": ["kind"]
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "type": "string",
+                          "enum": ["upstream"]
+                        },
+                        "url": {
+                          "type": "string",
+                          "maxLength": 300
+                        },
+                        "auth": {
+                          "oneOf": [
+                            {
+                              "type": "null"
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "username": {
+                                  "type": "string",
+                                  "minLength": 1,
+                                  "maxLength": 256
+                                },
+                                "password": {
+                                  "type": "string",
+                                  "maxLength": 256
+                                }
+                              },
+                              "additionalProperties": false,
+                              "required": ["username", "password"]
+                            }
+                          ]
+                        }
+                      },
+                      "additionalProperties": false,
+                      "required": ["kind", "url"]
+                    }
+                  ]
+                },
+                "passthroughHosts": {
+                  "type": "array",
+                  "maxItems": 256,
+                  "items": {
+                    "type": "string",
+                    "maxLength": 255
+                  }
+                },
+                "ignoredHosts": {
+                  "type": "array",
+                  "maxItems": 256,
+                  "items": {
+                    "type": "string",
+                    "maxLength": 255
+                  }
+                }
+              },
+              "additionalProperties": false
+            },
+            "restart": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false,
+          "required": ["proxyId"]
+        },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "delete_proxy",
+        "title": "Delete proxy",
+        "description": "Deletes a stopped proxy and its links. Its recordings and requests are kept. Ask the user before deleting a proxy you did not create.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "proxyId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            }
+          },
+          "additionalProperties": false,
+          "required": ["proxyId"]
+        },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "start_proxy",
+        "title": "Start proxy",
+        "description": "Starts a proxy's mitmdump and returns its listen address, proxyUrl, and env (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY) to set on the client whose traffic you want; only traffic sent through it is seen. Starting a running proxy returns its address. A running proxy forwards traffic but stores nothing until start_recording. For HTTPS the client must trust the inspector's CA: see certificate_info. Omit proxyId to use the default proxy (this thread's most recently linked one, else this project's); pass it to use any other proxy (list_proxies shows the ids). At most 8 proxies run at once.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "proxyId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32,
+              "description": "Omit to use the default proxy: this thread's most recently linked one, else this project's."
+            }
+          },
+          "additionalProperties": false
+        },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "stop_proxy",
+        "title": "Stop proxy",
+        "description": "Stops a proxy's mitmdump and ends its open recording; recorded requests are kept. Replays in progress through it end as unknown, because the upstream may already have received them. Omit proxyId to use the default proxy (this thread's most recently linked one, else this project's); pass it to use any other proxy (list_proxies shows the ids).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "proxyId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32,
+              "description": "Omit to use the default proxy: this thread's most recently linked one, else this project's."
+            }
+          },
+          "additionalProperties": false
+        },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "link_proxy",
+        "title": "Link proxy",
+        "description": "Links a proxy to a thread or project so calls from there without proxyId use it. target \"thread\" or \"project\" means this call's own thread or project; { threadId } or { projectId } links another one, for example a subagent's thread. A target can link several proxies; its most recently linked one is the default, so linking an already linked proxy again makes it the default. You do not need a link to use a proxy: passing proxyId always works.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "proxyId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "target": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "enum": ["thread", "project"]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "threadId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": ["threadId"]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "projectId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": ["projectId"]
+                }
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": ["proxyId", "target"]
+        },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "unlink_proxy",
+        "title": "Unlink proxy",
+        "description": "Removes a thread's or project's link to proxyId, or all of its links when proxyId is omitted (\"thread\" and \"project\" mean this call's own). Returns proxyIds, the proxies that were unlinked; empty when nothing was linked. The most recent remaining link becomes the default.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "proxyId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32,
+              "description": "Omit to remove every link of the target."
+            },
+            "target": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "enum": ["thread", "project"]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "threadId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": ["threadId"]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "projectId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": ["projectId"]
+                }
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": ["target"]
+        },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "start_recording",
+        "title": "Start recording",
+        "description": "Starts storing the traffic of a running proxy in a new recording. The proxy must be running: call start_proxy first. Refused if it is already recording. Returns recordingId. Omit proxyId to use the default proxy (this thread's most recently linked one, else this project's); pass it to use any other proxy (list_proxies shows the ids).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "proxyId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32,
+              "description": "Omit to use the default proxy: this thread's most recently linked one, else this project's."
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 128
+            }
+          },
+          "additionalProperties": false
+        },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "stop_recording",
+        "title": "Stop recording",
+        "description": "Ends a proxy's open recording; the proxy keeps forwarding. Returns the recordingId, or null when nothing was recording. Omit proxyId to use the default proxy (this thread's most recently linked one, else this project's); pass it to use any other proxy (list_proxies shows the ids).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "proxyId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32,
+              "description": "Omit to use the default proxy: this thread's most recently linked one, else this project's."
+            }
+          },
+          "additionalProperties": false
+        },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "list_recordings",
+        "title": "List recordings",
+        "description": "Lists a proxy's recordings, newest first, with request counts. allProxies: true lists every proxy's. Omit proxyId to use the default proxy (this thread's most recently linked one, else this project's); pass it to use any other proxy (list_proxies shows the ids).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "proxyId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32,
+              "description": "Omit to use the default proxy: this thread's most recently linked one, else this project's."
+            },
+            "allProxies": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "delete_recording",
+        "title": "Delete recording",
+        "description": "Deletes a stopped recording and every request in it; this cannot be undone. Ask the user first.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "recordingId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            }
+          },
+          "additionalProperties": false,
+          "required": ["recordingId"]
+        },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "search_requests",
+        "title": "Search requests",
+        "description": "Searches recorded requests, newest first, and returns short summaries (method, host, path, status, sizes) without headers or bodies. query matches text in the host or path. Results are scoped to one proxy: omit proxyId to use the default proxy (this thread's most recently linked one, else this project's); pass it to use any other proxy (list_proxies shows the ids). recordingId or allProxies: true searches without that scope. flowType tunnel lists pass-through tunnels (host, SNI, byte counts). Pass the returned cursor to get the next, older page; cursor is null when there are no more. Use get_request for one request's details.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "maxLength": 512
+            },
+            "method": {
+              "type": "string",
+              "maxLength": 32
+            },
+            "host": {
+              "type": "string",
+              "maxLength": 255
+            },
+            "status": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 999
+            },
+            "proxyId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32,
+              "description": "Omit to use the default proxy: this thread's most recently linked one, else this project's."
+            },
+            "recordingId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "allProxies": {
+              "type": "boolean",
+              "default": false
+            },
+            "flowType": {
+              "type": "string",
+              "enum": ["http", "websocket", "tunnel", "other"]
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            },
+            "cursor": {
+              "type": "string",
+              "maxLength": 1024
+            }
+          },
+          "additionalProperties": false
+        },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "get_request",
+        "title": "Get request",
+        "description": "Returns one recorded request and its response: ordered headers (long values are cut and flagged headersTruncated) and per-body metadata. Bodies are omitted unless bodies names a side; then a decoded preview of at most previewBytes is included. Use read_body to page through a larger body. Tunnel rows have sni, clientAddr, endedAt, bytesUp, and bytesDown instead of bodies. Credential header values (Authorization, Proxy-Authorization, X-Api-Key, X-Auth-Token, and similar) read [redacted], and Cookie and Set-Cookie keep cookie names with [redacted] values, unless includeSensitiveHeaders is true; ask for them only when the user needs them.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "requestId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "previewBytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 32768,
+              "default": 8192
+            },
+            "bodies": {
+              "type": "string",
+              "enum": ["none", "request", "response", "both"],
+              "default": "none"
+            },
+            "includeSensitiveHeaders": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": ["requestId"],
+          "additionalProperties": false
+        },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "read_body",
+        "title": "Read body",
+        "description": "Reads one chunk of a recorded request or response body as base64, at most 131072 bytes per call. Call again with offset + length until eof is true. decoded: false returns the raw stored bytes, still content-encoded; decoded: true returns the body after gzip, deflate or br decoding. truncatedAtCapture means the inspector kept only the start of the body.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "requestId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "side": {
+              "type": "string",
+              "enum": ["request", "response"]
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "length": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 131072
+            },
+            "decoded": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": ["requestId", "side", "offset", "length"],
+          "additionalProperties": false
+        },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "export_requests",
+        "title": "Export requests",
+        "description": "Exports requests as HAR, cURL commands, raw HTTP, JSON (the only format that includes pass-through tunnels), fetch, or Python requests snippets. Pass requestIds, or a filter (scoped like search_requests). A filter exports at most the newest 500 matches; when more match, the result has truncated: true and matched, the total. An export of at most 64 KiB whose result fits one response is returned inline unless output is \"file\". Larger ones, and output \"file\", are written to the inspector's exports folder (file.path, the newest 64 are kept), because the inspector may write only there; copy the file elsewhere yourself if the user wants it. Credential header values (Authorization, Proxy-Authorization, X-Api-Key, X-Auth-Token, and similar) read [redacted], and Cookie and Set-Cookie keep cookie names with [redacted] values, unless includeSensitiveHeaders is true; ask for them only when the user needs them.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "requestIds": {
+              "type": "array",
+              "maxItems": 500,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32
+              }
+            },
+            "filter": {
+              "type": "object",
+              "properties": {
+                "proxyId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32,
+                  "description": "Omit to use the default proxy: this thread's most recently linked one, else this project's."
+                },
+                "recordingId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32
+                },
+                "allProxies": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "query": {
+                  "type": "string",
+                  "maxLength": 512
+                },
+                "method": {
+                  "type": "string",
+                  "maxLength": 32
+                },
+                "host": {
+                  "type": "string",
+                  "maxLength": 255
+                },
+                "status": {
+                  "type": "integer",
+                  "minimum": 100,
+                  "maximum": 999
+                }
+              },
+              "additionalProperties": false
+            },
+            "format": {
+              "type": "string",
+              "enum": ["har", "curl", "raw", "json", "fetch", "python"]
+            },
+            "includeBodies": {
+              "type": "boolean",
+              "default": true
+            },
+            "output": {
+              "type": "string",
+              "enum": ["auto", "inline", "file"],
+              "default": "auto"
+            },
+            "includeSensitiveHeaders": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false,
+          "required": ["format"]
+        },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "read_export",
+        "title": "Read export",
+        "description": "Reads one chunk of an export file as base64, at most 131072 bytes per call.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "exportId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "length": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 131072
+            }
+          },
+          "additionalProperties": false,
+          "required": ["exportId", "offset", "length"]
+        },
+        "mutates": false,
+        "agent": false
+      },
+      {
+        "name": "format_headers",
+        "title": "Format headers",
+        "description": "Formats one side's headers or cookies of a recorded request as raw lines, JSON, cURL -H flags, a Cookie header, a Netscape cookie jar, a JavaScript Headers object, or a Python dict. names keeps only those headers; cookies false drops cookie headers, a list keeps only those cookie names. Credential header values (Authorization, Proxy-Authorization, X-Api-Key, X-Auth-Token, and similar) read [redacted], and Cookie and Set-Cookie keep cookie names with [redacted] values, unless includeSensitiveHeaders is true; ask for them only when the user needs them.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "requestId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "side": {
+              "type": "string",
+              "enum": ["request", "response"]
+            },
+            "names": {
+              "type": "array",
+              "maxItems": 256,
+              "items": {
+                "type": "string",
+                "maxLength": 256
+              }
+            },
+            "cookies": {
+              "oneOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "array",
+                  "maxItems": 256,
+                  "items": {
+                    "type": "string",
+                    "maxLength": 256
+                  }
+                }
+              ]
+            },
+            "format": {
+              "type": "string",
+              "enum": ["raw", "json", "curl", "cookie-header", "netscape", "js", "python"]
+            },
+            "includeSensitiveHeaders": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false,
+          "required": ["requestId", "side", "format"]
+        },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "decode_value",
+        "title": "Decode value",
+        "description": "Runs a chain of up to 16 decode or encode steps over text, base64 bytes, or a recorded header or body ({ requestId, side, header? }; a body has its content-encoding removed first). Returns every step's output. Steps: base64, base64url, url, hex, html, unicode, gzip, deflate, brotli (direction decode or encode), jwt and json (decode), hash (algorithm md5, sha1, sha256, sha512), aes (mode cbc, gcm with tag, or ctr; key, iv, encoding hex, base64, or utf8), xor (key, encoding). A failing step reports its error and stops the chain; earlier steps are kept. Input is at most 1 MiB. A credential header source (Authorization, Cookie, X-Api-Key, and similar) is refused unless includeSensitiveHeaders is true; ask for them only when the user needs them.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "source": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "text": {
+                      "type": "string",
+                      "maxLength": 200000
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": ["text"]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "base64": {
+                      "type": "string",
+                      "maxLength": 200000
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": ["base64"]
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "requestId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 32
+                    },
+                    "side": {
+                      "type": "string",
+                      "enum": ["request", "response"]
+                    },
+                    "header": {
+                      "type": "string",
+                      "maxLength": 256
+                    }
+                  },
+                  "additionalProperties": false,
+                  "required": ["requestId", "side"]
+                }
+              ]
+            },
+            "steps": {
+              "type": "array",
+              "maxItems": 16,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "op": {
+                    "type": "string",
+                    "enum": [
+                      "base64",
+                      "base64url",
+                      "url",
+                      "hex",
+                      "html",
+                      "unicode",
+                      "gzip",
+                      "deflate",
+                      "brotli",
+                      "jwt",
+                      "json",
+                      "hash",
+                      "aes",
+                      "xor"
+                    ]
+                  },
+                  "direction": {
+                    "type": "string",
+                    "enum": ["decode", "encode"]
+                  },
+                  "algorithm": {
+                    "type": "string",
+                    "enum": ["md5", "sha1", "sha256", "sha512"]
+                  },
+                  "aes": {
+                    "type": "object",
+                    "properties": {
+                      "mode": {
+                        "type": "string",
+                        "enum": ["cbc", "gcm", "ctr"]
+                      },
+                      "key": {
+                        "type": "string",
+                        "maxLength": 1024
+                      },
+                      "iv": {
+                        "type": "string",
+                        "maxLength": 1024
+                      },
+                      "tag": {
+                        "type": "string",
+                        "maxLength": 1024
+                      },
+                      "encoding": {
+                        "type": "string",
+                        "enum": ["hex", "base64", "utf8"]
+                      }
+                    },
+                    "additionalProperties": false,
+                    "required": ["mode", "key", "iv", "encoding"]
+                  },
+                  "xor": {
+                    "type": "object",
+                    "properties": {
+                      "key": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1024
+                      },
+                      "encoding": {
+                        "type": "string",
+                        "enum": ["hex", "base64", "utf8"]
+                      }
+                    },
+                    "additionalProperties": false,
+                    "required": ["key", "encoding"]
+                  }
+                },
+                "required": ["op"],
+                "additionalProperties": false
+              }
+            },
+            "includeSensitiveHeaders": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "additionalProperties": false,
+          "required": ["source", "steps"]
+        },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "certificate_info",
+        "title": "Certificate info",
+        "description": "Describes the inspector's CA certificate, which every proxy uses to intercept HTTPS: the cert file paths (never the private key), a bundle of system CAs plus this CA, env vars that make common clients trust it (NODE_EXTRA_CA_CERTS, SSL_CERT_FILE, REQUESTS_CA_BUNDLE, and more, plus the proxy URL when the proxy runs), and browser NSS databases with whether each trusts it. systemTrust lists the commands that add the CA to this machine's system trust store; they need sudo, so give them to the user to run and never run them yourself. Creates the CA on first use. Paths are on the machine running T3 Code.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "proxyId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32,
+              "description": "Omit to use the default proxy: this thread's most recently linked one, else this project's."
+            }
+          },
+          "additionalProperties": false
+        },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "install_certificate_nss",
+        "title": "Install certificate in browsers",
+        "description": "Adds the inspector's CA to the Chrome/Chromium and Firefox NSS databases of the user running T3 Code (Linux only, needs certutil), so those browsers trust intercepted HTTPS. Ask the user before installing. Returns one result per database. uninstall_certificate_nss removes it again.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "dbs": {
+              "type": "array",
+              "maxItems": 64,
+              "items": {
+                "type": "string",
+                "maxLength": 4096
+              },
+              "description": "Paths from certificate_info nss.dbs. Omit for every discovered database."
+            }
+          },
+          "additionalProperties": false
+        },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "uninstall_certificate_nss",
+        "title": "Remove certificate from browsers",
+        "description": "Removes the inspector's CA from the Chrome/Chromium and Firefox NSS databases that install_certificate_nss added it to (Linux only, needs certutil). Returns one result per database.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "dbs": {
+              "type": "array",
+              "maxItems": 64,
+              "items": {
+                "type": "string",
+                "maxLength": 4096
+              },
+              "description": "Paths from certificate_info nss.dbs. Omit for every discovered database."
+            }
+          },
+          "additionalProperties": false
+        },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "preview_replay",
+        "title": "Preview replay",
+        "description": "Shows where a replay of a recorded request would go (scheme, host, port, method, path, body size) and whether it would be refused, without sending anything. Takes the same input as replay_request without idempotencyKey. Each call returns a fresh idempotencyKey. A key is for one replay only: pass it to replay_request, and if you retry that replay, pass the same key unchanged. When the replay goes to a different scheme, host, or port than the recorded request, recorded credential headers (Authorization, Cookie, X-Api-Key, and similar) are left out, unless includeSensitiveHeaders is true; pass it only when the user wants those credentials sent to the new destination. withheldHeaders lists the headers that would be left out.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "requestId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "edits": {
+              "$ref": "#/$defs/edits"
+            },
+            "includeSensitiveHeaders": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": ["requestId"],
+          "additionalProperties": false,
+          "$defs": {
+            "edits": {
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32
+                },
+                "url": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 8192
+                },
+                "headers": {
+                  "type": "array",
+                  "description": "Replaces the whole header list. A credential header whose value is still [redacted], or a cookie whose value is [redacted], is sent with the recorded value while the replay keeps the recorded scheme, host, and port, so you can edit other headers without asking for credentials.",
+                  "maxItems": 256,
+                  "items": {
+                    "type": "array",
+                    "prefixItems": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "string"
+                      }
+                    ],
+                    "minItems": 2,
+                    "maxItems": 2
+                  }
+                },
+                "body": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "inline"
+                        },
+                        "base64": {
+                          "type": "string",
+                          "maxLength": 174764
+                        }
+                      },
+                      "required": ["kind", "base64"],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "draft"
+                        },
+                        "draftId": {
+                          "type": "string",
+                          "maxLength": 64
+                        }
+                      },
+                      "required": ["kind", "draftId"],
+                      "additionalProperties": false
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "replay_request",
+        "title": "Replay request",
+        "description": "Sends a recorded request again, as stored or with edits, through mitmproxy. Call preview_replay first and pass its idempotencyKey; get a new key from preview_replay for each distinct replay. Returns replayId and state as soon as the replay is accepted, usually pending; then call get_replay with waitMs for the outcome. After a timed-out or unclear result, retry with the exact same key or call get_replay, never a new key. A key protects only exact retries: a request with a new key is a new replay. If a retry is refused as expired or not issued, tell the user the earlier replay may have been sent and ask before requesting a new key. Only failed with dispatched false means the request was definitely not sent; unknown, or failed with dispatched true, means it may have been. The replay leaves through the source request's proxy when it runs, else through that proxy's upstream. Recorded credential headers go to a different scheme, host, or port only with includeSensitiveHeaders true; see preview_replay.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "requestId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "idempotencyKey": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 96
+            },
+            "edits": {
+              "$ref": "#/$defs/edits"
+            },
+            "includeSensitiveHeaders": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": ["requestId", "idempotencyKey"],
+          "additionalProperties": false,
+          "$defs": {
+            "edits": {
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32
+                },
+                "url": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 8192
+                },
+                "headers": {
+                  "type": "array",
+                  "description": "Replaces the whole header list. A credential header whose value is still [redacted], or a cookie whose value is [redacted], is sent with the recorded value while the replay keeps the recorded scheme, host, and port, so you can edit other headers without asking for credentials.",
+                  "maxItems": 256,
+                  "items": {
+                    "type": "array",
+                    "prefixItems": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "string"
+                      }
+                    ],
+                    "minItems": 2,
+                    "maxItems": 2
+                  }
+                },
+                "body": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "inline"
+                        },
+                        "base64": {
+                          "type": "string",
+                          "maxLength": 174764
+                        }
+                      },
+                      "required": ["kind", "base64"],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "const": "draft"
+                        },
+                        "draftId": {
+                          "type": "string",
+                          "maxLength": 64
+                        }
+                      },
+                      "required": ["kind", "draftId"],
+                      "additionalProperties": false
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "get_replay",
+        "title": "Get replay",
+        "description": "Returns a replay's state: pending, completed, failed or unknown, whether it was dispatched, a detail, and resultRequestId for the stored response. With waitMs, waits up to that long for the replay to leave pending, so you need no polling loop. unknown, or failed with dispatched true, means the upstream may have received the request. not-found means the replay settled long ago and is no longer kept.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "replayId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "waitMs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 20000,
+              "default": 0
+            }
+          },
+          "required": ["replayId"],
+          "additionalProperties": false
+        },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "body_draft_write",
+        "title": "Write body draft",
+        "description": "Writes one chunk of an edited replay body into a draft. Omit draftId to start a new draft.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "draftId": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "base64": {
+              "type": "string",
+              "maxLength": 174764
+            }
+          },
+          "required": ["offset", "base64"],
+          "additionalProperties": false
+        },
+        "mutates": true,
+        "agent": false
+      }
+    ],
+    "topics": [
+      {
+        "name": "proxies"
+      },
+      {
+        "name": "requests"
+      }
+    ],
+    "resources": [],
+    "prerequisites": [
+      {
+        "executable": "mitmdump",
+        "hint": "Install mitmproxy (https://mitmproxy.org) and make mitmdump available on PATH."
+      }
+    ]
+  },
+  "settings": {
+    "client": [],
+    "environment": [
+      {
+        "key": "listenHost",
+        "label": "Default listen host for new proxies",
+        "type": "string",
+        "default": "127.0.0.1"
+      },
+      {
+        "key": "listenPort",
+        "label": "Default listen port for new proxies (auto ports start here)",
+        "type": "number",
+        "default": 8080
+      },
+      {
+        "key": "maxBodyBytes",
+        "label": "Bytes kept per body (0 to 16 MiB)",
+        "type": "number",
+        "default": 1048576
+      },
+      {
+        "key": "maxDiskBytes",
+        "label": "Storage budget in bytes (at least 64 MiB)",
+        "type": "number",
+        "default": 536870912
+      },
+      {
+        "key": "maxRequestsPerCapture",
+        "label": "Requests kept per recording",
+        "type": "number",
+        "default": 50000
+      }
+    ]
+  },
+  "capabilities": ["chat.attach", "chat.reference", "file.save", "clipboard.write"]
+}

@@ -1019,6 +1019,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             input: tool.input,
             output: result?.output,
             completedMetadata: status === "completed" ? result?.metadata : undefined,
+            t3McpServer: rootOf(state).mcp?.name,
           },
         ),
       });

@@ -49,6 +49,13 @@ const CLAUDE_INVESTIGATION_ALLOWED = [
 // Denies override allows; block git --output/-o because allowed trailing args can otherwise write anywhere.
 const CLAUDE_INVESTIGATION_DENIED = ["Bash(git * --output*)", "Bash(git * -o *)"].join(",");
 
+const CLAUDE_WEB_SEARCH_TOOLS = "WebSearch,WebFetch";
+// Fetched pages may carry instructions; keep every CLAUDE.md, the user's included, out of the run.
+const CLAUDE_WEB_SEARCH_ENV = {
+  CLAUDE_CODE_DISABLE_CLAUDE_MDS: "1",
+  CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
+};
+
 const NO_SESSION_PERSISTENCE = "--no-session-persistence";
 // Claude Code before 2.0.63 exits with this on stderr; those runs retry without the flag.
 const NO_SESSION_PERSISTENCE_REJECTED = `error: unknown option '${NO_SESSION_PERSISTENCE}'`;
@@ -130,6 +137,7 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
     prompt,
     outputSchema: outputSchemaJson,
     modelSelection,
+    webSearch,
     investigate,
   }: TextGenerationOperations.Request<S>): Effect.fn.Return<
     S["Type"],
@@ -199,6 +207,9 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
               )
           : cwd;
       const managedMcpConfig = yield* hasClaudeManagedMcpConfig();
+      const env = webSearch
+        ? { ...claudeEnvironment, ...CLAUDE_WEB_SEARCH_ENV }
+        : claudeEnvironment;
       const spawnCommand = yield* resolveSpawnCommand(
         claudeSettings.binaryPath || "claude",
         [
@@ -221,7 +232,17 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
                 "--disallowedTools",
                 CLAUDE_INVESTIGATION_DENIED,
               ]
-            : ["--tools", ""]),
+            : webSearch
+              ? [
+                  "--tools",
+                  CLAUDE_WEB_SEARCH_TOOLS,
+                  "--allowedTools",
+                  CLAUDE_WEB_SEARCH_TOOLS,
+                  // MCP tools bypass --tools; managed-mcp.json rules out --strict-mcp-config.
+                  "--disallowedTools",
+                  "mcp__*",
+                ]
+              : ["--tools", ""]),
           "--disable-slash-commands",
           ...(noSessionPersistence ? [NO_SESSION_PERSISTENCE] : []),
           // managed-mcp.json already isolates servers and makes Claude reject this flag.
@@ -229,10 +250,10 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
           "--permission-mode",
           "dontAsk",
         ],
-        { env: claudeEnvironment },
+        { env },
       );
       const command = ChildProcess.make(spawnCommand.command, spawnCommand.args, {
-        env: claudeEnvironment,
+        env,
         cwd: workingDirectory,
         shell: spawnCommand.shell,
         stdin: {
@@ -289,7 +310,7 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
         );
       }),
       Effect.scoped,
-      Effect.timeoutOption(investigate?.timeoutMs ?? CLAUDE_TIMEOUT_MS),
+      Effect.timeoutOption(investigate?.timeoutMs ?? webSearch?.timeoutMs ?? CLAUDE_TIMEOUT_MS),
       Effect.flatMap(
         Option.match({
           onNone: () =>
@@ -335,5 +356,7 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
     );
   });
 
-  return TextGenerationOperations.fromRunner("ClaudeTextGeneration", runClaudeJson);
+  return TextGenerationOperations.fromRunner("ClaudeTextGeneration", runClaudeJson, {
+    searchesWeb: true,
+  });
 });

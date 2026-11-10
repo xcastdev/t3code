@@ -54,4 +54,4 @@ assistant but leaves its routines disabled; enable only the routines you want to
 Recovering saved history returns context to the assistant's main conversation. Assistant history
 does not offer forks or file restoration.
 
-For MCP servers, skills, commands and snippets, see [Skills, commands and MCP servers](./agent-resources.md).
+For MCP servers, skills, commands and snippets, see [Skills, commands and MCP servers](./agent-resources.md). To let an assistant call a plugin's tools, select them under **Plugin tools** in its resource bindings; see [Plugins](./plugins.md).

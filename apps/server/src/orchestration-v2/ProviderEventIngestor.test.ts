@@ -259,6 +259,7 @@ it.effect("refreshes the failing instance snapshot after a committed usage_limit
           generateThreadTitle: () => Effect.die("unused"),
           generateReviewGuide: () => Effect.die("unused"),
           describeImage: () => Effect.die("unused"),
+          webSearch: () => Effect.die("unused"),
           extractMemoryFacts: () => Effect.die("unused"),
         },
         snapshot: {

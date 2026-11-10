@@ -9,7 +9,11 @@ import {
   deriveAvailableRevertTurnCounts,
   deriveWorkspaceMutationId,
 } from "./ChatView.logic";
-import { recallCheckoutIsRepo, rememberCheckoutIsRepo } from "./ChatView.logic";
+import {
+  nextCompactLauncherThreadKey,
+  recallCheckoutIsRepo,
+  rememberCheckoutIsRepo,
+} from "./ChatView.logic";
 import { ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
 import { deriveProviderInstanceEntries } from "../providerInstances";
 import { ensureInlineContextReferences } from "../lib/composerContextReferences";
@@ -1056,6 +1060,7 @@ describe("snapshotComposerSend", () => {
       reviewComments: [],
       threadContexts: [],
       environmentContexts: [],
+      pluginReferences: [],
     });
 
     expect(snapshot.terminalContexts).toEqual([live]);
@@ -1158,6 +1163,7 @@ describe("restorePlanFollowUpComposer", () => {
       snapshot: {
         prompt: "Tighten step 2",
         environmentContexts: [],
+        pluginReferences: [],
         terminalContexts: [],
         reviewComments: [],
         previewAnnotations: [],
@@ -1176,6 +1182,7 @@ describe("restorePlanFollowUpComposer", () => {
       writePreviewAnnotations: () => undefined,
       writeThreadContexts: () => undefined,
       writeEnvironmentContexts: () => undefined,
+      writePluginReferences: () => undefined,
       resetCursor: ({ prompt }) => {
         composer.cursor = prompt;
       },
@@ -1283,5 +1290,64 @@ describe("deriveWorkspaceMutationId", () => {
     expect(deriveWorkspaceMutationId([item("reply", "assistant_message", "completed")], null)).toBe(
       null,
     );
+  });
+});
+
+describe("nextCompactLauncherThreadKey", () => {
+  type Step = {
+    readonly threadKey: string;
+    readonly narrow?: boolean;
+    readonly panelOpen?: boolean;
+    readonly surfaceShown?: boolean;
+  };
+  const run = (start: string | null, steps: ReadonlyArray<Step>) => {
+    let current = start;
+    return steps.map((step) => {
+      current = nextCompactLauncherThreadKey({
+        current,
+        narrow: true,
+        panelOpen: true,
+        surfaceShown: false,
+        ...step,
+      });
+      return current;
+    });
+  };
+
+  it.each([
+    ["the user opens the overlay", "t1", [{ threadKey: "t1" }], ["t1"]],
+    ["a saved open panel loads on a narrow layout", null, [{ threadKey: "t1" }], [null]],
+    [
+      "the window widens and narrows again",
+      "t1",
+      [{ threadKey: "t1" }, { threadKey: "t1", narrow: false }, { threadKey: "t1" }],
+      ["t1", null, null],
+    ],
+    [
+      "a surface shows in the sheet, then its last tab closes",
+      null,
+      [{ threadKey: "t1", surfaceShown: true }, { threadKey: "t1" }],
+      ["t1", "t1"],
+    ],
+    [
+      "a maximized surface's last tab closes",
+      "t1",
+      [{ threadKey: "t1", surfaceShown: true }, { threadKey: "t1" }],
+      ["t1", "t1"],
+    ],
+    [
+      "the user switches away and back",
+      "t1",
+      [{ threadKey: "t2" }, { threadKey: "t1" }],
+      [null, null],
+    ],
+    [
+      "the panel closes",
+      "t1",
+      [{ threadKey: "t1", panelOpen: false }, { threadKey: "t1" }],
+      [null, null],
+    ],
+  ] as const)("when %s", (_name, start, steps, expected) => {
+    expect(run(start, steps)).toEqual(expected);
   });
 });
