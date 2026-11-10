@@ -59,7 +59,9 @@ function EvalArtifact(props: {
         Open {artifact.label}
       </DialogTrigger>
       <DialogPopup variant="media">
-        <DialogTitle>{artifact.label}</DialogTitle>
+        <div className="shrink-0 px-3 py-3 pr-12">
+          <DialogTitle>{artifact.label}</DialogTitle>
+        </div>
         <AttachmentFilePreview
           name={artifact.name}
           mimeType="text/plain"
