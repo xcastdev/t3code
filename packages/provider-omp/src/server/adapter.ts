@@ -948,6 +948,10 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
               catch: (cause) => protocol("OMP native host tool installation failed", cause),
             });
             if (authorized.catalogInstalled) yield* catalogs.acknowledgeCatalogEndpoint(config);
+            else
+              yield* Effect.logWarning("OMP MCP catalog unavailable; T3 tools only", {
+                cause: authorized.catalogError,
+              });
           }
           installedConfig = config;
         },

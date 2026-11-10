@@ -198,6 +198,7 @@ export interface AuthorizedMcpTools {
   readonly readOnlyT3ToolNames: ReadonlySet<string>;
   /** False when the catalog endpoint failed; T3's own tools are still available. */
   readonly catalogInstalled: boolean;
+  readonly catalogError?: unknown;
   callTool(
     name: string,
     args: Record<string, unknown>,
@@ -228,6 +229,7 @@ export async function connectAuthorizedMcpTools(
   const routes = new Map(t3.tools.map((tool) => [tool.name, t3.client]));
   if (routes.size !== t3.tools.length) throw new Error("Invalid or duplicate MCP catalog tool");
   let catalogInstalled = true;
+  let catalogError: unknown;
   if (config.catalogEndpoint && config.catalogEndpoint !== config.endpoint) {
     // Like the other providers, a failing catalog server costs only the catalog, not the session.
     try {
@@ -239,6 +241,7 @@ export async function connectAuthorizedMcpTools(
     } catch (error) {
       if (signal.aborted) throw error;
       catalogInstalled = false;
+      catalogError = error;
     }
   }
   return {
@@ -246,6 +249,7 @@ export async function connectAuthorizedMcpTools(
     t3ToolNames,
     readOnlyT3ToolNames,
     catalogInstalled,
+    ...(catalogInstalled ? {} : { catalogError }),
     callTool: async (name, args, callSignal, onProgress) => {
       const client = routes.get(name);
       if (!client) throw new Error("Tool unavailable for this authorized catalog");
