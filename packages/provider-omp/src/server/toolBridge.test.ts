@@ -58,10 +58,14 @@ it("separates native cancellation, tool errors and sanitized transport failures"
   await bridge.replace(
     [
       { name: "bad", inputSchema: {} },
-      { name: "ok", inputSchema: {} },
+      { name: "ok", description: "  ", inputSchema: {} },
     ],
     "g",
   );
+  expect(sent[0]).toMatchObject({
+    type: "set_host_tools",
+    tools: [{ description: "bad" }, { description: "ok" }],
+  });
   await bridge.handle({ type: "host_tool_call", id: "1", toolName: "ok", arguments: {} });
   expect(sent.at(-1)).toMatchObject({
     isError: true,
@@ -185,6 +189,7 @@ it("lists T3 and catalog tools together and sends each call to the server that l
   ]);
   expect([...authorized.t3ToolNames]).toEqual(["t3_thread_list", "t3_thread_send"]);
   expect([...authorized.readOnlyT3ToolNames]).toEqual(["t3_thread_list"]);
+  expect(authorized.catalogInstalled).toBe(true);
   const signal = new AbortController().signal;
   await authorized.callTool("t3_thread_list", {}, signal);
   await authorized.callTool("plugin_inspector__headers", {}, signal);
@@ -241,4 +246,27 @@ it("keeps pending calls to kept tools across a catalog swap and cancels the rest
     },
     { type: "host_tool_result", id: "a", result: { content: [{ type: "text", text: "done" }] } },
   ]);
+});
+it("keeps T3's tools when the catalog endpoint fails", async () => {
+  const { connectAuthorizedMcpTools } = await import("./toolBridge.ts");
+  const authorized = await connectAuthorizedMcpTools(
+    {
+      endpoint: "https://fixture.test/mcp",
+      catalogEndpoint: "https://fixture.test/mcp/catalog/s1",
+      authorizationHeader: "Bearer private",
+    },
+    new AbortController().signal,
+    async (url, init) => {
+      if (String(url).includes("/catalog/")) return new Response("upstream down", { status: 502 });
+      const body = JSON.parse(String(init?.body));
+      if (body.method === "notifications/initialized") return new Response(null, { status: 202 });
+      const result =
+        body.method === "initialize"
+          ? { protocolVersion: "2025-06-18" }
+          : { tools: [{ name: "t3_thread_list", inputSchema: { type: "object" } }] };
+      return Response.json({ jsonrpc: "2.0", id: body.id, result });
+    },
+  );
+  expect(authorized.tools.map((tool) => tool.name)).toEqual(["t3_thread_list"]);
+  expect(authorized.catalogInstalled).toBe(false);
 });

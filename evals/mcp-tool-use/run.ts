@@ -575,7 +575,8 @@ const visibleT3Tools = (options: {
       (options.ompSimulation === true || !terminalNames.has(tool.name)) &&
       (options.links === true || !hiddenWhileLinksOff.has(tool.name)) &&
       (options.viewImage === true || !hiddenWhileViewImageOff.has(tool.name)) &&
-      (options.webSearch === true || !hiddenWhileWebSearchOff.has(tool.name)) &&
+      ((options.webSearch === true && options.ompSimulation !== true) ||
+        !hiddenWhileWebSearchOff.has(tool.name)) &&
       !(options.subagent === true && hiddenFromSubagents.has(tool.name)),
   ),
   ...pluginTools(options.plugins ?? []),

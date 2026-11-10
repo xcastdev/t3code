@@ -75,7 +75,8 @@ export class OmpToolBridge {
       tools: [...next.values()].map((t) => ({
         name: t.name,
         label: t.name,
-        description: t.description ?? t.name,
+        // OMP rejects a blank description, which would fail the whole tool installation.
+        description: t.description?.trim() || t.name,
         parameters: t.inputSchema,
         loadMode: "discoverable",
       })),
@@ -195,6 +196,8 @@ export interface AuthorizedMcpTools {
   readonly t3ToolNames: ReadonlySet<string>;
   /** T3 tools annotated read-only; catalog servers' annotations are not trusted. */
   readonly readOnlyT3ToolNames: ReadonlySet<string>;
+  /** False when the catalog endpoint failed; T3's own tools are still available. */
+  readonly catalogInstalled: boolean;
   callTool(
     name: string,
     args: Record<string, unknown>,
@@ -208,33 +211,41 @@ export async function connectAuthorizedMcpTools(
   signal: AbortSignal,
   fetcher: typeof fetch = fetch,
 ): Promise<AuthorizedMcpTools> {
-  const endpoints = [config.endpoint];
-  if (config.catalogEndpoint && config.catalogEndpoint !== config.endpoint)
-    endpoints.push(config.catalogEndpoint);
-  const tools: CatalogTool[] = [];
-  const t3ToolNames = new Set<string>();
-  const readOnlyT3ToolNames = new Set<string>();
-  const routes = new Map<string, AuthorizedMcpClient>();
-  for (const endpoint of endpoints) {
+  const list = async (endpoint: string) => {
     const client = new AuthorizedMcpClient(
       { endpoint, authorizationHeader: config.authorizationHeader },
       fetcher,
     );
     await client.connect(signal);
-    for (const tool of await client.listTools(signal)) {
-      if (routes.has(tool.name)) throw new Error("Invalid or duplicate MCP catalog tool");
-      routes.set(tool.name, client);
-      if (endpoint === config.endpoint) {
-        t3ToolNames.add(tool.name);
-        if (tool.readOnly) readOnlyT3ToolNames.add(tool.name);
-      }
-      tools.push(tool);
+    return { client, tools: await client.listTools(signal) };
+  };
+  const t3 = await list(config.endpoint);
+  const tools = [...t3.tools];
+  const t3ToolNames = new Set(t3.tools.map((tool) => tool.name));
+  const readOnlyT3ToolNames = new Set(
+    t3.tools.filter((tool) => tool.readOnly).map((tool) => tool.name),
+  );
+  const routes = new Map(t3.tools.map((tool) => [tool.name, t3.client]));
+  if (routes.size !== t3.tools.length) throw new Error("Invalid or duplicate MCP catalog tool");
+  let catalogInstalled = true;
+  if (config.catalogEndpoint && config.catalogEndpoint !== config.endpoint) {
+    // Like the other providers, a failing catalog server costs only the catalog, not the session.
+    try {
+      const catalog = await list(config.catalogEndpoint);
+      if (catalog.tools.some((tool) => routes.has(tool.name)))
+        throw new Error("Invalid or duplicate MCP catalog tool");
+      for (const tool of catalog.tools) routes.set(tool.name, catalog.client);
+      tools.push(...catalog.tools);
+    } catch (error) {
+      if (signal.aborted) throw error;
+      catalogInstalled = false;
     }
   }
   return {
     tools,
     t3ToolNames,
     readOnlyT3ToolNames,
+    catalogInstalled,
     callTool: async (name, args, callSignal, onProgress) => {
       const client = routes.get(name);
       if (!client) throw new Error("Tool unavailable for this authorized catalog");

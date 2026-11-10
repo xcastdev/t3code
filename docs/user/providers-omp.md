@@ -42,6 +42,9 @@ The composer permission mode applies to OMP tools:
   execution tools.
 - **Full access** allows tools without T3 Code approval prompts.
 
+In every mode, T3 Code's own read-only tools, such as listing threads or checking a delegated
+task, run without a prompt.
+
 OMP has no T3 Code AI approval reviewer, so **Auto** is unavailable. These permissions govern
 native tool execution; they do not create an operating-system sandbox.
 

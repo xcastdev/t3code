@@ -947,7 +947,7 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
               try: () => bridge.replace(authorized.tools, identity, keep),
               catch: (cause) => protocol("OMP native host tool installation failed", cause),
             });
-            yield* catalogs.acknowledgeCatalogEndpoint(config);
+            if (authorized.catalogInstalled) yield* catalogs.acknowledgeCatalogEndpoint(config);
           }
           installedConfig = config;
         },
