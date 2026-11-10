@@ -845,17 +845,19 @@ describe("large text preview recovery", () => {
       const before = visibleRow().dataset.previewRow;
       const offset =
         visibleRow().getBoundingClientRect().top - viewport().getBoundingClientRect().top;
-      await screen.rerender(view(1_000_000));
-      await vi.waitFor(() => {
-        expect(visibleRow().dataset.previewRow).toBe(before);
-        expect(
-          Math.abs(
-            visibleRow().getBoundingClientRect().top -
-              viewport().getBoundingClientRect().top -
-              offset,
-          ),
-        ).toBeLessThan(Math.max(5, visibleRow().offsetHeight / 29 + 1));
-      });
+      for (const total of [1_000_000, 2_000_000, count]) {
+        await screen.rerender(view(total));
+        await vi.waitFor(() => {
+          expect(visibleRow().dataset.previewRow).toBe(before);
+          expect(
+            Math.abs(
+              visibleRow().getBoundingClientRect().top -
+                viewport().getBoundingClientRect().top -
+                offset,
+            ),
+          ).toBeLessThan(1);
+        });
+      }
     },
   );
 

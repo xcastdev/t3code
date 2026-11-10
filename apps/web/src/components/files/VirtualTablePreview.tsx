@@ -260,20 +260,22 @@ function ScaledRows(props: Omit<Parameters<typeof RowPage>[0], "page">) {
   const contentRef = useRef<HTMLDivElement>(null);
   const [layout, setLayout] = useState({ offset: 0, height: 0, rowHeight: 29 });
   const [top, setTop] = useState(0);
+  const [scrollRemainder, setScrollRemainder] = useState(0);
   const handledReveal = useRef<string | null>(null);
   const pendingReveal = useRef<{ row: number; attempts: number } | null>(null);
   const pendingEnd = useRef(false);
   const position = { top, height: props.viewportHeight };
+  const logicalScrollTop = Math.max(0, top + scrollRemainder);
   const scrollHeight = Math.min(8_000_000, props.count * 29);
   // Chromium caps a scroll surface at 33 million pixels. Scale the track for
   // multi-million-line logs while retaining real row heights in the viewport.
   const headerRows = props.header ? 1 : 0;
   const maxFirst = Math.max(0, props.count - headerRows - Math.floor(position.height / 29));
   const scale = Math.max(1, scrollHeight - position.height) / Math.max(1, maxFirst * 29);
-  const first = Math.min(maxFirst, Math.floor(position.top / scale / 29)) + headerRows;
+  const first = Math.min(maxFirst, Math.floor(logicalScrollTop / scale / 29)) + headerRows;
   // The final mounted rows keep their measured height and scroll natively.
   const nativeTail = first - headerRows === maxFirst;
-  const scrollModel = useRef({ scale, maxFirst, heights: [] as number[] });
+  const scrollModel = useRef({ scale, maxFirst, heights: [] as number[], remainder: 0 });
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Measure native tail rows and preserve the DOM scroll position when the virtual track scale changes.
   useLayoutEffect(() => {
     const previous = scrollModel.current;
@@ -282,12 +284,13 @@ function ScaledRows(props: Omit<Parameters<typeof RowPage>[0], "page">) {
           .filter((row) => Number(row.dataset.previewRow) >= first)
           .map((row) => row.offsetHeight)
       : [];
-    scrollModel.current = { scale, maxFirst, heights };
+    scrollModel.current = { scale, maxFirst, heights, remainder: scrollRemainder };
     const node = ref.current;
     if (!node || (previous.scale === scale && previous.maxFirst === maxFirst)) return;
     const previousEnd = previous.maxFirst * 29 * previous.scale;
-    let logicalTop = Math.min(previous.maxFirst * 29, node.scrollTop / previous.scale);
-    let remaining = Math.max(0, node.scrollTop - previousEnd);
+    const previousTop = node.scrollTop + previous.remainder;
+    let logicalTop = Math.min(previous.maxFirst * 29, previousTop / previous.scale);
+    let remaining = Math.max(0, previousTop - previousEnd);
     // Native-tail pixels cross rows of different heights before returning to the scaled track.
     for (const height of previous.heights) {
       logicalTop += Math.min(1, remaining / height) * 29;
@@ -301,7 +304,11 @@ function ScaledRows(props: Omit<Parameters<typeof RowPage>[0], "page">) {
       remaining = Math.max(0, remaining - 1);
       if (!remaining) break;
     }
-    node.scrollTop = Math.min(maxFirst * 29, logicalTop) * scale + nativeOffset;
+    const nextTop = Math.min(maxFirst * 29, logicalTop) * scale + nativeOffset;
+    node.scrollTop = nextTop;
+    // Browsers round scrollTop; a fraction of a track pixel can span several wrapped text pixels.
+    const remainder = nextTop - node.scrollTop;
+    setScrollRemainder(Math.abs(remainder) < 1 ? remainder : 0);
     setTop(node.scrollTop);
   });
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Scroll the DOM viewport to a requested line after its virtual track has committed.
@@ -316,12 +323,13 @@ function ScaledRows(props: Omit<Parameters<typeof RowPage>[0], "page">) {
     if (!node || !props.count || handledReveal.current === key) return;
     const row = Math.min(props.count, Math.max(1, props.revealLine)) - 1;
     node.scrollTop = Math.max(0, (row - headerRows) * 29) * scale;
+    setScrollRemainder(0);
     setTop(node.scrollTop);
     pendingEnd.current = false;
     pendingReveal.current = { row, attempts: 0 };
     handledReveal.current = key;
   }, [props.revealLine, props.revealRequestId, props.count, headerRows, scale]);
-  const atStart = position.top === 0;
+  const atStart = logicalScrollTop === 0;
   const rowHeight = () =>
     contentRef.current?.querySelector<HTMLElement>(`[data-preview-row="${first}"]`)?.offsetHeight ||
     29;
@@ -455,6 +463,7 @@ function ScaledRows(props: Omit<Parameters<typeof RowPage>[0], "page">) {
           event.preventDefault();
           pendingEnd.current = event.key === "End";
           pendingReveal.current = null;
+          setScrollRemainder(0);
           node.scrollTop = event.key === "Home" ? 0 : node.scrollHeight;
           setTop(node.scrollTop);
         }
@@ -468,13 +477,13 @@ function ScaledRows(props: Omit<Parameters<typeof RowPage>[0], "page">) {
           style={{
             top:
               maxFirst === 0
-                ? 0
+                ? -scrollRemainder
                 : nativeTail
-                  ? maxFirst * scale * 29 - layout.offset
+                  ? maxFirst * scale * 29 - layout.offset - scrollRemainder
                   : position.top +
                     (atStart
                       ? 0
-                      : -layout.offset - ((position.top / scale / 29) % 1) * layout.rowHeight),
+                      : -layout.offset - ((logicalScrollTop / scale / 29) % 1) * layout.rowHeight),
           }}
         >
           {Array.from(
