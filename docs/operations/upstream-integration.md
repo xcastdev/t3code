@@ -204,9 +204,11 @@ under a new receipt id. A rejected receipt still refuses, and only runs still qu
 be promoted.
 
 Thread details pages long server lists four at a time, as upstream does, inside the
-fork's Processes section. The tool inspector keeps output images inside the fork's
-Output pane rather than above the input. Without a known threshold, the compaction note
-no longer names the model, because upstream's shared message dropped that parameter.
+fork's Processes section. When a tool's output is only images, such as a screenshot,
+they lead the tool details on web and mobile, as upstream shows them; images that come
+with text stay beside that text in the output. Without a known threshold, the
+compaction note no longer names the model, because upstream's shared message dropped
+that parameter.
 
 Assistant chats keep their `"chat"` lineage relationship next to upstream's
 `sideChat` flag; the two are separate features. Idle-compaction modes use upstream's

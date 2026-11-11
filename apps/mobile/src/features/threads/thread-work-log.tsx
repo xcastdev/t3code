@@ -1032,6 +1032,29 @@ const ThreadWorkLogRow = function ThreadWorkLogRow(
                 ? "Output is no longer available."
                 : "Loading output…"
               : null;
+  // A screenshot-style result is only images, so it leads; images beside text follow the text.
+  const imagesLead = Boolean(ompEval) || !fetchedOutput?.trim();
+  const outputGallery = (
+    <FilePreviewGallery
+      value={outputImages.map((resource) => ({
+        kind: "image",
+        environmentId: props.environmentId,
+        resource,
+      }))}
+    >
+      {outputImages.map((resource) => (
+        <View key={resource.index} className="pb-1.5">
+          <ThreadMarkdownImage
+            environmentId={props.environmentId}
+            resource={resource}
+            alt={null}
+            resourceRevision={ompEval?.view.attachmentRevision}
+            onPressPreview={props.onPressPreview}
+          />
+        </View>
+      ))}
+    </FilePreviewGallery>
+  );
   const exitLine =
     failedExitCode === null ? null : (
       <Text className="mt-1.5 font-mono text-2xs leading-normal text-danger-foreground">
@@ -1205,25 +1228,7 @@ const ThreadWorkLogRow = function ThreadWorkLogRow(
               {props.renderImage({ href: viewedImagePath, alt: null, title: null })}
             </View>
           ) : null}
-          <FilePreviewGallery
-            value={outputImages.map((resource) => ({
-              kind: "image",
-              environmentId: props.environmentId,
-              resource,
-            }))}
-          >
-            {outputImages.map((resource) => (
-              <View key={resource.index} className="pb-1.5">
-                <ThreadMarkdownImage
-                  environmentId={props.environmentId}
-                  resource={resource}
-                  alt={null}
-                  resourceRevision={ompEval?.view.attachmentRevision}
-                  onPressPreview={props.onPressPreview}
-                />
-              </View>
-            ))}
-          </FilePreviewGallery>
+          {imagesLead ? outputGallery : null}
           {ompEval ? (
             <OmpEvalDetail
               view={ompEval.view}
@@ -1345,6 +1350,7 @@ const ThreadWorkLogRow = function ThreadWorkLogRow(
               {streamsOutput ? null : exitLine}
             </ScrollView>
           )}
+          {imagesLead ? null : outputGallery}
           {streamsOutput ? (
             <>
               <ThreadCommandOutput

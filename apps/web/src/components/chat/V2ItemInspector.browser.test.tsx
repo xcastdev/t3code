@@ -159,6 +159,44 @@ describe("V2ItemInspector", () => {
     });
   });
 
+  it("leads with image-only tool output and keeps images beside their text otherwise", async () => {
+    detail.data = null;
+    const image = { type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" };
+    const tool = (content: ReadonlyArray<unknown>) => (
+      <V2ItemInspector
+        projectedItem={{
+          ...projected,
+          item: {
+            ...edit,
+            type: "dynamic_tool" as const,
+            toolName: "device_screenshot",
+            input: { deviceId: "phone" },
+            output: { content },
+          },
+        }}
+        environmentId={EnvironmentId.make("environment")}
+      />
+    );
+    const imageLeads = (screen: { container: HTMLElement }) => {
+      const img = screen.container.querySelector("img[alt='Tool output image']");
+      const input = [...screen.container.querySelectorAll("*")].find(
+        (element) => element.textContent === "Input" && element.children.length === 0,
+      );
+      expect(img).not.toBeNull();
+      expect(input).toBeDefined();
+      return Boolean(img!.compareDocumentPosition(input!) & Node.DOCUMENT_POSITION_FOLLOWING);
+    };
+
+    await using screen = await render(tool([image]));
+    await expect.element(screen.getByAltText("Tool output image")).toBeVisible();
+    expect(imageLeads(screen)).toBe(true);
+    expect(screen.container.textContent).not.toContain("No output.");
+
+    await screen.rerender(tool([image, { type: "text", text: "Saved to shot.png" }]));
+    await expect.element(screen.getByText("Saved to shot.png")).toBeVisible();
+    expect(imageLeads(screen)).toBe(false);
+  });
+
   it("opens native full output through the authenticated typed artifact resource", async () => {
     artifactAsset.requests = [];
     artifactAsset.resource = null;

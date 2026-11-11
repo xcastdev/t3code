@@ -175,8 +175,12 @@ interface ToolOutputState {
   readonly onImageExpand?: ((preview: ExpandedImagePreview) => void) | undefined;
 }
 
-function ToolOutput(props: ToolOutputState & { readonly codePath?: string | undefined }) {
-  const images = props.images.map((resource) => (
+// A screenshot-style result is only images; they lead the card instead of trailing the input.
+const isImageOnlyOutput = (state: ToolOutputState) =>
+  state.images.length > 0 && !state.output?.trim() && !state.error;
+
+function ToolOutputImages(props: ToolOutputState) {
+  return props.images.map((resource) => (
     <ChatMarkdownAssetImage
       key={resource.index}
       environmentId={props.environmentId}
@@ -186,6 +190,10 @@ function ToolOutput(props: ToolOutputState & { readonly codePath?: string | unde
       onImageExpand={props.onImageExpand}
     />
   ));
+}
+
+function ToolOutput(props: ToolOutputState & { readonly codePath?: string | undefined }) {
+  const images = <ToolOutputImages {...props} />;
   const text = props.output ? (
     props.codePath ? (
       <ToolCode text={props.output} path={props.codePath} />
@@ -198,7 +206,7 @@ function ToolOutput(props: ToolOutputState & { readonly codePath?: string | unde
     <div className="font-sans text-muted-foreground italic">Loading output…</div>
   ) : props.error ? (
     <div className="font-sans text-destructive">Couldn&apos;t load output: {props.error}</div>
-  ) : images.length === 0 ? (
+  ) : props.images.length === 0 ? (
     <div className="font-sans text-muted-foreground italic">No output.</div>
   ) : null;
   return (
@@ -235,12 +243,20 @@ export function FetchedToolDetail(props: {
 }) {
   const { output } = useFetchedTurnItem(props.projectedItem, props.environmentId, props.source);
   useInitialOutputReady(output.pending, props.onInitialOutputReady);
+  const imageOnly = isImageOnlyOutput(output);
   return (
     <ToolDetailCard>
+      {imageOnly ? (
+        <ToolDetailPane label="Output">
+          <ToolOutputImages {...output} onImageExpand={props.onImageExpand} />
+        </ToolDetailPane>
+      ) : null}
       {props.input ? <ToolDetailPane label="Input">{props.input}</ToolDetailPane> : null}
-      <ToolDetailPane label="Output">
-        <ToolOutput {...output} codePath={props.codePath} onImageExpand={props.onImageExpand} />
-      </ToolDetailPane>
+      {imageOnly ? null : (
+        <ToolDetailPane label="Output">
+          <ToolOutput {...output} codePath={props.codePath} onImageExpand={props.onImageExpand} />
+        </ToolDetailPane>
+      )}
     </ToolDetailCard>
   );
 }
@@ -269,8 +285,14 @@ function ToolCallBody(
   const call = toolCallLines({ command: props.command, args: props.args });
   const filePath = call.args ? toolArgsFilePath(call.args) : null;
   const terminal = call.command !== null;
+  const imageOnly = props.outputSlot === undefined && isImageOnlyOutput(props);
   return (
     <ToolDetailCard>
+      {imageOnly ? (
+        <ToolDetailPane label="Output">
+          <ToolOutputImages {...props} />
+        </ToolDetailPane>
+      ) : null}
       {call.command ? (
         <ToolDetailPane label="Input" surface="terminal">
           <TerminalCommand command={call.command} />
@@ -307,20 +329,22 @@ function ToolCallBody(
           <StructuredValue value={call.argsText} highlightJson bare />
         </ToolDetailPane>
       ) : null}
-      <ToolDetailPane
-        label="Output"
-        surface={terminal ? "terminal" : "code"}
-        scroll={props.outputSlot === undefined}
-        meta={
-          props.exitCode === undefined ? undefined : (
-            <span className={props.exitCode === 0 ? undefined : "text-destructive"}>
-              exit {props.exitCode}
-            </span>
-          )
-        }
-      >
-        {props.outputSlot ?? <ToolOutput {...props} />}
-      </ToolDetailPane>
+      {imageOnly ? null : (
+        <ToolDetailPane
+          label="Output"
+          surface={terminal ? "terminal" : "code"}
+          scroll={props.outputSlot === undefined}
+          meta={
+            props.exitCode === undefined ? undefined : (
+              <span className={props.exitCode === 0 ? undefined : "text-destructive"}>
+                exit {props.exitCode}
+              </span>
+            )
+          }
+        >
+          {props.outputSlot ?? <ToolOutput {...props} />}
+        </ToolDetailPane>
+      )}
     </ToolDetailCard>
   );
 }
