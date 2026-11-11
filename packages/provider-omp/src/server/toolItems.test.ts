@@ -24,6 +24,25 @@ it("keeps native hashline arguments/results, treats mounted writes as execution,
       args: { path: "xd://device/tap", content: "x" },
     }),
   ).toMatchObject({ kind: "dynamic_tool" });
+  const deviceWrite = (toolCallId: string, path: string, content: string) =>
+    tools.update({
+      type: "tool_execution_start",
+      toolCallId,
+      toolName: "write",
+      args: { path, content },
+    });
+  expect(deviceWrite("r", "xd://html_render", '{"path":"page.html"}')).toMatchObject({
+    name: "html_render",
+    input: { path: "page.html" },
+    kind: "dynamic_tool",
+  });
+  expect(tools.update({ type: "tool_execution_end", toolCallId: "r", result: {} })).toMatchObject({
+    name: "html_render",
+    input: { path: "page.html" },
+    complete: true,
+  });
+  expect(deviceWrite("n", "xd://html_render", "not json")).toMatchObject({ name: "write" });
+  expect(deviceWrite("p", "xd://html_render/x", "{}")).toMatchObject({ name: "write" });
   const run = tools.update({
     type: "tool_execution_update",
     toolCallId: "v",

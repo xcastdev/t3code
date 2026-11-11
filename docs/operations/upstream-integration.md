@@ -78,10 +78,6 @@ Assistant chats keep their `"chat"` lineage relationship next to upstream's
 `sideChat` flag; the two are separate features. Idle-compaction modes use upstream's
 `idleCompaction` field and still read the legacy `compactIdleThreads` field.
 
-Upstream's `html_render` handling for OMP's `xd://` device writes (#33677) applies
-only to OMP through the ACP registry. The native `provider-omp` tool items do not map
-those writes yet.
-
 ## Validation
 
 Every workspace package, app and the evals typecheck clean; lint reports no errors and

@@ -45,14 +45,33 @@ export interface OmpToolProjection {
   readonly patterns?: readonly string[];
   readonly webResults?: readonly { title?: string; url?: string; snippet?: string }[];
 }
+// OMP calls a mounted tool by writing its JSON arguments to `xd://<tool>`; show that call as the
+// tool itself, the same target runtimePolicyHooks approves, so clients can render its result.
+function deviceCall(name: string, input: unknown) {
+  if (name !== "write" || !nativeObject(input) || typeof input.content !== "string") return;
+  const path = typeof input.path === "string" ? input.path : "";
+  const tool = /^xd:\/\/([A-Za-z0-9_.-]{1,128})$/.exec(path)?.[1];
+  if (tool === undefined) return;
+  let args: unknown;
+  try {
+    args = JSON.parse(input.content);
+  } catch {
+    return;
+  }
+  return nativeObject(args) ? { name: tool, input: args } : undefined;
+}
 export class OmpToolItems {
   private readonly items = new Map<string, OmpToolProjection>();
   update(event: NativeRecord): OmpToolProjection | undefined {
     if (typeof event.toolCallId !== "string") return;
     const old = this.items.get(event.toolCallId);
     if (old?.complete) return old;
-    const name = typeof event.toolName === "string" ? event.toolName : (old?.name ?? "unknown");
-    const input = event.args ?? old?.input ?? {};
+    const nativeName =
+      typeof event.toolName === "string" ? event.toolName : (old?.name ?? "unknown");
+    const nativeInput = event.args ?? old?.input ?? {};
+    const device = deviceCall(nativeName, nativeInput);
+    const name = device?.name ?? nativeName;
+    const input = device?.input ?? nativeInput;
     const complete = event.type === "tool_execution_end";
     const failed = event.isError === true;
     let output = complete ? event.result : (event.partialResult ?? old?.output);
