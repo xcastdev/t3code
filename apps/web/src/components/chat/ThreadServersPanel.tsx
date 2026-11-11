@@ -10,8 +10,8 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
-import { GlobeIcon } from "lucide-react";
-import type { MouseEvent } from "react";
+import { ChevronDownIcon, ChevronUpIcon, GlobeIcon } from "lucide-react";
+import { type MouseEvent, useState } from "react";
 
 import { resolveDiscoveredServerUrl } from "../../browser/browserTargetResolver";
 import { readLocalApi } from "../../localApi";
@@ -22,15 +22,24 @@ import { useEnvironmentScope } from "../../state/session";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { openDiscoveredPort } from "../preview/openDiscoveredPort";
 import { stackedThreadToast, toastManager } from "../ui/toast";
+import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import { ThreadProcessRow } from "./ThreadProcessRow";
 import { THREAD_DETAILS_PANEL_ICON_CLASS } from "./threadDetailsPanelStyles";
 
-/** Local servers the thread's terminals and agent started, as rows for Processes. */
-export function ThreadServerRows(props: {
+const SERVER_PAGE_COUNT = 4;
+
+interface ThreadServerRowsProps {
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
   readonly servers: ReadonlyArray<DiscoveredLocalServer>;
-}) {
+}
+
+/** Local servers the thread's terminals and agent started, as rows for Processes. */
+export function ThreadServerRows(props: ThreadServerRowsProps) {
+  return <ThreadServerRowList key={`${props.environmentId}:${props.threadId}`} {...props} />;
+}
+
+function ThreadServerRowList(props: ThreadServerRowsProps) {
   const { servers } = props;
   const canOpen = useEnvironmentScope(props.environmentId, AuthPreviewOperateScope);
   const canStop = useAtomValue(
@@ -43,6 +52,7 @@ export function ThreadServerRows(props: {
   const stopServer = useAtomCommand(previewEnvironment.stopLocalServer, {
     label: "thread server stop",
   });
+  const [visibleCount, setVisibleCount] = useState(SERVER_PAGE_COUNT);
   if (servers.length === 0) return null;
   const externalClickLabel = isMacPlatform(navigator.platform) ? "⌘-click" : "Ctrl-click";
   const threadRef = scopeThreadRef(props.environmentId, props.threadId);
@@ -85,7 +95,8 @@ export function ThreadServerRows(props: {
     }
   };
 
-  return servers.map((server) => (
+  const hiddenCount = Math.max(0, servers.length - visibleCount);
+  const row = (server: DiscoveredLocalServer) => (
     <ThreadProcessRow
       key={`${server.pid}:${server.port}`}
       icon={<GlobeIcon aria-hidden className={THREAD_DETAILS_PANEL_ICON_CLASS} />}
@@ -106,5 +117,42 @@ export function ThreadServerRows(props: {
           }
         : {})}
     />
-  ));
+  );
+  const overflow = servers.slice(SERVER_PAGE_COUNT, visibleCount);
+
+  return (
+    <>
+      {servers.slice(0, SERVER_PAGE_COUNT).map(row)}
+      {overflow.length > 0 ? (
+        <li data-thread-details-server-overflow>
+          <ul className="m-0 list-none p-0">{overflow.map(row)}</ul>
+        </li>
+      ) : null}
+      {servers.length > SERVER_PAGE_COUNT ? (
+        <li>
+          <ThreadDetailsControl
+            variant="ghost"
+            size="sm"
+            onClick={() =>
+              setVisibleCount(
+                hiddenCount > 0 ? visibleCount + SERVER_PAGE_COUNT : SERVER_PAGE_COUNT,
+              )
+            }
+            part="row"
+            tone="muted"
+            className="w-full active:scale-100"
+          >
+            {hiddenCount > 0 ? (
+              <ChevronDownIcon aria-hidden className="size-4 shrink-0" />
+            ) : (
+              <ChevronUpIcon aria-hidden className="size-4 shrink-0" />
+            )}
+            {hiddenCount > 0
+              ? `Show ${Math.min(hiddenCount, SERVER_PAGE_COUNT)} more`
+              : "Show less"}
+          </ThreadDetailsControl>
+        </li>
+      ) : null}
+    </>
+  );
 }
