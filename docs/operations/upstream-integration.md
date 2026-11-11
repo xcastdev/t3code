@@ -8,13 +8,13 @@ known starting point.
 | ---------------- | ------------------------------------------ | ------------------------------------------ | ------------------------------------------ |
 | 2026-10-27       | `e07595714a467e18c750107137d2c2e50f0c3530` | `36d4d711b79c73eb33131944f73ea4a8c6156484` | `890e89f2e7b92c5524b47278da37ffd8fefc01dc` |
 | 2026-11-02       | `36d4d711b79c73eb33131944f73ea4a8c6156484` | `47f2c8d29e981c7723467efe137ee19e91df924e` | `63e994493a87319bfd31bcd0c71d6bcfcd123ab7` |
-| 2026-11-11       | `47f2c8d29e981c7723467efe137ee19e91df924e` | `d2c25950b4d9183ea342d5d5fc14c326b9e0172a` | `bec7f5fad7167ed8e897b3d91468779216a79123` |
+| 2026-11-11       | `47f2c8d29e981c7723467efe137ee19e91df924e` | `7e565c510d6dfaef2e1fd97bf9d89a97ce9cece7` | `bec7f5fad7167ed8e897b3d91468779216a79123` |
 
-The latest update is on `integration/upstream-2026-11-11`. It merges 1,064 upstream
+The latest update is on `integration/upstream-2026-11-11`. It merges 1,076 upstream
 commits since November 2, advancing the desktop and server package versions from
 0.1.6 to 0.1.9. The updated upstream tip is
-`fix(server): tell outside agents which MCP tools need a thread and that t3_thread_list takes allProjects (#26525)`.
-The [upstream comparison](https://github.com/pingdotgg/t3code/compare/47f2c8d29e981c7723467efe137ee19e91df924e...d2c25950b4d9183ea342d5d5fc14c326b9e0172a)
+`fix(git): stop new threads inheriting historical branch PRs (#34218)`.
+The [upstream comparison](https://github.com/pingdotgg/t3code/compare/47f2c8d29e981c7723467efe137ee19e91df924e...7e565c510d6dfaef2e1fd97bf9d89a97ce9cece7)
 contains the complete commit history.
 
 ## Included upstream changes
@@ -93,6 +93,9 @@ merge: six Codex account tests in `CodexChatGptAuth.test.ts` and
 ledger case, the provider-switch and OpenCode replay fixtures (including upstream's new
 OpenCode 2 pending-snapshot evidence), and a background-fetch case that fails only when
 `GIT_SSH_COMMAND` is set.
+
+The mobile dependency-graph test reports import cycles among the fork's Work task and
+Assistants screens; those files are unchanged by this merge.
 
 Two fork paths needed changes to stay correct on the merged runtime. Project Work run
 admission read the database while holding the event publish lane, which deadlocked

@@ -126,6 +126,11 @@ vi.mock("expo", () => ({
     return player;
   },
 }));
+// The fork's plugin registry would pull in the connection runtime and its native modules.
+vi.mock("../state/plugins", async () => {
+  const { AsyncResult, Atom } = await import("effect/reactivity");
+  return { pluginEnvironment: { registry: () => Atom.make(AsyncResult.initial()) } };
+});
 vi.mock("expo-video", () => ({
   useVideoPlayer: () => audio.video,
   VideoView: () => null,

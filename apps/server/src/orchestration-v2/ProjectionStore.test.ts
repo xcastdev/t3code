@@ -717,7 +717,10 @@ it.effect("idle compaction filters keep the latest run, live work and the newest
       .join("\n");
     assert.notInclude(runPlan, "orchestration_v2_projection_runs_thread_ordinal_idx");
     // Any index keyed by status qualifies, including the assistant attention index.
-    assert.match(runPlan, /SEARCH orchestration_v2_projection_runs USING INDEX \w+ \([^)]*status=\?/);
+    assert.match(
+      runPlan,
+      /SEARCH orchestration_v2_projection_runs USING INDEX \w+ \([^)]*status=\?/,
+    );
     // An id filter reads by primary key, not every row of the thread.
     const byId = traceSqlStatements();
     const found = yield* store
