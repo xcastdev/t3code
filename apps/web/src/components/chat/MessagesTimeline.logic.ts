@@ -1610,7 +1610,7 @@ export function deriveMessagesTimelineRows(input: {
   activeTurnStartedAt?: string | null;
   turnDiffSummaries: ReadonlyArray<TurnDiffSummary>;
   supportsConversationRollback: boolean;
-  threadStartCheckpointReady?: boolean;
+  threadStartCheckpointAvailable?: boolean;
   availableRevertTurnCounts?: ReadonlySet<number> | undefined;
   worktreeSetup?: WorktreeSetupSnapshot | null;
   /** Unset keeps each running batch of steps behind one live row. */
@@ -1644,7 +1644,7 @@ export function deriveMessagesTimelineRows(input: {
     ? deriveRevertTurnCountByUserMessageId({
         timelineEntries: input.timelineEntries,
         checkpoints: input.turnDiffSummaries,
-        threadStartCheckpointReady: input.threadStartCheckpointReady === true,
+        threadStartCheckpointAvailable: input.threadStartCheckpointAvailable === true,
         unsettledRunId,
         availableRevertTurnCounts: input.availableRevertTurnCounts,
       })

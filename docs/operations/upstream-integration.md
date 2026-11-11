@@ -8,13 +8,13 @@ known starting point.
 | ---------------- | ------------------------------------------ | ------------------------------------------ | ------------------------------------------ |
 | 2026-10-27       | `e07595714a467e18c750107137d2c2e50f0c3530` | `36d4d711b79c73eb33131944f73ea4a8c6156484` | `890e89f2e7b92c5524b47278da37ffd8fefc01dc` |
 | 2026-11-02       | `36d4d711b79c73eb33131944f73ea4a8c6156484` | `47f2c8d29e981c7723467efe137ee19e91df924e` | `63e994493a87319bfd31bcd0c71d6bcfcd123ab7` |
-| 2026-11-11       | `47f2c8d29e981c7723467efe137ee19e91df924e` | `7e565c510d6dfaef2e1fd97bf9d89a97ce9cece7` | `bec7f5fad7167ed8e897b3d91468779216a79123` |
+| 2026-11-11       | `47f2c8d29e981c7723467efe137ee19e91df924e` | `31eea883c7f7849ada6eb49265cb11fc64d2ecbd` | `bec7f5fad7167ed8e897b3d91468779216a79123` |
 
-The latest update is on `integration/upstream-2026-11-11`. It merges 1,076 upstream
+The latest update is on `integration/upstream-2026-11-11`. It merges 1,078 upstream
 commits since November 2, advancing the desktop and server package versions from
 0.1.6 to 0.1.9. The updated upstream tip is
-`fix(git): stop new threads inheriting historical branch PRs (#34218)`.
-The [upstream comparison](https://github.com/pingdotgg/t3code/compare/47f2c8d29e981c7723467efe137ee19e91df924e...7e565c510d6dfaef2e1fd97bf9d89a97ce9cece7)
+`fix(rewind): allow conversation-only rewind in non-git workspaces (#18379)`.
+The [upstream comparison](https://github.com/pingdotgg/t3code/compare/47f2c8d29e981c7723467efe137ee19e91df924e...31eea883c7f7849ada6eb49265cb11fc64d2ecbd)
 contains the complete commit history.
 
 ## Included upstream changes
