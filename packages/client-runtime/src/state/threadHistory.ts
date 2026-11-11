@@ -8,6 +8,7 @@ import type * as History from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
@@ -46,9 +47,7 @@ export function historySelectionIsCurrent(selected: HistorySelection, current: H
   );
 }
 
-export function prepareHistoryMutation<
-  I extends typeof History.ThreadHistoryArchiveIdentity.Type,
->(options: {
+export function prepareHistoryMutation<I extends History.ThreadHistoryArchiveIdentity>(options: {
   readonly selected: HistorySelection;
   readonly current: HistorySelection;
   readonly input: I;
@@ -145,12 +144,12 @@ export type HistoryMutationState = {
   readonly recoveryConnectionEpoch: string | null;
 };
 
-class HistoryOperationStorageError extends Error {
-  readonly _tag = "HistoryOperationStorageError";
-  constructor() {
-    super(
-      "The original recovery request could not be loaded or saved on this device. Check local storage before trying again.",
-    );
+class HistoryOperationStorageError extends Schema.TaggedError<HistoryOperationStorageError>()(
+  "HistoryOperationStorageError",
+  {},
+) {
+  override get message() {
+    return "The original recovery request could not be loaded or saved on this device. Check local storage before trying again.";
   }
 }
 
@@ -318,7 +317,7 @@ export function createThreadHistoryEnvironmentAtoms<R, E>(
       );
       if (settled) unsubscribe();
     });
-  const tracked = <I extends typeof History.ThreadHistoryArchiveIdentity.Type, A, F>(
+  const tracked = <I extends History.ThreadHistoryArchiveIdentity, A, F>(
     command: AtomCommand<{ readonly environmentId: EnvironmentId; readonly input: I }, A, F>,
     fileInput?: (input: I) => typeof History.ThreadHistoryRestoreFilesInput.Type,
     recoveryInput?: (input: I) => History.ThreadHistoryRecoverInput,

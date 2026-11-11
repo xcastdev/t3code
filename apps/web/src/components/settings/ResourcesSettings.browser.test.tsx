@@ -40,6 +40,7 @@ vi.mock("../../state/resources", async () => {
       write: permission,
       oauthBegin: permission,
       sessionReset: permission,
+      testConnection: permission,
     },
   };
 });

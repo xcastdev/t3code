@@ -20,7 +20,7 @@ export class ThreadHistoryService extends Context.Service<
     ) => Effect.Effect<typeof History.ThreadHistoryDetailResult.Type, ArchiveError | RecoveryError>;
     readonly recover: (
       input: ThreadHistoryRecoverInput,
-    ) => Effect.Effect<typeof History.ThreadHistoryRecoveryResult.Type, RecoveryError>;
+    ) => Effect.Effect<History.ThreadHistoryRecoveryResult, RecoveryError>;
     readonly restoreFiles: (
       input: typeof History.ThreadHistoryRestoreFilesInput.Type,
     ) => Effect.Effect<typeof History.ThreadHistoryRestoreFilesResult.Type, RecoveryError>;
@@ -28,7 +28,7 @@ export class ThreadHistoryService extends Context.Service<
       input: typeof History.ThreadHistoryFileRestoreStatusInput.Type,
     ) => Effect.Effect<typeof History.ThreadHistoryFileRestoreStatusResult.Type, RecoveryError>;
     readonly release: (
-      input: typeof History.ThreadHistoryArchiveIdentity.Type,
+      input: History.ThreadHistoryArchiveIdentity,
     ) => Effect.Effect<void, ArchiveError>;
     readonly reconcile: (
       input: typeof History.ThreadHistoryReconcileInput.Type,

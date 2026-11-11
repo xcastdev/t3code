@@ -32,7 +32,7 @@ export const decideProjectTeamGuidedTransition = (
   ) => ProjectWorkReducerState,
 ): ReadonlyArray<ProjectWorkEvent> => {
   const reject = (message: string): never => {
-    throw new ProjectWorkPolicyError("authority-required", message);
+    throw new ProjectWorkPolicyError({ code: "authority-required", message: message });
   };
   const t = command.transition;
   if (t?.kind === "memory.invalidate") {

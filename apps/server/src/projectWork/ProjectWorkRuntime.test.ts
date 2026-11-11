@@ -329,7 +329,7 @@ it.effect(
         source: { kind: "web" as const, id: "reviewed-client-source" },
         recordedAt: at,
       };
-      const bind = (command: typeof ProjectWorkTaskReviseProtectedSpecificationCommand.Type) => ({
+      const bind = (command: ProjectWorkTaskReviseProtectedSpecificationCommand) => ({
         ...command,
         approval: {
           ...command.approval,

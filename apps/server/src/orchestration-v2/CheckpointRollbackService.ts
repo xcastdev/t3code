@@ -1,4 +1,4 @@
-import * as Crypto from "effect/Crypto";
+import * as Digest from "effect/crypto/Digest";
 import * as Hex from "effect/encoding/Hex";
 import {
   CheckpointId,
@@ -118,7 +118,7 @@ export const layer: Layer.Layer<
   CheckpointRollbackServiceV2,
   never,
   | CheckpointServiceV2
-  | Crypto.Crypto
+  | Digest.Digest
   | ThreadHistoryArchive.ThreadHistoryArchiveService
   | GitWorkflowService.GitWorkflowService
   | EventSinkV2
@@ -136,7 +136,7 @@ export const layer: Layer.Layer<
   CheckpointRollbackServiceV2,
   Effect.gen(function* () {
     const checkpoints = yield* CheckpointServiceV2;
-    const crypto = yield* Crypto.Crypto;
+    const digest = yield* Digest.Digest;
     const archives = yield* ThreadHistoryArchive.ThreadHistoryArchiveService;
     const gitWorkflow = yield* GitWorkflowService.GitWorkflowService;
     const eventSink = yield* EventSinkV2;
@@ -237,9 +237,7 @@ export const layer: Layer.Layer<
         runsToRollback.map((run) => run.id),
       ]);
       const archiveId = Hex.encode(
-        yield* crypto
-          .digest("SHA-256", new TextEncoder().encode(operationIdentity))
-          .pipe(Effect.orDie),
+        yield* digest.digest(Digest.sha256, new TextEncoder().encode(operationIdentity)),
       );
       const archive = { threadId: input.threadId, archiveId };
       const preparation = {

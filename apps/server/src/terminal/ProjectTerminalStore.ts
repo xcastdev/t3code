@@ -66,11 +66,11 @@ export interface ProjectTerminalPersistence {
     projectId: ProjectId,
   ) => Effect.Effect<void, ProjectTerminalPersistenceError>;
   readonly loadExits?: Effect.Effect<
-    ReadonlyArray<typeof ProjectTerminalSummary.Type>,
+    ReadonlyArray<ProjectTerminalSummary>,
     ProjectTerminalPersistenceError
   >;
   readonly saveExit?: (
-    terminal: typeof ProjectTerminalSummary.Type,
+    terminal: ProjectTerminalSummary,
   ) => Effect.Effect<void, ProjectTerminalPersistenceError>;
   readonly remove?: (handle: {
     projectId: ProjectId;
@@ -111,7 +111,7 @@ export const makeSqlPersistence = Effect.fn("ProjectTerminalStore.make")(functio
       Effect.mapError((cause) => new ProjectTerminalPersistenceError({ cause })),
     ),
     saveExit: Effect.fn("ProjectTerminalStore.saveExit")(
-      function* (terminal: typeof ProjectTerminalSummary.Type) {
+      function* (terminal: ProjectTerminalSummary) {
         const payload = yield* encodeExit(terminal);
         yield* sql`INSERT INTO t3_workflow_v2_terminal_exits(project_id,terminal_id,generation,terminal_json) VALUES(${terminal.projectId},${terminal.terminalId},${terminal.generation},${payload}) ON CONFLICT(project_id,terminal_id,generation) DO NOTHING`;
       },

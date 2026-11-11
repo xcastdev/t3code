@@ -1,13 +1,12 @@
-import type {
-  ModelSelection,
-  ProviderInteractionMode,
-  RuntimeMode,
-  ServerProvider,
+import {
+  DEFAULT_PROVIDER_INTERACTION_MODE,
+  type ModelSelection,
+  type ProviderInteractionMode,
+  type RuntimeMode,
 } from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 
 import type { AgentThreadOwnerKind } from "../features/assistants/useAgentThreadOwner";
-import { resolveProviderInteractionMode } from "./legacy-plan-mode";
 
 interface TurnSettings {
   readonly modelSelection: ModelSelection;
@@ -21,30 +20,20 @@ export function composerOwnerAcceptsDraftSettings(kind: AgentThreadOwnerKind): b
 }
 
 /**
- * The settings a send uses. A canonical agent home always uses its thread's settings, which the
- * server keeps synchronized with the agent's configuration, so stale local overrides are ignored.
- * Other chats get the provider's mode normalization. While ownership is unresolved, outgoing
- * settings that differ from the thread (an override, or normalization dropping a saved Plan mode)
- * could be a canonical conflict, so the send waits (null) instead of guessing.
+ * A canonical agent home sends its thread's server-synchronized settings; other chats run in build
+ * mode. Unresolved ownership holds (null) any send whose settings differ from the thread's.
  */
 export function resolveComposerTurnSettings(input: {
   readonly ownerKind: AgentThreadOwnerKind;
   readonly draft: Partial<TurnSettings>;
   readonly thread: TurnSettings;
-  readonly providers: ReadonlyArray<
-    Pick<ServerProvider, "instanceId" | "showInteractionModeToggle">
-  >;
 }): TurnSettings | null {
   const { draft, thread } = input;
   if (input.ownerKind === "canonical") return thread;
-  const modelSelection = draft.modelSelection ?? thread.modelSelection;
   const settings = {
-    modelSelection,
+    modelSelection: draft.modelSelection ?? thread.modelSelection,
     runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
-    interactionMode: resolveProviderInteractionMode(
-      input.providers.find((provider) => provider.instanceId === modelSelection.instanceId),
-      draft.interactionMode ?? thread.interactionMode,
-    ),
+    interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
   };
   if (composerOwnerAcceptsDraftSettings(input.ownerKind)) return settings;
   return modelSelectionsEqual(settings.modelSelection, thread.modelSelection) &&

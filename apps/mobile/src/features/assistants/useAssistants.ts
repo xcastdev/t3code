@@ -72,6 +72,7 @@ export function useCursorPages() {
 /** False once the screen is gone, so a late response can't navigate from a closed form. */
 export function useMountedRef() {
   const mounted = useRef(true);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- late async responses must stop committing after unmount
   useEffect(() => {
     mounted.current = true;
     return () => {

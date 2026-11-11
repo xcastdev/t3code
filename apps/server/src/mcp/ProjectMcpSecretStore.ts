@@ -8,7 +8,7 @@ import {
   type ProjectMcpTransportDraft,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
-import * as Crypto from "effect/Crypto";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -289,7 +289,7 @@ export class ProjectMcpSecretStore extends Context.Service<
 >()("t3/mcp/ProjectMcpSecretStore") {}
 
 const make = Effect.gen(function* () {
-  const crypto = yield* Crypto.Crypto;
+  const random = yield* SecureRandom.SecureRandom;
   const secretStore = yield* ServerSecretStore.ServerSecretStore;
 
   const readJson = <A>(
@@ -362,20 +362,9 @@ const make = Effect.gen(function* () {
         ),
       );
 
-  const newCredentialId = crypto.randomUUIDv4().pipe(
-    Effect.map(ProjectMcpCredentialId.make),
-    Effect.mapError(
-      (cause) => new ProjectMcpSecretStoreError({ operation: "generate credential ID", cause }),
-    ),
-  );
+  const newCredentialId = random.uuidV4().pipe(Effect.map(ProjectMcpCredentialId.make));
 
-  const newOperationId = crypto
-    .randomUUIDv4()
-    .pipe(
-      Effect.mapError(
-        (cause) => new ProjectMcpSecretStoreError({ operation: "generate operation ID", cause }),
-      ),
-    );
+  const newOperationId = random.uuidV4();
 
   const resolveValue = (
     serverId: McpServerId,

@@ -558,6 +558,7 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const calls = yield* Ref.make(0);
+      const published = yield* Ref.make(0);
       const candidate: RunAdmission.PreparedResourceInstructions = {
         catalogRevision: 1,
         baseHash: "trusted-base",
@@ -591,6 +592,12 @@ it.effect(
                 assert.equal(input.proposedWorktreePath, "/tmp/proposed-worktree");
                 return { _tag: "ordinary" as const };
               }),
+            // Publication holds the publish lane, so its reads belong to the commit transaction.
+            committedPublication: () =>
+              Effect.gen(function* () {
+                assert.isTrue(Option.isSome(yield* Effect.serviceOption(sql.transactionService)));
+                return Ref.update(published, (value) => value + 1);
+              }),
           });
         }),
       ).pipe(Layer.provide(RunAdmission.layerOrdinary));
@@ -609,6 +616,7 @@ it.effect(
         assert.equal(committed.receipt.status, "accepted");
         assert.equal((yield* sink.commitCommand(input)).committed, false);
         assert.equal(yield* Ref.get(calls), 1);
+        assert.equal(yield* Ref.get(published), 1);
       }).pipe(Effect.provide(withAdmission(admission)));
     }),
 );

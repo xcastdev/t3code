@@ -59,7 +59,7 @@ it.live("shadows copied running schedules and every webhook table on reads and t
         );
       assert.equal(reused._tag, "Failure");
       const ownedId = `assistant-routine-${"b".repeat(64)}`;
-      yield* sql`INSERT INTO scheduled_tasks SELECT ${ownedId},title,prompt,enabled,schedule_json,project_id,thread_id,workspace_strategy_json,model_selection_json,runtime_mode,interaction_mode,created_by,creation_source,created_at,updated_at,next_run_at,last_run_at,last_run_status,last_run_error,run_count,webhook_token,webhook_secret,last_run_webhook_delivery_id FROM main.scheduled_tasks`;
+      yield* sql`INSERT INTO scheduled_tasks SELECT ${ownedId},title,prompt,enabled,schedule_json,project_id,thread_id,workspace_strategy_json,model_selection_json,runtime_mode,interaction_mode,created_by,creation_source,created_at,updated_at,next_run_at,last_run_at,last_run_status,last_run_error,run_count,webhook_token,webhook_secret,last_run_webhook_delivery_id,thread_mode FROM main.scheduled_tasks`;
       yield* sql`INSERT INTO scheduled_task_webhook_pending VALUES ('owned-delivery',${ownedId},'owned-key',0,'pending','{}','{}','[]')`;
       assert.equal(
         (yield* sql`INSERT INTO scheduled_task_webhook_pending VALUES ('duplicate-delivery',${ownedId},'owned-key',0,'pending','{}','{}','[]')`.pipe(

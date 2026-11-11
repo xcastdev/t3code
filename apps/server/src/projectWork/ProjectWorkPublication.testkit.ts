@@ -189,8 +189,8 @@ export function dependencies(
       reconcilePublication: () => Effect.fail(unsupported),
       supportsExactMerge: () => Effect.succeed(false),
       mergeExact: () => Effect.fail(unsupported),
-      reconcileMerge: Effect.fn("ProjectWorkPublicationHost.reconcileMerge")(() =>
-        Effect.sync(() => undefined),
+      reconcileMerge: Effect.fn("ProjectWorkPublicationHost.reconcileMerge")(
+        () => Effect.undefined,
       ),
       ...options.host,
     }),

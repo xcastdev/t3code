@@ -46,7 +46,7 @@ type Draft<T = ProjectWorkEvent> = T extends ProjectWorkEvent
   ? Omit<T, "eventId" | "projectId" | "revision">
   : never;
 function reject(message: string): never {
-  throw new ProjectWorkPolicyError("invalid-state", message);
+  throw new ProjectWorkPolicyError({ code: "invalid-state", message: message });
 }
 const unique = (values: ReadonlyArray<string>) => {
   if (new Set(values).size !== values.length) reject("Record references must be unique");
@@ -108,7 +108,10 @@ export const decideProjectTeamGuidedLifecycle = (
   const records = () => state.foundationRecords ?? [];
   const task = assertKnownTask(state, intent.taskId);
   if (task.revision !== intent.expectedTaskRevision)
-    throw new ProjectWorkPolicyError("stale-revision", "Guided task revision changed");
+    throw new ProjectWorkPolicyError({
+      code: "stale-revision",
+      message: "Guided task revision changed",
+    });
   let binding: Binding | undefined;
   let plannerAssignment: Membership | undefined;
   if (command.attribution.actor.kind !== "human") {
@@ -760,10 +763,10 @@ export const decideProjectTeamGuidedLifecycle = (
       if (task.state === "completed" || task.state === "canceled")
         reject("Terminal task requires an explicit reopen");
       if (task.specification?.protected)
-        throw new ProjectWorkPolicyError(
-          "protected-specification",
-          "Use the approved protected specification revision process",
-        );
+        throw new ProjectWorkPolicyError({
+          code: "protected-specification",
+          message: "Use the approved protected specification revision process",
+        });
       const matches = state.criteria.filter((entry) => entry.criterionId === intent.criterionId);
       const criterion = matches[0];
       if (
@@ -778,7 +781,10 @@ export const decideProjectTeamGuidedLifecycle = (
         task.specRevision !== intent.expectedSpecRevision ||
         projectTeamSpecificationHash(state, task.taskId) !== intent.expectedSpecificationHash
       )
-        throw new ProjectWorkPolicyError("stale-revision", "Criterion waiver target changed");
+        throw new ProjectWorkPolicyError({
+          code: "stale-revision",
+          message: "Criterion waiver target changed",
+        });
       if (criterion.revision >= Number.MAX_SAFE_INTEGER) reject("Criterion revision is exhausted");
       if (intent.action.kind === "waive") {
         const scopeHash = projectTeamScopeHash(state, task.taskId, currentPlan(task.taskId));

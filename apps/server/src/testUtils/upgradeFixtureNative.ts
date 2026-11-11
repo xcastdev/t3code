@@ -88,6 +88,7 @@ export function layerFixtureNative(
             mode !== "controlled-fixture" ||
             command._tag !== "StandardCommand" ||
             command.options.shell ||
+            !command.args.every((argument) => typeof argument === "string") ||
             !isTrustedUpgradeFixtureCommand(command.command, command.args) ||
             typeof command.options.cwd !== "string" ||
             !snapshot.projects.some((project) => rootFor(project.projectId) === command.options.cwd)

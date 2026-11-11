@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { assert, it } from "@effect/vitest";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as Handoffs from "../orchestration-v2/ContextHandoffService.ts";
@@ -81,6 +82,7 @@ const decodeCompanionRequest = Schema.decodeEffect(
 const database = Persistence.layerMemory;
 const platform = Layer.mergeAll(
   NodeServices.layer,
+  NodeCrypto.layer,
   Config.layerTest(process.cwd(), { prefix: "t3-assistant-memory-context-" }).pipe(
     Layer.provide(NodeServices.layer),
   ),
@@ -158,6 +160,7 @@ const fixture = () => {
       generateReviewGuide: unused,
       describeImage: unused,
       webSearch: unused,
+      generateTranscriptionPostProcessing: unused,
       extractMemoryFacts: Effect.fn("AssistantMemoryContextIntegration.extract")(function* (
         input: Generation.MemoryExtractionInput,
       ) {
@@ -1398,6 +1401,8 @@ it.live.each(["forget", "edit"] as const)(
           1,
         );
         assert.equal(yield* events.latestSequence(), sequence);
+        // The wake's drain extracts the edit after its cleanup; this waits for that pass under the processing lock.
+        yield* processing.reconcile();
         const context = yield* memory.context(record);
         if (operation === "edit") assert.include(context.text, "light editor");
         else assert.equal(context.text, "");

@@ -35,9 +35,10 @@ function recordEffect(action: string) {
 }
 
 vi.mock("../components/CustomSnoozeDialog", () => ({ requestCustomSnooze: vi.fn() }));
-vi.mock("react", () => ({
-  useCallback: (callback: unknown) => callback,
-  useMemo: (factory: () => unknown) => factory(),
+vi.mock(import("react"), async (importOriginal) => ({
+  ...(await importOriginal()),
+  useCallback: <T>(callback: T) => callback,
+  useMemo: <T>(factory: () => T) => factory(),
 }));
 vi.mock("@tanstack/react-router", () => ({
   useRouter: () => ({ navigate: async () => recordEffect("project-settings") }),

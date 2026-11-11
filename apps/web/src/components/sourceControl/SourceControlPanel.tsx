@@ -19,7 +19,7 @@ import {
   MinusIcon,
   PlusIcon,
   RefreshCwIcon,
-  SparklesIcon,
+  PenLineIcon,
 } from "lucide-react";
 import { type AsyncResult, type Atom, type AtomRegistry } from "effect/reactivity";
 import { type ReactNode, useContext, useEffect, useState } from "react";
@@ -562,7 +562,7 @@ function ChangesView(props: {
                 />
               }
             >
-              <SparklesIcon />
+              <PenLineIcon />
               {generating ? "Generating…" : "Generate"}
             </TooltipTrigger>
             <TooltipPopup side="top">Write a commit message for the staged changes</TooltipPopup>
@@ -751,6 +751,7 @@ function HistoryView(props: { readonly environmentId: EnvironmentId; readonly ro
 
   // Reconnecting starts a new chain even when HEAD did not move: refs, tags and remotes
   // the history includes may have changed while the connection was down.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- loads or disconnects the history in the workspace store as the connection changes
   useEffect(() => {
     const store = useSourceControlWorkspaceStore.getState();
     if (disconnected) {

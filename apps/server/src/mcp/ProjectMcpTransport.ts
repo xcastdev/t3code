@@ -1,4 +1,5 @@
 import type { McpServerId, ProjectMcpTransport } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 import {
   SSEClientTransport,
   type SSEClientTransportOptions,
@@ -15,22 +16,26 @@ import {
   type StdioServerParameters,
 } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-export class ProjectMcpSecretUnavailableError extends Error {
-  constructor(serverId: McpServerId, secretRef: string) {
-    void secretRef;
-    super(`MCP secret is unavailable for server '${serverId}'.`);
-    this.name = "ProjectMcpSecretUnavailableError";
+export class ProjectMcpSecretUnavailableError extends Schema.TaggedError<ProjectMcpSecretUnavailableError>()(
+  "ProjectMcpSecretUnavailableError",
+  { serverId: Schema.String },
+) {
+  override get message(): string {
+    return `MCP secret is unavailable for server '${this.serverId}'.`;
   }
 }
 
-export class ProjectMcpTransportConfigurationError extends Error {
-  constructor(serverId: McpServerId, reason: "oauth_provider_required" | "authorization_header") {
-    super(
-      reason === "oauth_provider_required"
-        ? `MCP OAuth provider is unavailable for server '${serverId}'.`
-        : `MCP OAuth transport cannot use a configured Authorization header for server '${serverId}'.`,
-    );
-    this.name = "ProjectMcpTransportConfigurationError";
+export class ProjectMcpTransportConfigurationError extends Schema.TaggedError<ProjectMcpTransportConfigurationError>()(
+  "ProjectMcpTransportConfigurationError",
+  {
+    serverId: Schema.String,
+    reason: Schema.Literals(["oauth_provider_required", "authorization_header"]),
+  },
+) {
+  override get message(): string {
+    return this.reason === "oauth_provider_required"
+      ? `MCP OAuth provider is unavailable for server '${this.serverId}'.`
+      : `MCP OAuth transport cannot use a configured Authorization header for server '${this.serverId}'.`;
   }
 }
 
@@ -66,7 +71,7 @@ const resolveHeaders = (
     entries.map(({ name, credential }) => {
       const value = resolveSecret(credential.id);
       if (value === undefined) {
-        throw new ProjectMcpSecretUnavailableError(serverId, credential.id);
+        throw new ProjectMcpSecretUnavailableError({ serverId });
       }
       return [name, value];
     }),
@@ -97,11 +102,17 @@ export const makeProjectMcpTransport = ({
         transport.authorization.type === "oauth" &&
         transport.headers.some(({ name }) => name.toLowerCase() === "authorization")
       ) {
-        throw new ProjectMcpTransportConfigurationError(serverId, "authorization_header");
+        throw new ProjectMcpTransportConfigurationError({
+          serverId,
+          reason: "authorization_header",
+        });
       }
       const headers = resolveHeaders(serverId, transport.headers, resolveSecret);
       if (transport.authorization.type === "oauth" && oauthProvider === undefined) {
-        throw new ProjectMcpTransportConfigurationError(serverId, "oauth_provider_required");
+        throw new ProjectMcpTransportConfigurationError({
+          serverId,
+          reason: "oauth_provider_required",
+        });
       }
       return constructors.streamableHttp(new URL(transport.url), {
         requestInit: { headers },
@@ -113,11 +124,17 @@ export const makeProjectMcpTransport = ({
         transport.authorization.type === "oauth" &&
         transport.headers.some(({ name }) => name.toLowerCase() === "authorization")
       ) {
-        throw new ProjectMcpTransportConfigurationError(serverId, "authorization_header");
+        throw new ProjectMcpTransportConfigurationError({
+          serverId,
+          reason: "authorization_header",
+        });
       }
       const headers = resolveHeaders(serverId, transport.headers, resolveSecret);
       if (transport.authorization.type === "oauth" && oauthProvider === undefined) {
-        throw new ProjectMcpTransportConfigurationError(serverId, "oauth_provider_required");
+        throw new ProjectMcpTransportConfigurationError({
+          serverId,
+          reason: "oauth_provider_required",
+        });
       }
       return constructors.legacySse(new URL(transport.url), {
         eventSourceInit: {},

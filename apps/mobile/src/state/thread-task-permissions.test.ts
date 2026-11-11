@@ -21,6 +21,7 @@ import {
 import type { DraftComposerImageAttachment } from "../lib/composerImages";
 import type { PendingThreadRequests } from "@t3tools/client-runtime/state/thread-requests";
 import { sendApprovalFeedback } from "@t3tools/client-runtime/state/thread-requests";
+import { DateTime } from "effect";
 import { AsyncResult, type Atom } from "effect/reactivity";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -39,6 +40,9 @@ const state = vi.hoisted(() => ({
   projection: null as OrchestrationV2ThreadProjection | null,
   pendingRequests: { approvals: [], userInputs: [] } as PendingThreadRequests,
   enqueue: vi.fn(async () => undefined),
+  freshPending: false,
+  compactDue: false,
+  setFreshPending: vi.fn(),
   clearDraft: vi.fn(),
   approve: vi.fn(),
   answer: vi.fn(),
@@ -54,12 +58,13 @@ const state = vi.hoisted(() => ({
   thread: {
     id: "thread",
     environmentId: "secondary",
+    lineage: { rootThreadId: "thread", parentThreadId: null, relationshipToParent: null },
     projectId: "project",
     modelSelection: { instanceId: "codex", model: "gpt-5.4" },
     runtimeMode: "full-access",
     interactionMode: "default",
     runtime: null,
-    latestRun: null,
+    latestRun: null as unknown,
   },
 }));
 
@@ -75,6 +80,10 @@ vi.mock("react", () => ({
   ],
 }));
 vi.mock("expo-crypto", () => ({ randomUUID: () => "uuid" }));
+vi.mock("@t3tools/client-runtime/state/context-window", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@t3tools/client-runtime/state/context-window")>()),
+  shouldCompactBeforeSend: () => state.compactDue,
+}));
 vi.mock("../lib/attachmentUpload", () => ({ prepareTurnAttachments: vi.fn() }));
 vi.mock("../lib/uuid", () => ({ uuidv4: () => "uuid" }));
 vi.mock("./queued-run-edit", () => ({
@@ -147,6 +156,8 @@ vi.mock("./use-composer-drafts", async () => {
     composerDraftsAtom: Atom.make({}),
     composerContextImportsAtom: Atom.make({}),
     getComposerDraftSnapshot: () => state.draft,
+    isFreshSessionPending: () => state.freshPending,
+    setFreshSessionPending: state.setFreshPending,
     clearComposerDraftContent: state.clearDraft,
     clearComposerDraft: state.clearDraft,
     setComposerDraftText: (_key: string, text: string) => {
@@ -182,8 +193,11 @@ vi.mock("../features/assistants/useAgentThreadOwner", () => ({
   useAgentThreadOwner: () => ({ kind: state.ownerKind }),
 }));
 
+import { Alert } from "react-native";
 import { useThreadComposerState } from "./use-thread-composer-state";
 import { useSelectedThreadRequests } from "./use-selected-thread-requests";
+
+const NO_SIDE_CHATS = { startSideChat: async () => false };
 
 beforeEach(() => {
   state.grantedEnvironments = new Set(["primary"]);
@@ -198,12 +212,12 @@ beforeEach(() => {
   state.ownerKind = "ordinary";
   state.thread.modelSelection = { instanceId: "codex", model: "gpt-5.4" };
   state.thread.interactionMode = "default";
+  state.freshPending = false;
+  state.compactDue = false;
+  state.thread.latestRun = null;
   state.projection = null;
   state.serverConfig = {
-    providers: [
-      { instanceId: "codex", driver: "codex", enabled: true },
-      { instanceId: "grok", driver: "grok", enabled: true, showInteractionModeToggle: false },
-    ],
+    providers: [{ instanceId: "codex", driver: "codex", enabled: true }],
     environment: { capabilities: {} },
   } as unknown as ServerConfig;
   state.pendingRequests = {
@@ -226,7 +240,7 @@ beforeEach(() => {
 describe("mobile task permissions", () => {
   it("consumes an approval reply without queueing a parent message", async () => {
     state.grantedEnvironments.add("secondary");
-    const composer = useThreadComposerState();
+    const composer = useThreadComposerState(NO_SIDE_CHATS);
     const requests = useSelectedThreadRequests();
     const approval = { ...state.pendingRequests.approvals[0]!, supportsFeedback: true };
     const messageId = await composer.onSendMessage(undefined, async (text) =>
@@ -250,7 +264,7 @@ describe("mobile task permissions", () => {
 
   it("preserves a draft changed during an approval reply and never sends it to the parent", async () => {
     state.grantedEnvironments.add("secondary");
-    const composer = useThreadComposerState();
+    const composer = useThreadComposerState(NO_SIDE_CHATS);
     const beforeDispatch = async () => {
       state.draft = { ...state.draft, text: "New feedback" };
       return "responded" as const;
@@ -262,21 +276,141 @@ describe("mobile task permissions", () => {
   });
 
   it("keeps a connected read-only task's draft instead of queueing it with another environment's grant", async () => {
-    const composer = useThreadComposerState();
+    const composer = useThreadComposerState(NO_SIDE_CHATS);
     expect(await composer.onSendMessage()).toBeNull();
     expect(state.enqueue).not.toHaveBeenCalled();
     expect(state.clearDraft).not.toHaveBeenCalled();
     composer.onChangeDraftMessage("Edited locally");
-    composer.onUpdateInteractionMode("plan");
     expect(state.draft.text).toBe("Edited locally");
-    expect(state.updateSettings).toHaveBeenCalledWith("secondary:thread", {
-      interactionMode: "plan",
+  });
+
+  it("keeps an armed fresh session for the message after an approval redirect", async () => {
+    state.grantedEnvironments.add("secondary");
+    state.freshPending = true;
+    const composer = useThreadComposerState(NO_SIDE_CHATS);
+    expect(await composer.onSendMessage(undefined, async () => true)).toBe("message");
+    expect(state.enqueue).toHaveBeenLastCalledWith(
+      expect.not.objectContaining({ freshContext: true }),
+    );
+    expect(state.setFreshPending).not.toHaveBeenCalled();
+    expect(await composer.onSendMessage()).toBe("message");
+    expect(state.enqueue).toHaveBeenLastCalledWith(expect.objectContaining({ freshContext: true }));
+    expect(state.setFreshPending).toHaveBeenCalledWith("secondary:thread", false);
+  });
+
+  it("compacts a stale thread before sending unless a fresh session is armed", async () => {
+    state.grantedEnvironments.add("secondary");
+    state.projection = {
+      thread: {
+        ...state.thread,
+        activeProviderThreadId: null,
+        lineage: { rootThreadId: "thread", parentThreadId: null, relationshipToParent: null },
+      },
+      runs: [],
+      attempts: [],
+      nodes: [],
+      subagents: [],
+      providerSessions: [],
+      providerThreads: [],
+      providerTurns: [],
+      runtimeRequests: [],
+      messages: [],
+      plans: [],
+      turnItems: [],
+      checkpointScopes: [],
+      checkpoints: [],
+      contextHandoffs: [],
+      contextTransfers: [],
+      visibleTurnItems: [],
+      updatedAt: DateTime.makeUnsafe(0),
+    } as unknown as OrchestrationV2ThreadProjection;
+    state.compactDue = true;
+    const composer = useThreadComposerState(NO_SIDE_CHATS);
+    await composer.onSendMessage();
+    expect(state.enqueue).toHaveBeenLastCalledWith(
+      expect.objectContaining({ compactBeforeSend: true }),
+    );
+    state.freshPending = true;
+    await composer.onSendMessage();
+    expect(state.enqueue).toHaveBeenLastCalledWith(
+      expect.not.objectContaining({ compactBeforeSend: true }),
+    );
+    expect(state.enqueue).toHaveBeenLastCalledWith(expect.objectContaining({ freshContext: true }));
+  });
+
+  it("sends a typed /clear with an approval redirect as that reply's text", async () => {
+    state.grantedEnvironments.add("secondary");
+    state.serverConfig = {
+      ...state.serverConfig,
+      environment: { capabilities: { freshContext: true } },
+    } as ServerConfig;
+    state.thread.latestRun = { runId: "run" };
+    state.draft = { ...state.draft, text: "/clear" };
+    const composer = useThreadComposerState(NO_SIDE_CHATS);
+    const beforeDispatch = vi.fn(async () => "responded" as const);
+    expect(await composer.onSendMessage(undefined, beforeDispatch)).toBeNull();
+    expect(beforeDispatch).toHaveBeenCalledWith("/clear", false);
+    expect(state.setFreshPending).not.toHaveBeenCalled();
+  });
+
+  it("starts a side chat for /side instead of sending to the thread", async () => {
+    state.grantedEnvironments.add("secondary");
+    state.serverConfig = {
+      ...state.serverConfig,
+      environment: { capabilities: { sideChats: true } },
+    } as ServerConfig;
+    // The thread gets the composer's mode and model only on its next send.
+    const selection: ModelSelection = {
+      instanceId: ProviderInstanceId.make("codex"),
+      model: "gpt-5.4",
+      options: [{ id: "reasoningEffort", value: "xhigh" }],
+    };
+    state.draft = {
+      ...state.draft,
+      text: "/side why does this fail?",
+      modelSelection: selection,
+      runtimeMode: "approval-required",
+    };
+    const startSideChat = vi.fn(async () => true);
+    const composer = useThreadComposerState({ startSideChat });
+    expect(composer.sideChatUnavailableReason).toBeNull();
+    expect(await composer.onSendMessage()).toBeNull();
+    expect(startSideChat).toHaveBeenCalledExactlyOnceWith(
+      { environmentId: "secondary", threadId: "thread" },
+      "why does this fail?",
+      { runtimeMode: "approval-required", modelSelection: selection },
+    );
+    expect(state.enqueue).not.toHaveBeenCalled();
+    expect(state.clearDraft).toHaveBeenCalled();
+
+    // An attachment added while the side chat starts stays in the draft.
+    vi.clearAllMocks();
+    startSideChat.mockImplementationOnce(async () => {
+      state.draft = {
+        ...state.draft,
+        attachments: [{ id: "added" } as DraftComposerImageAttachment],
+      };
+      return true;
     });
+    state.draft = { ...state.draft, text: "/side again?", attachments: [] };
+    expect(await useThreadComposerState({ startSideChat }).onSendMessage()).toBeNull();
+    expect(startSideChat).toHaveBeenCalledOnce();
+    expect(state.clearDraft).not.toHaveBeenCalled();
+    // A model the send would refuse does not start a side chat either.
+    vi.clearAllMocks();
+    state.serverConfig = {
+      ...state.serverConfig,
+      providers: [{ instanceId: "codex", driver: "codex", enabled: false }],
+    } as unknown as ServerConfig;
+    state.draft = { ...state.draft, attachments: [] };
+    expect(await useThreadComposerState({ startSideChat }).onSendMessage()).toBeNull();
+    expect(startSideChat).not.toHaveBeenCalled();
+    expect(Alert.alert).toHaveBeenCalledOnce();
   });
 
   it("rechecks a retained send callback before clearing or queueing the draft", async () => {
     state.grantedEnvironments.add("secondary");
-    const composer = useThreadComposerState();
+    const composer = useThreadComposerState(NO_SIDE_CHATS);
     state.grantedEnvironments.delete("secondary");
     expect(await composer.onSendMessage()).toBeNull();
     expect(state.clearDraft).not.toHaveBeenCalled();
@@ -353,6 +487,7 @@ describe("mobile handoff preview and submission", () => {
       auth: { status: "authenticated" as const },
       availability: "available" as "available" | "unavailable",
       models: [{ slug: selection.model }],
+      slashCommands: [],
     };
     const projectOverride = { enabled: false };
     state.serverConfig = {
@@ -419,24 +554,27 @@ describe("mobile handoff preview and submission", () => {
       ],
     };
 
-    const disabled = useThreadComposerState();
+    const disabled = useThreadComposerState(NO_SIDE_CHATS);
     expect(disabled.pendingHandoff).toBeNull();
     expect(await disabled.onSendMessage()).toBeNull();
     expect(state.enqueue).not.toHaveBeenCalled();
     expect(state.clearDraft).not.toHaveBeenCalled();
 
     projectOverride.enabled = true;
-    expect(useThreadComposerState().pendingHandoff).toEqual({ from: [source], to: selection });
+    expect(useThreadComposerState(NO_SIDE_CHATS).pendingHandoff).toEqual({
+      from: [source],
+      to: selection,
+    });
 
     provider.availability = "unavailable";
-    const unavailable = useThreadComposerState();
+    const unavailable = useThreadComposerState(NO_SIDE_CHATS);
     expect(unavailable.pendingHandoff).toBeNull();
     expect(await unavailable.onSendMessage()).toBeNull();
     expect(state.enqueue).not.toHaveBeenCalled();
     expect(state.clearDraft).not.toHaveBeenCalled();
 
     provider.availability = "available";
-    const available = useThreadComposerState();
+    const available = useThreadComposerState(NO_SIDE_CHATS);
     expect(available.pendingHandoff).toEqual({ from: [source], to: selection });
     expect(await available.onSendMessage()).toBe("message");
     expect(state.enqueue).toHaveBeenCalledExactlyOnceWith(
@@ -463,7 +601,7 @@ describe("mobile agent-owned composer settings", () => {
   it("sends a canonical home with its current synchronized settings, not persisted overrides", async () => {
     stageConflictingOverrides();
     state.ownerKind = "canonical";
-    const composer = useThreadComposerState();
+    const composer = useThreadComposerState(NO_SIDE_CHATS);
     expect(composer.modelSelection).toEqual({ instanceId: "codex", model: "gpt-5.4" });
     expect(composer.runtimeMode).toBe("full-access");
     expect(composer.interactionMode).toBe("default");
@@ -479,7 +617,7 @@ describe("mobile agent-owned composer settings", () => {
 
     // The agent's configuration changed on the server while the composer stayed mounted.
     state.thread.modelSelection = { instanceId: "codex", model: "gpt-5.5" };
-    const remounted = useThreadComposerState();
+    const remounted = useThreadComposerState(NO_SIDE_CHATS);
     expect(remounted.modelSelection).toEqual({ instanceId: "codex", model: "gpt-5.5" });
     expect(await remounted.onSendMessage()).toBe("message");
     expect(state.enqueue).toHaveBeenLastCalledWith(
@@ -487,12 +625,11 @@ describe("mobile agent-owned composer settings", () => {
     );
   });
 
-  it("shows and queues a canonical home's saved Plan mode on a provider without a mode toggle", async () => {
+  it("shows and queues a canonical home's saved Plan mode", async () => {
     state.grantedEnvironments.add("secondary");
     state.ownerKind = "canonical";
-    state.thread.modelSelection = { instanceId: "grok", model: "grok-code-fast-1" };
     state.thread.interactionMode = "plan";
-    const composer = useThreadComposerState();
+    const composer = useThreadComposerState(NO_SIDE_CHATS);
     expect(composer.interactionMode).toBe("plan");
     expect(await composer.onSendMessage()).toBe("message");
     expect(state.enqueue).toHaveBeenLastCalledWith(
@@ -501,7 +638,7 @@ describe("mobile agent-owned composer settings", () => {
 
     // The agent's configuration moved back to Default on the server.
     state.thread.interactionMode = "default";
-    const updated = useThreadComposerState();
+    const updated = useThreadComposerState(NO_SIDE_CHATS);
     expect(updated.interactionMode).toBe("default");
     expect(await updated.onSendMessage()).toBe("message");
     expect(state.enqueue).toHaveBeenLastCalledWith(
@@ -510,13 +647,12 @@ describe("mobile agent-owned composer settings", () => {
   });
 
   it.each(["ordinary", "child"] as const)(
-    "still normalizes a %s Plan override for a provider without a mode toggle",
+    "sends a %s chat's saved Plan override in build mode",
     async (kind) => {
       state.grantedEnvironments.add("secondary");
       state.ownerKind = kind;
-      state.thread.modelSelection = { instanceId: "grok", model: "grok-code-fast-1" };
       state.draft.interactionMode = "plan";
-      const composer = useThreadComposerState();
+      const composer = useThreadComposerState(NO_SIDE_CHATS);
       expect(composer.interactionMode).toBe("default");
       expect(await composer.onSendMessage()).toBe("message");
       expect(state.enqueue).toHaveBeenLastCalledWith(
@@ -530,10 +666,9 @@ describe("mobile agent-owned composer settings", () => {
 
   it("keeps a canonical home's settings out of local drafts", () => {
     state.ownerKind = "canonical";
-    const composer = useThreadComposerState();
+    const composer = useThreadComposerState(NO_SIDE_CHATS);
     composer.onUpdateModelSelection({ instanceId: ProviderInstanceId.make("codex"), model: "x" });
     composer.onUpdateRuntimeMode("approval-required");
-    composer.onUpdateInteractionMode("plan");
     expect(state.updateSettings).not.toHaveBeenCalled();
   });
 
@@ -542,10 +677,9 @@ describe("mobile agent-owned composer settings", () => {
     async (kind) => {
       stageConflictingOverrides();
       state.ownerKind = kind;
-      const composer = useThreadComposerState();
+      const composer = useThreadComposerState(NO_SIDE_CHATS);
       composer.onUpdateModelSelection({ instanceId: ProviderInstanceId.make("codex"), model: "x" });
       composer.onUpdateRuntimeMode("full-access");
-      composer.onUpdateInteractionMode("default");
       expect(state.updateSettings).not.toHaveBeenCalled();
       expect(await composer.onSendMessage()).toBeNull();
       expect(state.enqueue).not.toHaveBeenCalled();
@@ -554,7 +688,7 @@ describe("mobile agent-owned composer settings", () => {
       state.draft.modelSelection = undefined;
       state.draft.runtimeMode = undefined;
       state.draft.interactionMode = undefined;
-      expect(await useThreadComposerState().onSendMessage()).toBe("message");
+      expect(await useThreadComposerState(NO_SIDE_CHATS).onSendMessage()).toBe("message");
       expect(state.enqueue).toHaveBeenCalledWith(
         expect.objectContaining({ modelSelection: { instanceId: "codex", model: "gpt-5.4" } }),
       );
@@ -562,19 +696,18 @@ describe("mobile agent-owned composer settings", () => {
   );
 
   it.each(["unknown", "offline"] as const)(
-    "while ownership is %s, holds a saved Plan mode the provider would normalize away",
+    "while ownership is %s, holds a saved Plan mode that build mode would replace",
     async (kind) => {
       state.grantedEnvironments.add("secondary");
       state.ownerKind = kind;
-      state.thread.modelSelection = { instanceId: "grok", model: "grok-code-fast-1" };
       state.thread.interactionMode = "plan";
-      expect(await useThreadComposerState().onSendMessage()).toBeNull();
+      expect(await useThreadComposerState(NO_SIDE_CHATS).onSendMessage()).toBeNull();
       expect(state.enqueue).not.toHaveBeenCalled();
       expect(state.clearDraft).not.toHaveBeenCalled();
       expect(state.draft.text).toBe("Keep my draft");
 
       state.ownerKind = "canonical";
-      expect(await useThreadComposerState().onSendMessage()).toBe("message");
+      expect(await useThreadComposerState(NO_SIDE_CHATS).onSendMessage()).toBe("message");
       expect(state.enqueue).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({
           text: "Keep my draft",
@@ -588,7 +721,7 @@ describe("mobile agent-owned composer settings", () => {
   it.each(["ordinary", "child"] as const)("keeps %s draft overrides", async (kind) => {
     stageConflictingOverrides();
     state.ownerKind = kind;
-    const composer = useThreadComposerState();
+    const composer = useThreadComposerState(NO_SIDE_CHATS);
     composer.onUpdateRuntimeMode("full-access");
     expect(state.updateSettings).toHaveBeenCalledWith("secondary:thread", {
       runtimeMode: "full-access",
@@ -598,7 +731,7 @@ describe("mobile agent-owned composer settings", () => {
       expect.objectContaining({
         modelSelection: { instanceId: "codex", model: "old-model" },
         runtimeMode: "approval-required",
-        interactionMode: "plan",
+        interactionMode: "default",
       }),
     );
   });

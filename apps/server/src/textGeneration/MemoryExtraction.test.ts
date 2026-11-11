@@ -1,3 +1,5 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { assert, it } from "@effect/vitest";
 import {
   ProviderInstanceId,
@@ -47,6 +49,7 @@ const makeInstance = (
       generateReviewGuide: unsupported,
       describeImage: unsupported,
       webSearch: unsupported,
+      generateTranscriptionPostProcessing: unsupported,
     },
   };
 };
@@ -60,6 +63,8 @@ const service = (instances: readonly ProviderInstance[]) =>
         }),
         Layer.mock(Hosts.SourceControlProviderRegistry)({ resolveLink: () => undefined }),
         ServerSettings.layerTest(),
+        NodeServices.layer,
+        NodeCrypto.layer,
       ),
     ),
   );

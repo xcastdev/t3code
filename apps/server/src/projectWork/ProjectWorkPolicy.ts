@@ -1,4 +1,5 @@
 import { projectWorkPayloadFingerprint } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 import type {
   ProjectTeamRecord,
   ProjectWorkAction,
@@ -19,42 +20,36 @@ import type {
   ProjectWorkResultInvalidation,
 } from "@t3tools/contracts";
 
-export type ProjectWorkPolicyFailureCode =
-  | "unknown-task"
-  | "unknown-criterion"
-  | "unknown-evidence"
-  | "unknown-relationship"
-  | "unknown-blocker"
-  | "stale-revision"
-  | "invalid-state"
-  | "invalid-specification"
-  | "invalid-relationship"
-  | "active-attempt"
-  | "unresolved-dependency"
-  | "unsatisfied-criterion"
-  | "protected-specification"
-  | "approval-required"
-  | "authority-required"
-  | "duplicate-record"
-  | "deferred-command";
+const ProjectWorkPolicyFailureCode = Schema.Literals([
+  "unknown-task",
+  "unknown-criterion",
+  "unknown-evidence",
+  "unknown-relationship",
+  "unknown-blocker",
+  "stale-revision",
+  "invalid-state",
+  "invalid-specification",
+  "invalid-relationship",
+  "active-attempt",
+  "unresolved-dependency",
+  "unsatisfied-criterion",
+  "protected-specification",
+  "approval-required",
+  "authority-required",
+  "duplicate-record",
+  "deferred-command",
+]);
+export type ProjectWorkPolicyFailureCode = typeof ProjectWorkPolicyFailureCode.Type;
 
 /** A domain rejection that callers can map to a typed command receipt. */
-export class ProjectWorkPolicyError extends Error {
-  readonly _tag = "ProjectWorkPolicyError";
-  readonly code: ProjectWorkPolicyFailureCode;
-  readonly details: Readonly<Record<string, unknown>> | undefined;
-
-  constructor(
+export class ProjectWorkPolicyError extends Schema.TaggedError<ProjectWorkPolicyError>()(
+  "ProjectWorkPolicyError",
+  {
     code: ProjectWorkPolicyFailureCode,
-    message: string,
-    details?: Readonly<Record<string, unknown>>,
-  ) {
-    super(message);
-    this.name = "ProjectWorkPolicyError";
-    this.code = code;
-    this.details = details;
-  }
-}
+    message: Schema.String,
+    details: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  },
+) {}
 
 export interface ProjectWorkState {
   readonly foundationRecords?: ReadonlyArray<ProjectTeamRecord>;
@@ -118,8 +113,12 @@ const terminalStates = new Set(["completed", "canceled"]);
 const taskFor = (state: ProjectWorkState, taskId: ProjectWorkTaskId): ProjectWorkTask => {
   const task = state.tasks.find((entry) => entry.taskId === taskId);
   if (task === undefined) {
-    throw new ProjectWorkPolicyError("unknown-task", `Task '${taskId}' does not exist.`, {
-      taskId,
+    throw new ProjectWorkPolicyError({
+      code: "unknown-task",
+      message: `Task '${taskId}' does not exist.`,
+      details: {
+        taskId,
+      },
     });
   }
   return task;
@@ -133,11 +132,11 @@ const activeAttemptFor = (state: ProjectWorkState, taskId: ProjectWorkTaskId) =>
 const criterionFor = (state: ProjectWorkState, criterionId: string): ProjectWorkCriterion => {
   const criterion = state.criteria.find((entry) => entry.criterionId === criterionId);
   if (criterion === undefined) {
-    throw new ProjectWorkPolicyError(
-      "unknown-criterion",
-      `Criterion '${criterionId}' does not exist.`,
-      { criterionId },
-    );
+    throw new ProjectWorkPolicyError({
+      code: "unknown-criterion",
+      message: `Criterion '${criterionId}' does not exist.`,
+      details: { criterionId },
+    });
   }
   return criterion;
 };
@@ -439,11 +438,11 @@ export function assertProjectWorkExpectedRevision(
   commandType: string,
 ): void {
   if (expectedRevision !== undefined && expectedRevision !== state.revision) {
-    throw new ProjectWorkPolicyError(
-      "stale-revision",
-      `Expected project-work revision ${expectedRevision}, current revision is ${state.revision}.`,
-      { commandType, expectedRevision, currentRevision: state.revision },
-    );
+    throw new ProjectWorkPolicyError({
+      code: "stale-revision",
+      message: `Expected project-work revision ${expectedRevision}, current revision is ${state.revision}.`,
+      details: { commandType, expectedRevision, currentRevision: state.revision },
+    });
   }
 }
 
@@ -453,11 +452,11 @@ export function assertProjectWorkAttribution(
   kind: "human" | "agent" = "human",
 ): ProjectWorkAttribution {
   if (attribution === undefined || attribution.actor.kind !== kind) {
-    throw new ProjectWorkPolicyError(
-      "authority-required",
-      `${commandType} requires attribution by a ${kind}.`,
-      { commandType, requiredActorKind: kind },
-    );
+    throw new ProjectWorkPolicyError({
+      code: "authority-required",
+      message: `${commandType} requires attribution by a ${kind}.`,
+      details: { commandType, requiredActorKind: kind },
+    });
   }
   return attribution;
 }
@@ -486,14 +485,14 @@ export function canRevokeProjectWorkCriterionWaiver(
 export function assertNoActiveAttempt(state: ProjectWorkState, taskId: ProjectWorkTaskId): void {
   const attempt = activeAttemptFor(state, taskId);
   if (attempt !== undefined) {
-    throw new ProjectWorkPolicyError(
-      "active-attempt",
-      `Task '${taskId}' already has an active attempt.`,
-      {
+    throw new ProjectWorkPolicyError({
+      code: "active-attempt",
+      message: `Task '${taskId}' already has an active attempt.`,
+      details: {
         taskId,
         attemptId: attempt.attemptId,
       },
-    );
+    });
   }
 }
 
@@ -514,8 +513,12 @@ export function assertKnownCriterion(
 export function assertKnownBlocker(state: ProjectWorkState, blockerId: string): ProjectWorkBlocker {
   const blocker = state.blockers.find((entry) => entry.blockerId === blockerId);
   if (blocker === undefined) {
-    throw new ProjectWorkPolicyError("unknown-blocker", `Blocker '${blockerId}' does not exist.`, {
-      blockerId,
+    throw new ProjectWorkPolicyError({
+      code: "unknown-blocker",
+      message: `Blocker '${blockerId}' does not exist.`,
+      details: {
+        blockerId,
+      },
     });
   }
   return blocker;
@@ -528,25 +531,25 @@ export function assertTaskCanBeReady(
   const task = taskFor(state, taskId);
   const policy = deriveProjectWorkTaskPolicy(state, taskId);
   if (task.state !== "specified") {
-    throw new ProjectWorkPolicyError(
-      "invalid-state",
-      `Task '${taskId}' must be specified before it is ready.`,
-      {
+    throw new ProjectWorkPolicyError({
+      code: "invalid-state",
+      message: `Task '${taskId}' must be specified before it is ready.`,
+      details: {
         taskId,
         state: task.state,
       },
-    );
+    });
   }
   if (!policy.readiness.ready) {
-    throw new ProjectWorkPolicyError(
-      policy.readiness.reasons.includes("unresolved-dependency")
+    throw new ProjectWorkPolicyError({
+      code: policy.readiness.reasons.includes("unresolved-dependency")
         ? "unresolved-dependency"
         : policy.readiness.reasons.includes("approval-required")
           ? "approval-required"
           : "invalid-specification",
-      `Task '${taskId}' is not ready: ${policy.readiness.reasons.join(", ")}.`,
-      { taskId, reasons: policy.readiness.reasons },
-    );
+      message: `Task '${taskId}' is not ready: ${policy.readiness.reasons.join(", ")}.`,
+      details: { taskId, reasons: policy.readiness.reasons },
+    });
   }
   return task;
 }

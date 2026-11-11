@@ -1,4 +1,4 @@
-import * as Crypto from "effect/Crypto";
+import * as Digest from "effect/crypto/Digest";
 import * as Hex from "effect/encoding/Hex";
 import {
   CheckpointRef,
@@ -136,7 +136,7 @@ const make = Effect.gen(function* () {
   const assistantPolicy = yield* Effect.serviceOption(
     AssistantPolicy.ThreadHistoryRecoveryAssistantPolicy,
   );
-  const crypto = yield* Crypto.Crypto;
+  const digest = yield* Digest.Digest;
   const archives = yield* Archive.ThreadHistoryArchiveService;
   const projections = yield* ProjectionStoreV2;
   const checkpoints = yield* CheckpointStore.CheckpointStore;
@@ -279,9 +279,10 @@ const make = Effect.gen(function* () {
     return {
       threadId: input.threadId,
       archiveId: Hex.encode(
-        yield* crypto
-          .digest("SHA-256", new TextEncoder().encode(`restore-files:${input.commandId}`))
-          .pipe(Effect.orDie),
+        yield* digest.digest(
+          Digest.sha256,
+          new TextEncoder().encode(`restore-files:${input.commandId}`),
+        ),
       ),
     };
   });

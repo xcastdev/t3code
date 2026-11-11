@@ -291,7 +291,7 @@ export function SettingsAgentRouteScreen({
   const detail = detailQuery.data;
   const selection = currentAssistantSelection(detail, connection.epoch);
   const latest = useRef(selection);
-  // oxlint-disable-next-line t3code/react-effect-budget -- Pending confirmations must read the latest committed remote revision.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Pending confirmations must read the latest committed remote revision.
   useEffect(() => {
     latest.current = selection;
   });

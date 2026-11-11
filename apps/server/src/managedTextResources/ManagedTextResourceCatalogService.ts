@@ -129,8 +129,9 @@ const decodeChanged = Schema.decodeUnknownSync(ManagedTextResourceChangedSchema)
 const fail = (code: ManagedTextResourceRpcError["code"], message: string) =>
   new ManagedTextResourceRpcErrorSchema({ code, message });
 
+const isRepositoryError = Schema.is(ManagedTextResourceRepositoryError);
 const mapRepositoryError = (cause: unknown): ManagedTextResourceRpcError => {
-  if (!(cause instanceof ManagedTextResourceRepositoryError)) {
+  if (!isRepositoryError(cause)) {
     return fail("invalid-override", "The managed text resource operation failed.");
   }
   switch (cause.code) {
@@ -355,9 +356,7 @@ const mutate = <A>(
                   Effect.tryPromise({
                     try: () => result,
                     catch: (cause) =>
-                      cause instanceof ManagedTextResourceRepositoryError
-                        ? mapRepositoryError(cause)
-                        : authorizationFailure,
+                      isRepositoryError(cause) ? mapRepositoryError(cause) : authorizationFailure,
                   }),
                 onSuccess: () => {
                   resolve();

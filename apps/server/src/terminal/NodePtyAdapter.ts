@@ -26,6 +26,20 @@ export class NodePtyModuleLoadError extends Schema.TaggedError<NodePtyModuleLoad
   }
 }
 
+class NodePtyCancelError extends Schema.TaggedError<NodePtyCancelError>()("NodePtyCancelError", {
+  terminalPid: Schema.Number,
+  cause: Schema.Defect(),
+}) {
+  override get message(): string {
+    return `Failed to cancel Windows terminal startup for ${this.terminalPid}.`;
+  }
+}
+
+class LinuxSessionReadError extends Schema.TaggedError<LinuxSessionReadError>()(
+  "LinuxSessionReadError",
+  { pid: Schema.Number, cause: Schema.Defect() },
+) {}
+
 type NodePtyModuleLoader = () => Promise<typeof import("node-pty")>;
 
 // node-pty's native addon stays external; single-executables need require to resolve disk modules and spawn helpers.
@@ -136,18 +150,21 @@ const waitForWindowsPid = (
 
 // The private agent cancels pending connections before a child exists; public kill waits for first output.
 const killStartingWindowsPty = (process: import("node-pty").IPty) =>
-  Effect.try(() => {
-    if (
-      "_agent" in process &&
-      typeof process._agent === "object" &&
-      process._agent !== null &&
-      "kill" in process._agent &&
-      typeof process._agent.kill === "function"
-    ) {
-      process._agent.kill();
-    } else {
-      process.kill();
-    }
+  Effect.try({
+    try: () => {
+      if (
+        "_agent" in process &&
+        typeof process._agent === "object" &&
+        process._agent !== null &&
+        "kill" in process._agent &&
+        typeof process._agent.kill === "function"
+      ) {
+        process._agent.kill();
+      } else {
+        process.kill();
+      }
+    },
+    catch: (cause) => new NodePtyCancelError({ terminalPid: process.pid, cause }),
   }).pipe(
     Effect.catch((error) =>
       Effect.logWarning("failed to cancel Windows terminal startup", {
@@ -202,11 +219,17 @@ const readLinuxIdentity = (
 
 const captureLinuxSession = Effect.fn("NodePtyAdapter.captureLinuxSession")(
   function* (pid: number) {
-    const initial = yield* Effect.try(() => readLinuxIdentity(pid));
+    const initial = yield* Effect.try({
+      try: () => readLinuxIdentity(pid),
+      catch: (cause) => new LinuxSessionReadError({ pid, cause }),
+    });
     if (!initial) return undefined;
     // forkpty's child establishes its session before exec; the parent may return first.
     for (let attempt = 0; attempt < 20; attempt++) {
-      const current = yield* Effect.try(() => readLinuxIdentity(pid));
+      const current = yield* Effect.try({
+        try: () => readLinuxIdentity(pid),
+        catch: (cause) => new LinuxSessionReadError({ pid, cause }),
+      });
       if (!current || current.start !== initial.start) return undefined;
       if (current.session === pid && current.group === pid) return current;
       yield* Effect.sleep("10 millis");

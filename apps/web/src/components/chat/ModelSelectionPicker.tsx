@@ -85,7 +85,6 @@ export function ModelSelectionPicker({
           model: selection.model,
           modelOptions: selection.options ?? null,
           allowPromptInjectedEffort: false,
-          planModeEnabled: false,
           onModelOptionsChange: (options) => {
             const { options: _previous, ...rest } = selection;
             onChange(options === undefined ? rest : { ...rest, options });

@@ -311,6 +311,7 @@ function fixture(
     Layer.succeed(SecretRequests.SecretRequests, {
       answer: unused,
       saveToFile: unused,
+      savePasted: unused,
       prepareCatalog: (request) =>
         Effect.sync(() => {
           expect(request.authSessionId).toBe(sessionId);

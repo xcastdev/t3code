@@ -62,10 +62,12 @@ export interface RegisterCatalogSessionInput {
   readonly entries: ReadonlyArray<ResolvedMcpCatalogEntry>;
 }
 export interface McpCatalogGatewaySession extends RegisterCatalogSessionInput {}
-export class McpCatalogGatewayError extends Error {
-  readonly _tag = "McpCatalogGatewayError";
-  constructor() {
-    super("MCP catalog apply failed.");
+export class McpCatalogGatewayError extends Schema.TaggedError<McpCatalogGatewayError>()(
+  "McpCatalogGatewayError",
+  {},
+) {
+  override get message(): string {
+    return "MCP catalog apply failed.";
   }
 }
 export interface McpCatalogGatewayShape {
@@ -110,9 +112,10 @@ const UNKNOWN_RESOURCE_MESSAGE = "Unknown MCP catalog resource.";
 const ASSISTANT_TOOL_REFUSED_MESSAGE = "This tool is not selected in the assistant configuration.";
 const ASSISTANT_RESOURCE_REFUSED_MESSAGE =
   "Assistant resource access requires a configured selection.";
-class McpCatalogPluginRefusal extends Error {
-  readonly _tag = "McpCatalogPluginRefusal";
-}
+class McpCatalogPluginRefusal extends Schema.TaggedError<McpCatalogPluginRefusal>()(
+  "McpCatalogPluginRefusal",
+  { message: Schema.String },
+) {}
 interface PluginSource {
   readonly catalog: () => Promise<ReadonlyArray<PluginService.PluginAgentCatalogEntry>>;
   /** Resolves to the operation's JSON result text; rejects with the refusal the agent sees. */
@@ -399,11 +402,12 @@ const make = Effect.gen(function* () {
     Effect.flatMap(plugins.list, (snapshot) => {
       const record = snapshot.installed.find((candidate) => candidate.pluginId === pluginId);
       return Effect.fail(
-        new McpCatalogPluginRefusal(
-          record !== undefined && !record.enabled
-            ? `Plugin "${record.name}" is disabled.`
-            : missing,
-        ),
+        new McpCatalogPluginRefusal({
+          message:
+            record !== undefined && !record.enabled
+              ? `Plugin "${record.name}" is disabled.`
+              : missing,
+        }),
       );
     });
   const callPlugin = Effect.fn("McpCatalogGateway.callPlugin")(function* (
@@ -422,7 +426,7 @@ const make = Effect.gen(function* () {
         ? target.operation
         : readableResources(entry).find((item) => item.name === target.name)?.operation;
     if (operationName === undefined)
-      return yield* Effect.fail(new McpCatalogPluginRefusal(missing));
+      return yield* new McpCatalogPluginRefusal({ message: missing });
     const declared = entry.operations.find(
       (operation) => operation.name === operationName && operation.agent,
     );
@@ -438,7 +442,7 @@ const make = Effect.gen(function* () {
         shell?.runtimeMode !== "full-access" ||
         shell.interactionMode !== "default")
     )
-      return yield* Effect.fail(new McpCatalogPluginRefusal(PLUGIN_MUTATION_REFUSED_MESSAGE));
+      return yield* new McpCatalogPluginRefusal({ message: PLUGIN_MUTATION_REFUSED_MESSAGE });
     const result = yield* plugins
       .callOperation({
         pluginId,
@@ -502,14 +506,14 @@ const make = Effect.gen(function* () {
       const stage = { input, revoked: false };
       stages.add(stage);
       try {
-        if (!(yield* valid(input))) return yield* Effect.fail(new McpCatalogGatewayError());
+        if (!(yield* valid(input))) return yield* new McpCatalogGatewayError();
         const ids = new Set(input.entries.map((entry) => entry.logicalServerId));
         if (
           ids.size !== input.entries.length ||
           input.entries.length > 50 ||
           input.entries.some((entry) => entry.providerInstanceId !== input.providerInstanceId)
         )
-          return yield* Effect.fail(new McpCatalogGatewayError());
+          return yield* new McpCatalogGatewayError();
         const installed = sessions.get(input.catalogSessionId);
         if (
           (installed &&
@@ -522,7 +526,7 @@ const make = Effect.gen(function* () {
               candidate.session.catalogSessionId !== input.catalogSessionId,
           )
         )
-          return yield* Effect.fail(new McpCatalogGatewayError());
+          return yield* new McpCatalogGatewayError();
         // Provider history outlives generations and restarts, so issued aliases are durable.
         const issued = yield* aliasStore.read(input.catalogSessionId);
         const scope = yield* Scope.make("parallel");
@@ -539,7 +543,7 @@ const make = Effect.gen(function* () {
         ).pipe(Effect.onError(() => Scope.close(scope, Exit.void)));
         if (!(yield* valid(input)) || stage.revoked) {
           yield* Scope.close(scope, Exit.void);
-          return yield* Effect.fail(new McpCatalogGatewayError());
+          return yield* new McpCatalogGatewayError();
         }
         const previous = sessions.get(input.catalogSessionId);
         const aliases = catalogAliases(input.entries, issued);

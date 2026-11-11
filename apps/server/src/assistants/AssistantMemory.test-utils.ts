@@ -114,6 +114,7 @@ export const fixture = (
         generateReviewGuide: unused,
         describeImage: unused,
         webSearch: unused,
+        generateTranscriptionPostProcessing: unused,
         extractMemoryFacts: extract,
       }),
     ),

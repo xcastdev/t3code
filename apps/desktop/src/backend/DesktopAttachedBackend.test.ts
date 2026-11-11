@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as DesktopConfig from "../app/DesktopConfig.ts";
 import { assert, describe, it } from "@effect/vitest";
@@ -143,6 +144,7 @@ const fixture = Effect.gen(function* () {
   });
   const dependencies = Layer.mergeAll(
     NodeServices.layer,
+    NodeCrypto.layer,
     settingsLayer,
     environment,
     Layer.succeed(HttpClient.HttpClient, http),

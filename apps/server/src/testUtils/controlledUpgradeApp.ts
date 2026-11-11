@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off -- Fresh ephemeral credentials never leave the fixture manifest.
 import * as NodeCrypto from "node:crypto";
 import * as NodePath from "node:path";
+import * as PlatformNodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   AuthStandardClientScopes,
@@ -53,6 +54,9 @@ import { layerFixtureFilesystem } from "./upgradeFixtureFilesystem.ts";
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as AuthHttp from "../auth/http.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import * as AssetSigner from "../assets/AssetSigner.ts";
+import * as ProviderInstallation from "../provider/providerInstallation.ts";
+import * as TextGenerators from "../textGeneration/TextGenerators.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as Analytics from "../telemetry/AnalyticsService.ts";
@@ -198,7 +202,10 @@ export function controlledUpgradeApplicationLayer(
       resolveFileManagerRevealKind: () => Effect.as(Effect.void, undefined),
     }),
     Layer.mock(RemoteOpenTargets.RemoteOpenTargets)({ resolveTargets: () => Effect.succeed([]) }),
-    Layer.mock(DirectEndpoints.DirectEndpoints)({ resolve: () => Effect.succeed([]) }),
+    Layer.mock(DirectEndpoints.DirectEndpoints)({
+      resolve: () => Effect.succeed([]),
+      resolveAvailable: () => Effect.succeed([]),
+    }),
     Layer.mock(ManagedFolders.ManagedProjectFolders)({
       scratchRoot: Effect.succeedNone,
       namedProjectsRoot: NodePath.join(snapshot.fixtureRoot, "projects"),
@@ -242,11 +249,16 @@ export function controlledUpgradeApplicationLayer(
     localReadServices,
     environment,
     layerControlledFreshSecrets,
-    base,
     auth,
     config,
     layerControlledNotificationPorts.pipe(Layer.provide(layerControlledFreshSecrets)),
-  );
+    AssetSigner.layer.pipe(
+      Layer.provide(Layer.merge(layerControlledFreshSecrets, PlatformNodeCrypto.layer)),
+    ),
+    // The fixture installs no providers and runs no standalone text generators.
+    Layer.mock(ProviderInstallation.ProviderInstallation)({}),
+    Layer.mock(TextGenerators.TextGenerators)({}),
+  ).pipe(Layer.provideMerge(base));
   const terminals = layerControlledTerminal(snapshot).pipe(Layer.provideMerge(safeServices));
   const business = layerControlledBusiness(snapshot).pipe(Layer.provideMerge(terminals));
   const routines = layerControlledRoutines.pipe(Layer.provideMerge(business));
@@ -321,7 +333,7 @@ export function controlledUpgradeApplicationLayer(
     Layer.provideMerge(
       layerApplicationHttpServer.pipe(Layer.provide(Layer.merge(config, NetService.layer))),
     ),
-    Layer.provideMerge(NodeServices.layer),
+    Layer.provideMerge(Layer.merge(NodeServices.layer, PlatformNodeCrypto.layer)),
   );
   return Layer.effectDiscard(
     Effect.gen(function* () {

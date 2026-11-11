@@ -24,12 +24,12 @@ import * as Schema from "effect/Schema";
 import { useContext, useState } from "react";
 import { View } from "react-native";
 
+import { AppBar } from "../../components/ui/AppBar";
 import { Button } from "../../components/ui/Button";
 import * as Dialog from "../../components/ui/Dialog";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { beginForegroundHandoff } from "../../lib/foreground-handoff";
 import { uuidv4 } from "../../lib/uuid";
-import { NativeStackScreenOptions } from "../../native/StackHeader";
 import { useAssetUrlState } from "../../state/assets";
 import { appAtomRegistry } from "../../state/atom-registry";
 import { pluginEnvironment } from "../../state/plugins";
@@ -135,9 +135,10 @@ export function PluginPanelRouteScreen(props: StaticScreenProps<PluginPanelRoute
     install.kind === "client" || install.kind === "environment" ? install.record : null;
   const title =
     record?.manifest.ui?.panels.find((panel) => panel.id === panelId)?.title ?? "Plugin";
+  const navigation = useNavigation();
   return (
     <View className="flex-1 bg-screen">
-      <NativeStackScreenOptions options={{ title, headerTitle: title }} />
+      <AppBar title={title} onBack={() => navigation.goBack()} />
       {panelKey === null ? (
         <PluginPanelMissing />
       ) : (

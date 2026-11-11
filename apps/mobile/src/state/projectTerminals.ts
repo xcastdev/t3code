@@ -36,6 +36,7 @@ export function useStreamEvents<A, E>(
   const registry = useContext(RegistryContext);
   const handleValue = useEffectEvent(onValue);
   const handleError = useEffectEvent(onError);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- subscribes to the atom registry's stream for as long as this reader is mounted
   useEffect(() => {
     if (atom === null) return;
     let last: unknown = undefined;

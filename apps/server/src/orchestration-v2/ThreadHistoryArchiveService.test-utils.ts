@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 
 import { ThreadId, OrchestrationV2AppThreadJson, OrchestrationV2RunJson } from "@t3tools/contracts";
@@ -18,6 +19,7 @@ import * as Archive from "./ThreadHistoryArchiveService.ts";
 const infrastructure = Layer.mergeAll(
   Sqlite.layerMemory,
   NodeServices.layer,
+  NodeCrypto.layer,
   ServerConfig.layerTest(process.cwd(), { prefix: "t3-history-test-" }).pipe(
     Layer.provide(NodeServices.layer),
   ),

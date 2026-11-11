@@ -12,7 +12,7 @@ export function ProjectWorkShortcut({ paletteOpen }: { readonly paletteOpen: boo
   const threadRef = routeTarget?.kind === "server" ? routeTarget.threadRef : null;
   const target = useProjectWorkTarget();
   const navigate = useNavigate();
-  // oxlint-disable-next-line t3code/react-effect-budget -- Register the route command while mounted and remove it when the route target changes or unmounts.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- registers the projectWork.open command with the shortcut dispatcher and removes it on change or unmount
   useEffect(() => {
     if (target === null) return;
     return registerCommands(

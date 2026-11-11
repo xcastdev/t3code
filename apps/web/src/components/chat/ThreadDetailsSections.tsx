@@ -4,6 +4,7 @@ import {
   isProjectTerminalRunning,
   projectTerminalStatusLabel,
 } from "@t3tools/client-runtime/project-terminal-view";
+import type { ContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
 import type { ThreadStructure } from "@t3tools/client-runtime/state/models";
 import {
   type AtomCommandResult,
@@ -30,7 +31,7 @@ import {
   TerminalSquareIcon,
 } from "lucide-react";
 
-import { formatContextWindowTokens, type ContextWindowSnapshot } from "~/lib/contextWindow";
+import { formatContextWindowTokens } from "~/lib/contextWindow";
 import { revealThreadTerminal } from "~/lib/revealThreadTerminal";
 import { confirmTerminalClose } from "~/lib/terminalCloseConfirm";
 import { cn } from "~/lib/utils";
@@ -46,9 +47,10 @@ import { useAtomCommand } from "~/state/use-atom-command";
 
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
-import { formatContextWindowCompactionMessage } from "./ContextWindowMeter.logic";
+import { formatContextWindowCompactionMessage } from "./compaction.logic";
 import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import { ThreadDetailsSection, ThreadDetailsSummary } from "./ThreadDetailsSection";
+import type { RunWorkSummary } from "./runWorkSummary";
 import { latestTodoList } from "./ThreadDetailsSections.logic";
 import { ThreadProcessRow } from "./ThreadProcessRow";
 import { ThreadServerRows } from "./ThreadServersPanel";
@@ -77,6 +79,7 @@ export interface ThreadDetailsContextProps {
   readonly onCompact?: (() => void) | undefined;
   readonly compactDisabled: boolean;
   readonly compactDisabledReason: string | null;
+  readonly latestRunWork: RunWorkSummary | null;
 }
 
 export function ThreadDetailsContextSection(
@@ -155,14 +158,22 @@ export function ThreadDetailsContextSection(
           ))}
           {usage.compactsAutomatically ? (
             <SectionNote>
-              {formatContextWindowCompactionMessage(
-                props.modelDisplayName,
-                usage.autoCompactThreshold,
-              )}
+              {formatContextWindowCompactionMessage(usage.autoCompactThreshold)}
             </SectionNote>
           ) : null}
         </div>
       )}
+      {props.latestRunWork ? (
+        <div className="flex flex-col gap-0.5 px-2.5 py-1 text-2xs leading-4">
+          <span className="text-muted-foreground">
+            Latest turn{props.latestRunWork.effort ? ` · ${props.latestRunWork.effort}` : ""}
+          </span>
+          <span className="font-medium text-foreground/85 tabular-nums">
+            {props.latestRunWork.label}
+          </span>
+          <span className="text-muted-foreground">{props.latestRunWork.retentionLabel}</span>
+        </div>
+      ) : null}
       {props.onCompact ? (
         <Tooltip>
           <TooltipTrigger

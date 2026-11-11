@@ -658,7 +658,7 @@ function SkillEditorForm({
 
   const registry = useContext(RegistryContext);
   const reloadRequestRef = useRef(0);
-  // oxlint-disable-next-line t3code/react-effect-budget -- Invalidate pending catalog reloads when the editor unmounts.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- unmount guard that invalidates pending catalog reloads once the editor is gone
   useEffect(
     () => () => {
       reloadRequestRef.current++;

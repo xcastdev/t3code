@@ -24,7 +24,7 @@ import {
   type ProjectMcpTransportDraft,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
-import * as Crypto from "effect/Crypto";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -110,7 +110,7 @@ const make = Effect.gen(function* () {
   const secrets = yield* Secrets.ProjectMcpSecretStore;
   const requests = yield* SecretRequests.SecretRequests;
   const oauth = yield* OAuth.ProjectMcpOAuth;
-  const crypto = yield* Crypto.Crypto;
+  const random = yield* SecureRandom.SecureRandom;
   // A WebSocket can outlive its grant; resolve persisted authority on each call.
   const actorFor = Effect.fn("McpCatalogClientService.actorFor")(function* (
     sessionId: AuthSessionId,
@@ -196,7 +196,7 @@ const make = Effect.gen(function* () {
       const draft = yield* mapTransport(input.transport, (credential) =>
         Effect.gen(function* () {
           if ("secret" in credential && credential.secret !== undefined) {
-            const id = ProjectMcpCredentialId.make(yield* crypto.randomUUIDv4().pipe(Effect.orDie));
+            const id = ProjectMcpCredentialId.make(yield* random.uuidV4());
             values.set(id, Redacted.value(credential.secret));
             return { name: credential.name, id };
           }
@@ -381,7 +381,7 @@ const make = Effect.gen(function* () {
             .pipe(Effect.mapError(failure)),
         };
       }
-      const definitionId = McpDefinitionId.make(yield* crypto.randomUUIDv4().pipe(Effect.orDie));
+      const definitionId = McpDefinitionId.make(yield* random.uuidV4());
       draft = yield* mapTransport(draft, (credential) => {
         if ("value" in credential && credential.value !== undefined)
           return Effect.succeed({ name: credential.name, value: credential.value });
@@ -407,9 +407,7 @@ const make = Effect.gen(function* () {
       };
     });
     if (operation.type === "create" || operation.type === "update") {
-      const logicalServerId =
-        operation.logicalServerId ??
-        McpServerId.make(yield* crypto.randomUUIDv4().pipe(Effect.orDie));
+      const logicalServerId = operation.logicalServerId ?? McpServerId.make(yield* random.uuidV4());
       const previous = current.definitions.find((item) => item.logicalServerId === logicalServerId);
       if ((operation.type === "create") === (previous !== undefined)) return yield* failure();
       const result = yield* prepare(logicalServerId, operation.definition.transport, previous);

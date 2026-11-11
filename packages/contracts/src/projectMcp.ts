@@ -433,7 +433,7 @@ export type ProjectMcpCatalog = typeof ProjectMcpCatalog.Type;
 export class ProjectMcpNameConflictError extends Schema.TaggedError<ProjectMcpNameConflictError>()(
   "ProjectMcpNameConflictError",
   {
-    name: TrimmedNonEmptyString.check(Schema.isMaxLength(PROJECT_MCP_NAME_MAX_LENGTH)),
+    serverName: TrimmedNonEmptyString.check(Schema.isMaxLength(PROJECT_MCP_NAME_MAX_LENGTH)),
     message: TrimmedNonEmptyString,
   },
 ) {}
@@ -441,7 +441,7 @@ export class ProjectMcpNameConflictError extends Schema.TaggedError<ProjectMcpNa
 export class ProjectMcpEnvironmentVariableNameConflictError extends Schema.TaggedError<ProjectMcpEnvironmentVariableNameConflictError>()(
   "ProjectMcpEnvironmentVariableNameConflictError",
   {
-    name: ProjectMcpEnvironmentVariableName,
+    variableName: ProjectMcpEnvironmentVariableName,
     message: TrimmedNonEmptyString,
   },
 ) {}

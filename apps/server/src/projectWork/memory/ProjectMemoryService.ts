@@ -1,5 +1,5 @@
 import { ProjectMemoryFactPolicy } from "./ProjectMemoryFactPolicy.ts";
-import * as Crypto from "effect/Crypto";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import {
   ProjectMemorySource,
@@ -125,7 +125,7 @@ const make = Effect.gen(function* () {
   const factPolicy = yield* Effect.serviceOption(ProjectMemoryFactPolicy);
   const projects = yield* ProjectStore.ProjectStoreV2;
   const ownerAuthority = yield* Effect.serviceOption(ProjectMemoryOwnerAuthority);
-  const crypto = yield* Crypto.Crypto;
+  const random = yield* SecureRandom.SecureRandom;
   const environment = yield* Environment.ServerEnvironment;
   const assertOwner = Effect.fn("ProjectMemory.assertOwner")(function* (scope: MemoryScope) {
     if (scope.environmentId !== (yield* environment.getEnvironmentId))
@@ -321,7 +321,7 @@ const make = Effect.gen(function* () {
           return yield* new ProjectMemoryError({ reason: "invalid" });
         const value = yield* decodeNewGrant({
           ...input,
-          id: yield* crypto.randomUUIDv4(),
+          id: yield* random.uuidV4(),
           createdAt: DateTime.formatIso(yield* DateTime.now),
           revokedAt: null,
         });

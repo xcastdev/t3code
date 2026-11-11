@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import {
   McpServerId,
   type ProjectMcpCredentialId,
@@ -63,12 +64,12 @@ const makeSecretLayer = (config: ServerConfig.ServerConfig["Service"]) =>
   ProjectMcpSecretStore.layer.pipe(
     Layer.provideMerge(ServerSecretStore.layer),
     Layer.provideMerge(Layer.succeed(ServerConfig.ServerConfig, config)),
-    Layer.provideMerge(NodeServices.layer),
+    Layer.provideMerge(Layer.merge(NodeServices.layer, NodeCrypto.layer)),
   );
 
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
-it.layer(NodeServices.layer)("ProjectMcpSecretStore", (it) => {
+it.layer(Layer.merge(NodeServices.layer, NodeCrypto.layer))("ProjectMcpSecretStore", (it) => {
   it.effect("stores create values under generated credential IDs and exposes only references", () =>
     Effect.gen(function* () {
       const config = yield* ServerConfig.ServerConfig;
@@ -772,42 +773,45 @@ it.layer(NodeServices.layer)("ProjectMcpSecretStore", (it) => {
   );
 });
 
-it.layer(NodeServices.layer)("shared definition OAuth owner", (it) => {
-  it.effect.each(["committed", "prepared-restart"] as const)(
-    "retains transport credentials during %s reconciliation",
-    (state) =>
-      Effect.gen(function* () {
-        const config = yield* ServerConfig.ServerConfig;
-        const prepared = yield* Effect.gen(function* () {
-          const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
-          const operation = yield* secrets.prepareCreate(
-            scopedOAuthOwner,
-            httpDraft("shared-owner-value"),
-            [scopedOAuthOwner],
-          );
-          if (state === "committed") yield* operation.commit;
-          return operation;
-        }).pipe(Effect.provide(makeSecretLayer(config)));
-        yield* Effect.gen(function* () {
-          const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
-          const bytes = yield* ServerSecretStore.ServerSecretStore;
-          const id = credentialId(prepared.transport);
-          yield* secrets.reconcile([
-            {
-              id: scopedOAuthOwner,
-              transport: prepared.transport,
-              oauthStateOwnerId: scopedOAuthOwner,
-            },
-          ]);
-          assert.equal(yield* secrets.resolve(scopedOAuthOwner, id), "shared-owner-value");
-          assert.isTrue(
-            Option.isSome(yield* bytes.get(ProjectMcpSecretStore.credentialSecretName(id))),
-          );
-        }).pipe(Effect.provide(Layer.fresh(makeSecretLayer(config))));
-      }).pipe(
-        Effect.provide(
-          ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-shared-definition-owner-" }),
+it.layer(Layer.merge(NodeServices.layer, NodeCrypto.layer))(
+  "shared definition OAuth owner",
+  (it) => {
+    it.effect.each(["committed", "prepared-restart"] as const)(
+      "retains transport credentials during %s reconciliation",
+      (state) =>
+        Effect.gen(function* () {
+          const config = yield* ServerConfig.ServerConfig;
+          const prepared = yield* Effect.gen(function* () {
+            const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+            const operation = yield* secrets.prepareCreate(
+              scopedOAuthOwner,
+              httpDraft("shared-owner-value"),
+              [scopedOAuthOwner],
+            );
+            if (state === "committed") yield* operation.commit;
+            return operation;
+          }).pipe(Effect.provide(makeSecretLayer(config)));
+          yield* Effect.gen(function* () {
+            const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+            const bytes = yield* ServerSecretStore.ServerSecretStore;
+            const id = credentialId(prepared.transport);
+            yield* secrets.reconcile([
+              {
+                id: scopedOAuthOwner,
+                transport: prepared.transport,
+                oauthStateOwnerId: scopedOAuthOwner,
+              },
+            ]);
+            assert.equal(yield* secrets.resolve(scopedOAuthOwner, id), "shared-owner-value");
+            assert.isTrue(
+              Option.isSome(yield* bytes.get(ProjectMcpSecretStore.credentialSecretName(id))),
+            );
+          }).pipe(Effect.provide(Layer.fresh(makeSecretLayer(config))));
+        }).pipe(
+          Effect.provide(
+            ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-shared-definition-owner-" }),
+          ),
         ),
-      ),
-  );
-});
+    );
+  },
+);

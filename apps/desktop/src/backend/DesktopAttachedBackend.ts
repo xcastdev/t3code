@@ -12,11 +12,11 @@ import { fetchRemoteEnvironmentDescriptor } from "@t3tools/client-runtime/enviro
 import { parseOAuthScope } from "@t3tools/shared/oauthScope";
 import { resolveRemotePairingTarget } from "@t3tools/shared/remote";
 import * as Context from "effect/Context";
-import * as Crypto from "effect/Crypto";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Base64 from "effect/encoding/Base64";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -235,7 +235,7 @@ export class DesktopAttachedBackend extends Context.Service<
 >()("@t3tools/desktop/backend/DesktopAttachedBackend") {}
 
 const make = Effect.gen(function* () {
-  const crypto = yield* Crypto.Crypto;
+  const random = yield* SecureRandom.SecureRandom;
   const settings = yield* DesktopAppSettings.DesktopAppSettings;
   const safeStorage = yield* ElectronSafeStorage.ElectronSafeStorage;
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
@@ -316,7 +316,7 @@ const make = Effect.gen(function* () {
       httpBaseUrl: input.httpBaseUrl,
       wsBaseUrl: input.wsBaseUrl,
       environmentId: input.descriptor.environmentId,
-      attachmentRevision: yield* crypto.randomUUIDv4().pipe(
+      attachmentRevision: yield* random.uuidV4().pipe(
         Effect.mapError(
           () =>
             new DesktopAttachPersistenceError({

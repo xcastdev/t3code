@@ -1,7 +1,7 @@
 import { assert, describe, it } from "@effect/vitest";
 import type { ManagedSkillKey, ProviderInstanceId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import * as Data from "effect/Data";
+import * as Schema from "effect/Schema";
 import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -28,7 +28,10 @@ const candidate = (nativeIdentity: string, nativePath: string): NativeSkillCandi
 });
 
 describe("NativeSkillObservationService", () => {
-  class TestDiscoveryError extends Data.TaggedError("TestDiscoveryError") {}
+  class TestDiscoveryError extends Schema.TaggedError<TestDiscoveryError>()(
+    "TestDiscoveryError",
+    {},
+  ) {}
 
   it("preserves the owning provider's external filesystem classification", () => {
     const [observed] = serverProviderSkillsToNativeCandidates(

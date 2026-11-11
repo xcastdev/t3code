@@ -459,30 +459,34 @@ const stateForRecords = <K extends "knowledge" | "decisions" | "comments">(
 
 const assertProject = (state: ProjectWorkState, projectId: string, commandType: string): void => {
   if (state.projectId !== projectId) {
-    throw new ProjectWorkPolicyError(
-      "invalid-state",
-      `${commandType} targets project '${projectId}', expected '${state.projectId}'.`,
-      { commandType, projectId, currentProjectId: state.projectId },
-    );
+    throw new ProjectWorkPolicyError({
+      code: "invalid-state",
+      message: `${commandType} targets project '${projectId}', expected '${state.projectId}'.`,
+      details: { commandType, projectId, currentProjectId: state.projectId },
+    });
   }
 };
 
 const assertTaskMutable = (task: ProjectWorkTask, commandType: string): void => {
   if (task.state === "canceled") {
-    throw new ProjectWorkPolicyError("invalid-state", `Task '${task.taskId}' is canceled.`, {
-      taskId: task.taskId,
-      commandType,
+    throw new ProjectWorkPolicyError({
+      code: "invalid-state",
+      message: `Task '${task.taskId}' is canceled.`,
+      details: {
+        taskId: task.taskId,
+        commandType,
+      },
     });
   }
 };
 
 const assertProtectedSpecificationMutable = (task: ProjectWorkTask, commandType: string): void => {
   if (task.specification?.protected === true) {
-    throw new ProjectWorkPolicyError(
-      "protected-specification",
-      `Task '${task.taskId}' has a protected specification; use an approved protected revision.`,
-      { taskId: task.taskId, commandType, specRevision: task.specification.revision },
-    );
+    throw new ProjectWorkPolicyError({
+      code: "protected-specification",
+      message: `Task '${task.taskId}' has a protected specification; use an approved protected revision.`,
+      details: { taskId: task.taskId, commandType, specRevision: task.specification.revision },
+    });
   }
 };
 
@@ -491,11 +495,11 @@ const assertCriterionBelongsToTask = (
   taskId: ProjectWorkTaskId,
 ): void => {
   if (criterion.taskId !== taskId) {
-    throw new ProjectWorkPolicyError(
-      "invalid-specification",
-      `Criterion '${criterion.criterionId}' belongs to another task.`,
-      { criterionId: criterion.criterionId, taskId },
-    );
+    throw new ProjectWorkPolicyError({
+      code: "invalid-specification",
+      message: `Criterion '${criterion.criterionId}' belongs to another task.`,
+      details: { criterionId: criterion.criterionId, taskId },
+    });
   }
 };
 
@@ -504,25 +508,29 @@ const assertRelationshipTasks = (
   relationship: ProjectWorkRelationship,
 ): void => {
   if (relationship.projectId !== state.projectId) {
-    throw new ProjectWorkPolicyError(
-      "invalid-relationship",
-      `Relationship '${relationship.relationshipId}' targets project '${relationship.projectId}', expected '${state.projectId}'.`,
-      { relationshipId: relationship.relationshipId, projectId: relationship.projectId },
-    );
+    throw new ProjectWorkPolicyError({
+      code: "invalid-relationship",
+      message: `Relationship '${relationship.relationshipId}' targets project '${relationship.projectId}', expected '${state.projectId}'.`,
+      details: { relationshipId: relationship.relationshipId, projectId: relationship.projectId },
+    });
   }
   assertKnownTask(state, relationship.fromTaskId);
   assertKnownTask(state, relationship.toTaskId);
   if (relationship.fromTaskId === relationship.toTaskId) {
-    throw new ProjectWorkPolicyError("invalid-relationship", "A task cannot relate to itself.", {
-      taskId: relationship.fromTaskId,
+    throw new ProjectWorkPolicyError({
+      code: "invalid-relationship",
+      message: "A task cannot relate to itself.",
+      details: {
+        taskId: relationship.fromTaskId,
+      },
     });
   }
   if (state.relationships.some((entry) => entry.relationshipId === relationship.relationshipId)) {
-    throw new ProjectWorkPolicyError(
-      "duplicate-record",
-      `Relationship '${relationship.relationshipId}' already exists.`,
-      { relationshipId: relationship.relationshipId },
-    );
+    throw new ProjectWorkPolicyError({
+      code: "duplicate-record",
+      message: `Relationship '${relationship.relationshipId}' already exists.`,
+      details: { relationshipId: relationship.relationshipId },
+    });
   }
   if (
     (relationship.kind === "depends-on" || relationship.kind === "blocks") &&
@@ -537,21 +545,25 @@ const assertRelationshipTasks = (
       relationship.kind === "blocks" ? relationship.toTaskId : relationship.fromTaskId,
       relationship.kind === "blocks" ? relationship.fromTaskId : relationship.toTaskId,
     );
-    throw new ProjectWorkPolicyError(
-      "invalid-relationship",
-      `The relationship would create a dependency cycle: ${cycle?.join(" -> ") ?? "unknown"}.`,
-      {
+    throw new ProjectWorkPolicyError({
+      code: "invalid-relationship",
+      message: `The relationship would create a dependency cycle: ${cycle?.join(" -> ") ?? "unknown"}.`,
+      details: {
         relationshipId: relationship.relationshipId,
         cycle,
       },
-    );
+    });
   }
 };
 
 const assertUniqueId = (values: ReadonlyArray<string>, id: string, label: string): void => {
   if (values.includes(id)) {
-    throw new ProjectWorkPolicyError("duplicate-record", `${label} '${id}' already exists.`, {
-      id,
+    throw new ProjectWorkPolicyError({
+      code: "duplicate-record",
+      message: `${label} '${id}' already exists.`,
+      details: {
+        id,
+      },
     });
   }
 };
@@ -562,7 +574,11 @@ const assertUniqueValues = (
   details?: Readonly<Record<string, unknown>>,
 ): void => {
   if (new Set(values).size !== values.length) {
-    throw new ProjectWorkPolicyError("duplicate-record", `${label} must be unique.`, details);
+    throw new ProjectWorkPolicyError({
+      code: "duplicate-record",
+      message: `${label} must be unique.`,
+      details: details,
+    });
   }
 };
 
@@ -608,13 +624,25 @@ export function decideProjectWorkCommand(
         (record) => record.recordId === command.issueRecordId,
       );
       if (issue?.kind !== "issue" || issue.projectId !== command.projectId)
-        throw new ProjectWorkPolicyError("invalid-state", "Unknown issue in this project");
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: "Unknown issue in this project",
+        });
       if (issue.revision !== command.expectedIssueRevision)
-        throw new ProjectWorkPolicyError("stale-revision", "Issue revision is stale");
+        throw new ProjectWorkPolicyError({
+          code: "stale-revision",
+          message: "Issue revision is stale",
+        });
       if (issue.status === "detached")
-        throw new ProjectWorkPolicyError("invalid-state", "Detached issues cannot be refined");
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: "Detached issues cannot be refined",
+        });
       if (issue.taskId !== undefined || issue.missionId !== undefined)
-        throw new ProjectWorkPolicyError("invalid-state", "Issue is already linked to work");
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: "Issue is already linked to work",
+        });
 
       const events: Array<ProjectWorkEvent> = [];
       const record = (input: ProjectTeamRecord) => {
@@ -675,14 +703,20 @@ export function decideProjectWorkCommand(
         } else {
           const task = currentTask(working, target.taskId);
           if (task.projectId !== command.projectId)
-            throw new ProjectWorkPolicyError("invalid-state", "Task belongs to another project");
+            throw new ProjectWorkPolicyError({
+              code: "invalid-state",
+              message: "Task belongs to another project",
+            });
           if (task.revision !== target.expectedTaskRevision)
-            throw new ProjectWorkPolicyError("stale-revision", "Task revision is stale");
+            throw new ProjectWorkPolicyError({
+              code: "stale-revision",
+              message: "Task revision is stale",
+            });
           if (task.state === "completed" || task.state === "canceled")
-            throw new ProjectWorkPolicyError(
-              "invalid-state",
-              "Completed or canceled tasks cannot be linked by refinement",
-            );
+            throw new ProjectWorkPolicyError({
+              code: "invalid-state",
+              message: "Completed or canceled tasks cannot be linked by refinement",
+            });
         }
         record({
           ...issue,
@@ -750,19 +784,19 @@ export function decideProjectWorkCommand(
           applyProjectWorkEvents,
         );
       if (command.claim !== undefined)
-        throw new ProjectWorkPolicyError(
-          "deferred-command",
-          "Native claims are unavailable in human Work",
-        );
+        throw new ProjectWorkPolicyError({
+          code: "deferred-command",
+          message: "Native claims are unavailable in human Work",
+        });
       let working = mutableState(state);
       const events: Array<ProjectWorkEvent> = [];
       const seen = new Set<string>();
       for (const input of command.records) {
         if (seen.has(input.recordId))
-          throw new ProjectWorkPolicyError(
-            "duplicate-record",
-            "One transaction cannot write the same record twice",
-          );
+          throw new ProjectWorkPolicyError({
+            code: "duplicate-record",
+            message: "One transaction cannot write the same record twice",
+          });
         seen.add(input.recordId);
         if (
           [
@@ -775,10 +809,10 @@ export function decideProjectWorkCommand(
           ].includes(input.kind) ||
           (input.kind === "gate" && input.status === "consumed")
         )
-          throw new ProjectWorkPolicyError(
-            "deferred-command",
-            "Execution-owned records are unavailable in human Work",
-          );
+          throw new ProjectWorkPolicyError({
+            code: "deferred-command",
+            message: "Execution-owned records are unavailable in human Work",
+          });
         const prior = working.foundationRecords?.find(
           (record) => record.recordId === input.recordId,
         );
@@ -790,10 +824,10 @@ export function decideProjectWorkCommand(
             input.missionId !== prior.missionId ||
             input.generation !== prior.generation)
         )
-          throw new ProjectWorkPolicyError(
-            "authority-required",
-            "Issue synchronization cannot change work links or generation",
-          );
+          throw new ProjectWorkPolicyError({
+            code: "authority-required",
+            message: "Issue synchronization cannot change work links or generation",
+          });
         const record = validateProjectTeamRecord(working, input, command.attribution);
         const recorded = event(
           { type: "project-work.foundation.recorded", record, occurredAt: command.committedAt },
@@ -830,10 +864,10 @@ export function decideProjectWorkCommand(
       });
       if (command.deliverableKind === undefined) return [created];
       if (command.attribution?.actor.kind !== "human")
-        throw new ProjectWorkPolicyError(
-          "authority-required",
-          "Guided deliverable capture requires authenticated human attribution",
-        );
+        throw new ProjectWorkPolicyError({
+          code: "authority-required",
+          message: "Guided deliverable capture requires authenticated human attribution",
+        });
       const record = validateProjectTeamRecord(
         applyProjectWorkEvents(state, [created]),
         {
@@ -864,35 +898,36 @@ export function decideProjectWorkCommand(
       assertTaskMutable(task, command.type);
       assertProtectedSpecificationMutable(task, command.type);
       if (task.state !== "draft" && task.state !== "specified") {
-        throw new ProjectWorkPolicyError(
-          "invalid-state",
-          `Task '${task.taskId}' cannot be specified from '${task.state}'.`,
-          {
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: `Task '${task.taskId}' cannot be specified from '${task.state}'.`,
+          details: {
             taskId: task.taskId,
             state: task.state,
           },
-        );
+        });
       }
       if (command.specification.protected === true) {
-        throw new ProjectWorkPolicyError(
-          "approval-required",
-          "Protected specifications must be established through an approved protection intent.",
-          { taskId: task.taskId, specRevision: command.specification.revision },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "approval-required",
+          message:
+            "Protected specifications must be established through an approved protection intent.",
+          details: { taskId: task.taskId, specRevision: command.specification.revision },
+        });
       }
       if (
         task.specification !== undefined &&
         command.specification.revision <= task.specification.revision
       ) {
-        throw new ProjectWorkPolicyError(
-          "stale-revision",
-          "A specification revision must increase the current revision.",
-          {
+        throw new ProjectWorkPolicyError({
+          code: "stale-revision",
+          message: "A specification revision must increase the current revision.",
+          details: {
             taskId: task.taskId,
             currentRevision: task.specification.revision,
             nextRevision: command.specification.revision,
           },
-        );
+        });
       }
       const criteria = new Set(state.criteria.map((entry) => String(entry.criterionId)));
       assertUniqueValues(command.specification.criterionIds, "Specification criterion IDs", {
@@ -903,14 +938,15 @@ export function decideProjectWorkCommand(
         return !criteria.has(String(id)) || criterion?.taskId !== task.taskId;
       });
       if (missing.length > 0) {
-        throw new ProjectWorkPolicyError(
-          "invalid-specification",
-          "Every specification criterion must already exist; missing criteria are not allowed.",
-          {
+        throw new ProjectWorkPolicyError({
+          code: "invalid-specification",
+          message:
+            "Every specification criterion must already exist; missing criteria are not allowed.",
+          details: {
             taskId: task.taskId,
             criterionIds: missing,
           },
-        );
+        });
       }
       return [
         event({
@@ -926,60 +962,61 @@ export function decideProjectWorkCommand(
       const task = currentTask(state, command.taskId);
       assertTaskMutable(task, command.type);
       if (task.specification?.protected !== true) {
-        throw new ProjectWorkPolicyError(
-          "invalid-specification",
-          `Task '${task.taskId}' does not have a protected specification.`,
-          { taskId: task.taskId },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "invalid-specification",
+          message: `Task '${task.taskId}' does not have a protected specification.`,
+          details: { taskId: task.taskId },
+        });
       }
       if (command.specification.revision <= task.specification.revision) {
-        throw new ProjectWorkPolicyError(
-          "stale-revision",
-          "A protected specification revision must increase the current revision.",
-          {
+        throw new ProjectWorkPolicyError({
+          code: "stale-revision",
+          message: "A protected specification revision must increase the current revision.",
+          details: {
             taskId: task.taskId,
             currentRevision: task.specification.revision,
             nextRevision: command.specification.revision,
           },
-        );
+        });
       }
       if (command.specification.protected !== true) {
-        throw new ProjectWorkPolicyError(
-          "protected-specification",
-          "A protected specification revision must remain protected.",
-          { taskId: task.taskId, specRevision: command.specification.revision },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "protected-specification",
+          message: "A protected specification revision must remain protected.",
+          details: { taskId: task.taskId, specRevision: command.specification.revision },
+        });
       }
       if (
         command.approval.taskId !== command.taskId ||
         command.approval.specRevision !== command.specification.revision
       ) {
-        throw new ProjectWorkPolicyError(
-          "approval-required",
-          "Protected revision approval must bind to this task and exact new specification revision.",
-          { taskId: task.taskId, specRevision: command.specification.revision },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "approval-required",
+          message:
+            "Protected revision approval must bind to this task and exact new specification revision.",
+          details: { taskId: task.taskId, specRevision: command.specification.revision },
+        });
       }
       if (command.attribution === undefined || command.approval.attribution === undefined) {
-        throw new ProjectWorkPolicyError(
-          "authority-required",
-          "Protected revisions require request and approval attribution.",
-          { taskId: task.taskId },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "authority-required",
+          message: "Protected revisions require request and approval attribution.",
+          details: { taskId: task.taskId },
+        });
       }
       const payloadFingerprint = projectWorkPayloadFingerprint(
         projectWorkProtectedRevisionFingerprintPayload(command),
       );
       if (payloadFingerprint !== command.approval.payloadFingerprint) {
-        throw new ProjectWorkPolicyError(
-          "approval-required",
-          "Protected revision approval does not match the complete revision payload.",
-          {
+        throw new ProjectWorkPolicyError({
+          code: "approval-required",
+          message: "Protected revision approval does not match the complete revision payload.",
+          details: {
             taskId: task.taskId,
             expectedFingerprint: payloadFingerprint,
             receivedFingerprint: command.approval.payloadFingerprint,
           },
-        );
+        });
       }
       const criterionIds = new Set(
         state.criteria.map((criterion) => String(criterion.criterionId)),
@@ -992,20 +1029,20 @@ export function decideProjectWorkCommand(
         return !criterionIds.has(String(criterionId)) || criterion?.taskId !== task.taskId;
       });
       if (missingCriteria.length > 0) {
-        throw new ProjectWorkPolicyError(
-          "invalid-specification",
-          "Protected revision references missing criteria.",
-          { taskId: task.taskId, criterionIds: missingCriteria },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "invalid-specification",
+          message: "Protected revision references missing criteria.",
+          details: { taskId: task.taskId, criterionIds: missingCriteria },
+        });
       }
       const expectedCriterionSnapshots = command.specification.criterionIds.map((criterionId) => {
         const criterion = state.criteria.find((entry) => entry.criterionId === criterionId);
         if (criterion === undefined) {
-          throw new ProjectWorkPolicyError(
-            "unknown-criterion",
-            `Criterion '${criterionId}' does not exist.`,
-            { taskId: task.taskId, criterionId },
-          );
+          throw new ProjectWorkPolicyError({
+            code: "unknown-criterion",
+            message: `Criterion '${criterionId}' does not exist.`,
+            details: { taskId: task.taskId, criterionId },
+          });
         }
         return criterion;
       });
@@ -1017,19 +1054,19 @@ export function decideProjectWorkCommand(
             canonicalProjectWorkPayload(expectedCriterionSnapshots[index]),
         )
       ) {
-        throw new ProjectWorkPolicyError(
-          "invalid-specification",
-          "Protected revision criterion snapshots must match the current criteria.",
-          { taskId: task.taskId, criterionIds: command.specification.criterionIds },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "invalid-specification",
+          message: "Protected revision criterion snapshots must match the current criteria.",
+          details: { taskId: task.taskId, criterionIds: command.specification.criterionIds },
+        });
       }
       const affectedResultIds = [...new Set(command.affectedResultIds)];
       if (affectedResultIds.length !== command.affectedResultIds.length) {
-        throw new ProjectWorkPolicyError(
-          "duplicate-record",
-          "Protected revision result IDs must be unique.",
-          { taskId: task.taskId, resultIds: command.affectedResultIds },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "duplicate-record",
+          message: "Protected revision result IDs must be unique.",
+          details: { taskId: task.taskId, resultIds: command.affectedResultIds },
+        });
       }
       const candidateTask = taskCopy(task, {
         specification: command.specification,
@@ -1086,11 +1123,11 @@ export function decideProjectWorkCommand(
       const task = currentTask(state, command.taskId);
       assertTaskMutable(task, command.type);
       if (task.state === "completed") {
-        throw new ProjectWorkPolicyError(
-          "invalid-state",
-          `Completed task '${task.taskId}' cannot be blocked.`,
-          { taskId: task.taskId },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: `Completed task '${task.taskId}' cannot be blocked.`,
+          details: { taskId: task.taskId },
+        });
       }
       assertUniqueId(
         state.blockers.map((entry) => String(entry.blockerId)),
@@ -1120,24 +1157,24 @@ export function decideProjectWorkCommand(
     case "project-work.task.resolve-blocker": {
       const task = currentTask(state, command.taskId);
       if (task.state !== "blocked")
-        throw new ProjectWorkPolicyError(
-          "invalid-state",
-          "Only blocked tasks can resolve a blocker.",
-          { taskId: task.taskId, state: task.state },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: "Only blocked tasks can resolve a blocker.",
+          details: { taskId: task.taskId, state: task.state },
+        });
       if (task.blockerId !== command.blockerId)
-        throw new ProjectWorkPolicyError(
-          "unknown-blocker",
-          `Blocker '${command.blockerId}' is not active for task '${task.taskId}'.`,
-          { taskId: task.taskId, blockerId: command.blockerId },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "unknown-blocker",
+          message: `Blocker '${command.blockerId}' is not active for task '${task.taskId}'.`,
+          details: { taskId: task.taskId, blockerId: command.blockerId },
+        });
       const blocker = assertKnownBlocker(state, command.blockerId);
       if (blocker.resolvedAt !== undefined)
-        throw new ProjectWorkPolicyError(
-          "invalid-state",
-          `Blocker '${blocker.blockerId}' is already resolved.`,
-          { blockerId: blocker.blockerId },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: `Blocker '${blocker.blockerId}' is already resolved.`,
+          details: { blockerId: blocker.blockerId },
+        });
       return [
         event({
           type: "project-work.task.blocker-resolved",
@@ -1151,18 +1188,22 @@ export function decideProjectWorkCommand(
     case "project-work.task.reopen": {
       const task = currentTask(state, command.taskId);
       if (task.state === "canceled")
-        throw new ProjectWorkPolicyError("invalid-state", "Canceled tasks cannot be reopened.", {
-          taskId: task.taskId,
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: "Canceled tasks cannot be reopened.",
+          details: {
+            taskId: task.taskId,
+          },
         });
       if (
         task.state !== "completed" &&
         !(task.state === "failed" && task.failureKind === "recoverable")
       )
-        throw new ProjectWorkPolicyError(
-          "invalid-state",
-          `Task '${task.taskId}' is not reopenable.`,
-          { taskId: task.taskId, state: task.state },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: `Task '${task.taskId}' is not reopenable.`,
+          details: { taskId: task.taskId, state: task.state },
+        });
       const candidate = taskCopy(task, {
         state: "specified",
         completedAt: undefined,
@@ -1191,11 +1232,11 @@ export function decideProjectWorkCommand(
       const task = currentTask(state, command.taskId);
       assertTaskMutable(task, command.type);
       if (task.state === "completed") {
-        throw new ProjectWorkPolicyError(
-          "invalid-state",
-          `Completed task '${task.taskId}' cannot be canceled.`,
-          { taskId: task.taskId },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: `Completed task '${task.taskId}' cannot be canceled.`,
+          details: { taskId: task.taskId },
+        });
       }
       return [
         event({
@@ -1258,27 +1299,27 @@ export function decideProjectWorkCommand(
       const task = currentTask(state, command.taskId);
       assertTaskMutable(task, command.type);
       if (task.specification === undefined || task.specification.revision !== command.specRevision)
-        throw new ProjectWorkPolicyError(
-          "invalid-specification",
-          "Approval must bind to the current specification revision.",
-          {
+        throw new ProjectWorkPolicyError({
+          code: "invalid-specification",
+          message: "Approval must bind to the current specification revision.",
+          details: {
             taskId: task.taskId,
             specRevision: command.specRevision,
             currentRevision: task.specification?.revision,
           },
-        );
+        });
       if (task.approval?.specRevision === command.specRevision)
-        throw new ProjectWorkPolicyError(
-          "duplicate-record",
-          "Specification revision is already approved.",
-          { taskId: task.taskId, specRevision: command.specRevision },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "duplicate-record",
+          message: "Specification revision is already approved.",
+          details: { taskId: task.taskId, specRevision: command.specRevision },
+        });
       if (command.attribution === undefined)
-        throw new ProjectWorkPolicyError(
-          "authority-required",
-          "Specification approval requires attribution.",
-          { taskId: task.taskId },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "authority-required",
+          message: "Specification approval requires attribution.",
+          details: { taskId: task.taskId },
+        });
       const approval: ProjectWorkApproval = {
         approvalId: command.approvalId,
         taskId: task.taskId,
@@ -1304,11 +1345,11 @@ export function decideProjectWorkCommand(
           (watcher) => projectWorkActorKey(watcher) === projectWorkActorKey(command.watcher),
         )
       )
-        throw new ProjectWorkPolicyError(
-          "duplicate-record",
-          "Actor is already watching this task.",
-          { taskId: task.taskId },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "duplicate-record",
+          message: "Actor is already watching this task.",
+          details: { taskId: task.taskId },
+        });
       return [
         event({
           type: "project-work.task.watched",
@@ -1326,8 +1367,12 @@ export function decideProjectWorkCommand(
           (watcher) => projectWorkActorKey(watcher) === projectWorkActorKey(command.watcher),
         )
       )
-        throw new ProjectWorkPolicyError("invalid-state", "Actor is not watching this task.", {
-          taskId: task.taskId,
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: "Actor is not watching this task.",
+          details: {
+            taskId: task.taskId,
+          },
         });
       return [
         event({
@@ -1343,27 +1388,27 @@ export function decideProjectWorkCommand(
       const task = currentTask(state, command.taskId);
       assertTaskMutable(task, command.type);
       if (task.specification === undefined)
-        throw new ProjectWorkPolicyError(
-          "invalid-specification",
-          "A task must have a specification before it can be protected.",
-          { taskId: task.taskId },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "invalid-specification",
+          message: "A task must have a specification before it can be protected.",
+          details: { taskId: task.taskId },
+        });
       if (task.specification.revision !== command.specRevision)
-        throw new ProjectWorkPolicyError(
-          "stale-revision",
-          "Protection must bind to the current specification revision.",
-          {
+        throw new ProjectWorkPolicyError({
+          code: "stale-revision",
+          message: "Protection must bind to the current specification revision.",
+          details: {
             taskId: task.taskId,
             specRevision: command.specRevision,
             currentRevision: task.specification.revision,
           },
-        );
+        });
       if (task.specification.protected)
-        throw new ProjectWorkPolicyError(
-          "protected-specification",
-          "Specification is already protected.",
-          { taskId: task.taskId },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "protected-specification",
+          message: "Specification is already protected.",
+          details: { taskId: task.taskId },
+        });
       return [
         event({
           type: "project-work.task.specification-protected",
@@ -1378,34 +1423,34 @@ export function decideProjectWorkCommand(
       const task = currentTask(state, command.taskId);
       assertTaskMutable(task, command.type);
       if (command.criterion.waiver !== undefined) {
-        throw new ProjectWorkPolicyError(
-          "invalid-specification",
-          "Criterion upsert cannot waive a criterion; use the explicit waiver command.",
-          { taskId: task.taskId, criterionId: command.criterion.criterionId },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "invalid-specification",
+          message: "Criterion upsert cannot waive a criterion; use the explicit waiver command.",
+          details: { taskId: task.taskId, criterionId: command.criterion.criterionId },
+        });
       }
       assertCriterionBelongsToTask(command.criterion, task.taskId);
       if (task.specification?.protected === true)
-        throw new ProjectWorkPolicyError(
-          "protected-specification",
-          "Criteria cannot be mutated after specification protection.",
-          { taskId: task.taskId, criterionId: command.criterion.criterionId },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "protected-specification",
+          message: "Criteria cannot be mutated after specification protection.",
+          details: { taskId: task.taskId, criterionId: command.criterion.criterionId },
+        });
       const existing = state.criteria.find(
         (criterion) => criterion.criterionId === command.criterion.criterionId,
       );
       if (existing !== undefined && existing.taskId !== task.taskId) {
-        throw new ProjectWorkPolicyError(
-          "duplicate-record",
-          `Criterion '${command.criterion.criterionId}' belongs to another task.`,
-          { criterionId: command.criterion.criterionId, taskId: task.taskId },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "duplicate-record",
+          message: `Criterion '${command.criterion.criterionId}' belongs to another task.`,
+          details: { criterionId: command.criterion.criterionId, taskId: task.taskId },
+        });
       }
       if (existing?.status === "waived" || existing?.waiver !== undefined)
-        throw new ProjectWorkPolicyError(
-          "authority-required",
-          "Revoke the current waiver explicitly before editing this criterion",
-        );
+        throw new ProjectWorkPolicyError({
+          code: "authority-required",
+          message: "Revoke the current waiver explicitly before editing this criterion",
+        });
       return [
         event({
           type: "project-work.criterion.upserted",
@@ -1427,11 +1472,11 @@ export function decideProjectWorkCommand(
       const task = currentTask(state, command.taskId);
       assertTaskMutable(task, command.type);
       if (task.specification?.protected === true)
-        throw new ProjectWorkPolicyError(
-          "protected-specification",
-          "Criteria cannot be mutated after specification protection.",
-          { taskId: task.taskId, criterionId: command.criterionId },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "protected-specification",
+          message: "Criteria cannot be mutated after specification protection.",
+          details: { taskId: task.taskId, criterionId: command.criterionId },
+        });
       const criterion = assertKnownCriterion(state, command.criterionId);
       assertCriterionBelongsToTask(criterion, task.taskId);
       return [
@@ -1455,26 +1500,30 @@ export function decideProjectWorkCommand(
         criterion.revision !== command.expectedCriterionRevision ||
         task.specRevision !== command.expectedSpecRevision
       )
-        throw new ProjectWorkPolicyError(
-          "stale-revision",
-          "Waiver revocation target revision changed",
-        );
+        throw new ProjectWorkPolicyError({
+          code: "stale-revision",
+          message: "Waiver revocation target revision changed",
+        });
       if (task.specification?.protected)
-        throw new ProjectWorkPolicyError(
-          "protected-specification",
-          "Use the approved protected specification revision process",
-        );
+        throw new ProjectWorkPolicyError({
+          code: "protected-specification",
+          message: "Use the approved protected specification revision process",
+        });
       if (
         !command.reason.trim() ||
         command.reason.trim() !== command.reason ||
         command.reason.length > 4000
       )
-        throw new ProjectWorkPolicyError("invalid-state", "Waiver revocation requires a reason");
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: "Waiver revocation requires a reason",
+        });
       if (!canRevokeProjectWorkCriterionWaiver(state, task, criterion))
-        throw new ProjectWorkPolicyError(
-          "invalid-state",
-          "Waiver revocation requires a current ordinary waived criterion on inactive nonterminal work",
-        );
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message:
+            "Waiver revocation requires a current ordinary waived criterion on inactive nonterminal work",
+        });
       return [
         event({
           type: "project-work.criterion.waiver-revoked",
@@ -1494,10 +1543,10 @@ export function decideProjectWorkCommand(
     case "project-work.evidence.add": {
       const evidence = command.evidence;
       if (evidence.evidenceId.startsWith("delivery-acceptance:"))
-        throw new ProjectWorkPolicyError(
-          "authority-required",
-          "Delivery acceptance evidence requires its private audited transition",
-        );
+        throw new ProjectWorkPolicyError({
+          code: "authority-required",
+          message: "Delivery acceptance evidence requires its private audited transition",
+        });
       assertUniqueId(
         state.evidence.map((entry) => String(entry.evidenceId)),
         evidence.evidenceId,
@@ -1523,8 +1572,12 @@ export function decideProjectWorkCommand(
           ? { ...command.knowledge, attribution: command.attribution }
           : command.knowledge;
       if (knowledge.projectId !== state.projectId)
-        throw new ProjectWorkPolicyError("invalid-state", "Knowledge belongs to another project.", {
-          knowledgeId: knowledge.knowledgeId,
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: "Knowledge belongs to another project.",
+          details: {
+            knowledgeId: knowledge.knowledgeId,
+          },
         });
       assertUniqueId(
         stateForRecords(state, "knowledge").map((entry) => String(entry.knowledgeId)),
@@ -1547,8 +1600,12 @@ export function decideProjectWorkCommand(
           ? { ...command.decision, attribution: command.attribution }
           : command.decision;
       if (decision.projectId !== state.projectId)
-        throw new ProjectWorkPolicyError("invalid-state", "Decision belongs to another project.", {
-          decisionId: decision.decisionId,
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: "Decision belongs to another project.",
+          details: {
+            decisionId: decision.decisionId,
+          },
         });
       assertUniqueId(
         stateForRecords(state, "decisions").map((entry) => String(entry.decisionId)),
@@ -1556,10 +1613,10 @@ export function decideProjectWorkCommand(
         "Decision",
       );
       if (decision.state !== "proposed")
-        throw new ProjectWorkPolicyError(
-          "invalid-state",
-          "A proposed decision must start proposed.",
-        );
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: "A proposed decision must start proposed.",
+        });
       return [
         event({
           type: "project-work.decision.proposed",
@@ -1575,13 +1632,13 @@ export function decideProjectWorkCommand(
         (entry) => entry.decisionId === command.decisionId,
       );
       if (decision === undefined || decision.state !== "proposed")
-        throw new ProjectWorkPolicyError(
-          "invalid-state",
-          "Only proposed decisions can be accepted.",
-          {
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: "Only proposed decisions can be accepted.",
+          details: {
             decisionId: command.decisionId,
           },
-        );
+        });
       return [
         event({
           type: "project-work.decision.accepted",
@@ -1597,13 +1654,13 @@ export function decideProjectWorkCommand(
         (entry) => entry.decisionId === command.decisionId,
       );
       if (decision === undefined || decision.state !== "proposed")
-        throw new ProjectWorkPolicyError(
-          "invalid-state",
-          "Only proposed decisions can be rejected.",
-          {
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: "Only proposed decisions can be rejected.",
+          details: {
             decisionId: command.decisionId,
           },
-        );
+        });
       return [
         event({
           type: "project-work.decision.rejected",
@@ -1617,31 +1674,31 @@ export function decideProjectWorkCommand(
     }
     case "project-work.decision.supersede": {
       if (command.attribution === undefined)
-        throw new ProjectWorkPolicyError(
-          "deferred-command",
-          "Command 'project-work.decision.supersede' requires attribution.",
-          { commandType: command.type },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "deferred-command",
+          message: "Command 'project-work.decision.supersede' requires attribution.",
+          details: { commandType: command.type },
+        });
       const decision = stateForRecords(state, "decisions").find(
         (entry) => entry.decisionId === command.decisionId,
       );
       if (decision === undefined || decision.state !== "accepted")
-        throw new ProjectWorkPolicyError(
-          "invalid-state",
-          "Only accepted decisions can be superseded.",
-          {
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: "Only accepted decisions can be superseded.",
+          details: {
             decisionId: command.decisionId,
           },
-        );
+        });
       if (
         command.replacement.supersedesDecisionId !== undefined &&
         command.replacement.supersedesDecisionId !== command.decisionId
       )
-        throw new ProjectWorkPolicyError(
-          "invalid-state",
-          "A replacement decision must supersede the decision named by the command.",
-          { decisionId: command.decisionId },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: "A replacement decision must supersede the decision named by the command.",
+          details: { decisionId: command.decisionId },
+        });
       const replacement = {
         ...command.replacement,
         supersedesDecisionId: command.decisionId,
@@ -1650,10 +1707,10 @@ export function decideProjectWorkCommand(
           : {}),
       };
       if (replacement.projectId !== state.projectId || replacement.state !== "proposed")
-        throw new ProjectWorkPolicyError(
-          "invalid-state",
-          "A superseding decision must be a proposed decision in this project.",
-        );
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: "A superseding decision must be a proposed decision in this project.",
+        });
       assertUniqueId(
         stateForRecords(state, "decisions").map((entry) => String(entry.decisionId)),
         String(replacement.decisionId),
@@ -1676,10 +1733,17 @@ export function decideProjectWorkCommand(
           ? { ...command.comment, attribution: command.attribution }
           : command.comment;
       if (comment.projectId !== state.projectId)
-        throw new ProjectWorkPolicyError("invalid-state", "Comment belongs to another project.");
+        throw new ProjectWorkPolicyError({
+          code: "invalid-state",
+          message: "Comment belongs to another project.",
+        });
       if (stateForRecords(state, "comments").some((entry) => entry.commentId === comment.commentId))
-        throw new ProjectWorkPolicyError("duplicate-record", "Comment already exists.", {
-          commentId: comment.commentId,
+        throw new ProjectWorkPolicyError({
+          code: "duplicate-record",
+          message: "Comment already exists.",
+          details: {
+            commentId: comment.commentId,
+          },
         });
       if (comment.taskId !== undefined) currentTask(state, comment.taskId);
       return [
@@ -1720,11 +1784,11 @@ export function decideProjectWorkCommand(
         (entry) => entry.relationshipId === command.relationshipId,
       );
       if (relationship === undefined)
-        throw new ProjectWorkPolicyError(
-          "unknown-relationship",
-          `Relationship '${command.relationshipId}' does not exist.`,
-          { relationshipId: command.relationshipId },
-        );
+        throw new ProjectWorkPolicyError({
+          code: "unknown-relationship",
+          message: `Relationship '${command.relationshipId}' does not exist.`,
+          details: { relationshipId: command.relationshipId },
+        });
       return [
         event({
           type: "project-work.relationship.unlinked",
@@ -1735,10 +1799,10 @@ export function decideProjectWorkCommand(
       ];
     }
     default: {
-      throw new ProjectWorkPolicyError(
-        "deferred-command",
-        "The project-work command is not supported by this decider.",
-      );
+      throw new ProjectWorkPolicyError({
+        code: "deferred-command",
+        message: "The project-work command is not supported by this decider.",
+      });
     }
   }
 }
@@ -1940,7 +2004,10 @@ export function applyProjectWorkEvents(
     switch (event.type) {
       case "project-work.foundation.recorded": {
         if (!isProjectTeamRecord(event.record))
-          throw new ProjectWorkPolicyError("invalid-state", "Foundation event record is malformed");
+          throw new ProjectWorkPolicyError({
+            code: "invalid-state",
+            message: "Foundation event record is malformed",
+          });
         if (
           "taskId" in event.record &&
           event.record.taskId !== undefined &&
@@ -1948,12 +2015,15 @@ export function applyProjectWorkEvents(
             (task) => task.taskId === ("taskId" in event.record ? event.record.taskId : undefined),
           )
         )
-          throw new ProjectWorkPolicyError(
-            "unknown-task",
-            "Foundation event refers to an unknown task",
-          );
+          throw new ProjectWorkPolicyError({
+            code: "unknown-task",
+            message: "Foundation event refers to an unknown task",
+          });
         if (!("projectId" in event.record) || event.record.projectId !== next.projectId)
-          throw new ProjectWorkPolicyError("invalid-state", "Foundation event project mismatch");
+          throw new ProjectWorkPolicyError({
+            code: "invalid-state",
+            message: "Foundation event project mismatch",
+          });
         const old = next.foundationRecords?.find(
           (record) => record.recordId === event.record.recordId,
         );
@@ -1961,10 +2031,10 @@ export function applyProjectWorkEvents(
           old !== undefined &&
           (old.kind !== event.record.kind || event.record.generation < old.generation)
         )
-          throw new ProjectWorkPolicyError(
-            "invalid-state",
-            "Foundation event identity or generation changed",
-          );
+          throw new ProjectWorkPolicyError({
+            code: "invalid-state",
+            message: "Foundation event identity or generation changed",
+          });
         if (
           old?.kind === "task-membership" &&
           event.record.kind === "task-membership" &&
@@ -1972,15 +2042,15 @@ export function applyProjectWorkEvents(
           canonicalProjectWorkPayload(old.rootConstraints) !==
             canonicalProjectWorkPayload(event.record.rootConstraints)
         )
-          throw new ProjectWorkPolicyError(
-            "invalid-state",
-            "Frozen root constraints cannot change during replay",
-          );
+          throw new ProjectWorkPolicyError({
+            code: "invalid-state",
+            message: "Frozen root constraints cannot change during replay",
+          });
         if (event.record.revision !== (old === undefined ? 0 : old.revision + 1))
-          throw new ProjectWorkPolicyError(
-            "stale-revision",
-            "Foundation event revision is not contiguous",
-          );
+          throw new ProjectWorkPolicyError({
+            code: "stale-revision",
+            message: "Foundation event revision is not contiguous",
+          });
         next.foundationRecords = [
           ...(next.foundationRecords ?? []).filter(
             (record) => record.recordId !== event.record.recordId,
@@ -2289,10 +2359,10 @@ export function applyProjectWorkEvents(
           canonicalProjectWorkPayload(criterion.waiver) !==
             canonicalProjectWorkPayload(event.previousWaiver)
         )
-          throw new ProjectWorkPolicyError(
-            "stale-revision",
-            "Retained waiver revocation target changed",
-          );
+          throw new ProjectWorkPolicyError({
+            code: "stale-revision",
+            message: "Retained waiver revocation target changed",
+          });
         const { waiver: _waiver, ...retained } = criterion;
         const index = next.criteria.findIndex(
           (entry) => entry.criterionId === criterion.criterionId,
@@ -2460,10 +2530,10 @@ export function applyProjectWorkEvents(
         );
         break;
       default:
-        throw new ProjectWorkPolicyError(
-          "deferred-command",
-          `Event '${event.type}' is not supported by the human Work reducer.`,
-        );
+        throw new ProjectWorkPolicyError({
+          code: "deferred-command",
+          message: `Event '${event.type}' is not supported by the human Work reducer.`,
+        });
     }
     if (event.type !== "project-work.activity.recorded") {
       const taskId =

@@ -64,7 +64,7 @@ export function WorkAgentAvatar({
   const progress = useSharedValue(0);
   const reduced = useReducedMotion();
   const motion = avatar?.motion === true;
-  // oxlint-disable-next-line t3code/react-effect-budget -- Preview requests drive a native animation that must cancel on unmount.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Preview requests drive a native animation that must cancel on unmount.
   useEffect(() => {
     progress.set(0);
     if (preview > 0 && motion && !reduced) progress.set(withTiming(1, { duration: 900 }));

@@ -10,7 +10,7 @@ export function AgentsShortcut({ paletteOpen }: { readonly paletteOpen: boolean 
   const routeTarget = useThreadRouteTarget();
   const threadRef = routeTarget?.kind === "server" ? routeTarget.threadRef : null;
   const navigate = useNavigate();
-  // oxlint-disable-next-line t3code/react-effect-budget -- Register the route command while mounted and remove it when the route target changes or unmounts.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- registers the agents.open command with the shortcut dispatcher and removes it on change or unmount
   useEffect(() => {
     return registerCommands(
       {

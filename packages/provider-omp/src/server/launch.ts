@@ -4,8 +4,8 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeOS from "node:os";
-import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
 import { parseRuntimeArgs, validateRuntimeConfig } from "./runtimeOptions.ts";
 import { runtimeAssetSources } from "./runtimeAssets.generated.ts";
@@ -99,7 +99,9 @@ export function resolveInstalledOmp(
     throw new Error("Unsupported OMP executable layout; use a source-bearing npm installation");
   return root;
 }
-class OmpAssetError extends Data.TaggedError("OmpAssetError")<{ cause: unknown }> {}
+class OmpAssetError extends Schema.TaggedError<OmpAssetError>()("OmpAssetError", {
+  cause: Schema.Defect(),
+}) {}
 export const materializeOmpRuntimeAssets = Effect.fn("Omp.materializeRuntimeAssets")(function* (
   cacheDir: string,
 ) {

@@ -40,6 +40,8 @@ import {
 } from "./ProjectWorkDecider.ts";
 import { toPersistenceSqlError, type ProjectionRepositoryError } from "../persistence/Errors.ts";
 
+const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+
 export type { ProjectWorkActivity, ProjectWorkCheckpoint } from "./ProjectWorkDecider.ts";
 export type ProjectWorkProjectionEvent = ProjectWorkEvent;
 
@@ -796,11 +798,10 @@ export const persistProjectWorkState = Effect.fn("ProjectWorkProjection.persistP
         ${previous === undefined ? sql`` : sql`AND EXISTS (SELECT 1 FROM t3_workflow_v2_work_changed_fts changed WHERE changed.record_kind = 'activity' AND changed.record_id = activity_id)`}
     `;
     yield* sql`INSERT INTO t3_workflow_v2_work_projection_state (projector, last_applied_sequence, rebuild_generation, updated_at) VALUES (${"project-work:" + projectId}, ${options.lastAppliedSequence ?? state.revision}, 0, ${options.updatedAt ?? state.history?.at(-1)?.occurredAt ?? "1970-01-01T00:00:00.000Z"}) ON CONFLICT(projector) DO UPDATE SET last_applied_sequence = excluded.last_applied_sequence, updated_at = excluded.updated_at`;
-    // @effect-diagnostics-next-line preferSchemaOverJson:off -- state is produced by the typed reducer.
-    const stateJson = JSON.stringify({
+    const stateJson = yield* encodeJson({
       ...nextState,
       checkpointVersion: PROJECT_WORK_CHECKPOINT_VERSION,
-    });
+    }).pipe(Effect.orDie);
     yield* sql`
       INSERT INTO t3_workflow_v2_work_reducer_checkpoints
         (project_id, last_sequence, state_json, updated_at)

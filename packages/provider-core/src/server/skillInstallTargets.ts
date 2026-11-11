@@ -7,6 +7,12 @@ import type { ProviderDriverKind } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import type * as FileSystem from "effect/FileSystem";
 import type * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
+
+class SkillInstallTargetProbeReadError extends Schema.TaggedError<SkillInstallTargetProbeReadError>()(
+  "SkillInstallTargetProbeReadError",
+  { path: Schema.String, cause: Schema.Defect() },
+) {}
 
 export type SkillInstallTargetId =
   | "provider-project"
@@ -41,7 +47,10 @@ export function verifyExternalOpenCodeInstallTargets(input: {
       const probePath = input.path.join(ancestor, `.t3-skill-probe-${NodeCrypto.randomUUID()}.txt`);
       const probeContent = NodeCrypto.randomUUID();
       yield* input.fileSystem.writeFileString(probePath, probeContent);
-      return yield* Effect.tryPromise(() => input.readFile(probePath, ancestor)).pipe(
+      return yield* Effect.tryPromise({
+        try: () => input.readFile(probePath, ancestor),
+        catch: (cause) => new SkillInstallTargetProbeReadError({ path: probePath, cause }),
+      }).pipe(
         Effect.map((read) => read?.type === "text" && read.content.trim() === probeContent),
         Effect.orElseSucceed(() => false),
         Effect.ensuring(input.fileSystem.remove(probePath, { force: true }).pipe(Effect.ignore)),

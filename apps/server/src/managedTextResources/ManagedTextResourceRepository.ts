@@ -3,6 +3,7 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
+import * as Schema from "effect/Schema";
 
 export type ManagedTextResourceKind = "command" | "snippet";
 export type ManagedTextResourceState = "active" | "disabled" | "invalid";
@@ -41,23 +42,23 @@ export interface ManagedTextResourceRepositoryChange {
   }>;
 }
 
-export class ManagedTextResourceRepositoryError extends Error {
-  readonly code:
-    | "not_found"
-    | "revision_conflict"
-    | "already_exists"
-    | "invalid_content"
-    | "invalid_override"
-    | "mutation_failed";
-
-  constructor(
-    code: ManagedTextResourceRepositoryError["code"],
-    message: string,
-    options?: ErrorOptions,
-  ) {
-    super(`managed_text_resource_${code}: ${message}`, options);
-    this.name = "ManagedTextResourceRepositoryError";
-    this.code = code;
+export class ManagedTextResourceRepositoryError extends Schema.TaggedError<ManagedTextResourceRepositoryError>()(
+  "ManagedTextResourceRepositoryError",
+  {
+    code: Schema.Literals([
+      "not_found",
+      "revision_conflict",
+      "already_exists",
+      "invalid_content",
+      "invalid_override",
+      "mutation_failed",
+    ]),
+    detail: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return `managed_text_resource_${this.code}: ${this.detail}`;
   }
 }
 
@@ -143,29 +144,29 @@ const assertKey = (key: string): void => {
     !KEY_PATTERN.test(key) ||
     RESERVED_WINDOWS_COMPONENT.test(key)
   ) {
-    throw new ManagedTextResourceRepositoryError(
-      "invalid_content",
-      `The key '${key}' is not a portable managed text resource key.`,
-    );
+    throw new ManagedTextResourceRepositoryError({
+      code: "invalid_content",
+      detail: `The key '${key}' is not a portable managed text resource key.`,
+    });
   }
 };
 
 const validateBody = (body: string): void => {
   if (body.length > BODY_MAX_LENGTH) {
-    throw new ManagedTextResourceRepositoryError(
-      "invalid_content",
-      `Resource content exceeds ${BODY_MAX_LENGTH} characters.`,
-    );
+    throw new ManagedTextResourceRepositoryError({
+      code: "invalid_content",
+      detail: `Resource content exceeds ${BODY_MAX_LENGTH} characters.`,
+    });
   }
 };
 
 const normalizeName = (name: string | undefined, key: string): string => {
   const normalized = name?.trim() || key;
   if (normalized.length > NAME_MAX_LENGTH) {
-    throw new ManagedTextResourceRepositoryError(
-      "invalid_content",
-      `Resource names cannot exceed ${NAME_MAX_LENGTH} characters.`,
-    );
+    throw new ManagedTextResourceRepositoryError({
+      code: "invalid_content",
+      detail: `Resource names cannot exceed ${NAME_MAX_LENGTH} characters.`,
+    });
   }
   return normalized;
 };
@@ -300,18 +301,18 @@ export const makeManagedTextResourceRepository = (
       await NodeFSP.mkdir(metadataDirectory, { recursive: true });
       const metadataStat = await NodeFSP.lstat(metadataDirectory);
       if (!metadataStat.isDirectory() || metadataStat.isSymbolicLink()) {
-        throw new ManagedTextResourceRepositoryError(
-          "invalid_override",
-          "The project .t3code directory must be a real directory.",
-        );
+        throw new ManagedTextResourceRepositoryError({
+          code: "invalid_override",
+          detail: "The project .t3code directory must be a real directory.",
+        });
       }
       await NodeFSP.mkdir(kindDirectory, { recursive: true });
       const kindStat = await NodeFSP.lstat(kindDirectory);
       if (!kindStat.isDirectory() || kindStat.isSymbolicLink()) {
-        throw new ManagedTextResourceRepositoryError(
-          "invalid_override",
-          `The project .t3code/${kind}s directory must be a real directory.`,
-        );
+        throw new ManagedTextResourceRepositoryError({
+          code: "invalid_override",
+          detail: `The project .t3code/${kind}s directory must be a real directory.`,
+        });
       }
       return kindDirectory;
     }
@@ -343,29 +344,29 @@ export const makeManagedTextResourceRepository = (
         actualDirectory.dev !== expectedDirectory.dev ||
         actualDirectory.ino !== expectedDirectory.ino
       )
-        throw new ManagedTextResourceRepositoryError(
-          "revision_conflict",
-          "The resource directory changed during mutation preparation.",
-        );
+        throw new ManagedTextResourceRepositoryError({
+          code: "revision_conflict",
+          detail: "The resource directory changed during mutation preparation.",
+        });
     }
     const expected = observedFiles?.get(filePath);
     let actual: string | undefined;
     try {
       const stat = NodeFS.lstatSync(filePath);
       if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 400_000)
-        throw new ManagedTextResourceRepositoryError(
-          "invalid_override",
-          "Resource paths must be regular files.",
-        );
+        throw new ManagedTextResourceRepositoryError({
+          code: "invalid_override",
+          detail: "Resource paths must be regular files.",
+        });
       actual = digest(NodeFS.readFileSync(filePath));
     } catch (cause) {
       if (!isNodeError(cause, "ENOENT")) throw cause;
     }
     if (actual !== expected)
-      throw new ManagedTextResourceRepositoryError(
-        "revision_conflict",
-        "The resource changed during mutation preparation.",
-      );
+      throw new ManagedTextResourceRepositoryError({
+        code: "revision_conflict",
+        detail: "The resource changed during mutation preparation.",
+      });
   };
   const assertNoPendingRecovery = async (writing: boolean) => {
     let pending: unknown;
@@ -376,10 +377,10 @@ export const makeManagedTextResourceRepository = (
       throw cause;
     }
     if (!writing && isObject(pending) && pending.phase === "committed") return;
-    throw new ManagedTextResourceRepositoryError(
-      "mutation_failed",
-      `A prior mutation needs recovery before ${writing ? "writing" : "reading"} this catalog. Recovery record: ${pendingPath}`,
-    );
+    throw new ManagedTextResourceRepositoryError({
+      code: "mutation_failed",
+      detail: `A prior mutation needs recovery before ${writing ? "writing" : "reading"} this catalog. Recovery record: ${pendingPath}`,
+    });
   };
   const persistIntent = async (recovery: MutationRecovery) => {
     await writeAtomic(
@@ -481,11 +482,11 @@ export const makeManagedTextResourceRepository = (
       }
     }
     if (errors.length > 0)
-      throw new ManagedTextResourceRepositoryError(
-        "mutation_failed",
-        `Mutation compensation or cleanup is incomplete. Later edits were preserved. Recovery record: ${pendingPath}`,
-        { cause: new AggregateError([cause, ...errors]) },
-      );
+      throw new ManagedTextResourceRepositoryError({
+        code: "mutation_failed",
+        detail: `Mutation compensation or cleanup is incomplete. Later edits were preserved. Recovery record: ${pendingPath}`,
+        cause: new AggregateError([cause, ...errors]),
+      });
   };
   const prepareRecovery = async (): Promise<MutationRecovery> => {
     const directory = NodePath.join(resourceRoot, `recovery-${NodeCrypto.randomUUID()}`);
@@ -527,11 +528,11 @@ export const makeManagedTextResourceRepository = (
         await NodeFSP.rm(recoveryPath, { force: true });
         await NodeFSP.rmdir(directory);
       } catch (cleanupCause) {
-        throw new ManagedTextResourceRepositoryError(
-          "mutation_failed",
-          `Recovery preparation cleanup failed: ${directory}`,
-          { cause: new AggregateError([cause, cleanupCause]) },
-        );
+        throw new ManagedTextResourceRepositoryError({
+          code: "mutation_failed",
+          detail: `Recovery preparation cleanup failed: ${directory}`,
+          cause: new AggregateError([cause, cleanupCause]),
+        });
       }
       throw cause;
     }
@@ -539,20 +540,20 @@ export const makeManagedTextResourceRepository = (
   const commitFile = async (filePath: string, commit: () => void, publishedHash?: string) => {
     const recovery = activeRecovery;
     if (recovery === undefined)
-      throw new ManagedTextResourceRepositoryError(
-        "mutation_failed",
-        "A resource mutation requires recovery ownership.",
-      );
+      throw new ManagedTextResourceRepositoryError({
+        code: "mutation_failed",
+        detail: "A resource mutation requires recovery ownership.",
+      });
     const directory = await NodeFSP.stat(NodePath.dirname(filePath));
     let original: Buffer | undefined;
     let originalMode = 0o600;
     try {
       const stat = await NodeFSP.lstat(filePath);
       if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 400_000)
-        throw new ManagedTextResourceRepositoryError(
-          "invalid_override",
-          "Resource paths must be regular files.",
-        );
+        throw new ManagedTextResourceRepositoryError({
+          code: "invalid_override",
+          detail: "Resource paths must be regular files.",
+        });
       original = await NodeFSP.readFile(filePath);
       originalMode = stat.mode & 0o777;
     } catch (cause) {
@@ -560,10 +561,10 @@ export const makeManagedTextResourceRepository = (
     }
     const originalHash = original === undefined ? undefined : digest(original);
     if (originalHash !== observedFiles?.get(filePath))
-      throw new ManagedTextResourceRepositoryError(
-        "revision_conflict",
-        "The resource changed during mutation preparation.",
-      );
+      throw new ManagedTextResourceRepositoryError({
+        code: "revision_conflict",
+        detail: "The resource changed during mutation preparation.",
+      });
     const recoveryPath =
       original === undefined ? undefined : `${filePath}.recovery-${NodeCrypto.randomUUID()}`;
     const file: RecoveryFile = {
@@ -614,10 +615,10 @@ export const makeManagedTextResourceRepository = (
               currentDirectory.dev !== directoryStat.dev ||
               currentDirectory.ino !== directoryStat.ino
             )
-              throw new ManagedTextResourceRepositoryError(
-                "revision_conflict",
-                "The resource directory changed during mutation preparation.",
-              );
+              throw new ManagedTextResourceRepositoryError({
+                code: "revision_conflict",
+                detail: "The resource directory changed during mutation preparation.",
+              });
             NodeFS.renameSync(temporaryPath, filePath);
           },
           digest(value),
@@ -833,10 +834,10 @@ export const makeManagedTextResourceRepository = (
       !isObject(value.fingerprints) ||
       Object.values(value.fingerprints).some((fingerprint) => typeof fingerprint !== "string")
     ) {
-      throw new ManagedTextResourceRepositoryError(
-        "invalid_content",
-        "The managed text resource catalog revision file is malformed.",
-      );
+      throw new ManagedTextResourceRepositoryError({
+        code: "invalid_content",
+        detail: "The managed text resource catalog revision file is malformed.",
+      });
     }
     return {
       version: 1,
@@ -965,10 +966,10 @@ export const makeManagedTextResourceRepository = (
           input.expectedCatalogRevision !== undefined &&
           input.expectedCatalogRevision !== current.revision
         )
-          throw new ManagedTextResourceRepositoryError(
-            "revision_conflict",
-            `Expected catalog revision ${input.expectedCatalogRevision}, found ${current.revision}.`,
-          );
+          throw new ManagedTextResourceRepositoryError({
+            code: "revision_conflict",
+            detail: `Expected catalog revision ${input.expectedCatalogRevision}, found ${current.revision}.`,
+          });
         recovery = await prepareRecovery();
         activeRecovery = recovery;
         activeGuard = input.commitGuard;
@@ -1003,11 +1004,11 @@ export const makeManagedTextResourceRepository = (
         try {
           await cleanupRecovery(recovery);
         } catch (cause) {
-          throw new ManagedTextResourceRepositoryError(
-            "mutation_failed",
-            `Resource committed, but recovery cleanup is incomplete. Recovery record: ${pendingPath}`,
-            { cause },
-          );
+          throw new ManagedTextResourceRepositoryError({
+            code: "mutation_failed",
+            detail: `Resource committed, but recovery cleanup is incomplete. Recovery record: ${pendingPath}`,
+            cause: cause,
+          });
         }
         return { value, catalogRevision, change };
       } catch (cause) {
@@ -1149,10 +1150,10 @@ export const makeManagedTextResourceRepository = (
           const directory = environmentKindDirectory(input.kind);
           const entries = await readFiles(directory, input.kind, "environment");
           if (entries.some((entry) => entry.key === input.key)) {
-            throw new ManagedTextResourceRepositoryError(
-              "already_exists",
-              `A ${input.kind} named '${input.key}' already exists in this environment.`,
-            );
+            throw new ManagedTextResourceRepositoryError({
+              code: "already_exists",
+              detail: `A ${input.kind} named '${input.key}' already exists in this environment.`,
+            });
           }
           const definition = createDefinition(input);
           await writeDefinition(directory, definition, 0o600);
@@ -1182,10 +1183,10 @@ export const makeManagedTextResourceRepository = (
       const all = await listEnvironmentUnlocked();
       const existing = await findById(all, input.id, input.kind);
       if (existing === undefined || existing.state === "invalid") {
-        throw new ManagedTextResourceRepositoryError(
-          "not_found",
-          `Resource '${input.id}' was not found.`,
-        );
+        throw new ManagedTextResourceRepositoryError({
+          code: "not_found",
+          detail: `Resource '${input.id}' was not found.`,
+        });
       }
       const { value, catalogRevision } = await executeMutation({
         scope: "environment",
@@ -1201,16 +1202,16 @@ export const makeManagedTextResourceRepository = (
               entry.id === input.id && (input.kind === undefined || entry.kind === input.kind),
           );
           if (current === undefined || current.state === "invalid") {
-            throw new ManagedTextResourceRepositoryError(
-              "not_found",
-              `Resource '${input.id}' was not found.`,
-            );
+            throw new ManagedTextResourceRepositoryError({
+              code: "not_found",
+              detail: `Resource '${input.id}' was not found.`,
+            });
           }
           if (current.revision !== input.expectedRevision) {
-            throw new ManagedTextResourceRepositoryError(
-              "revision_conflict",
-              `Expected revision ${input.expectedRevision}, found ${current.revision}.`,
-            );
+            throw new ManagedTextResourceRepositoryError({
+              code: "revision_conflict",
+              detail: `Expected revision ${input.expectedRevision}, found ${current.revision}.`,
+            });
           }
           const definition = createDefinition({
             kind: current.kind,
@@ -1243,10 +1244,10 @@ export const makeManagedTextResourceRepository = (
       const all = await listEnvironmentUnlocked();
       const existing = await findById(all, input.id, input.kind);
       if (existing === undefined || existing.state === "invalid" || existing.body === undefined) {
-        throw new ManagedTextResourceRepositoryError(
-          "not_found",
-          `Resource '${input.id}' was not found.`,
-        );
+        throw new ManagedTextResourceRepositoryError({
+          code: "not_found",
+          detail: `Resource '${input.id}' was not found.`,
+        });
       }
       const { value, catalogRevision } = await executeMutation({
         scope: "environment",
@@ -1262,16 +1263,16 @@ export const makeManagedTextResourceRepository = (
               entry.id === input.id && (input.kind === undefined || entry.kind === input.kind),
           );
           if (current === undefined || current.state === "invalid" || current.body === undefined) {
-            throw new ManagedTextResourceRepositoryError(
-              "not_found",
-              `Resource '${input.id}' was not found.`,
-            );
+            throw new ManagedTextResourceRepositoryError({
+              code: "not_found",
+              detail: `Resource '${input.id}' was not found.`,
+            });
           }
           if (current.revision !== input.expectedRevision) {
-            throw new ManagedTextResourceRepositoryError(
-              "revision_conflict",
-              `Expected revision ${input.expectedRevision}, found ${current.revision}.`,
-            );
+            throw new ManagedTextResourceRepositoryError({
+              code: "revision_conflict",
+              detail: `Expected revision ${input.expectedRevision}, found ${current.revision}.`,
+            });
           }
           const definition: StoredDefinition = {
             version: 1,
@@ -1303,10 +1304,10 @@ export const makeManagedTextResourceRepository = (
       const all = await listEnvironmentUnlocked();
       const existing = await findById(all, input.id, input.kind);
       if (existing === undefined || existing.state === "invalid") {
-        throw new ManagedTextResourceRepositoryError(
-          "not_found",
-          `Resource '${input.id}' was not found.`,
-        );
+        throw new ManagedTextResourceRepositoryError({
+          code: "not_found",
+          detail: `Resource '${input.id}' was not found.`,
+        });
       }
       const { value, catalogRevision } = await executeMutation({
         scope: "environment",
@@ -1322,16 +1323,16 @@ export const makeManagedTextResourceRepository = (
               entry.id === input.id && (input.kind === undefined || entry.kind === input.kind),
           );
           if (current === undefined || current.state === "invalid") {
-            throw new ManagedTextResourceRepositoryError(
-              "not_found",
-              `Resource '${input.id}' was not found.`,
-            );
+            throw new ManagedTextResourceRepositoryError({
+              code: "not_found",
+              detail: `Resource '${input.id}' was not found.`,
+            });
           }
           if (current.revision !== input.expectedRevision) {
-            throw new ManagedTextResourceRepositoryError(
-              "revision_conflict",
-              `Expected revision ${input.expectedRevision}, found ${current.revision}.`,
-            );
+            throw new ManagedTextResourceRepositoryError({
+              code: "revision_conflict",
+              detail: `Expected revision ${input.expectedRevision}, found ${current.revision}.`,
+            });
           }
           const filePath = definitionPath(environmentKindDirectory(current.kind), current.key);
           await commitFile(filePath, () => NodeFS.unlinkSync(filePath));
@@ -1355,16 +1356,16 @@ export const makeManagedTextResourceRepository = (
         ];
         const entry = await findById(candidates, input.id, input.kind);
         if (entry === undefined || entry.state === "invalid" || entry.body === undefined) {
-          throw new ManagedTextResourceRepositoryError(
-            "not_found",
-            `Resource '${input.id}' was not found.`,
-          );
+          throw new ManagedTextResourceRepositoryError({
+            code: "not_found",
+            detail: `Resource '${input.id}' was not found.`,
+          });
         }
         if (entry.revision !== input.revision) {
-          throw new ManagedTextResourceRepositoryError(
-            "revision_conflict",
-            `Expected revision ${input.revision}, found ${entry.revision}.`,
-          );
+          throw new ManagedTextResourceRepositoryError({
+            code: "revision_conflict",
+            detail: `Expected revision ${input.revision}, found ${entry.revision}.`,
+          });
         }
         return {
           kind: entry.kind,
@@ -1402,19 +1403,19 @@ export const makeManagedTextResourceRepository = (
             (entry) => entry.kind === input.kind && entry.key === input.key,
           );
           if (input.expectedRevision === null && current !== undefined) {
-            throw new ManagedTextResourceRepositoryError(
-              "revision_conflict",
-              `Expected no project entry for '${input.key}'.`,
-            );
+            throw new ManagedTextResourceRepositoryError({
+              code: "revision_conflict",
+              detail: `Expected no project entry for '${input.key}'.`,
+            });
           }
           if (
             typeof input.expectedRevision === "string" &&
             current?.revision !== input.expectedRevision
           ) {
-            throw new ManagedTextResourceRepositoryError(
-              "revision_conflict",
-              `Expected revision ${input.expectedRevision}, found ${current?.revision ?? "none"}.`,
-            );
+            throw new ManagedTextResourceRepositoryError({
+              code: "revision_conflict",
+              detail: `Expected revision ${input.expectedRevision}, found ${current?.revision ?? "none"}.`,
+            });
           }
           const directory = await projectKindDirectory(input.projectRoot, input.kind, true);
           const definition = createDefinition({
@@ -1425,10 +1426,10 @@ export const makeManagedTextResourceRepository = (
             ...(current?.state === "active" && current.id !== undefined ? { id: current.id } : {}),
           });
           if (directory === undefined) {
-            throw new ManagedTextResourceRepositoryError(
-              "mutation_failed",
-              "The project override directory could not be created.",
-            );
+            throw new ManagedTextResourceRepositoryError({
+              code: "mutation_failed",
+              detail: "The project override directory could not be created.",
+            });
           }
           await writeDefinition(directory, definition, 0o644, true);
           return {
@@ -1471,17 +1472,17 @@ export const makeManagedTextResourceRepository = (
             input.expectedRevision !== undefined &&
             current?.revision !== input.expectedRevision
           ) {
-            throw new ManagedTextResourceRepositoryError(
-              "revision_conflict",
-              `Expected revision ${input.expectedRevision}, found ${current?.revision ?? "none"}.`,
-            );
+            throw new ManagedTextResourceRepositoryError({
+              code: "revision_conflict",
+              detail: `Expected revision ${input.expectedRevision}, found ${current?.revision ?? "none"}.`,
+            });
           }
           const directory = await projectKindDirectory(input.projectRoot, input.kind, true);
           if (directory === undefined) {
-            throw new ManagedTextResourceRepositoryError(
-              "mutation_failed",
-              "The project override directory could not be created.",
-            );
+            throw new ManagedTextResourceRepositoryError({
+              code: "mutation_failed",
+              detail: "The project override directory could not be created.",
+            });
           }
           const tombstone: StoredDisabledEntry = {
             version: 1,
@@ -1529,23 +1530,23 @@ export const makeManagedTextResourceRepository = (
             (entry) => entry.kind === input.kind && entry.key === input.key,
           );
           if (current === undefined) {
-            throw new ManagedTextResourceRepositoryError(
-              "not_found",
-              `Project state '${input.key}' was not found.`,
-            );
+            throw new ManagedTextResourceRepositoryError({
+              code: "not_found",
+              detail: `Project state '${input.key}' was not found.`,
+            });
           }
           if (input.expectedRevision !== undefined && current.revision !== input.expectedRevision) {
-            throw new ManagedTextResourceRepositoryError(
-              "revision_conflict",
-              `Expected revision ${input.expectedRevision}, found ${current.revision}.`,
-            );
+            throw new ManagedTextResourceRepositoryError({
+              code: "revision_conflict",
+              detail: `Expected revision ${input.expectedRevision}, found ${current.revision}.`,
+            });
           }
           const directory = await projectKindDirectory(input.projectRoot, input.kind, false);
           if (directory === undefined) {
-            throw new ManagedTextResourceRepositoryError(
-              "not_found",
-              `Project state '${input.key}' was not found.`,
-            );
+            throw new ManagedTextResourceRepositoryError({
+              code: "not_found",
+              detail: `Project state '${input.key}' was not found.`,
+            });
           }
           const filePath = definitionPath(directory, input.key);
           await commitFile(filePath, () => NodeFS.unlinkSync(filePath));
@@ -1628,10 +1629,10 @@ export const makeManagedTextResourceRepository = (
             (entry) => entry.kind === input.kind && entry.key === input.key,
           );
           if (existing === undefined) {
-            throw new ManagedTextResourceRepositoryError(
-              "not_found",
-              `Thread state '${input.key}' was not found.`,
-            );
+            throw new ManagedTextResourceRepositoryError({
+              code: "not_found",
+              detail: `Thread state '${input.key}' was not found.`,
+            });
           }
           await writeThreadFile(
             input.threadId,

@@ -103,6 +103,7 @@ export function AgentDetailPage({
   const detail = detailQuery.data;
   const selection = currentAssistantSelection(detail, connection.epoch);
   const latest = useRef(selection);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- publishes the committed selection to a ref that async actions check before writing
   useEffect(() => {
     latest.current = selection;
   });

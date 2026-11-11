@@ -19,7 +19,8 @@ import {
 } from "./ProjectTeamPolicy.ts";
 export const reviewDigest = (value: unknown) =>
   NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(value)).digest("hex");
-const stale = () => new ProjectWorkPolicyError("authority-required", "Review proof is stale");
+const stale = () =>
+  new ProjectWorkPolicyError({ code: "authority-required", message: "Review proof is stale" });
 export const records = (state: ProjectWorkReducerState) => state.foundationRecords ?? [];
 export const binding = (state: ProjectWorkReducerState, id: string) =>
   records(state).find(

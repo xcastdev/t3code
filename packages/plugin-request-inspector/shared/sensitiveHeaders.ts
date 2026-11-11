@@ -68,7 +68,10 @@ export function redactHeaderValue(name: string, value: string): string {
       return redactCookiePairs(value);
     case "set-cookie":
       // Some servers fold several cookies into one header; an Expires date's comma is never followed by `name=`.
-      return value.split(/,\s*(?=[^;,=\s]+=)/).map(redactSetCookie).join(", ");
+      return value
+        .split(/,\s*(?=[^;,=\s]+=)/)
+        .map(redactSetCookie)
+        .join(", ");
     default:
       return isSensitiveHeader(name) ? REDACTED_VALUE : value;
   }

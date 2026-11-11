@@ -95,6 +95,7 @@ export function AgentRoutines({ context }: { readonly context: AgentContext }) {
   const routines = (list?.routines ?? []).filter((routine) => !routine.deleted);
   // Confirmations are async; actions compare against the newest list, not the one clicked on.
   const latest = useRef(routines);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- publishes the committed routine list to a ref that async confirmations read
   useEffect(() => {
     latest.current = routines;
   });

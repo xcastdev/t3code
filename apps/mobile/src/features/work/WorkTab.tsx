@@ -10,7 +10,7 @@ import { Button } from "../../components/ui/Button";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { ScreenScrollView as ScrollView } from "../../components/ui/ScreenScrollView";
 import { useProject } from "../../state/entities";
-import { useWorkspaceTabs } from "../workspace/WorkspaceTabsContext";
+import { useWorkspaceTabs } from "../layout/workspace/WorkspaceTabsContext";
 import { WorkProjectContent, WorkProjectList } from "./WorkScreens";
 import { WorkTaskContent } from "./WorkTaskScreen";
 import { WorkText } from "./WorkParts";

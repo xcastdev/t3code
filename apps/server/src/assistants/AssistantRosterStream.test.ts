@@ -85,6 +85,8 @@ it.effect(
         }),
       });
       const service = EventSinkV2.of({
+        consumeProviderEvents: () => Effect.die("unused"),
+        withProviderBatch: () => Effect.die("unused"),
         write: () => Effect.die("unused"),
         writeWithEffects: () => Effect.die("unused"),
         writeIfRunCurrent: () => Effect.die("unused"),

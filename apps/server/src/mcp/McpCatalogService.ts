@@ -23,7 +23,7 @@ import {
   type McpCatalogMutationError,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
-import * as Crypto from "effect/Crypto";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -107,7 +107,7 @@ interface SessionRow {
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
-  const crypto = yield* Crypto.Crypto;
+  const random = yield* SecureRandom.SecureRandom;
   // One pending invalidation is enough: subscribers always re-read authoritative state.
   const sessionChanges = yield* PubSub.sliding<void>(1);
   const notifySessionChanges = PubSub.publish(sessionChanges, undefined);
@@ -330,13 +330,7 @@ const make = Effect.gen(function* () {
           if (encodeJson(operation.definition.transport).includes('"value":'))
             return yield* fail("Credential values cannot enter the catalog.");
           const transport = yield* decode(ProjectMcpTransport, operation.definition.transport);
-          const id =
-            operation.logicalServerId ??
-            McpServerId.make(
-              yield* crypto
-                .randomUUIDv4()
-                .pipe(Effect.mapError(() => fail("MCP catalog identity allocation failed."))),
-            );
+          const id = operation.logicalServerId ?? McpServerId.make(yield* random.uuidV4());
           const previous = definitions.find((d) => d.logicalServerId === id);
           if ((operation.type === "create") === Boolean(previous))
             return yield* fail("MCP catalog logical server identity conflicts.");
@@ -365,11 +359,7 @@ const make = Effect.gen(function* () {
             operation.definitionId ??
             (previous && !hasCatalogTransportIdentityChange(previous.transport, transport)
               ? previous.definitionId
-              : McpDefinitionId.make(
-                  yield* crypto
-                    .randomUUIDv4()
-                    .pipe(Effect.mapError(() => fail("MCP catalog identity allocation failed."))),
-                ));
+              : McpDefinitionId.make(yield* random.uuidV4()));
           const definition = yield* decode(McpCatalogDefinition, {
             ...operation.definition,
             transport,
@@ -545,12 +535,7 @@ const make = Effect.gen(function* () {
         yield* validate(definitions);
         const snapshot: McpCatalogSnapshot = {
           catalogSessionId:
-            input.mcpCatalogSessionId ??
-            McpCatalogSessionId.make(
-              yield* crypto
-                .randomUUIDv4()
-                .pipe(Effect.mapError(() => fail("MCP catalog identity allocation failed."))),
-            ),
+            input.mcpCatalogSessionId ?? McpCatalogSessionId.make(yield* random.uuidV4()),
           threadId: input.threadId,
           providerInstanceId: input.providerInstanceId,
           baseline: definitions,

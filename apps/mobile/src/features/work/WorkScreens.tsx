@@ -928,7 +928,7 @@ function Bindings({
   const [notice, setNotice] = useState<string | null>(null);
   const [binding, setBinding] = useState(false);
   const [detaching, setDetaching] = useState<string | null>(null);
-  // oxlint-disable-next-line t3code/react-effect-budget -- Issue bindings are fetched from the environment when the checkout changes.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Issue bindings are fetched from the environment when the checkout changes.
   useEffect(() => {
     let live = true;
     void projectWorkEnvironment.issue

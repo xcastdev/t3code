@@ -8,7 +8,7 @@ import {
   PluginRequestError,
   type PluginChatTargets,
   type PluginManifest,
-  type PluginRequestErrorReason,
+  PluginRequestErrorReason,
   type PluginSubscriptionEvent,
   type ProjectId,
   type ThreadId,
@@ -145,23 +145,27 @@ const decode = <S extends Schema.Top & { readonly DecodingServices: never }>(
   params: unknown,
 ) => Schema.decodeUnknownOption(schema)(params);
 
-class BridgeFailure extends Error {
-  readonly code: number;
-  readonly reason: PluginRequestErrorReason | undefined;
-  constructor(code: number, message: string, reason?: PluginRequestErrorReason) {
-    super(message);
-    this.code = code;
-    this.reason = reason;
+class BridgeFailure extends Schema.TaggedError<BridgeFailure>()("BridgeFailure", {
+  code: Schema.Number,
+  detail: Schema.String,
+  reason: Schema.optional(PluginRequestErrorReason),
+}) {
+  override get message() {
+    return this.detail;
   }
 }
 
+const bridgeFailure = (code: number, detail: string, reason?: PluginRequestErrorReason) =>
+  new BridgeFailure({ code, detail, ...(reason === undefined ? {} : { reason }) });
+
 const isPluginRequestError = Schema.is(PluginRequestError);
+const isBridgeFailure = Schema.is(BridgeFailure);
 
 const refusal = (reason: PluginRequestErrorReason) =>
-  new BridgeFailure(REQUEST_FAILED, new PluginRequestError({ reason }).message, reason);
+  bridgeFailure(REQUEST_FAILED, new PluginRequestError({ reason }).message, reason);
 
 const errorPayload = (error: unknown) => {
-  if (error instanceof BridgeFailure) {
+  if (isBridgeFailure(error)) {
     return {
       code: error.code,
       message: error.message,
@@ -373,7 +377,7 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
 
   const answer = (id: JsonRpcId, run: () => Promise<unknown>) => {
     if (pending >= PLUGIN_LIMITS.maxPendingRequests) {
-      fail(id, new BridgeFailure(REQUEST_FAILED, "Too many requests in flight."));
+      fail(id, bridgeFailure(REQUEST_FAILED, "Too many requests in flight."));
       return;
     }
     pending += 1;
@@ -396,7 +400,7 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
   ): S["Type"] => {
     const decoded = decode(schema, value);
     if (Option.isNone(decoded)) {
-      throw new BridgeFailure(INVALID_PARAMS, `Invalid params for ${method}.`);
+      throw bridgeFailure(INVALID_PARAMS, `Invalid params for ${method}.`);
     }
     return decoded.value;
   };
@@ -454,7 +458,7 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
   // Web also refuses panel clicks within seconds of input elsewhere in T3, so a retry must wait.
   const requireActivation = (activated: boolean, action: "Attaching" | "Copying" | "Saving") => {
     if (!activated) {
-      throw new BridgeFailure(
+      throw bridgeFailure(
         REQUEST_FAILED,
         `${action} was blocked. Wait a few seconds, then click or tap in the panel again.`,
       );
@@ -463,7 +467,7 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
 
   const openSave = (saveId: string) => {
     if (save === null || save.saveId !== saveId) {
-      throw new BridgeFailure(INVALID_PARAMS, "No such save is open.");
+      throw bridgeFailure(INVALID_PARAMS, "No such save is open.");
     }
     return save;
   };
@@ -485,7 +489,7 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
       return;
     }
     if (!initialized) {
-      throw new BridgeFailure(NOT_INITIALIZED, "Call t3/initialize first.");
+      throw bridgeFailure(NOT_INITIALIZED, "Call t3/initialize first.");
     }
     switch (method) {
       case "t3/state.get":
@@ -494,7 +498,7 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
       case "t3/state.set": {
         const { value } = params(StateSetParams, rawParams, method);
         if (value === undefined) {
-          throw new BridgeFailure(INVALID_PARAMS, "t3/state.set needs a value.");
+          throw bridgeFailure(INVALID_PARAMS, "t3/state.set needs a value.");
         }
         if (jsonBytes(value) > PLUGIN_LIMITS.maxPayloadBytes) throw refusal("too-large");
         answer(id, () => options.state.set(value).then(() => ({})));
@@ -534,7 +538,7 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
           manifest.ui?.panels.some((panel) => panel.id === contributionId) === true ||
           manifest.ui?.commands.some((command) => command.id === contributionId) === true;
         if (!known) {
-          throw new BridgeFailure(INVALID_PARAMS, "This plugin declares no such panel or command.");
+          throw bridgeFailure(INVALID_PARAMS, "This plugin declares no such panel or command.");
         }
         answer(id, () => options.openSurface(contributionId).then(() => ({})));
         return;
@@ -563,7 +567,7 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
         const current = openSave(saveId);
         const decoded = Base64.decode(base64);
         if (Result.isFailure(decoded)) {
-          throw new BridgeFailure(INVALID_PARAMS, "The chunk is not valid base64.");
+          throw bridgeFailure(INVALID_PARAMS, "The chunk is not valid base64.");
         }
         // A copy owns its ArrayBuffer, which Blob parts require.
         const chunk = new Uint8Array(decoded.success);
@@ -571,7 +575,7 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
         const received = current.received + chunk.byteLength;
         if (current.size !== undefined && received > current.size) {
           save = null;
-          throw new BridgeFailure(INVALID_PARAMS, `The file is larger than ${current.size} bytes.`);
+          throw bridgeFailure(INVALID_PARAMS, `The file is larger than ${current.size} bytes.`);
         }
         if (received > PLUGIN_LIMITS.maxSaveBytes) {
           save = null;
@@ -587,7 +591,7 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
         const current = openSave(saveId);
         save = null;
         if (current.size !== undefined && current.received !== current.size) {
-          throw new BridgeFailure(
+          throw bridgeFailure(
             INVALID_PARAMS,
             `The file is ${current.received} bytes, not ${current.size}.`,
           );
@@ -630,7 +634,7 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
         return;
       }
       default:
-        throw new BridgeFailure(METHOD_NOT_FOUND, `Method not found: ${method}`);
+        throw bridgeFailure(METHOD_NOT_FOUND, `Method not found: ${method}`);
     }
   };
 
@@ -642,11 +646,11 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
       if (typeof method !== "string" || id === undefined) return;
       const normalised = normaliseMessage(data);
       if (normalised === undefined) {
-        fail(id, new BridgeFailure(INVALID_REQUEST, "Messages must be plain JSON."));
+        fail(id, bridgeFailure(INVALID_REQUEST, "Messages must be plain JSON."));
         return;
       }
       if (normalised.value === undefined) {
-        fail(id, new BridgeFailure(INVALID_REQUEST, "Message too large.", "too-large"));
+        fail(id, bridgeFailure(INVALID_REQUEST, "Message too large.", "too-large"));
         return;
       }
       const message = normalised.value as { readonly params?: unknown };

@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
@@ -48,7 +49,7 @@ const layer = Layer.mergeAll(
   IdAllocator.layer,
   McpProviderSessions.layer,
   TestProviderHost.layer({ cwd: "/workspace" }),
-).pipe(Layer.provideMerge(NodeServices.layer));
+).pipe(Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)));
 
 const fixture = Effect.fn("OpenCode2Test.fixture")(function* (
   options: {

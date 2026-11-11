@@ -99,6 +99,7 @@ export function useCursorPages() {
 /** False once the component is gone, so a late response can't act on a closed form. */
 export function useMountedRef() {
   const mounted = useRef(true);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- unmount guard read by late async responses
   useEffect(() => {
     mounted.current = true;
     return () => {

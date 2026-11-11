@@ -21,7 +21,7 @@ type Communication = Extract<
   }
 >;
 const reject = (message: string): never => {
-  throw new ProjectWorkPolicyError("invalid-state", message);
+  throw new ProjectWorkPolicyError({ code: "invalid-state", message: message });
 };
 const records = (state: ProjectWorkReducerState) => state.foundationRecords ?? [];
 

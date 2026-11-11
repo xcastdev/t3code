@@ -1,5 +1,6 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as Stream from "effect/Stream";
 import * as Layer from "effect/Layer";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
@@ -80,6 +81,7 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
           otherWorkingThreads: Effect.fn(
             "ProviderSessionManager.ProviderSessionManagerV2.otherWorkingThreads",
           )(() => Effect.succeed([])),
+          subscribePromptSuggestion: () => Stream.empty,
         }),
       );
       const registry = Layer.succeed(

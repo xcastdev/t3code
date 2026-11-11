@@ -32,6 +32,7 @@ describe("orchestration protocol compatibility", () => {
     expect(announced.origin).toBe(selected.origin);
     expect(announced.pathname).toBe(selected.pathname);
     announced.searchParams.delete("orchestrationProtocol");
+    announced.searchParams.delete("clientCapabilities");
     expect(announced.href).toBe(selected.href);
   });
 
@@ -46,6 +47,7 @@ describe("orchestration protocol compatibility", () => {
     expect(socketUrl.searchParams.get("orchestrationProtocol")).toBe(
       String(ORCHESTRATION_PROTOCOL_VERSION),
     );
+    expect(socketUrl.searchParams.get("clientCapabilities")).toBe("settingsSecretReferences");
     expect(socketUrl.searchParams.get("wsTicket")).toBe("secret");
     expect(socketUrl.searchParams.get("connectionMethod")).toBe("relay");
   });

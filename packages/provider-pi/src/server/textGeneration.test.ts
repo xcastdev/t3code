@@ -9,6 +9,7 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
+import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import { makePiTextGeneration } from "./textGeneration.ts";
@@ -21,6 +22,7 @@ const makeFakePi = (
   setModelError?: string,
   thinking?: { readonly error?: string; readonly beforeAck?: Effect.Effect<void> },
   turnEvents: ReadonlyArray<Record<string, unknown>> = [],
+  models?: ReadonlyArray<Record<string, unknown>>,
 ) =>
   Effect.gen(function* () {
     const stdout = yield* Queue.unbounded<Uint8Array, Cause.Done>();
@@ -52,6 +54,8 @@ const makeFakePi = (
                 ? { ...response, success: false, error: thinking.error }
                 : { ...response, success: true },
             );
+          } else if (record["type"] === "get_available_models" && models !== undefined) {
+            yield* emit({ ...response, success: true, data: { models } });
           } else if (record["type"] === "set_model" && setModelError !== undefined) {
             yield* emit({ ...response, success: false, error: setModelError });
           } else {
@@ -79,6 +83,35 @@ const makeFakePi = (
     );
     return { spawner, received, thinkingRequested };
   });
+
+it.effect("runs Pi offline, since the process is stopped as soon as it answers", () =>
+  Effect.gen(function* () {
+    const pi = yield* makeFakePi(JSON.stringify({ subject: "Update README", body: "" }));
+    const launches: Array<ReadonlyArray<string>> = [];
+    const spawner = ChildProcessSpawner.make((command) => {
+      if (ChildProcess.isStandardCommand(command)) launches.push(command.args.map(String));
+      return pi.spawner.spawn(command);
+    });
+    const textGeneration = yield* makePiTextGeneration(
+      { enabled: true, binaryPath: "pi", launchArgs: "", customModels: [] },
+      {},
+    ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
+
+    const result = yield* textGeneration.generateCommitMessage({
+      cwd: process.cwd(),
+      branch: "main",
+      stagedSummary: "M README.md",
+      stagedPatch: "diff --git a/README.md b/README.md",
+      modelSelection: createModelSelection(ProviderInstanceId.make("pi"), "default"),
+    });
+
+    assert.equal(result.subject, "Update README");
+    assert.deepEqual(
+      launches.map((args) => args.filter((arg) => arg === "--offline")),
+      [["--offline"]],
+    );
+  }),
+);
 
 it.effect("names the model and the disabled extensions when Pi cannot load it", () =>
   Effect.gen(function* () {
@@ -124,7 +157,7 @@ it.effect("extracts facts through the configured native Pi model", () =>
     assert.deepEqual(result, { facts });
     assert.deepEqual(
       pi.received.find((record) => record["type"] === "set_model"),
-      { id: "t3-0", type: "set_model", provider: "demo", modelId: "demo-model" },
+      { id: "t3-1", type: "set_model", provider: "demo", modelId: "demo-model" },
     );
     assert.notInclude(encodeJsonLine(pi.received), "private-native-token");
   }).pipe(Effect.scoped),
@@ -151,9 +184,15 @@ it.effect.each(["off", "minimal", "low", "medium", "high", "xhigh", "max"])(
       assert.deepEqual(result, { facts: [] });
       assert.deepEqual(
         pi.received.map((request) => request["type"]),
-        ["set_model", "set_thinking_level", "prompt", "get_last_assistant_text"],
+        [
+          "get_available_models",
+          "set_model",
+          "set_thinking_level",
+          "prompt",
+          "get_last_assistant_text",
+        ],
       );
-      assert.equal(pi.received[1]?.["level"], thinking);
+      assert.equal(pi.received[2]?.["level"], thinking);
     }).pipe(Effect.scoped),
 );
 
@@ -181,7 +220,7 @@ it.effect("waits for the native thinking acknowledgement before prompting", () =
     yield* Deferred.await(pi.thinkingRequested);
     assert.deepEqual(
       pi.received.map((request) => request["type"]),
-      ["set_model", "set_thinking_level"],
+      ["get_available_models", "set_model", "set_thinking_level"],
     );
     yield* Deferred.succeed(acknowledge, undefined);
     assert.deepEqual(yield* Fiber.join(fiber), { facts: [] });
@@ -237,6 +276,37 @@ it.effect.each(["unsupported", true])(
       assert.equal(error._tag, "TextGenerationError");
       assert.deepEqual(pi.received, []);
     }).pipe(Effect.scoped),
+);
+
+it.effect("selects the provider and id Pi reported when the provider contains a slash", () =>
+  Effect.gen(function* () {
+    const provider = "llama-server=http://127.0.0.1:8080";
+    const pi = yield* makeFakePi(
+      JSON.stringify({ subject: "Update README", body: "" }),
+      undefined,
+      undefined,
+      [],
+      [{ provider, id: "qwen3" }],
+    );
+    const textGeneration = yield* makePiTextGeneration(
+      { enabled: true, binaryPath: "pi", launchArgs: "", customModels: [] },
+      {},
+    ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, pi.spawner));
+
+    yield* textGeneration.generateCommitMessage({
+      cwd: process.cwd(),
+      branch: "main",
+      stagedSummary: "M README.md",
+      stagedPatch: "diff --git a/README.md b/README.md",
+      modelSelection: createModelSelection(ProviderInstanceId.make("pi"), `${provider}/qwen3`),
+    });
+
+    const setModel = pi.received.find((record) => record["type"] === "set_model");
+    assert.deepEqual(
+      { provider: setModel?.["provider"], modelId: setModel?.["modelId"] },
+      { provider, modelId: "qwen3" },
+    );
+  }),
 );
 
 const failedTurnWith = (errorMessage: string) => ({

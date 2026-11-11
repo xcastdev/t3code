@@ -289,9 +289,15 @@ const make = Effect.gen(function* () {
         binding.leaseGeneration !== current.fence
       )
         return denied("owner-fence-stale");
-      const authorized = yield* Effect.try(() =>
-        assertProjectTeamRunAuthority(state, binding, role, binding.status === "reserved"),
-      ).pipe(Effect.isSuccess);
+      const authorized = yield* Effect.try({
+        try: () =>
+          assertProjectTeamRunAuthority(state, binding, role, binding.status === "reserved"),
+        catch: () =>
+          new ProjectWorkPolicyError({
+            code: "authority-required",
+            message: "Run authority revoked",
+          }),
+      }).pipe(Effect.isSuccess);
       if (!authorized) return denied("owner-authority-revoked");
       if (
         (state.foundationRecords ?? []).some(
@@ -401,9 +407,10 @@ const make = Effect.gen(function* () {
       prepareCapture === undefined &&
       Option.isNone(yield* Effect.serviceOption(sql.transactionService))
     )
-      return yield* Effect.fail(
-        new ProjectWorkPolicyError("invalid-state", "Admission requires the V2 transaction"),
-      );
+      return yield* new ProjectWorkPolicyError({
+        code: "invalid-state",
+        message: "Admission requires the V2 transaction",
+      });
     const persisted = (yield* storedThread(input.threadId))[0];
     const targetRows = yield* rowsForThread(input.threadId);
     if (input.retainedOwner === null && (yield* hasStoredOwner(input.threadId)))
@@ -644,9 +651,15 @@ const make = Effect.gen(function* () {
       (record) => record.kind === "role-revision" && record.recordId === rootBinding.roleRevisionId,
     );
     if (role?.kind !== "role-revision") return denied("owner-role-unavailable");
-    const authorized = yield* Effect.try(() =>
-      assertProjectTeamRunAuthority(state, rootBinding, role, rootBinding.status === "reserved"),
-    ).pipe(Effect.isSuccess);
+    const authorized = yield* Effect.try({
+      try: () =>
+        assertProjectTeamRunAuthority(state, rootBinding, role, rootBinding.status === "reserved"),
+      catch: () =>
+        new ProjectWorkPolicyError({
+          code: "authority-required",
+          message: "Run authority revoked",
+        }),
+    }).pipe(Effect.isSuccess);
     if (!authorized) return denied("owner-authority-revoked");
     const prior =
       yield* sql<Row>`SELECT * FROM t3_workflow_v2_run_admissions WHERE binding_id=${rootBinding.recordId} ORDER BY generation DESC LIMIT 1`;
@@ -1134,20 +1147,19 @@ const make = Effect.gen(function* () {
       return { stop: false, cancelControlIds: [] };
     },
   );
-  const publishCommitted = Effect.fn("ProjectWorkRunAdmission.publishCommitted")(function* (
+  const committedPublication = Effect.fn("ProjectWorkRunAdmission.committedPublication")(function* (
     commandId: string,
   ) {
-    if (Option.isNone(eventBus)) return;
+    if (Option.isNone(eventBus)) return Effect.void;
     const rows = yield* sql<{
       sequence: number;
       payload_json: string;
     }>`SELECT sequence,payload_json FROM t3_workflow_v2_work_events WHERE command_id=${`admission:${commandId}`} ORDER BY sequence`;
-    yield* eventBus.value.publish(
-      rows.map((row) => ({
-        cursor: row.sequence,
-        event: decodeProjectWorkEvent(decodeJson(row.payload_json)),
-      })),
-    );
+    const events = rows.map((row) => ({
+      cursor: row.sequence,
+      event: decodeProjectWorkEvent(decodeJson(row.payload_json)),
+    }));
+    return events.length === 0 ? Effect.void : eventBus.value.publish(events);
   });
   const wrap = <A, E>(operation: string, effect: Effect.Effect<A, E>) =>
     effect.pipe(
@@ -1204,8 +1216,11 @@ const make = Effect.gen(function* () {
     observeNativeTurn: Effect.fn("RunAdmission.RunAdmission.observeNativeTurn")((input) =>
       wrap("observeNativeTurn", observeNativeTurn(input)),
     ),
-    publishCommitted: Effect.fn("RunAdmission.RunAdmission.publishCommitted")((commandId) =>
-      publishCommitted(commandId).pipe(Effect.ignore),
+    committedPublication: Effect.fn("RunAdmission.RunAdmission.committedPublication")((commandId) =>
+      committedPublication(commandId).pipe(
+        Effect.map((publish) => publish.pipe(Effect.ignore)),
+        Effect.orElseSucceed(() => Effect.void),
+      ),
     ),
   });
 });

@@ -3,6 +3,7 @@ import { OmpEvalDetail } from "./OmpEvalDetail";
 import type { ToolCallDiffTarget } from "../../diffPanelStore";
 import type { EnvironmentId, OrchestrationV2ProjectedTurnItem } from "@t3tools/contracts";
 import {
+  isJsonToolText,
   toolCallLines,
   turnItemDetailRevision,
   turnItemNeedsDetailFetch,
@@ -41,9 +42,10 @@ import {
   isFilePathArg,
   toolArgsFilePath,
 } from "./ToolCallDetail.logic";
-import type { TurnItemSource } from "./timelineRowContext";
+import { useInitialOutputReady, type TurnItemSource } from "./timelineRowContext";
 
 interface V2ItemInspectorProps {
+  readonly onInitialOutputReady?: (() => void) | undefined;
   readonly projectedItem: OrchestrationV2ProjectedTurnItem;
   readonly environmentId: EnvironmentId;
   readonly cwd?: string | undefined;
@@ -58,7 +60,7 @@ function SyntaxTokens({
   language,
 }: {
   readonly text: string;
-  readonly language: "json" | "typescript";
+  readonly language: "json" | "typescript" | "html";
 }) {
   const resolvedTheme = useRenderedAppearance();
   const highlighter = use(getSyntaxHighlighterPromise(language));
@@ -79,16 +81,6 @@ function SyntaxTokens({
 const monoClassName =
   "font-mono text-(length:--font-size-code,var(--text-2xs)) leading-relaxed whitespace-pre-wrap break-words select-text";
 
-function isJsonText(text: string): boolean {
-  if (!text) return false;
-  try {
-    JSON.parse(text);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function StructuredValue({
   value,
   highlightJson = false,
@@ -97,12 +89,12 @@ function StructuredValue({
 }: {
   readonly value: unknown;
   readonly highlightJson?: boolean;
-  readonly language?: "typescript";
+  readonly language?: "typescript" | "html" | "json";
   /** Inside a tool pane, which already scrolls and sets the type. */
   readonly bare?: boolean;
 }) {
   const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
-  const isJson = highlightJson && isJsonText(text);
+  const isJson = highlightJson && isJsonToolText(text);
   if (!text) return null;
   return (
     <pre
@@ -197,7 +189,7 @@ function ToolOutput(props: ToolOutputState & { readonly codePath?: string | unde
   const text = props.output ? (
     props.codePath ? (
       <ToolCode text={props.output} path={props.codePath} />
-    ) : isJsonText(props.output) ? (
+    ) : isJsonToolText(props.output) ? (
       <StructuredValue value={props.output} highlightJson bare />
     ) : (
       <div className="whitespace-pre-wrap break-words">{props.output}</div>
@@ -233,6 +225,7 @@ function keyedByOccurrence<T>(values: ReadonlyArray<T>) {
  * output fetched from the environment. A read's output highlights for its file's type.
  */
 export function FetchedToolDetail(props: {
+  readonly onInitialOutputReady?: (() => void) | undefined;
   readonly projectedItem: OrchestrationV2ProjectedTurnItem;
   readonly environmentId: EnvironmentId;
   readonly input: ReactNode;
@@ -241,6 +234,7 @@ export function FetchedToolDetail(props: {
   readonly source?: TurnItemSource | undefined;
 }) {
   const { output } = useFetchedTurnItem(props.projectedItem, props.environmentId, props.source);
+  useInitialOutputReady(output.pending, props.onInitialOutputReady);
   return (
     <ToolDetailCard>
       {props.input ? <ToolDetailPane label="Input">{props.input}</ToolDetailPane> : null}
@@ -289,12 +283,16 @@ function ToolCallBody(
               <div key={key}>
                 <dt className="text-muted-foreground">{key}</dt>
                 <dd className="min-w-0">
-                  {key === "code" && isJavaScriptReplTool(props.toolName) ? (
+                  {key === "html" ? (
+                    <StructuredValue value={value} language="html" bare />
+                  ) : key === "code" && isJavaScriptReplTool(props.toolName) ? (
                     <StructuredValue value={value} language="typescript" bare />
                   ) : filePath && isFileContentArg(key) ? (
                     <ToolCode text={value} path={filePath} />
                   ) : isFilePathArg(key) ? (
                     <ToolPath path={value} />
+                  ) : isJsonToolText(value) ? (
+                    <StructuredValue value={value} language="json" bare />
                   ) : (
                     <div className="whitespace-pre-wrap break-words">{value}</div>
                   )}
@@ -368,6 +366,7 @@ export const V2ItemInspector = memo(function V2ItemInspector(props: V2ItemInspec
   );
   const item = fetched.item;
   const outputState = fetched.output;
+  useInitialOutputReady(streamsOutput || outputState.pending, props.onInitialOutputReady);
   return (
     <div className="space-y-2 text-xs" data-v2-item-inspector={item.type}>
       {item.type === "reasoning" && item.text ? (
@@ -393,6 +392,7 @@ export const V2ItemInspector = memo(function V2ItemInspector(props: V2ItemInspec
           outputSlot={
             streamsOutput ? (
               <CommandOutputPanel
+                onInitialOutputReady={props.onInitialOutputReady}
                 environmentId={props.environmentId}
                 threadId={props.projectedItem.sourceThreadId}
                 itemId={props.projectedItem.sourceItemId}

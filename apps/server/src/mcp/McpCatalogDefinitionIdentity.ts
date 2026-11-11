@@ -59,12 +59,9 @@ const oauthRegistrationIdentityChanged = (
 };
 
 /**
- * Returns whether an update changes the owner of a complete MCP transport.
- *
- * Comparisons are intentionally exact and order-sensitive. Credential display
- * names are metadata, but supplied values, ids, header/environment names, and
- * their order are part of the transport identity because the secret store
- * cannot safely compare secret contents.
+ * Exact and order-sensitive: credential display names are metadata, but supplied
+ * values, ids, header/environment names, and their order are transport identity
+ * because the secret store cannot safely compare secret contents.
  */
 export const hasCatalogTransportIdentityChange = (
   previous: ProjectMcpTransport,

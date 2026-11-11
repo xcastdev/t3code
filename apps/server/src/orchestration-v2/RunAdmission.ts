@@ -179,7 +179,11 @@ export class RunAdmission extends Context.Service<
       { readonly stop: boolean; readonly cancelControlIds: ReadonlyArray<string> },
       RunAdmissionError
     >;
-    readonly publishCommitted: (commandId: string) => Effect.Effect<void>;
+    /**
+     * Reads inside the commit transaction; the returned effect publishes once it commits.
+     * Publication holds EventSink's publish lane, so it must not wait on SQL.
+     */
+    readonly committedPublication: (commandId: string) => Effect.Effect<Effect.Effect<void>>;
   }
 >()("t3/orchestration-v2/RunAdmission") {}
 
@@ -206,6 +210,8 @@ export const layerOrdinary = Layer.succeed(
     observeNativeTurn: Effect.fn("RunAdmission.observeNativeTurn")(() =>
       Effect.succeed({ stop: false, cancelControlIds: [] }),
     ),
-    publishCommitted: Effect.fn("RunAdmission.publishCommitted")(() => Effect.void),
+    committedPublication: Effect.fn("RunAdmission.committedPublication")(() =>
+      Effect.succeed(Effect.void),
+    ),
   }),
 );

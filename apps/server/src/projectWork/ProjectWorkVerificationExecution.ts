@@ -8,6 +8,7 @@ import { verificationSha256 } from "./ProjectWorkVerificationExecutable.ts";
 import * as Effect from "effect/Effect";
 import { ProcessRunner } from "../processRunner.ts";
 import { verificationError } from "./ProjectWorkVerificationError.ts";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 
 const fs = process.getBuiltinModule("fs");
 const path = process.getBuiltinModule("path");
@@ -43,7 +44,7 @@ export const assertVerificationTarget = Effect.fn("ProjectWorkVerification.asser
           ],
           cwd: target.worktree,
           env: {
-            PATH: process.env.PATH,
+            PATH: (yield* HostProcess.Environment).PATH,
             LANG: "C",
             LC_ALL: "C",
             GIT_CONFIG_NOSYSTEM: "1",
@@ -204,7 +205,7 @@ export const captureVerificationPhysicalValidation = Effect.fn(
         args: ["--no-optional-locks", "-c", "core.hooksPath=/dev/null", ...args],
         cwd: target.worktree,
         env: {
-          PATH: process.env.PATH,
+          PATH: (yield* HostProcess.Environment).PATH,
           LANG: "C",
           LC_ALL: "C",
           GIT_CONFIG_NOSYSTEM: "1",

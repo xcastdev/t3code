@@ -38,7 +38,10 @@ export const projectTeamRequiresSemanticRepair = (state: ProjectWorkState, taskI
   let root = taskId;
   while (true) {
     if (seen.has(root))
-      throw new ProjectWorkPolicyError("authority-required", "Repair lineage has a cycle");
+      throw new ProjectWorkPolicyError({
+        code: "authority-required",
+        message: "Repair lineage has a cycle",
+      });
     seen.add(root);
     const membership = records.find(
       (record) => record.kind === "task-membership" && record.taskId === root,
@@ -57,10 +60,10 @@ export const projectTeamRequiresSemanticRepair = (state: ProjectWorkState, taskI
 
 export const assertProjectTeamOrdinarySuccessor = (state: ProjectWorkState, taskId: string) => {
   if (projectTeamRequiresSemanticRepair(state, taskId)) {
-    throw new ProjectWorkPolicyError(
-      "authority-required",
-      "Canonical semantic failure requires exact repair authorization",
-    );
+    throw new ProjectWorkPolicyError({
+      code: "authority-required",
+      message: "Canonical semantic failure requires exact repair authorization",
+    });
   }
 };
 
@@ -125,7 +128,7 @@ const projectTeamAssignmentProfile = (
 /** A child grant retains the exact parent approvals and its derived assignment scope. */
 export const assertProjectTeamAssignmentAuthorization = (state: ProjectWorkState, grant: Gate) => {
   function deny(message: string): never {
-    throw new ProjectWorkPolicyError("authority-required", message);
+    throw new ProjectWorkPolicyError({ code: "authority-required", message: message });
   }
   const proof = grant.assignmentAuthorization;
   const records = state.foundationRecords ?? [];
@@ -280,7 +283,7 @@ export const assertProjectTeamRunAuthority = (
   issuing: boolean,
 ): void => {
   function deny(message: string): never {
-    throw new ProjectWorkPolicyError("authority-required", message);
+    throw new ProjectWorkPolicyError({ code: "authority-required", message: message });
   }
   const records = state.foundationRecords ?? [];
   const task = state.tasks.find((t) => t.taskId === binding.taskId);

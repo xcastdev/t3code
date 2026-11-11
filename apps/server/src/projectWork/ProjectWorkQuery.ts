@@ -43,6 +43,8 @@ import {
 import { type ProjectWorkActivity, type ProjectWorkCheckpoint } from "./ProjectWorkProjection.ts";
 import { deriveProjectWorkTaskPolicy } from "./ProjectWorkPolicy.ts";
 
+const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+
 const isPersistenceError = Schema.is(Schema.Union([PersistenceSqlError, PersistenceDecodeError]));
 const projectKey = (input: string | { readonly projectId: string }) =>
   typeof input === "string" ? input : input.projectId;
@@ -976,8 +978,10 @@ const makeProjectWorkQuery = Effect.gen(function* () {
             (total, value) => total + (Array.isArray(value) ? value.length : 0),
             0,
           );
-          // @effect-diagnostics-next-line preferSchemaOverJson:off -- byte ceiling on a typed derived snapshot.
-          if (count > 10_000 || Buffer.byteLength(JSON.stringify(current)) > 16 * 1024 * 1024)
+          if (
+            count > 10_000 ||
+            Buffer.byteLength(yield* encodeJson(current).pipe(Effect.orDie)) > 16 * 1024 * 1024
+          )
             throw new Error("Work export exceeds bounded export size");
           if (!includeHistory) return { snapshot: current };
           const rows = yield* sql<Record<string, unknown>>`
@@ -986,8 +990,10 @@ const makeProjectWorkQuery = Effect.gen(function* () {
             WHERE project_id = ${projectId}
             ORDER BY sequence ASC LIMIT 10001
           `;
-          // @effect-diagnostics-next-line preferSchemaOverJson:off -- byte ceiling on stored event payload strings.
-          if (rows.length > 10_000 || Buffer.byteLength(JSON.stringify(rows)) > 16 * 1024 * 1024)
+          if (
+            rows.length > 10_000 ||
+            Buffer.byteLength(yield* encodeJson(rows).pipe(Effect.orDie)) > 16 * 1024 * 1024
+          )
             throw new Error("Work history exceeds bounded export size");
           const history = rows
             .map((row) => parse<unknown>(String(row.payloadJson), undefined))

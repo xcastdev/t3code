@@ -538,7 +538,7 @@ function SkillsSection({ target }: { target: MobileResourceTarget }) {
           return (
             <ListRowLayout
               key={skillEntryId(entry)}
-              icon="sparkles"
+              icon="wrench.and.screwdriver"
               label={`${entry.name}  $${entry.key}`}
               description={notes.join(" · ")}
               accessory={
@@ -975,7 +975,7 @@ function InventorySection({ target }: { target: MobileResourceTarget }) {
             row.kind === "mcp"
               ? "server.rack"
               : row.kind === "skill"
-                ? "sparkles"
+                ? "wrench.and.screwdriver"
                 : "text.alignleft"
           }
           label={row.name}
@@ -1228,7 +1228,7 @@ export function SettingsSkillEditorRouteScreen({ route }: SkillEditorProps) {
 /** Mounted state for async work that must not land after the editor is gone. */
 function useMountedRef() {
   const mounted = useRef(true);
-  // oxlint-disable-next-line t3code/react-effect-budget -- Async editor requests must stop committing after unmount.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Async editor requests must stop committing after unmount.
   useEffect(() => {
     mounted.current = true;
     return () => {

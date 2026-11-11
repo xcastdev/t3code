@@ -26,6 +26,9 @@ const storage = Layer.effectDiscard(
     yield* sql`CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT PRIMARY KEY,project_id TEXT)`;
     yield* createEventLog;
     yield* sql`ALTER TABLE orchestration_events ADD COLUMN application_event_version INTEGER NOT NULL DEFAULT 1`;
+    // The event store names these indexes in INDEXED BY clauses.
+    yield* sql`CREATE INDEX idx_orchestration_events_application_sequence ON orchestration_events(application_event_version, sequence)`;
+    yield* sql`CREATE INDEX idx_orchestration_events_agent_stream_sequence ON orchestration_events(stream_id, sequence) WHERE application_event_version = 2 AND aggregate_kind = 'thread'`;
     for (const statement of assistantRoutineMigration.statements) yield* sql.unsafe(statement);
   }),
 );

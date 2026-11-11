@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 // @effect-diagnostics nodeBuiltinImport:off - Tests probe worker pids and read /proc directly.
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
@@ -161,7 +162,7 @@ const withSupervisor = <A, E, R>(
     Effect.provide(
       PluginWorkerSupervisor.layer.pipe(
         Layer.provideMerge(selfInvocationLayer),
-        Layer.provideMerge(NodeServices.layer),
+        Layer.provideMerge(Layer.merge(NodeServices.layer, NodeCrypto.layer)),
       ),
     ),
     Effect.scoped,
@@ -518,7 +519,7 @@ describe("PluginWorkerSupervisor with the packed echo backend", () => {
       yield* Queue.end(stdin);
       expect(yield* handle.exitCode).toBe(0);
       expect(isGone(pid)).toBe(true);
-    }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
+    }).pipe(Effect.provide(Layer.merge(NodeServices.layer, NodeCrypto.layer)), Effect.scoped),
   );
 });
 

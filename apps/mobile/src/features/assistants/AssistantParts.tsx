@@ -8,7 +8,7 @@ import { ListChoiceRow } from "../../components/ui/ListChoiceRow";
 import { ListRow } from "../../components/ui/ListRow";
 import { buildModelOptions } from "../../lib/modelOptions";
 import { useEnvironmentServerConfig } from "../../state/entities";
-import { useSelectWorkspaceDetail } from "../workspace/useSelectWorkspaceDetail";
+import { useSelectWorkspaceDetail } from "../layout/workspace/useSelectWorkspaceDetail";
 import type { AssistantTone } from "@t3tools/client-runtime/assistant-presentation";
 
 export const TONE_PREFIX: Record<AssistantTone, string> = {
@@ -46,7 +46,7 @@ export function AssistantModelChoice(props: {
   return (
     <>
       <ListRow
-        icon="sparkles"
+        icon="cube"
         label="Model"
         detail={selected ? `${selected.providerLabel} · ${selected.label}` : "Choose a model"}
         disabled={props.disabled}

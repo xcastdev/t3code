@@ -27,7 +27,7 @@ import {
   type ProjectMemorySourceRead,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
-import * as Crypto from "effect/Crypto";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -870,11 +870,8 @@ it.effect("normal thread Stop checks current grants at the shared custom command
         execute: (input: Parameters<typeof interruptThreadTurn>[0]) =>
           interruptThreadTurn(input).pipe(
             Effect.provideService(
-              Crypto.Crypto,
-              Crypto.make({
-                randomBytes: (size) => new Uint8Array(size),
-                digest: (_algorithm, bytes) => Effect.succeed(bytes),
-              }),
+              SecureRandom.SecureRandom,
+              SecureRandom.make((size) => new Uint8Array(size)),
             ),
           ),
       });

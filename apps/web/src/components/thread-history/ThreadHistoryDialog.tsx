@@ -107,6 +107,7 @@ function ThreadHistoryDialog(props: {
   const [owner] = useState(createHistorySelectionOwner);
   const [cursors, setCursors] = useState<ReadonlyArray<string | undefined>>([undefined]);
   const [selected, setSelected] = useState<HistorySelection | null>(null);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- activates the committed selection in the history owner that async results check, and releases it
   useEffect(() => {
     owner.activate(selected);
     return () => owner.release();
@@ -387,6 +388,7 @@ function ArchiveDetail(props: {
 
   const { environmentId, threadId, archiveId } = selected;
   // Retained request identities must be loaded before any action can offer a fresh one.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- hydrates the archive's retained request identities into the atom registry
   useEffect(() => {
     void threadHistoryEnvironment.hydrate(registry, { environmentId, threadId, archiveId });
   }, [registry, environmentId, threadId, archiveId]);

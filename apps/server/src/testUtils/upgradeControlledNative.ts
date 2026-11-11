@@ -226,7 +226,9 @@ export function layerControlledProcessRunner(snapshot: UpgradeSnapshot) {
             command._tag !== "StandardCommand" ||
             command.options.shell ||
             command.command !== "git" ||
-            typeof command.options.cwd !== "string"
+            typeof command.options.cwd !== "string" ||
+            // A redacted argument is not inspectable, so the fixture refuses it.
+            !command.args.every((argument) => typeof argument === "string")
           )
             return Effect.die(new FixtureNativeDenied({ operation: "controlled.spawn" }));
           const cwd = command.options.cwd;

@@ -89,6 +89,7 @@ const decodeAdmission = Schema.decodeUnknownEffect(
 const database = Persistence.layerMemory;
 const platform = Layer.mergeAll(
   NodeServices.layer,
+  NodeCrypto.layer,
   Runner.layer.pipe(Layer.provide(NodeServices.layer)),
   Config.layerTest(process.cwd(), { prefix: "t3-assistant-admission-" }).pipe(
     Layer.provide(NodeServices.layer),

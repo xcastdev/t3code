@@ -147,11 +147,9 @@ const STATUS_STAGE: Record<ProjectTerminalStatus, number> = {
 };
 
 /**
- * The status to show for a viewer: its attach stream and the project metadata
- * stream both report the terminal, and neither is always newer. A finished
- * generation stays finished; otherwise the later update wins, so a metadata
- * `stopping` or `unknown` is never hidden behind the attach snapshot. Ties go
- * to the later lifecycle stage, then to metadata, which keeps the viewer
+ * Attach and metadata streams both report the terminal and neither is always newer. A finished
+ * generation stays finished; otherwise the later update wins, so metadata `stopping`/`unknown`
+ * is never hidden. Ties go to the later lifecycle stage, then to metadata, keeping the viewer
  * passive rather than writable when the order is unknown.
  */
 export function effectiveProjectTerminal(

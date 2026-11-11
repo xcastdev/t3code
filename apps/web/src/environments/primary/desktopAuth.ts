@@ -1,15 +1,16 @@
 import type { DesktopAttachedBackendTarget } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 
 import { readPrimaryEnvironmentTarget } from "./target";
 
 let desktopBearerTokenPromise: Promise<string> | null = null;
 
-export class DesktopAttachedCredentialTargetMismatchError extends Error {
-  constructor() {
-    super(
-      "The attached T3 Code server changed while a request was being prepared. Reconnect, or open Settings → Connections to refresh it.",
-    );
-    this.name = "DesktopAttachedCredentialTargetMismatchError";
+export class DesktopAttachedCredentialTargetMismatchError extends Schema.TaggedError<DesktopAttachedCredentialTargetMismatchError>()(
+  "DesktopAttachedCredentialTargetMismatchError",
+  {},
+) {
+  override get message(): string {
+    return "The attached T3 Code server changed while a request was being prepared. Reconnect, or open Settings → Connections to refresh it.";
   }
 }
 
@@ -26,14 +27,10 @@ function sameAttachedTarget(
 }
 
 /**
- * Reads the desktop primary credential.
- *
- * An attached server's bearer is never cached here: each call hands the main process
- * the exact attachment captured from the bootstrap, and it refuses unless that is still
- * the current, identity-verified attachment. `expected` pins the call to a target the
- * caller already used (a request URL or a registered connection), so a token for a
- * newer attachment can never be returned for an older one; `"managed"` pins it to the
- * bundled server.
+ * Never caches an attached server's bearer: the main process refuses unless the bootstrap's
+ * attachment is still the current, identity-verified one. `expected` pins the call to a target
+ * the caller already used, so a newer attachment's token never answers for an older one;
+ * `"managed"` pins it to the bundled server.
  */
 export function readDesktopPrimaryBearerToken(
   expected?: DesktopAttachedBackendTarget | "managed",
@@ -58,7 +55,7 @@ export function readDesktopPrimaryBearerToken(
       : expected !== undefined &&
         (attached === undefined || !sameAttachedTarget(attached, expected))
   )
-    return Promise.reject(new DesktopAttachedCredentialTargetMismatchError());
+    return Promise.reject(new DesktopAttachedCredentialTargetMismatchError({}));
   if (attached !== undefined) {
     desktopBearerTokenPromise = null;
     return bridge.getLocalEnvironmentBearerToken(attached);
@@ -76,7 +73,7 @@ export function attachedTargetForRequestUrl(url: string): DesktopAttachedBackend
   const attached = readPrimaryEnvironmentTarget()?.attached;
   if (attached === undefined) return undefined;
   if (new URL(url).origin !== new URL(attached.httpBaseUrl).origin) {
-    throw new DesktopAttachedCredentialTargetMismatchError();
+    throw new DesktopAttachedCredentialTargetMismatchError({});
   }
   return attached;
 }

@@ -16,12 +16,12 @@ export type ManagedTextResourceForm = {
   readonly name: string;
   readonly body: string;
   readonly entry: ManagedTextResourceSummary | null;
-  readonly expectedCatalogRevision: typeof ManagedTextResourceCatalogRevision.Type;
+  readonly expectedCatalogRevision: ManagedTextResourceCatalogRevision;
 };
 
 export function createManagedTextResourceForm(
   form: Omit<ManagedTextResourceForm, "expectedCatalogRevision">,
-  expectedCatalogRevision: typeof ManagedTextResourceCatalogRevision.Type,
+  expectedCatalogRevision: ManagedTextResourceCatalogRevision,
 ): ManagedTextResourceForm {
   return { ...form, expectedCatalogRevision };
 }

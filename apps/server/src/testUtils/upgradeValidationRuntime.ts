@@ -215,6 +215,10 @@ function makeUpgradeValidationRuntime(
         refreshWorkspaceSnapshot: Effect.fn(
           "ProviderRegistry.ProviderRegistry.refreshWorkspaceSnapshot",
         )(() => Effect.succeed([])),
+        invalidateModelCaches: Effect.fn("ProviderRegistry.ProviderRegistry.invalidateModelCaches")(
+          () => Effect.void,
+        ),
+        refreshModelCatalog: Effect.void,
         getProviderMaintenanceCapabilitiesForInstance: Effect.fn(
           "ProviderRegistry.ProviderRegistry.getProviderMaintenanceCapabilitiesForInstance",
         )(() => Effect.die(new UpgradeValidationDenied({ operation: "provider maintenance" }))),

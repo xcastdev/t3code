@@ -84,7 +84,15 @@ const preservationScheduleLayer = ScheduledTasks.layer.pipe(
         }),
       ),
       Layer.mock(ThreadLaunch.ThreadLaunchService)({}),
-      Layer.mock(ThreadManagement.ThreadManagementService)({}),
+      Layer.mock(ThreadManagement.ThreadManagementService)({
+        // The schedule binds to the fixture's live thread.
+        getThreadShell: () =>
+          Effect.succeed({
+            projectId: preservationIds.project,
+            archivedAt: null,
+            deletedAt: null,
+          } as never),
+      }),
       Layer.mock(ManagedFolders.ManagedProjectFolders)({
         namedProjectsRoot: "/fixture-only",
         isScratchProject: () => Effect.succeed(false),
@@ -134,6 +142,28 @@ export const writePreservationSettings = Effect.fn("upgradeFixture.writeSettings
       defaultModelSelection: { instanceId: "codex", model: "gpt-5.4" },
     }),
   );
+});
+
+/**
+ * Runs today's write path against a migration-66 database. Columns that path writes and the
+ * database lacks exist only for the write, so the source keeps the migration-66 shape.
+ */
+const withLaterColumns = Effect.fn("upgradeFixture.withLaterColumns")(function* <A, E, R>(
+  columns: ReadonlyArray<readonly [table: string, column: string, definition: string]>,
+  write: Effect.Effect<A, E, R>,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  const added: Array<readonly [string, string]> = [];
+  for (const [table, column, definition] of columns) {
+    const existing = yield* sql`SELECT 1 FROM pragma_table_info(${table}) WHERE name = ${column}`;
+    if (existing.length > 0) continue;
+    yield* sql.unsafe(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    added.push([table, column]);
+  }
+  const result = yield* write;
+  for (const [table, column] of added)
+    yield* sql.unsafe(`ALTER TABLE ${table} DROP COLUMN ${column}`);
+  return result;
 });
 
 export const seedUpgradePreservation = Effect.fn("upgradeFixture.seedPreservation")(function* (
@@ -392,27 +422,30 @@ export const seedUpgradePreservation = Effect.fn("upgradeFixture.seedPreservatio
       ],
     },
   });
-  yield* sink.commitCommand({
-    commandId: preservationIds.command,
-    threadId: preservationIds.thread,
-    commandType: "fixture.conversation",
-    acceptedAt: at,
-    events,
-    effects: [
-      {
-        id: "preservation-running",
-        commandId: preservationIds.command,
-        threadId: preservationIds.thread,
-        request: { type: "provider-runtime.continue", sourceRunId: preservationIds.run },
-      },
-      {
-        id: "preservation-pending",
-        commandId: preservationIds.command,
-        threadId: preservationIds.thread,
-        request: { type: "provider-turn.start", runId: preservationIds.run },
-      },
-    ],
-  });
+  yield* withLaterColumns(
+    [["orchestration_v2_projection_messages", "search_text", "TEXT"]],
+    sink.commitCommand({
+      commandId: preservationIds.command,
+      threadId: preservationIds.thread,
+      commandType: "fixture.conversation",
+      acceptedAt: at,
+      events,
+      effects: [
+        {
+          id: "preservation-running",
+          commandId: preservationIds.command,
+          threadId: preservationIds.thread,
+          request: { type: "provider-runtime.continue", sourceRunId: preservationIds.run },
+        },
+        {
+          id: "preservation-pending",
+          commandId: preservationIds.command,
+          threadId: preservationIds.thread,
+          request: { type: "provider-turn.start", runId: preservationIds.run },
+        },
+      ],
+    }),
+  );
   const outbox = yield* Outbox.EffectOutboxV2;
   yield* outbox.claimNext({ workerId: "previous-fixture-worker" });
   yield* sink.commitCommand({
@@ -482,7 +515,10 @@ export const seedUpgradePreservation = Effect.fn("upgradeFixture.seedPreservatio
     runtimeMode: "full-access",
     interactionMode: "default",
   });
-  yield* (yield* ScheduledTasks.ScheduledTaskService).upsert(schedule);
+  yield* withLaterColumns(
+    [["scheduled_tasks", "thread_mode", "TEXT NOT NULL DEFAULT 'new_thread'"]],
+    (yield* ScheduledTasks.ScheduledTaskService).upsert(schedule),
+  );
 });
 
 /** These are the same decoders/readers used by clients and continuation recovery, not raw row hashes. */

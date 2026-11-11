@@ -28,6 +28,7 @@ import * as AssistantResources from "../assistants/AssistantResources.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
 import * as Result from "effect/Result";
 import * as InstructionDelivery from "./InstructionDelivery.ts";
+import * as WorktreeBranchSync from "./WorktreeBranchSync.ts";
 import * as GuestShareService from "../guest/GuestShareService.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
@@ -327,6 +328,8 @@ const layerAgentSessionImporterProvided = AgentSessionImporter.layer.pipe(
       layerEventSink,
       IdAllocator.layer,
       ProviderSessionRuntime.layer,
+      ProviderAdapterRegistry.layerFromProviderInstanceRegistry,
+      ThreadCommandExecutor.layer,
     ),
   ),
 );
@@ -601,6 +604,9 @@ export const layerProduction = Layer.mergeAll(
     Layer.provide(layerEventSink),
   ),
   layerAssistantRuntime,
+  WorktreeBranchSync.layer.pipe(
+    Layer.provide(Layer.merge(layerThreadManagementProvided, ProjectionStore.layer)),
+  ),
   layer.pipe(Layer.provide(layerProjectService)),
   layerProjectService,
   layerManagedProjectFoldersProvided,

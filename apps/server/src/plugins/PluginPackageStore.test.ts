@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeZlib from "node:zlib";
 
@@ -133,7 +134,7 @@ const putAttachment = Effect.fn("test.putAttachment")(function* (bytes: Uint8Arr
 
 const baseLayer = ServerSecretStore.layer.pipe(
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-plugin-store-" })),
-  Layer.provideMerge(NodeServices.layer),
+  Layer.provideMerge(Layer.merge(NodeServices.layer, NodeCrypto.layer)),
 );
 
 const withStore = <A, E, R>(

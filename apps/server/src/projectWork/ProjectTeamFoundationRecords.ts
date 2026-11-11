@@ -19,7 +19,7 @@ import {
 
 const decodeTeamRecord = Schema.decodeUnknownSync(ProjectTeamRecord);
 const reject = (message: string): never => {
-  throw new ProjectWorkPolicyError("invalid-state", message);
+  throw new ProjectWorkPolicyError({ code: "invalid-state", message: message });
 };
 const stable = (record: TeamRecord) => {
   const mutable = new Set(["status", "revision", "generation", "updatedAt"]);

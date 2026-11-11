@@ -252,6 +252,10 @@ export const layerControlledProviders = Layer.unwrap(
           refreshWorkspaceSnapshot: Effect.fn(
             "ProviderRegistry.ProviderRegistry.refreshWorkspaceSnapshot",
           )(() => Effect.succeed(visible)),
+          invalidateModelCaches: Effect.fn(
+            "ProviderRegistry.ProviderRegistry.invalidateModelCaches",
+          )(() => Effect.void),
+          refreshModelCatalog: Effect.void,
           getProviderMaintenanceCapabilitiesForInstance: Effect.fn(
             "ProviderRegistry.ProviderRegistry.getProviderMaintenanceCapabilitiesForInstance",
           )(() => Effect.die("Fixture provider maintenance is disabled")),

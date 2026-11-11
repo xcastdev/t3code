@@ -15,11 +15,12 @@ import {
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import { EnvironmentId, ProjectId, type ProjectTerminalDockSummary } from "@t3tools/contracts";
-import type { StaticScreenProps } from "@react-navigation/native";
+import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import { useContext, useEffect, useRef, useState } from "react";
 import { ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { AppBar } from "../../components/ui/AppBar";
 import { AppText as Text } from "../../components/ui/AppText";
 import { Button } from "../../components/ui/Button";
 import * as Dialog from "../../components/ui/Dialog";
@@ -27,7 +28,6 @@ import { Chip } from "../../components/ui/Chip";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { ListToggleRow } from "../../components/ui/ListToggleRow";
 import { Notice } from "../../components/ui/Notice";
-import { NativeStackScreenOptions } from "../../native/StackHeader";
 import { useProject } from "../../state/entities";
 import {
   projectTerminalEnvironment,
@@ -52,6 +52,7 @@ export function ProjectTerminalRouteScreen({ route }: Props) {
   const project = useProject(scopeProjectRef(environmentId, projectId));
   const dock = useProjectTerminalDock(environmentId, projectId);
   const insets = useSafeAreaInsets();
+  const navigation = useNavigation();
   const [selectedId, setSelectedId] = useState<string | null>(route.params.terminalId ?? null);
   const selected =
     dock.terminals.find((terminal) => terminal.terminalId === selectedId) ??
@@ -59,7 +60,7 @@ export function ProjectTerminalRouteScreen({ route }: Props) {
     null;
   return (
     <View className="flex-1 bg-screen" style={{ paddingBottom: insets.bottom }}>
-      <NativeStackScreenOptions options={{ title: project?.title ?? "Project terminals" }} />
+      <AppBar title={project?.title ?? "Project terminals"} onBack={() => navigation.goBack()} />
       {dock.error !== null ? (
         <View className="gap-2 px-4 pt-3">
           <Notice tone="danger" icon="exclamationmark.triangle" message={dock.error} />
@@ -146,7 +147,7 @@ function ProjectTerminalPane({
     setStreamError,
   );
   // A reconnect marker means this reader missed output; reattaching yields a fresh snapshot.
-  // oxlint-disable-next-line t3code/react-effect-budget -- A reconnect marker reattaches the external terminal stream.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- A reconnect marker reattaches the external terminal stream.
   useEffect(() => {
     if (state.phase === "reconnecting") registry.refresh(attachAtom);
   }, [state.phase, attachAtom, registry]);

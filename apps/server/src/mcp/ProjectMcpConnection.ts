@@ -10,8 +10,12 @@ import {
   ProjectMcpSecretUnavailableError,
   ProjectMcpTransportConfigurationError,
 } from "./ProjectMcpTransport.ts";
+import * as Schema from "effect/Schema";
 
 export const PROJECT_MCP_HANDSHAKE_TIMEOUT_MS = 15_000;
+
+const isSecretUnavailable = Schema.is(ProjectMcpSecretUnavailableError);
+const isTransportConfigurationError = Schema.is(ProjectMcpTransportConfigurationError);
 
 export const connectProjectMcp = async (
   transport: Omit<Transport, "sessionId">,
@@ -53,9 +57,9 @@ export const describeProjectMcpFailure = (
     current = current instanceof Error ? current.cause : undefined;
   }
   for (const error of errors) {
-    if (error instanceof ProjectMcpSecretUnavailableError)
+    if (isSecretUnavailable(error))
       return "A stored secret for this server is unavailable. Enter it again.";
-    if (error instanceof ProjectMcpTransportConfigurationError) return error.message;
+    if (isTransportConfigurationError(error)) return error.message;
     if (error instanceof UnauthorizedError)
       return "The server requires authorization. Connect OAuth for it first.";
     if (

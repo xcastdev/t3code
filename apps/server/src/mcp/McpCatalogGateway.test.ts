@@ -80,7 +80,7 @@ const setupWith = Effect.fn("testMcpCatalogGateway.setup")(function* (
         };
       }),
     issue: () => Effect.die("unused"),
-    resolve: () => Effect.sync(() => undefined),
+    resolve: () => Effect.undefined,
     touch: () => Effect.void,
     revokeProviderSession: (identity) =>
       Effect.gen(function* () {

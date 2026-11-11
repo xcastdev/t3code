@@ -1,5 +1,5 @@
 import type { EnvironmentId, OrchestrationV2TurnItem } from "@t3tools/contracts";
-import type { FilePreviewSource } from "../../components/FilePreviewModal";
+import type { FilePreviewSource } from "../../components/ui/FilePreviewModal";
 import { Button } from "../../components/ui/Button";
 import { useRef, type ComponentRef } from "react";
 import { ScrollView, View } from "react-native";

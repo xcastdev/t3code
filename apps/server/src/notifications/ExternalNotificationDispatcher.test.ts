@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { it, expect } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { DEFAULT_SERVER_SETTINGS, ProjectWorkTaskId } from "@t3tools/contracts";
@@ -212,7 +213,7 @@ it.effect(
         externalNotifications: { destinations: [destination] },
       });
       expect(saved.externalNotifications.destinations[0]?.webhookUrl).toBe(destination.webhookUrl);
-      const client = Settings.redactServerSettingsForClient(saved);
+      const client = Settings.redactServerSettingsForClient(saved, { secretReferences: true });
       expect(client.externalNotifications.destinations[0]?.webhookUrl).toBe(SECRET_REDACTED);
       expect(yield* fs.readFileString(config.settingsPath)).not.toContain(destination.webhookUrl);
       const stored = yield* store.get("notification-webhook-aGE");
@@ -232,7 +233,7 @@ it.effect(
           Layer.provideMerge(
             ServerConfig.layerTest(process.cwd(), { prefix: "t3code-notifications-test-" }),
           ),
-          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(Layer.merge(NodeServices.layer, NodeCrypto.layer)),
         ),
       ),
     ),

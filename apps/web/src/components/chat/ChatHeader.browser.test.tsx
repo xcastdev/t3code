@@ -12,6 +12,7 @@ const persisted = vi.hoisted(() => ({
     name: string;
   },
 }));
+const openMenu = vi.hoisted(() => vi.fn());
 vi.mock(import("../assistants/useAssistantHome"), async (importOriginal) => ({
   ...(await importOriginal()),
   useAssistantThreadOwner: () => persisted.owner,
@@ -30,10 +31,10 @@ vi.mock(import("../../state/use-orchestration-command"), async (importOriginal) 
     }) as never,
 }));
 vi.mock(import("~/hooks/useThreadActionMenu"), () => ({
-  useThreadActionMenu: () => ({ openMenu: () => {}, closeMenu: () => {} }),
+  useThreadActionMenu: () => ({ openMenu, closeMenu: () => {} }),
 }));
 
-import { render } from "../../../test/render";
+import { render, stubGlobal } from "../../../test/render";
 import { ChatHeader } from "./ChatHeader";
 
 function header(title: string) {
@@ -105,4 +106,13 @@ it("titles an agent's Home as Home under the agent and offers no rename there", 
     .element(screen.getByRole("textbox", { name: "Thread title" }))
     .not.toBeInTheDocument();
   expect(persisted.title).toBe("Scholar");
+});
+
+it("opens the thread menu on a desktop title click without waiting", async () => {
+  openMenu.mockClear();
+  persisted.owner = null;
+  using _bridge = stubGlobal("desktopBridge", {});
+  await using screen = await render(header("New thread"));
+  await screen.getByRole("button", { name: "Thread actions for New thread" }).click();
+  expect(openMenu).toHaveBeenCalledOnce();
 });

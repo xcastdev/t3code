@@ -15,7 +15,7 @@ type Limits = Extract<ProjectTeamRecord, { kind: "limits" }>;
 type Role = Extract<ProjectTeamRecord, { kind: "role-revision" }>;
 type Member = Extract<ProjectTeamRecord, { kind: "member" }>;
 const reject = (reason: string): never => {
-  throw new ProjectWorkPolicyError("authority-required", reason);
+  throw new ProjectWorkPolicyError({ code: "authority-required", message: reason });
 };
 const increment = (value: number) => {
   if (!Number.isSafeInteger(value) || value < 0 || value >= Number.MAX_SAFE_INTEGER)

@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFSP from "node:fs/promises";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import { createOpencodeClient } from "@opencode-ai/sdk/v2";
@@ -30,7 +31,7 @@ const dependencies = Layer.mergeAll(
     HttpClient.HttpClient,
     HttpClient.make(() => Effect.die("The test must not contact a live provider")),
   ),
-).pipe(Layer.provideMerge(NodeServices.layer));
+).pipe(Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)));
 
 it.effect("resolves and probes the configured external instance through its own SDK endpoint", () =>
   Effect.gen(function* () {

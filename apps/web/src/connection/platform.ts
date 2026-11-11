@@ -40,6 +40,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { FetchHttpClient } from "effect/http";
 
@@ -314,17 +315,21 @@ export const prepareDesktopSshEnvironment = Effect.fn("web.connectionPlatform.ss
   },
 );
 
+const isAttachedCredentialTargetMismatch = Schema.is(DesktopAttachedCredentialTargetMismatchError);
+
 const ANALYTICS_DEVICE_ID_KEY = "t3code:analytics-device-id";
 
 // Lives as long as this browser profile's site data. Storage can be blocked, which only drops the id.
 const analyticsDevice = {
-  id: Effect.try(() => {
-    const existing = window.localStorage.getItem(ANALYTICS_DEVICE_ID_KEY);
-    if (existing) return existing;
-    const created = randomUUID();
-    window.localStorage.setItem(ANALYTICS_DEVICE_ID_KEY, created);
-    return created;
-  }).pipe(Effect.option),
+  id: Effect.sync(
+    Option.liftThrowable(() => {
+      const existing = window.localStorage.getItem(ANALYTICS_DEVICE_ID_KEY);
+      if (existing) return existing;
+      const created = randomUUID();
+      window.localStorage.setItem(ANALYTICS_DEVICE_ID_KEY, created);
+      return created;
+    }),
+  ),
 };
 
 const layerCapabilities = Layer.effectContext(
@@ -371,7 +376,7 @@ const layerCapabilities = Layer.effectContext(
         : Effect.tryPromise({
             try: () => readDesktopPrimaryBearerToken(pinned.attached ?? "managed"),
             catch: (cause) =>
-              cause instanceof DesktopAttachedCredentialTargetMismatchError
+              isAttachedCredentialTargetMismatch(cause)
                 ? new ConnectionBlockedError({ reason: "configuration", detail: cause.message })
                 : new ConnectionTransientError({
                     reason: "remote-unavailable",

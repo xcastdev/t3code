@@ -1,8 +1,8 @@
 import { assert, it } from "@effect/vitest";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
-import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -135,13 +135,6 @@ const fetchRegistrationFixture: FetchLike = async (input, init) => {
     });
   return fetchOAuthFixture(input, init);
 };
-const cryptoLayer = Layer.succeed(
-  Crypto.Crypto,
-  Crypto.make({
-    randomBytes: (size) => crypto.getRandomValues(new Uint8Array(size)),
-    digest: (_algorithm, data) => Effect.succeed(data),
-  }),
-);
 const secretLayer = ProjectMcpSecretStore.layer.pipe(
   Layer.provideMerge(ServerSecretStore.layer),
   Layer.provideMerge(NodeServices.layer),
@@ -150,7 +143,7 @@ const secretLayer = ProjectMcpSecretStore.layer.pipe(
       Layer.provide(NodeServices.layer),
     ),
   ),
-  Layer.provideMerge(cryptoLayer),
+  Layer.provideMerge(NodeCrypto.layer),
 );
 const decodePersistedRecord = Schema.decodeUnknownSync(
   Schema.fromJsonString(Schema.Struct({ redirectUrl: Schema.optional(Schema.String) })),
@@ -983,7 +976,7 @@ it.effect.each(
             if (reader === "status") assert.equal(yield* oauth.status(serverId), "connected");
             else
               assert.equal(
-                (yield* Effect.tryPromise(async () => provider.tokens()))?.access_token,
+                (yield* Effect.promise(async () => provider.tokens()))?.access_token,
                 "first",
               );
           }),
@@ -1117,7 +1110,7 @@ it.effect("credential read failures remain errors rather than disconnected statu
     failReads = true;
     assert.isTrue(Exit.isFailure(yield* Effect.exit(oauth.status(serverId))));
     assert.isTrue(
-      Exit.isFailure(yield* Effect.exit(Effect.tryPromise(async () => provider.tokens()))),
+      Exit.isFailure(yield* Effect.exit(Effect.promise(async () => provider.tokens()))),
     );
     failReads = false;
     assert.equal(yield* oauth.status(serverId), "connected");

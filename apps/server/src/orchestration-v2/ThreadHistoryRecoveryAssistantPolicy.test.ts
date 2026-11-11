@@ -1,3 +1,4 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
@@ -86,7 +87,7 @@ const base = Layer.mergeAll(Archive.layer, Projects.layer, Policy.layer).pipe(
   Layer.provideMerge(Projection.layer),
   Layer.provideMerge(schema),
   Layer.provideMerge(Layer.mock(CheckpointStore.CheckpointStore)({})),
-  Layer.provideMerge(NodeServices.layer),
+  Layer.provideMerge(Layer.merge(NodeServices.layer, NodeCrypto.layer)),
 );
 const decodeThread = Schema.decodeUnknownEffect(OrchestrationV2AppThreadJson);
 const decodeRun = Schema.decodeUnknownEffect(OrchestrationV2RunJson);

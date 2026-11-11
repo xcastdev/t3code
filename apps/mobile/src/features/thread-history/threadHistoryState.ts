@@ -1,9 +1,10 @@
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { createThreadHistoryEnvironmentAtoms } from "@t3tools/client-runtime/state/thread-history";
 import {
   makeHistoryOperationPersistence,
   type HistoryOperationPersistence,
 } from "@t3tools/client-runtime/state/thread-history-storage";
+
+import Storage from "expo-sqlite/kv-store";
 
 import { connectionAtomRuntime } from "../../connection/runtime";
 import { uuidv4 } from "../../lib/uuid";
@@ -11,16 +12,18 @@ import { uuidv4 } from "../../lib/uuid";
 const CLIENT_NAMESPACE_KEY = "t3code.thread-history.client-namespace";
 
 const storage = {
-  getItem: (key: string) => AsyncStorage.getItem(key),
-  setItem: (key: string, value: string) => AsyncStorage.setItem(key, value),
-  removeItem: (key: string) => AsyncStorage.removeItem(key),
+  getItem: (key: string) => Storage.getItemAsync(key),
+  setItem: (key: string, value: string) => Storage.setItemAsync(key, value),
+  removeItem: async (key: string) => {
+    await Storage.removeItemAsync(key);
+  },
 };
 
 /**
  * Resolved once per launch; a storage failure rejects hydration, which refuses every
  * history mutation rather than letting a retry identity be silently forgotten.
  */
-function asyncStoragePersistence(): HistoryOperationPersistence {
+function kvStorePersistence(): HistoryOperationPersistence {
   let resolving: Promise<HistoryOperationPersistence> | null = null;
   const resolve = () => {
     resolving ??= (async () => {
@@ -43,5 +46,5 @@ function asyncStoragePersistence(): HistoryOperationPersistence {
 }
 
 export const threadHistoryEnvironment = createThreadHistoryEnvironmentAtoms(connectionAtomRuntime, {
-  operationPersistence: asyncStoragePersistence(),
+  operationPersistence: kvStorePersistence(),
 });

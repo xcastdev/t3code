@@ -146,6 +146,7 @@ describe("resolveInitialServerAuthGateState", () => {
 
     const testWindow = installTestBrowser("http://localhost/");
     testWindow.desktopBridge = {
+      getLocalEnvironmentEnabled: () => true,
       getLocalEnvironmentBootstraps: () => [
         {
           id: "primary",

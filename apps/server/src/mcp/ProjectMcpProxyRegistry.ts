@@ -2,6 +2,7 @@ import type { ResolvedMcpCatalogEntry } from "@t3tools/contracts";
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as Layer from "effect/Layer";
 import * as Scope from "effect/Scope";
 import { makeProjectMcpTransport } from "./ProjectMcpTransport.ts";
@@ -9,10 +10,12 @@ import { connectProjectMcp } from "./ProjectMcpConnection.ts";
 import * as Secrets from "./ProjectMcpSecretStore.ts";
 import * as OAuth from "./ProjectMcpOAuth.ts";
 
-export class ProjectMcpConnectionError extends Error {
-  readonly _tag = "ProjectMcpConnectionError";
-  constructor() {
-    super("MCP upstream connection failed.");
+export class ProjectMcpConnectionError extends Schema.TaggedError<ProjectMcpConnectionError>()(
+  "ProjectMcpConnectionError",
+  {},
+) {
+  override get message(): string {
+    return "MCP upstream connection failed.";
   }
 }
 

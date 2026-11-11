@@ -109,7 +109,7 @@ function IssueBindingsGeneration({
   const [bindings, setBindings] = useState<Bindings>({ status: "loading" });
   const [preparing, setPreparing] = useState(false);
 
-  // oxlint-disable-next-line t3code/react-effect-budget -- Repository queries cancel replies when this scope or connection changes.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- lists repository bindings from the environment and drops the reply when the scope or connection changes
   useEffect(() => {
     if (!writer.canIssue) return;
     let live = true;

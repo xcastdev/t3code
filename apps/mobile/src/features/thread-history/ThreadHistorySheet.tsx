@@ -42,11 +42,9 @@ import { StackActions, useNavigation, type StaticScreenProps } from "@react-navi
 import * as Option from "effect/Option";
 import { AsyncResult, Atom, type AtomRegistry } from "effect/reactivity";
 import { useContext, useEffect, useState } from "react";
-import { Platform, ScrollView, View } from "react-native";
-import { ScreenStack } from "react-native-screens";
+import { ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { AndroidSheetHeader } from "../../components/ui/AndroidScreenHeader";
 import { AppText as Text } from "../../components/ui/AppText";
 import { Button } from "../../components/ui/Button";
 import * as Dialog from "../../components/ui/Dialog";
@@ -54,14 +52,10 @@ import { ListRow } from "../../components/ui/ListRow";
 import { ListSection } from "../../components/ui/ListSection";
 import { Notice } from "../../components/ui/Notice";
 import { ScreenContent } from "../../components/ui/ScreenContent";
+import { SheetHeader } from "../../components/ui/SheetHeader";
 import { uuidv4 } from "../../lib/uuid";
-import { NativeStackScreenOptions, nativeHeaderScrollEdgeEffects } from "../../native/StackHeader";
-import { NativeHeader, NativeScreen } from "../../native/ThemedScreenStack";
-import { useAdaptiveWorkspaceLayout } from "../layout/AdaptiveWorkspaceLayout";
 import { createHistorySelectionOwner, type HistorySelectionOwner } from "./historySelectionOwner";
 import { threadHistoryEnvironment } from "./threadHistoryState";
-
-const HEADER_SCROLL_EDGE_EFFECTS = nativeHeaderScrollEdgeEffects(Platform.OS, Platform.Version);
 
 type Header = typeof ThreadHistoryArchiveHeader.Type;
 type HistoryTarget = { readonly environmentId: EnvironmentId; readonly threadId: ThreadId };
@@ -90,7 +84,6 @@ function readLiveEpoch(registry: AtomRegistry.AtomRegistry, environmentId: Envir
 
 /** Read-only until the user picks an action; opening it starts nothing on the provider. */
 export function ThreadHistorySheet({ route }: StaticScreenProps<HistoryTarget>) {
-  const { layout } = useAdaptiveWorkspaceLayout();
   const target = route.params;
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
@@ -102,6 +95,7 @@ export function ThreadHistorySheet({ route }: StaticScreenProps<HistoryTarget>) 
   const [owner] = useState(createHistorySelectionOwner);
   const [cursors, setCursors] = useState<ReadonlyArray<string | undefined>>([undefined]);
   const [selected, setSelected] = useState<HistorySelection | null>(null);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- holds the selection owner's registration for the shown archive until it changes or unmounts
   useEffect(() => {
     owner.activate(selected);
     return () => owner.release();
@@ -161,7 +155,7 @@ export function ThreadHistorySheet({ route }: StaticScreenProps<HistoryTarget>) 
     <ScrollView
       nestedScrollEnabled
       className="flex-1"
-      contentInsetAdjustmentBehavior={Platform.OS === "ios" ? "automatic" : "never"}
+      contentInsetAdjustmentBehavior="automatic"
       contentContainerClassName="gap-5 px-5 pb-6"
       contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 16) + 8 }}
     >
@@ -221,42 +215,10 @@ export function ThreadHistorySheet({ route }: StaticScreenProps<HistoryTarget>) 
     </ScrollView>
   );
 
-  if (Platform.OS === "ios") {
-    // A plain formSheet screen never renders a stack header, so it comes from a nested native stack.
-    return (
-      <View collapsable={false} className="flex-1 bg-sheet">
-        <ScreenStack style={{ flex: 1 }}>
-          <NativeScreen
-            activityState={2}
-            enabled
-            isNativeStack
-            screenId="thread-history-sheet-native"
-            scrollEdgeEffects={HEADER_SCROLL_EDGE_EFFECTS}
-            className="flex-1 bg-sheet"
-          >
-            {content}
-            <NativeHeader
-              backgroundColor="rgba(0,0,0,0)"
-              tintColorClassName="accent-foreground"
-              hideBackButton
-              hideShadow={false}
-              title="History"
-              titleColorClassName="accent-foreground"
-              titleFontSize={18}
-              titleFontWeight="800"
-              translucent
-            />
-          </NativeScreen>
-        </ScreenStack>
-      </View>
-    );
-  }
-
   return (
     <View collapsable={false} className="flex-1 bg-sheet">
-      <NativeStackScreenOptions options={{ sheetCornerRadius: 28 }} />
-      <AndroidSheetHeader title="History" onBack={() => navigation.goBack()} />
-      <ScreenContent insetHorizontal={layout.usesSplitView}>{content}</ScreenContent>
+      <SheetHeader title="History" onClose={() => navigation.goBack()} />
+      <ScreenContent>{content}</ScreenContent>
     </View>
   );
 }
@@ -362,7 +324,7 @@ function ArchiveDetail(props: {
       ? checkedStatus.status
       : null;
 
-  // Retained request identities must be loaded before any action can offer a fresh one.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Retained request identities must be loaded before any action can offer a fresh one.
   useEffect(() => {
     void threadHistoryEnvironment.hydrate(registry, { environmentId, threadId, archiveId });
   }, [registry, environmentId, threadId, archiveId]);

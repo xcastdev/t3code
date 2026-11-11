@@ -81,6 +81,7 @@ export function AgentRoutinesSection({ context }: { readonly context: MobileAgen
       : null;
   const routines = (list?.routines ?? []).filter((routine) => !routine.deleted);
   const latest = useRef(routines);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- async confirmations read the latest committed routines, not the ones they closed over
   useEffect(() => {
     latest.current = routines;
   });

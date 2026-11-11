@@ -32,6 +32,7 @@ import {
 import { startDefaultThemeAdoption } from "./hooks/useDefaultTheme";
 import { startEnvironmentThemeRepaint } from "./hooks/useEnvironmentTheme";
 import { readLocalStorageValue, subscribeLocalStorageKey } from "./hooks/useLocalStorage";
+import { startHostEnvironmentLookup } from "./state/primaryEnvironment";
 import {
   getClientSettings,
   startModelPreferencesMigration,
@@ -55,7 +56,7 @@ import { installCommandPaletteCommands } from "./shortcuts/commandPaletteCommand
 import { installPluginCommands } from "./shortcuts/pluginCommands";
 import { startRecentChatTracking } from "./plugins/recentChat";
 import { registerOpenFavoriteEditorCommand } from "./components/chat/OpenInPickerShortcut";
-import { environmentThreadShells } from "./state/threads";
+import { environmentThreadShells, threadEnvironment } from "./state/threads";
 import { resolveThreadRouteTarget } from "./threadRoutes";
 
 /** Writes appearance settings onto the document, touching only the groups that changed. */
@@ -182,6 +183,7 @@ export function startAppServices(): AppRouter {
 
   startClientAppearance();
   startDocumentTitle();
+  startHostEnvironmentLookup();
   startEnvironmentThemeRepaint();
   startBrowserChromeThemeSync(router);
   startDefaultThemeAdoption();
@@ -207,6 +209,7 @@ export function startAppServices(): AppRouter {
     threadShellAtom: environmentThreadShells.threadShellAtom,
     threadRefsAtom: environmentThreadShells.threadRefsAtom,
     shellStateAtom: environmentShell.stateAtom,
+    pendingThreadIdsAtom: threadEnvironment.pendingThreadIdsAtom,
   });
   startMainAppLocationTracking(router);
   startWorkspaceFocus(router);

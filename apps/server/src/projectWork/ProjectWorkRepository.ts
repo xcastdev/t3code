@@ -34,6 +34,11 @@ import * as ProjectWorkEventBus from "./ProjectWorkEventBus.ts";
 import * as ProjectWorkContentGuard from "./ProjectWorkContentGuard.ts";
 import { toPersistenceSqlError, type ProjectionRepositoryError } from "../persistence/Errors.ts";
 
+const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
+
+const isPolicyError = Schema.is(ProjectWorkPolicyError);
+
 export type ProjectWorkRepositoryError = ProjectionRepositoryError | ProjectWorkPolicyError;
 
 export interface ProjectWorkCommandResult {
@@ -110,10 +115,11 @@ export const readCurrentState = Effect.fn("ProjectWorkRepository.readCurrentStat
     const events = yield* readProjectWorkEvents(sql, projectId);
     return applyProjectWorkEvents(emptyProjectWorkReducerState(projectId), events);
   }
-  const decoded = yield* Effect.try(() => {
-    // @effect-diagnostics-next-line preferSchemaOverJson:off -- validated derived checkpoint with event-log fallback.
-    return JSON.parse(String(checkpoint.stateJson)) as ProjectWorkReducerState;
-  }).pipe(Effect.option);
+  // A derived checkpoint; an unreadable one falls back to the event log.
+  const decoded = yield* decodeJson(String(checkpoint.stateJson)).pipe(
+    Effect.map((state) => state as ProjectWorkReducerState),
+    Effect.option,
+  );
   if (Option.isNone(decoded)) {
     const events = yield* readProjectWorkEvents(sql, projectId);
     return applyProjectWorkEvents(emptyProjectWorkReducerState(projectId), events);
@@ -246,21 +252,25 @@ const makeProjectWorkRepository = Effect.gen(function* () {
         Effect.gen(function* () {
           yield* assertProject(projectId);
           if (Option.isNone(yield* projects.get(ProjectId.make(projectId))))
-            return yield* Effect.fail(
-              new ProjectWorkPolicyError("invalid-state", "Project is permanently deleted"),
-            );
+            return yield* new ProjectWorkPolicyError({
+              code: "invalid-state",
+              message: "Project is permanently deleted",
+            });
           const contentCheck =
             contentGuard._tag === "Some"
-              ? contentGuard.value
-                  .assertCommandSafe(command)
-                  .pipe(
-                    Effect.mapError(
-                      (cause) => new ProjectWorkPolicyError("invalid-state", String(cause)),
-                    ),
-                  )
+              ? contentGuard.value.assertCommandSafe(command).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new ProjectWorkPolicyError({
+                        code: "invalid-state",
+                        message: String(cause),
+                      }),
+                  ),
+                )
               : Effect.try({
                   try: () => ProjectWorkContentGuard.assertProjectWorkCommandContentSafe(command),
-                  catch: (cause) => new ProjectWorkPolicyError("invalid-state", String(cause)),
+                  catch: (cause) =>
+                    new ProjectWorkPolicyError({ code: "invalid-state", message: String(cause) }),
                 });
           yield* contentCheck;
           // Never use a public snapshot or a bounded read as command authority.
@@ -311,13 +321,11 @@ const makeProjectWorkRepository = Effect.gen(function* () {
               (priorReceipt.sourceKind ?? null) === (attribution?.source.kind ?? null) &&
               (priorReceipt.sourceId ?? null) === (attribution?.source.id ?? null);
             if (!metadataMatches) {
-              return yield* Effect.fail(
-                new ProjectWorkPolicyError(
-                  "duplicate-record",
-                  `Command '${command.commandId}' was already committed by a different actor or payload.`,
-                  { commandId: command.commandId, projectId, actorBound: true },
-                ),
-              );
+              return yield* new ProjectWorkPolicyError({
+                code: "duplicate-record",
+                message: `Command '${command.commandId}' was already committed by a different actor or payload.`,
+                details: { commandId: command.commandId, projectId, actorBound: true },
+              });
             }
           }
           const priorCommandRows = yield* sql<Record<string, unknown>>`
@@ -408,23 +416,29 @@ const makeProjectWorkRepository = Effect.gen(function* () {
           );
           if (authorizedCommand !== command)
             yield* contentGuard._tag === "Some"
-              ? contentGuard.value
-                  .assertCommandSafe(authorizedCommand)
-                  .pipe(
-                    Effect.mapError(
-                      (cause) => new ProjectWorkPolicyError("invalid-state", String(cause)),
-                    ),
-                  )
+              ? contentGuard.value.assertCommandSafe(authorizedCommand).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new ProjectWorkPolicyError({
+                        code: "invalid-state",
+                        message: String(cause),
+                      }),
+                  ),
+                )
               : Effect.try({
                   try: () =>
                     ProjectWorkContentGuard.assertProjectWorkCommandContentSafe(authorizedCommand),
-                  catch: (cause) => new ProjectWorkPolicyError("invalid-state", String(cause)),
+                  catch: (cause) =>
+                    new ProjectWorkPolicyError({ code: "invalid-state", message: String(cause) }),
                 });
           const events = yield* Effect.try({
             try: () => decideProjectWorkCommand(current, authorizedCommand),
             catch: (cause) => {
-              if (!(cause instanceof ProjectWorkPolicyError))
-                return new ProjectWorkPolicyError("invalid-state", String(cause));
+              if (!isPolicyError(cause))
+                return new ProjectWorkPolicyError({
+                  code: "invalid-state",
+                  message: String(cause),
+                });
               if (cause.code !== "stale-revision") return cause;
               const changedFields = [
                 ...new Set(
@@ -433,15 +447,18 @@ const makeProjectWorkRepository = Effect.gen(function* () {
                     .flatMap((event) => changedFieldsForEvent(event.type)),
                 ),
               ];
-              return new ProjectWorkPolicyError(cause.code, cause.message, {
-                ...cause.details,
-                changedFields,
+              return new ProjectWorkPolicyError({
+                code: cause.code,
+                message: cause.message,
+                details: {
+                  ...cause.details,
+                  changedFields,
+                },
               });
             },
           });
           for (const event of events) {
-            // @effect-diagnostics-next-line preferSchemaOverJson:off -- events are already validated reducer payloads.
-            const payloadJson = JSON.stringify(event);
+            const payloadJson = yield* encodeJson(event).pipe(Effect.orDie);
             yield* sql`
             INSERT INTO t3_workflow_v2_work_events (
               event_id, project_id, event_type, occurred_at, command_id, payload_json
@@ -478,10 +495,10 @@ const makeProjectWorkRepository = Effect.gen(function* () {
             },
             delta,
           } satisfies ProjectWorkWriteResult;
-          // @effect-diagnostics-next-line preferSchemaOverJson:off -- event ids are already validated contract values.
-          const eventIdsJson = JSON.stringify(events.map((event) => event.eventId));
-          // @effect-diagnostics-next-line preferSchemaOverJson:off -- bounded receipt metadata.
-          const resultJson = JSON.stringify(writeResult);
+          const eventIdsJson = yield* encodeJson(events.map((event) => event.eventId)).pipe(
+            Effect.orDie,
+          );
+          const resultJson = yield* encodeJson(writeResult).pipe(Effect.orDie);
           yield* sql`
             INSERT INTO t3_workflow_v2_work_command_receipts (
               project_id, command_id, payload_fingerprint,
@@ -514,9 +531,8 @@ const makeProjectWorkRepository = Effect.gen(function* () {
           // from treating the callback's denial as a completed rejection.
           const uncertain = Cause.hasDies(cause) || Cause.hasInterrupts(cause);
           return Effect.failCause(
-            Cause.map(cause, (error) =>
-              !uncertain &&
-              (error instanceof ProjectWorkPolicyError || isAuthorizationFailure(error))
+            Cause.map(cause, (error): E | L | ProjectWorkRepositoryError =>
+              !uncertain && (isPolicyError(error) || isAuthorizationFailure(error))
                 ? error
                 : toPersistenceSqlError("ProjectWorkRepository.executeAuthorized")(
                     uncertain ? cause : error,
@@ -553,10 +569,10 @@ const makeProjectWorkRepository = Effect.gen(function* () {
       Effect.flatMap((transaction) =>
         Option.isSome(transaction)
           ? Effect.fail(
-              new ProjectWorkPolicyError(
-                "invalid-state",
-                "Work commands must own their transaction",
-              ),
+              new ProjectWorkPolicyError({
+                code: "invalid-state",
+                message: "Work commands must own their transaction",
+              }),
             )
           : executeUnpublished(...args).pipe(Effect.tap(publishCommitted)),
       ),
@@ -569,10 +585,10 @@ const makeProjectWorkRepository = Effect.gen(function* () {
         Effect.flatMap((transaction) =>
           Option.isSome(transaction)
             ? Effect.fail(
-                new ProjectWorkPolicyError(
-                  "invalid-state",
-                  "Work reservations must own their transaction",
-                ),
+                new ProjectWorkPolicyError({
+                  code: "invalid-state",
+                  message: "Work reservations must own their transaction",
+                }),
               )
             : executeUnpublished(
                 command,
@@ -608,9 +624,10 @@ export const appendAdmissionFoundationRecords = Effect.fn(
 ) {
   const transaction = yield* Effect.serviceOption(sql.transactionService);
   if (Option.isNone(transaction))
-    return yield* Effect.fail(
-      new ProjectWorkPolicyError("invalid-state", "Admission requires an existing transaction"),
-    );
+    return yield* new ProjectWorkPolicyError({
+      code: "invalid-state",
+      message: "Admission requires an existing transaction",
+    });
   const current = yield* readCurrentState(sql, projectId);
   const priorEvents = yield* sql<{
     event_id: string;

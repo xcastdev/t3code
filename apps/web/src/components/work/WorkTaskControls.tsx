@@ -111,6 +111,7 @@ export function WorkTaskControls({ surface }: { surface: WorkTaskSurface }) {
         taskId: task.taskId,
         expectedRevision: selected.revision,
         commandId: newCommandId(),
+        // oxlint-disable-next-line react/purity -- oxc#27309: this timestamp is read only by the resolve-blocker click handler.
         now: new Date().toISOString(),
         blockerId,
       }),

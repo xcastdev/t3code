@@ -101,6 +101,7 @@ export function ProjectTerminalViewer({
   const attachAtom = projectTerminalEnvironment.attach({ environmentId, input: handle });
 
   // A reconnect marker means this reader missed output; reattaching yields a fresh snapshot.
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- refreshes the attach stream atom in the registry when the stream reports a reconnect
   useEffect(() => {
     if (view.phase === "reconnecting") registry.refresh(attachAtom);
   }, [view.phase, attachAtom, registry]);
@@ -145,6 +146,7 @@ export function ProjectTerminalViewer({
       });
   });
 
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- creates the Ghostty terminal surface on the mount element, observes theme changes, and disposes both
   useEffect(() => {
     const mount = mountRef.current;
     if (!mount) return;
@@ -185,10 +187,12 @@ export function ProjectTerminalViewer({
     };
   }, []);
 
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- pushes write access to the imperative terminal surface
   useEffect(() => {
     if (surfaceRef.current) surfaceRef.current.input.readOnly = !writable;
   }, [writable]);
 
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- pushes font changes to the imperative terminal surface
   useEffect(() => {
     const current = fontRef.current;
     if (current.family === fontFamily && current.size === fontSize) return;

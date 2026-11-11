@@ -506,8 +506,7 @@ const make = Effect.gen(function* () {
           const record =
             (yield* ownerOf(input.threadId, input.projectId)) ??
             (input.originThreadId === undefined ? null : yield* ownerOf(input.originThreadId));
-          if (record === null)
-            return yield* previous.prepareResources?.(input) ?? Effect.sync(() => undefined);
+          if (record === null) return yield* previous.prepareResources?.(input) ?? Effect.undefined;
           if (input.operation === "bind-thread") return undefined;
           if (!(yield* current(record))) return undefined;
           yield* physical(record);

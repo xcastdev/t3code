@@ -26,6 +26,9 @@ vi.mock(import("../../composerDraftStore"), async (original) => {
   };
 });
 vi.mock("../ui/toast", () => ({ toastManager: { add: vi.fn() } }));
+vi.mock(import("./useApplyThreadModelPick"), () => ({
+  useApplyThreadModelPick: () => async () => {},
+}));
 
 function setup(thread: "server" | "local-draft") {
   const previousState = useComposerDraftStore.getState();
@@ -88,20 +91,14 @@ function setup(thread: "server" | "local-draft") {
   return { ...input, selection: useComposerSelection(input), instanceId };
 }
 
-const edits = ["runtime", "interaction", "model", "Shift+Tab"] as const;
+const edits = ["runtime", "model"] as const;
 function changeSettings(context: ReturnType<typeof setup>, edit: (typeof edits)[number]) {
   switch (edit) {
     case "runtime":
       context.selection.handleRuntimeModeChangeStable("approval-required");
       break;
-    case "interaction":
-      context.selection.handleInteractionModeChangeStable("plan");
-      break;
     case "model":
       context.selection.onProviderModelSelectStable(context.instanceId, "gpt-5.5");
-      break;
-    case "Shift+Tab":
-      context.selection.toggleInteractionModeStable();
       break;
   }
 }
@@ -114,7 +111,6 @@ it.each(["server", "local-draft"] as const)(
     const state = useComposerDraftStore.getState();
     expect(state.getComposerDraft(context.composerDraftTarget)).toMatchObject({
       runtimeMode: "approval-required",
-      interactionMode: "plan",
       modelSelectionByProvider: {
         [context.instanceId]: { instanceId: context.instanceId, model: "gpt-5.5" },
       },
@@ -126,7 +122,6 @@ it.each(["server", "local-draft"] as const)(
     if (thread === "local-draft") {
       expect(state.getDraftThread(context.composerDraftTarget)).toMatchObject({
         runtimeMode: "approval-required",
-        interactionMode: "plan",
       });
     }
   },

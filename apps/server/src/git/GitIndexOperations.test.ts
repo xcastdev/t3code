@@ -1,4 +1,5 @@
 import { assert, it } from "@effect/vitest";
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -19,7 +20,7 @@ const testLayer = GitVcsDriver.layer.pipe(
       Layer.provide(NodeServices.layer),
     ),
   ),
-  Layer.provideMerge(NodeServices.layer),
+  Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
 );
 const fixture = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -452,10 +453,12 @@ it.live.each(["succeeded", "rejected", "diverged"] as const)(
         Effect.gen(function* () {
           if (
             !ChildProcess.isStandardCommand(command) ||
-            !command.args.some((arg) => ["push", "fetch", "ls-remote"].includes(arg))
+            !command.args.some(
+              (arg) => typeof arg === "string" && ["push", "fetch", "ls-remote"].includes(arg),
+            )
           )
             return yield* nativeSpawner.spawn(command);
-          if (command.args.includes("push")) pushes.push(command.args);
+          if (command.args.includes("push")) pushes.push(command.args.map(String));
           return ChildProcessSpawner.makeHandle({
             pid: ChildProcessSpawner.ProcessId(1),
             exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(outcome === "rejected" ? 1 : 0)),
