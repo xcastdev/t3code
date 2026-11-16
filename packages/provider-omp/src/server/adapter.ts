@@ -955,7 +955,12 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
           }
           installedConfig = config;
         },
-        Effect.onError(() => Effect.tryPromise(() => bridge.cancelPending()).pipe(Effect.ignore)),
+        Effect.onError(() =>
+          Effect.tryPromise({
+            try: () => bridge.cancelPending(),
+            catch: (cause) => protocol("OMP pending tool cancellation failed", cause),
+          }).pipe(Effect.ignore),
+        ),
       );
       if (!catalogs.onChanged)
         return yield* protocol("OMP requires catalog revocation notifications");

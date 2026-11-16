@@ -246,6 +246,8 @@ export const ProjectTerminalWriteInput = Schema.Struct({
   expectedGeneration: Schema.optionalKey(TerminalToolkitId),
   ...ProjectTerminalHandle.fields,
   data: TerminalData,
+  binary: TerminalWriteInput.fields.binary,
+  reply: TerminalWriteInput.fields.reply,
 });
 export type ProjectTerminalWriteInput = typeof ProjectTerminalWriteInput.Type;
 

@@ -227,7 +227,11 @@ it.live(
         binaryPath: path.join(packageRoot, "dist/cli.js"),
         bunPath: fake,
         launchArgs: "--profile=work --model=test",
-        env: { PATH: process.env.PATH, TEST_PROVIDER_KEY: "scoped", T3CODE_TOKEN: "must-clear" },
+        env: {
+          PATH: (yield* HostProcess.Environment).PATH,
+          TEST_PROVIDER_KEY: "scoped",
+          T3CODE_TOKEN: "must-clear",
+        },
         cacheDir: root,
         config: { cwd: root, mode: "full-access", environment: "e", project: "p" },
         onUiRequest: (r, send) => send({ type: "extension_ui_response", id: r.id, value: "yes" }),

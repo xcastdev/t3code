@@ -24,6 +24,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as Sqlite from "../persistence/Sqlite.ts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Outbox from "./EffectOutbox.ts";
+import * as ProjectionStore from "./ProjectionStore.ts";
 import * as Worker from "./EffectWorker.ts";
 import * as Deadline from "./OwnerDeadlineControl.ts";
 import * as Admission from "./RunAdmission.ts";
@@ -93,7 +94,7 @@ it.effect(
         delayMs: 20000,
       });
       assert.equal(
-        DateTime.formatIso(Option.getOrThrow(yield* outbox.nextClaimableAt)),
+        DateTime.formatIso(Option.getOrThrow(yield* outbox.nextClaimableAt())),
         "1970-01-01T00:00:20.000Z",
       );
       assert.equal(
@@ -338,6 +339,7 @@ it.effect(
         Layer.provide(
           Layer.mergeAll(
             deadlines,
+            Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
             Layer.mock(ProviderSessions.ProviderSessionManagerV2)({}),
             Layer.mock(RunFinalization.RunFinalizationService)({
               finalize: ({ threadId }) => block(threadId),

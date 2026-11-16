@@ -1,6 +1,7 @@
 import {
   formatSubagentDisplayTitle,
   resolveSubagentMetadata,
+  subagentCardDetail,
   subagentDetailPreview,
 } from "@t3tools/client-runtime/state/subagent-display";
 import {
@@ -19,8 +20,6 @@ import type {
 } from "@t3tools/contracts";
 import { resolveSelectableModel } from "@t3tools/shared/model";
 import { deriveTurnWorkCounts, type TurnWorkCounts } from "@t3tools/shared/turnWorkCounts";
-
-import { subagentCardDetail } from "./subagent-card-presentation";
 
 const PROMPT_TITLE_LIMIT = 80;
 

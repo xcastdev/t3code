@@ -803,7 +803,7 @@ it.effect("allows controlled event commits without consuming copied outbox or sc
         assert.isAbove(before.length, 0);
         const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
         assert.equal(yield* worker.drain(), 0);
-        assert.isFalse(yield* worker.runOnce);
+        assert.isFalse(yield* worker.runOnce());
         assert.isFalse(yield* worker.runRecoveryOnce);
         yield* (yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService).recover;
         yield* (yield* UpgradeFixtureScheduler).tick;

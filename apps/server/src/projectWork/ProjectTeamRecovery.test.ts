@@ -66,16 +66,18 @@ it.effect("missing receipt permits only the retained identity to replay", () =>
     assert.deepEqual(yield* reconcile(snapshot), { status: "replay" });
   }).pipe(Effect.provide(layer)),
 );
-it.effect(
-  "foreign or rejected exact command receipts preserve uncertainty instead of authorizing replacement",
-  () =>
+it.effect.each(["thread.create", "message.dispatch"] as const)(
+  "foreign or rejected exact %s receipts preserve uncertainty instead of authorizing replacement",
+  (commandType) =>
     Effect.gen(function* () {
       const receipts = yield* Receipts.CommandReceiptStoreV2;
       const reconcile = yield* Recovery.make;
       yield* receipts.insertIfAbsent({
-        commandId: CommandId.make("dispatch:initial-message"),
+        commandId: CommandId.make(
+          commandType === "message.dispatch" ? "dispatch:initial-message" : "dispatch",
+        ),
         threadId: ThreadId.make("foreign"),
-        commandType: "message.dispatch",
+        commandType,
         acceptedAt: DateTime.makeUnsafe(at),
         resultSequence: 1,
         status: "accepted",
@@ -84,9 +86,11 @@ it.effect(
       const foreign = yield* reconcile(snapshot).pipe(Effect.result);
       assert.equal(foreign._tag, "Failure");
       yield* receipts.upsert({
-        commandId: CommandId.make("dispatch:initial-message"),
+        commandId: CommandId.make(
+          commandType === "message.dispatch" ? "dispatch:initial-message" : "dispatch",
+        ),
         threadId: ThreadId.make("thread"),
-        commandType: "message.dispatch",
+        commandType,
         acceptedAt: DateTime.makeUnsafe(at),
         resultSequence: 1,
         status: "rejected",

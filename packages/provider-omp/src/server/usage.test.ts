@@ -147,27 +147,33 @@ it.effect(
         environment: { HOME: home, XDG_DATA_HOME: xdg },
       };
       if (ompUsageReader.kind !== "transcripts") throw new Error("Expected native transcripts");
-      expect(yield* ompUsageReader.directories(input)).toEqual([
+      expect(yield* ompUsageReader.directories(input, { awaitRefresh: true })).toEqual([
         { dir: ownedOmpSessionDirectory(host.paths.stateDir, instanceId) },
         { dir: xdg + "/omp/profiles/work/sessions" },
       ]);
       expect(
-        yield* ompUsageReader.directories({
-          ...input,
-          config: {
-            ...input.config,
-            launchArgs: "--profile=work --agent-dir=" + home + "/explicit",
+        yield* ompUsageReader.directories(
+          {
+            ...input,
+            config: {
+              ...input.config,
+              launchArgs: "--profile=work --agent-dir=" + home + "/explicit",
+            },
           },
-        }),
+          { awaitRefresh: true },
+        ),
       ).toEqual([
         { dir: ownedOmpSessionDirectory(host.paths.stateDir, instanceId) },
         { dir: home + "/explicit/sessions" },
       ]);
       expect(
-        yield* ompUsageReader.directories({
-          ...input,
-          config: { ...input.config, launchArgs: "--session-dir=/unsupported" },
-        }),
+        yield* ompUsageReader.directories(
+          {
+            ...input,
+            config: { ...input.config, launchArgs: "--session-dir=/unsupported" },
+          },
+          { awaitRefresh: true },
+        ),
       ).toEqual([{ dir: ownedOmpSessionDirectory(host.paths.stateDir, instanceId) }]);
       const format = ompUsageReader.format;
       expect(format.sharedSessionsAcrossFiles).toBe(true);

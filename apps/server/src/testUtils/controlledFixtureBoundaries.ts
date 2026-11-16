@@ -65,6 +65,7 @@ import * as ProjectEnrichment from "../project/ProjectEnrichmentService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import { AssistantMemoryGateway } from "../assistants/AssistantMemoryGateway.ts";
 import * as SecretResolver from "@t3tools/secret-provider-core/server/SecretResolver";
+import * as SecretCheck from "../secrets/SecretCheck.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as NativeChildWorkQuery from "../orchestration-v2/NativeChildWorkQuery.ts";
 import * as PeerLinkRequests from "../peer/PeerLinkRequests.ts";
@@ -148,6 +149,7 @@ export const layerControlledFixtureBoundaries = Layer.mergeAll(
   Layer.mock(PeerLinkRequests.PeerLinkRequests)({}),
   Layer.mock(ScratchThreadPromotion.ScratchThreadPromotion)({}),
   Layer.mock(SecretResolver.SecretResolver)({}),
+  Layer.mock(SecretCheck.SecretCheck)({}),
   Layer.mock(SourceControlSignIn.SourceControlSignIn)({}),
   Layer.mock(TriageService.TriageService)({}),
 );

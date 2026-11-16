@@ -25,7 +25,7 @@ export function ThreadHeader(props: {
   readonly inspectorMode: ThreadInspectorMode | null;
   readonly onOpenFilesInspector: () => void;
 }) {
-  const goBack = useWorkspaceBackNavigation("threads");
+  const goBack = useWorkspaceBackNavigation();
   const navigation = useNavigation();
   const environmentId = EnvironmentId.make(String(props.gitControls.environmentId));
   const threadId = ThreadId.make(String(props.gitControls.threadId));

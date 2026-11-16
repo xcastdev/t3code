@@ -28,13 +28,13 @@ import { makeSqlPersistence } from "./ProjectTerminalStore.ts";
 
 class FakeProcess implements PtyProcess {
   readonly pid = 9100;
-  readonly writes: string[] = [];
+  readonly writes: Array<string | Buffer> = [];
   readonly resizes: number[][] = [];
   kills = 0;
   uncertain = false;
   private readonly data = new Set<(data: string) => void>();
   private readonly exits = new Set<(event: PtyExitEvent) => void>();
-  write(data: string) {
+  write(data: string | Buffer) {
     this.writes.push(data);
   }
   resize(cols: number, rows: number) {
@@ -107,18 +107,56 @@ it.effect("two attachments share one captured process; detaching does not stop i
     const first: ProjectTerminalAttachStreamEvent[] = [];
     const second: ProjectTerminalAttachStreamEvent[] = [];
     const seen = yield* Deferred.make<void>();
-    const detach = yield* manager.attachProjectStream(handle, (event) =>
-      Effect.sync(() => {
-        first.push(event);
-      }),
+    const detach = yield* manager.attachProjectStream(
+      handle,
+      (event) =>
+        Effect.sync(() => {
+          first.push(event);
+        }),
+      undefined,
+      "first",
     );
-    yield* manager.attachProjectStream(handle, (event) =>
-      Effect.gen(function* () {
-        second.push(event);
-        if (event.type === "output") yield* Deferred.succeed(seen, undefined);
-      }),
+    yield* manager.attachProjectStream(
+      handle,
+      (event) =>
+        Effect.gen(function* () {
+          second.push(event);
+          if (event.type === "output") yield* Deferred.succeed(seen, undefined);
+        }),
+      undefined,
+      "second",
+    );
+    yield* manager.writeProject(
+      { ...handle, data: "first reply", reply: true },
+      Effect.void,
+      undefined,
+      "first",
+    );
+    yield* manager.writeProject(
+      { ...handle, data: "duplicate reply", reply: true },
+      Effect.void,
+      undefined,
+      "second",
     );
     detach();
+    yield* manager.writeProject(
+      { ...handle, data: "detached reply", reply: true },
+      Effect.void,
+      undefined,
+      "first",
+    );
+    yield* manager.writeProject(
+      { ...handle, data: "second reply", reply: true },
+      Effect.void,
+      undefined,
+      "second",
+    );
+    yield* manager.writeProject(
+      { ...handle, data: "\u0080\u00ff", binary: true },
+      Effect.void,
+      undefined,
+      "second",
+    );
     process.output("hello shared world\n");
     yield* Deferred.await(seen);
     assert.equal(spawns.length, 1);
@@ -136,7 +174,12 @@ it.effect("two attachments share one captured process; detaching does not stop i
       rows: 24,
       expectedGeneration: terminal.generation,
     });
-    assert.deepStrictEqual(process.writes, ["input"]);
+    assert.deepStrictEqual(process.writes, [
+      "first reply",
+      "second reply",
+      Buffer.from([0x80, 0xff]),
+      "input",
+    ]);
     assert.deepStrictEqual(process.resizes, [[80, 24]]);
     assert.equal(
       (yield* Effect.result(
@@ -144,7 +187,7 @@ it.effect("two attachments share one captured process; detaching does not stop i
       ))._tag,
       "Failure",
     );
-    assert.equal(process.writes.length, 1);
+    assert.equal(process.writes.length, 4);
   }).pipe(Effect.scoped, Effect.provide(layer)),
 );
 

@@ -16,7 +16,7 @@ import {
   TerminalToolError,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
-import { Tool, Toolkit } from "effect/ai";
+import { McpSchema, Tool, Toolkit } from "effect/ai";
 
 import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -114,7 +114,8 @@ const TerminalSpawnTool = Tool.make("terminal_spawn", {
   .annotate(Tool.Readonly, false)
   .annotate(Tool.Destructive, true)
   .annotate(Tool.Idempotent, false)
-  .annotate(Tool.OpenWorld, true);
+  .annotate(Tool.OpenWorld, true)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
 const TerminalListTool = Tool.make("terminal_list", {
   description:
@@ -129,7 +130,8 @@ const TerminalListTool = Tool.make("terminal_list", {
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, false);
+  .annotate(Tool.OpenWorld, false)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
 const TerminalReadTool = Tool.make("terminal_read", {
   description:
@@ -144,7 +146,8 @@ const TerminalReadTool = Tool.make("terminal_read", {
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, false);
+  .annotate(Tool.OpenWorld, false)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
 const TerminalWriteTool = Tool.make("terminal_write", {
   description:
@@ -159,7 +162,8 @@ const TerminalWriteTool = Tool.make("terminal_write", {
   .annotate(Tool.Readonly, false)
   .annotate(Tool.Destructive, true)
   .annotate(Tool.Idempotent, false)
-  .annotate(Tool.OpenWorld, true);
+  .annotate(Tool.OpenWorld, true)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
 const TerminalResizeTool = Tool.make("terminal_resize", {
   description:
@@ -174,7 +178,8 @@ const TerminalResizeTool = Tool.make("terminal_resize", {
   .annotate(Tool.Readonly, false)
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, true);
+  .annotate(Tool.OpenWorld, true)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
 const TerminalKillTool = Tool.make("terminal_kill", {
   description:
@@ -189,7 +194,8 @@ const TerminalKillTool = Tool.make("terminal_kill", {
   .annotate(Tool.Readonly, false)
   .annotate(Tool.Destructive, true)
   .annotate(Tool.Idempotent, false)
-  .annotate(Tool.OpenWorld, true);
+  .annotate(Tool.OpenWorld, true)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
 const TerminalSubscribeCompletionTool = Tool.make("terminal_subscribe_completion", {
   description:
@@ -204,7 +210,8 @@ const TerminalSubscribeCompletionTool = Tool.make("terminal_subscribe_completion
   .annotate(Tool.Readonly, false)
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, false);
+  .annotate(Tool.OpenWorld, false)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
 const TerminalUnsubscribeCompletionTool = Tool.make("terminal_unsubscribe_completion", {
   description: "Stop this thread's one-shot completion subscription for a shared terminal.",
@@ -218,7 +225,8 @@ const TerminalUnsubscribeCompletionTool = Tool.make("terminal_unsubscribe_comple
   .annotate(Tool.Readonly, false)
   .annotate(Tool.Destructive, false)
   .annotate(Tool.Idempotent, true)
-  .annotate(Tool.OpenWorld, false);
+  .annotate(Tool.OpenWorld, false)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
 export const TerminalToolkit = Toolkit.make(
   TerminalSpawnTool,

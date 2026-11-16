@@ -3,7 +3,9 @@ import {
   CheckpointScopeId,
   CommandId,
   MessageId,
+  ModelSelection,
   NodeId,
+  NonNegativeInt,
   ProviderSessionId,
   ProjectId,
   RunAttemptId,
@@ -24,6 +26,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as Result from "effect/Result";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -53,12 +56,23 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("provider-runtime.continue"),
     sourceRunId: RunId,
+    processLossCount: Schema.optional(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   }),
   Schema.Struct({
     type: Schema.Literal("provider-session.detach"),
     providerSessionId: ProviderSessionId,
     detail: Schema.optional(Schema.String),
     revokeMcpCredential: Schema.optional(Schema.Boolean),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("provider-session.apply-model-selection"),
+    providerSessionId: ProviderSessionId,
+    providerThreadId: ProviderThreadId,
+    modelSelection: ModelSelection,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("provider-session.apply-thread-title"),
+    title: Schema.String,
   }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.start"),
@@ -77,6 +91,8 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
     messageId: MessageId,
+    modelSelection: Schema.optional(ModelSelection),
+    steerFollowUpAfterRunOrdinal: Schema.optional(NonNegativeInt),
   }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.restart"),
@@ -127,6 +143,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("attachment.cleanup"),
     attachmentIds: Schema.Array(Schema.String),
+    skipReferenced: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({
     type: Schema.Literal("thread-title.generate"),
@@ -157,6 +174,8 @@ export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
 ] as const satisfies ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
 
 export const PROCESS_BOUND_EFFECT_TYPES = [
+  "provider-session.apply-model-selection",
+  "provider-session.apply-thread-title",
   "provider-turn.start",
   "provider-turn.interrupt",
   "provider-turn.steer",
@@ -241,6 +260,7 @@ export interface EffectOutboxV2Shape {
   }) => Effect.Effect<ReadonlyArray<string>, EffectOutboxError>;
   readonly nextClaimableAtFor: (
     consumer: EffectConsumer,
+    input?: { readonly maxRunningTitleGenerations?: number },
   ) => Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
   readonly signalCancellations: (effectIds: ReadonlyArray<string>) => Effect.Effect<void>;
   readonly awaitCancellation: (effectId: string) => Effect.Effect<void>;
@@ -255,8 +275,11 @@ export interface EffectOutboxV2Shape {
     readonly workerId: string;
     readonly excludeRestartContinuations?: boolean;
     readonly consumer?: EffectConsumer;
+    readonly maxRunningTitleGenerations?: number;
   }) => Effect.Effect<Option.Option<OrchestrationEffectV2>, EffectOutboxError>;
-  readonly nextClaimableAt: Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
+  readonly nextClaimableAt: (input?: {
+    readonly maxRunningTitleGenerations?: number;
+  }) => Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
   readonly succeed: (input: {
     readonly effectId: string;
     readonly workerId: string;
@@ -358,6 +381,7 @@ export const layerWithOptions = ({
         availableBefore?: string,
         excludeRestartContinuations = false,
         consumer: EffectConsumer = "normal",
+        maxRunningTitleGenerations?: number,
       ) =>
         sql`
         ${
@@ -402,6 +426,19 @@ export const layerWithOptions = ({
               )
             )
         )
+        AND ${
+          maxRunningTitleGenerations === undefined
+            ? sql`1 = 1`
+            : sql`(
+                candidate.effect_type != 'thread-title.generate'
+                OR (
+                  SELECT COUNT(*)
+                  FROM orchestration_v2_effect_outbox AS running_title
+                  WHERE running_title.status = 'running'
+                    AND running_title.effect_type = 'thread-title.generate'
+                ) < ${maxRunningTitleGenerations}
+              )`
+        }
       `;
 
       const cancellationSignal = (effectId: string) => {
@@ -591,7 +628,12 @@ export const layerWithOptions = ({
         ),
         // The worker polls for the next effect even when there is no work to claim.
         claimNext: Effect.fnUntraced(
-          function* ({ workerId, excludeRestartContinuations = false, consumer = "normal" }) {
+          function* ({
+            workerId,
+            excludeRestartContinuations = false,
+            consumer = "normal",
+            maxRunningTitleGenerations,
+          }) {
             const nowIso = DateTime.formatIso(yield* DateTime.now);
             // Idle claims return empty; tracing their full SQL on every poll overwhelms useful traces.
             const claimStatement = sql<EffectRow>`
@@ -605,29 +647,56 @@ export const layerWithOptions = ({
             WHERE effect_id = (
               SELECT candidate.effect_id
               FROM orchestration_v2_effect_outbox AS candidate
-              WHERE ${claimableCandidatePredicate(nowIso, excludeRestartContinuations, consumer)}
+              WHERE ${claimableCandidatePredicate(nowIso, excludeRestartContinuations, consumer, maxRunningTitleGenerations)}
                 AND ${excludeRestartContinuations ? sql`candidate.effect_type != 'provider-runtime.continue'` : sql`1 = 1`}
               ORDER BY candidate.available_at ASC, candidate.created_at ASC, candidate.effect_id ASC
               LIMIT 1
             )
             RETURNING *
           `;
-            const rows = yield* claimStatement.pipe(Effect.withTracerEnabled(false));
-            const row = rows[0];
-            if (row === undefined) return Option.none();
-            cancellationSignals.set(row.effect_id, Deferred.makeUnsafe<void>());
-            return Option.some(yield* rowToEffect(row));
+            while (true) {
+              const rows = yield* claimStatement.pipe(Effect.withTracerEnabled(false));
+              const row = rows[0];
+              if (row === undefined) return Option.none();
+              const decoded = yield* Effect.result(rowToEffect(row));
+              if (Result.isSuccess(decoded)) {
+                cancellationSignals.set(row.effect_id, Deferred.makeUnsafe<void>());
+                return Option.some(decoded.success);
+              }
+              // Synthetic owner controls survive a build without their feature decoder.
+              if (row.thread_id.startsWith("workflow-owner-control:")) {
+                return yield* decoded.failure;
+              }
+              // Left running, an unreadable row would block every later effect on its thread.
+              yield* Effect.logWarning("Failing an orchestration effect this build cannot decode", {
+                effectId: row.effect_id,
+                effectType: row.effect_type,
+                cause: decoded.failure,
+              });
+              yield* service.fail({
+                effectId: row.effect_id,
+                workerId,
+                error: `This server build cannot decode the ${row.effect_type} effect.`,
+              });
+            }
           },
-          Effect.mapError((cause) => new EffectOutboxError({ operation: "claim", cause })),
+          Effect.mapError((cause) =>
+            isEffectOutboxError(cause)
+              ? cause
+              : new EffectOutboxError({ operation: "claim", cause }),
+          ),
         ),
-        nextClaimableAt: Effect.suspend(() => service.nextClaimableAtFor("normal")),
+        nextClaimableAt: (input = {}) => service.nextClaimableAtFor("normal", input),
         // The daemon probes this query whenever it has no claimable work.
         nextClaimableAtFor: Effect.fnUntraced(
-          function* (consumer: EffectConsumer) {
+          function* (
+            consumer: EffectConsumer,
+            { maxRunningTitleGenerations }: { readonly maxRunningTitleGenerations?: number } = {},
+          ) {
             const rows = yield* sql<{ readonly available_at: string | null }>`
           SELECT MIN(candidate.available_at) AS available_at
           FROM orchestration_v2_effect_outbox AS candidate
-          WHERE ${claimableCandidatePredicate(undefined, false, consumer)}
+          WHERE ${claimableCandidatePredicate(undefined, false, consumer, maxRunningTitleGenerations)}
         `.pipe(NodeSqliteClient.readOnly, Effect.withTracerEnabled(false));
             const availableAt = rows[0]?.available_at;
             if (availableAt === undefined || availableAt === null) return Option.none();
@@ -752,6 +821,16 @@ export const layerWithOptions = ({
             FROM orchestration_v2_effect_outbox
             WHERE status IN ('succeeded', 'cancelled')
               AND completed_at < ${cutoff}
+              AND NOT (
+                effect_type = 'provider-runtime.continue'
+                AND EXISTS (
+                  SELECT 1 FROM orchestration_v2_projection_runs AS recovery_run
+                  WHERE recovery_run.thread_id = orchestration_v2_effect_outbox.thread_id
+                    AND recovery_run.status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+                    AND json_extract(recovery_run.payload_json, '$.restartContinuationOfRunId') =
+                      json_extract(orchestration_v2_effect_outbox.payload_json, '$.sourceRunId')
+                )
+              )
             LIMIT ${PRUNE_BATCH_SIZE}
           )
           RETURNING effect_id

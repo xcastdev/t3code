@@ -5,6 +5,8 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import * as Predicate from "effect/Predicate";
+import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import { FixtureNativeDenied } from "./upgradeFixtureNative.ts";
 import { upgradeFixtureRoots } from "./upgradeFixtureRoots.ts";
 import * as WorkspaceFileSystem from "../workspace/WorkspaceFileSystem.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
@@ -205,6 +207,10 @@ export function layerFixtureWorkspace(
     Layer.provide(
       Layer.mergeAll(
         WorkspacePaths.layer,
+        Layer.mock(ChildProcessSpawner.ChildProcessSpawner)({
+          spawn: () =>
+            Effect.die(new FixtureNativeDenied({ operation: "workspace.process.spawn" })),
+        }),
         Layer.mock(WorkspaceEntries.WorkspaceEntries)({ refresh: () => Effect.void }),
         known,
       ),

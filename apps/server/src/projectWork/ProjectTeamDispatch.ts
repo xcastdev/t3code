@@ -665,14 +665,13 @@ const make = Effect.gen(function* () {
             }>`SELECT dispatch_id,request_json,result_json FROM t3_workflow_v2_team_dispatches WHERE binding_id=${binding.recordId} AND generation=${binding.generation}`;
             if (dispatchRows.length !== 1) return yield* rejected();
             const dispatchRow = dispatchRows[0]!;
-            const accepted = yield* receipts.getByCommandId(
-              CommandId.make(`${dispatchRow.dispatch_id}:initial-message`),
-            );
+            const accepted = yield* Recovery.readProjectTeamAssignmentReceipt(
+              dispatchRow.dispatch_id,
+              binding.threadId,
+            ).pipe(Effect.provideService(Receipts.CommandReceiptStoreV2, receipts));
             if (
               Option.isNone(accepted) ||
-              accepted.value.status !== "accepted" ||
-              accepted.value.threadId !== binding.threadId ||
-              accepted.value.commandType !== "message.dispatch"
+              run.userMessageId !== `${dispatchRow.dispatch_id}:message`
             )
               return yield* rejected();
             const join = {

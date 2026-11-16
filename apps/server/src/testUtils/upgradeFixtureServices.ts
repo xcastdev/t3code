@@ -19,6 +19,8 @@ import * as ProviderTurnControlService from "../orchestration-v2/ProviderTurnCon
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
+import * as Option from "effect/Option";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
 import * as ProviderRuntimeRecoveryService from "../orchestration-v2/ProviderRuntimeRecoveryService.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
@@ -108,9 +110,38 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
         ProviderContinuationRequests.layer,
         Layer.mock(CheckpointService.CheckpointServiceV2)({}),
         Layer.mock(ProviderSwitchService.ProviderSwitchServiceV2)({}),
-        Layer.mock(RunExecutionService.RunExecutionServiceV2)({}),
+        Layer.mock(RunExecutionService.RunExecutionServiceV2)({
+          forkBaseline: Effect.fn("RunExecutionService.RunExecutionServiceV2.forkBaseline")(() =>
+            Effect.succeed(refuse("checkpoint.baseline")),
+          ),
+        }),
         Layer.mock(GitWorkflowService.GitWorkflowService)({}),
-        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.unwrap(
+          Effect.gen(function* () {
+            const projects = yield* ProjectStore.ProjectStoreV2;
+            return Layer.mock(ProjectService.ProjectService)({
+              getById: Effect.fn("ProjectService.ProjectService.getById")((projectId, options) =>
+                projects.get(projectId, options).pipe(
+                  Effect.map(
+                    Option.map((project) => ({
+                      ...project,
+                      id: project.projectId,
+                      repositoryIdentity: null,
+                    })),
+                  ),
+                  Effect.mapError(
+                    (cause) =>
+                      new ProjectService.ProjectOperationError({
+                        operation: "read-project",
+                        projectId,
+                        cause,
+                      }),
+                  ),
+                ),
+              ),
+            });
+          }),
+        ),
         Layer.mock(ProviderAuthService.ProviderAuthService)({
           tryHandlePromptCommand: () => Effect.succeed(false),
         }),
@@ -150,10 +181,14 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
               EffectWorker.OrchestrationEffectWorkerV2.of({
                 awaitWork: Effect.never,
                 awaitControlWork: Effect.never,
-                runOnce: Effect.succeed(false),
+                runOnce: Effect.fn("EffectWorker.OrchestrationEffectWorkerV2.runOnce")(() =>
+                  Effect.succeed(false),
+                ),
                 runControlOnce: Effect.succeed(false),
                 runRecoveryOnce: Effect.succeed(false),
-                nextClaimableAt: Effect.succeedNone,
+                nextClaimableAt: Effect.fn(
+                  "EffectWorker.OrchestrationEffectWorkerV2.nextClaimableAt",
+                )(() => Effect.succeedNone),
                 nextControlClaimableAt: Effect.succeedNone,
                 drain: Effect.fn("EffectWorker.OrchestrationEffectWorkerV2.drain")(() =>
                   Effect.succeed(0),

@@ -98,13 +98,13 @@ describe("MCP app asset responses", () => {
           renderIntent: "plugin-panel",
         }),
       );
-      const meta = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">`;
+      const meta = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; connect-src 'none'; frame-src blob:; object-src 'none'; base-uri 'none'; form-action 'none'">`;
       const expected = injectMcpAppCookieBootstrap(
         injectMcpAppThemeBootstrap(`<!DOCTYPE html>${meta}${html.slice("<!DOCTYPE html>".length)}`),
       );
       expect(response.status).toBe(200);
       expect(response.headers.get("content-security-policy")).toBe(
-        "sandbox allow-scripts allow-forms allow-popups allow-downloads",
+        "sandbox allow-scripts allow-forms allow-popups allow-downloads; frame-src 'none'",
       );
       const body = yield* Effect.promise(() => response.text());
       expect(body).toBe(expected);
@@ -428,6 +428,8 @@ it.layer(
         expect(response.status).toBe(200);
         expect(yield* response.text).toBe(nextHtml);
         expect(response.headers["cache-control"]).toBe("no-cache");
+        expect(response.headers["content-security-policy"]).toBe("frame-ancestors 'none'");
+        expect(response.headers["x-frame-options"]).toBe("DENY");
         expect(response.headers["etag"]).toBeUndefined();
         expect(response.headers["last-modified"]).toBeUndefined();
       }

@@ -42,6 +42,6 @@ const ChecklistTool = Tool.make("t3_checklist", {
   .annotate(Tool.Destructive, false)
   .annotate(Tool.OpenWorld, false)
   // Harnesses with their own checklist tool never see this one.
-  .annotate(McpSchema.EnabledWhen, McpInvocationContext.visibleWithCapability("checklist"));
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.visibleWithChecklistCapability);
 
 export const ChecklistToolkit = Toolkit.make(ChecklistTool);

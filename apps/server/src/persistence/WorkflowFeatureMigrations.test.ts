@@ -325,7 +325,7 @@ it.effect(
         yield* sql`INSERT INTO orchestration_v2_effect_outbox (
         effect_id, command_id, thread_id, effect_type, payload_json, status,
         attempt_count, available_at, created_at, updated_at, lease_owner, lease_expires_at
-      ) VALUES (${id}, 'synthetic-command', ${id}, 'future-feature.control',
+      ) VALUES (${id}, 'synthetic-command', ${`workflow-owner-control:${id}`}, 'future-feature.control',
         '{"type":"future-feature.control"}', ${status}, 0, ${available},
         '1970-01-01T00:00:00.000Z', '1970-01-01T00:00:00.000Z',
         ${status === "running" ? "former-feature-worker" : null},

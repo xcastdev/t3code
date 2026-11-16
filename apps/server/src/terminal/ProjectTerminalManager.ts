@@ -52,6 +52,7 @@ interface Session {
   worker?: Fiber.Fiber<void, never>;
   process: PtyAdapter.PtyProcess | null;
   unsubscribe: Array<() => void>;
+  viewers: Map<string, { streams: number; answersQueries: boolean }>;
   listeners: Set<(event: ProjectTerminalAttachStreamEvent) => Effect.Effect<void>>;
 }
 const exitKey = (terminal: ProjectTerminalSummary) =>
@@ -171,6 +172,7 @@ export const makeProjectTerminalManager = Effect.fn("ProjectTerminalManager.make
           process: null,
           unsubscribe: [],
           listeners: new Set(),
+          viewers: new Map(),
         };
         sessions.set(key(record.terminal), session);
         if (active) yield* persist(session).pipe(Effect.orDie);
@@ -278,6 +280,7 @@ export const makeProjectTerminalManager = Effect.fn("ProjectTerminalManager.make
               process: null,
               unsubscribe: [],
               listeners: new Set(),
+              viewers: new Map(),
             };
             // Commit ownership before spawning; creator deletion cannot remove this record.
             yield* persist(session);
@@ -469,13 +472,25 @@ export const makeProjectTerminalManager = Effect.fn("ProjectTerminalManager.make
       input: ProjectTerminalHandle,
       listener: (event: ProjectTerminalAttachStreamEvent) => Effect.Effect<void>,
       registerCleanup?: (stop: () => void) => void,
+      viewerId?: string,
     ) =>
       locks.withLock(
         input.projectId,
         Effect.gen(function* () {
           const session = yield* requireSession(input, "attach");
+          if (viewerId !== undefined) {
+            const viewer = session.viewers.get(viewerId);
+            if (viewer) viewer.streams += 1;
+            else session.viewers.set(viewerId, { streams: 1, answersQueries: false });
+          }
+          let stopped = false;
           const stop = () => {
+            if (stopped) return;
+            stopped = true;
             session.listeners.delete(listener);
+            if (viewerId === undefined) return;
+            const viewer = session.viewers.get(viewerId);
+            if (viewer && --viewer.streams === 0) session.viewers.delete(viewerId);
           };
           session.listeners.add(listener);
           registerCleanup?.(stop);
@@ -515,6 +530,7 @@ export const makeProjectTerminalManager = Effect.fn("ProjectTerminalManager.make
       input: ProjectTerminalWriteInput,
       guard: Effect.Effect<void, TerminalToolError> = Effect.void,
       ownership?: ProjectTerminalOwnership,
+      viewerId?: string,
     ) =>
       locks.withLock(
         input.projectId,
@@ -530,8 +546,16 @@ export const makeProjectTerminalManager = Effect.fn("ProjectTerminalManager.make
             return yield* fail("write", "stale-generation", input);
           if (!process) return yield* fail("write", "not-running", input);
           yield* guard;
+          if (input.reply) {
+            const viewer = viewerId === undefined ? undefined : session.viewers.get(viewerId);
+            if (viewerId !== undefined && !viewer) return;
+            if (!viewer?.answersQueries) {
+              if ([...session.viewers.values()].some((other) => other.answersQueries)) return;
+              if (viewer) viewer.answersQueries = true;
+            }
+          }
           yield* Effect.try({
-            try: () => process.write(input.data),
+            try: () => process.write(PtyAdapter.ptyInput(input.data, input.binary)),
             catch: () => fail("write", "write-failed", input),
           });
         }),

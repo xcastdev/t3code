@@ -21,7 +21,7 @@ import { configuration, environmentId, input, repository } from "./AssistantTest
 const storage = Layer.effectDiscard(
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
-    yield* sql`CREATE TABLE auth_sessions(session_id TEXT PRIMARY KEY,subject TEXT,scopes TEXT,method TEXT,client_label TEXT,client_ip_address TEXT,client_user_agent TEXT,client_device_type TEXT,client_os TEXT,client_browser TEXT,issued_at TEXT,expires_at TEXT,last_connected_at TEXT,revoked_at TEXT)`;
+    yield* sql`CREATE TABLE auth_sessions(session_id TEXT PRIMARY KEY,subject TEXT,scopes TEXT,method TEXT,client_label TEXT,client_ip_address TEXT,client_user_agent TEXT,client_device_type TEXT,client_os TEXT,client_browser TEXT,issued_at TEXT,expires_at TEXT,last_connected_at TEXT,revoked_at TEXT,proof_key_thumbprint TEXT)`;
     yield* sql`CREATE TABLE orchestration_v2_projection_runs(run_id TEXT PRIMARY KEY,thread_id TEXT,status TEXT,requested_at TEXT,completed_at TEXT,payload_json TEXT)`;
     yield* sql`CREATE TABLE orchestration_v2_projection_threads(thread_id TEXT PRIMARY KEY,project_id TEXT)`;
     yield* createEventLog;

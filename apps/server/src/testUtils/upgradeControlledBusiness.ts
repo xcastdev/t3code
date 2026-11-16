@@ -7,6 +7,7 @@ import * as McpSessionRegistryTestkit from "../mcp/McpSessionRegistry.testkit.ts
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as Continuations from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as ProviderAuth from "../provider/ProviderAuthService.ts";
+import * as ProviderInstallationGate from "../provider/ProviderInstallationGate.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as SourceControl from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
@@ -83,6 +84,7 @@ import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
 export function layerControlledBusiness(snapshot: UpgradeSnapshot) {
   const boundaries = Layer.mergeAll(
     PreviewAgentActivity.layer,
+    ProviderInstallationGate.layer,
     Layer.succeed(HostProcess.Environment, {}),
     Layer.mock(SourceControl.SourceControlProviderRegistry)({
       discover: Effect.succeed([]),

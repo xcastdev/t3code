@@ -90,6 +90,8 @@ it.effect(
         write: () => Effect.die("unused"),
         writeWithEffects: () => Effect.die("unused"),
         writeIfRunCurrent: () => Effect.die("unused"),
+        writeIfTurnItemUnchanged: () => Effect.die("unused"),
+        writeIfSubagentUnchanged: () => Effect.die("unused"),
         writeIfProviderThreadOwner: () => Effect.die("unused"),
         writeIfProviderThreadUnchanged: () => Effect.die("unused"),
         commitCommand: () => Effect.die("unused"),

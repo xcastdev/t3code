@@ -57,6 +57,7 @@ interface RightPanelActionsInput {
   readonly rightPanelMaximized: boolean;
   readonly supportsPullRequests: boolean;
   readonly pullRequestsSurfaceAvailable: boolean;
+  readonly sourceControlSurfaceAvailable: boolean;
   readonly gitCwd: string | null;
   readonly activeProjectCwd: string | null;
   readonly onDiffPanelOpen: (() => void) | undefined;
@@ -148,9 +149,7 @@ export function useRightPanelActions(input: RightPanelActionsInput) {
     useRightPanelStore.getState().open(activeThreadRef, "files");
   };
   const addFilesSurfaceStable = useStableCallback(addFilesSurface);
-  // Nested repositories can live under a workspace that is not itself a repository.
-  const sourceControlSurfaceAvailable =
-    isServerThread && activeProject !== null && input.activeWorkspaceRoot !== undefined;
+  const sourceControlSurfaceAvailable = input.sourceControlSurfaceAvailable;
   const addSourceControlSurface = () => {
     if (!activeThreadRef || !sourceControlSurfaceAvailable) return;
     useRightPanelStore.getState().open(activeThreadRef, "source-control");
@@ -217,6 +216,12 @@ export function useRightPanelActions(input: RightPanelActionsInput) {
     if (surface.kind === "terminal") {
       focusTerminal(activeThreadRef, surface.activeTerminalId);
     }
+    if (surface.kind === "side-chat") {
+      requestWorkspaceFocus({
+        area: "panel",
+        selector: `[data-side-chat-pane="${CSS.escape(surface.threadId)}"] [data-workspace-area="composer"] [contenteditable="true"]`,
+      });
+    }
     if (surface.kind === "diff" && !diffOpen) {
       onDiffPanelOpen?.();
     }
@@ -279,24 +284,15 @@ export function useRightPanelActions(input: RightPanelActionsInput) {
       relativePath,
       resolvePathLinkTarget(relativePath, gitCwd ?? activeProjectCwd ?? ""),
     );
-    void navigator.clipboard.writeText(clipboardPath).then(
-      () => {
-        toastManager.add({
-          type: "success",
-          title: "Path copied",
-          description: clipboardPath,
-        });
-      },
-      (error) => {
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: "Failed to copy path",
-            description: error instanceof Error ? error.message : "An error occurred.",
-          }),
-        );
-      },
-    );
+    void navigator.clipboard.writeText(clipboardPath).then(undefined, (error) => {
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Failed to copy path",
+          description: error instanceof Error ? error.message : "An error occurred.",
+        }),
+      );
+    });
   };
   const copyRightPanelFilePathStable = useStableCallback(copyRightPanelFilePath);
   const addPullRequestSurface = () => {

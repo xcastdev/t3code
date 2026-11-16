@@ -423,7 +423,14 @@ export const seedUpgradePreservation = Effect.fn("upgradeFixture.seedPreservatio
     },
   });
   yield* withLaterColumns(
-    [["orchestration_v2_projection_messages", "search_text", "TEXT"]],
+    [
+      ["orchestration_v2_projection_messages", "search_text", "TEXT"],
+      [
+        "orchestration_v2_projection_turn_items",
+        "inline_work_output",
+        "INTEGER NOT NULL DEFAULT 0",
+      ],
+    ],
     sink.commitCommand({
       commandId: preservationIds.command,
       threadId: preservationIds.thread,
@@ -486,22 +493,25 @@ export const seedUpgradePreservation = Effect.fn("upgradeFixture.seedPreservatio
     resumeCursor: { threadId: "native-conversation", lastNativeTurnId: "native-turn" },
     runtimePayload: { nativeThreadId: "native-conversation", cwd: workspaceRoot },
   });
-  yield* (yield* AuthSessions.AuthSessionRepository).create({
-    sessionId: preservationIds.auth,
-    subject: "fixture-client",
-    scopes: ["orchestration:read", "orchestration:operate"],
-    method: "browser-session-cookie",
-    issuedAt: at,
-    expiresAt: DateTime.makeUnsafe("2099-01-01T00:00:00.000Z"),
-    client: {
-      label: "Fixture remote client",
-      ipAddress: "127.0.0.1",
-      userAgent: "fixture",
-      deviceType: "desktop",
-      os: "fixture-os",
-      browser: null,
-    },
-  });
+  yield* withLaterColumns(
+    [["auth_sessions", "proof_key_thumbprint", "TEXT"]],
+    (yield* AuthSessions.AuthSessionRepository).create({
+      sessionId: preservationIds.auth,
+      subject: "fixture-client",
+      scopes: ["orchestration:read", "orchestration:operate"],
+      method: "browser-session-cookie",
+      issuedAt: at,
+      expiresAt: DateTime.makeUnsafe("2099-01-01T00:00:00.000Z"),
+      client: {
+        label: "Fixture remote client",
+        ipAddress: "127.0.0.1",
+        userAgent: "fixture",
+        deviceType: "desktop",
+        os: "fixture-os",
+        browser: null,
+      },
+    }),
+  );
   const schedule = yield* decodeScheduledTask({
     id: "preservation-schedule",
     title: "Saved review",

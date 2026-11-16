@@ -12,6 +12,7 @@ import type { MemoryExtractionInput } from "@t3tools/provider-core/server/textGe
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as ProviderInstallationGate from "../provider/ProviderInstallationGate.ts";
 import * as Registry from "../provider/ProviderInstanceRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as Hosts from "../sourceControl/SourceControlProviderRegistry.ts";
@@ -62,6 +63,7 @@ const service = (instances: readonly ProviderInstance[]) =>
             Effect.succeed(instances.find((instance) => instance.instanceId === id)),
         }),
         Layer.mock(Hosts.SourceControlProviderRegistry)({ resolveLink: () => undefined }),
+        ProviderInstallationGate.layer,
         ServerSettings.layerTest(),
         NodeServices.layer,
         NodeCrypto.layer,

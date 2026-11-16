@@ -44,7 +44,7 @@ it.effect(
       ]);
       yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'running', lease_owner = 'copied', lease_expires_at = '2999-01-01T00:00:00.000Z' WHERE effect_id = 'copied-running'`;
       const before = yield* sql`SELECT * FROM orchestration_v2_effect_outbox ORDER BY effect_id`;
-      assert.isTrue(Option.isNone(yield* outbox.nextClaimableAt));
+      assert.isTrue(Option.isNone(yield* outbox.nextClaimableAt()));
       assert.isTrue(Option.isNone(yield* outbox.nextClaimableAtFor("owner-deadline")));
       assert.isTrue(Option.isNone(yield* outbox.claimNext({ workerId: "fixture" })));
       yield* outbox.enqueue([
@@ -64,11 +64,11 @@ it.effect(
         },
       ]);
       assert.isTrue(Option.isSome(yield* outbox.nextClaimableAtFor("owner-deadline")));
-      assert.isTrue(Option.isSome(yield* outbox.nextClaimableAt));
+      assert.isTrue(Option.isSome(yield* outbox.nextClaimableAt()));
       const claimed = Option.getOrThrow(yield* outbox.claimNext({ workerId: "fixture" }));
       assert.equal(claimed.id, "fresh-fixture");
       assert.isTrue(yield* outbox.succeed({ effectId: claimed.id, workerId: "fixture" }));
-      assert.isTrue(Option.isNone(yield* outbox.nextClaimableAt));
+      assert.isTrue(Option.isNone(yield* outbox.nextClaimableAt()));
       const claimedControl = Option.getOrThrow(
         yield* outbox.claimNext({
           workerId: "fixture-control",

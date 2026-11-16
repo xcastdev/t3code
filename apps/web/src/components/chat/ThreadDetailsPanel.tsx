@@ -9,13 +9,18 @@ import type {
   UsageLimitSourceSnapshots,
 } from "@t3tools/contracts";
 
-import type { DraftId } from "../../composerDraftStore";
+import { scopeProjectRef } from "@t3tools/client-runtime/environment";
+import { isScratchProject } from "@t3tools/client-runtime/state/projects";
+
+import type { ComposerThreadTarget, DraftId } from "../../composerDraftStore";
 import { type EnvMode } from "../BranchToolbar.logic";
 import { BranchToolbar } from "../BranchToolbar";
 import BaseGitActionsControl from "../GitActionsControl";
 import { GitBranchIcon, SlidersHorizontalIcon } from "lucide-react";
 import { lazy, memo, Suspense, useState, type ComponentProps, type MouseEvent } from "react";
 import { useClientSettings } from "../../hooks/useSettings";
+import { useProject, useServerConfigs } from "../../state/entities";
+import { ThreadDetailsThreadPrRows } from "./ThreadDetailsPrRows";
 import { cn } from "../../lib/utils";
 import { Menu, MenuPopup } from "../ui/menu";
 import {
@@ -62,6 +67,7 @@ export interface ThreadDetailsPanelProps extends Pick<
   worktreePath: string | null;
   isServerThread: boolean;
   draftId?: DraftId;
+  composerDraftTarget: ComposerThreadTarget;
   activeProjectName: string | undefined;
   gitCwd: string | null;
   workspaceMutationId: string | null;
@@ -94,6 +100,15 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
   const visible = useClientSettings(resolveThreadDetailsVisibility);
   const [menuPosition, setMenuPosition] = useState<{ x: number; y: number } | null>(null);
   const activeThreadRef = { environmentId: props.environmentId, threadId: props.threadId };
+  const project = useProject(scopeProjectRef(props.environmentId, props.projectId));
+  const serverConfig = useServerConfigs().get(props.environmentId);
+  // A No project thread's folder sits inside the shared scratch root, so it must never get git.
+  // Until the config and project load, a No project thread looks like any other folder.
+  const offersGit =
+    props.gitCwd !== null &&
+    serverConfig !== undefined &&
+    project !== null &&
+    !isScratchProject(project, serverConfig.scratchWorkspaceRoot);
   const branchToolbarProps = {
     showGitControls: props.isGitRepo,
     environmentId: props.environmentId,
@@ -214,8 +229,8 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                 </Suspense>
               </ThreadDetailsAutoCollapse>
 
-              {props.gitCwd &&
-              ((props.isGitRepo && visible.branch) ||
+              {(offersGit || visible.branch) &&
+              (visible.branch ||
                 (props.activeProjectName && (!props.isGitRepo || visible.changes))) ? (
                 <ThreadDetailsSection
                   headingId="thread-details-version-control-heading"
@@ -230,7 +245,7 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                   }
                 >
                   <div className="flex flex-col">
-                    {props.isGitRepo && visible.branch ? (
+                    {offersGit && props.isGitRepo && visible.branch ? (
                       <BranchToolbar
                         layout="panel"
                         panelSection="branch"
@@ -238,7 +253,17 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                         onOpenSourceControl={props.onOpenSourceControl}
                       />
                     ) : null}
-                    {props.activeProjectName && (!props.isGitRepo || visible.changes) ? (
+                    {!(offersGit && props.isGitRepo) && visible.branch ? (
+                      <ThreadDetailsThreadPrRows
+                        threadRef={activeThreadRef}
+                        project={project}
+                        composerTarget={props.composerDraftTarget}
+                      />
+                    ) : null}
+                    {offersGit &&
+                    props.gitCwd &&
+                    props.activeProjectName &&
+                    (!props.isGitRepo || visible.changes) ? (
                       <GitActionsControl
                         displayMode="panel"
                         showActions={false}

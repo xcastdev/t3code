@@ -23,6 +23,8 @@ const makeFakePi = (
   thinking?: { readonly error?: string; readonly beforeAck?: Effect.Effect<void> },
   turnEvents: ReadonlyArray<Record<string, unknown>> = [],
   models?: ReadonlyArray<Record<string, unknown>>,
+  version = "0.84.3",
+  thinkingError?: string,
 ) =>
   Effect.gen(function* () {
     const stdout = yield* Queue.unbounded<Uint8Array, Cause.Done>();
@@ -50,8 +52,8 @@ const makeFakePi = (
             yield* Deferred.succeed(thinkingRequested, undefined);
             if (thinking?.beforeAck) yield* thinking.beforeAck;
             yield* emit(
-              thinking?.error !== undefined
-                ? { ...response, success: false, error: thinking.error }
+              (thinking?.error ?? thinkingError) !== undefined
+                ? { ...response, success: false, error: thinking?.error ?? thinkingError }
                 : { ...response, success: true },
             );
           } else if (record["type"] === "get_available_models" && models !== undefined) {
@@ -63,24 +65,28 @@ const makeFakePi = (
           }
         }
       });
-    const spawner = ChildProcessSpawner.make(() =>
-      Effect.succeed(
+    const spawner = ChildProcessSpawner.make((command) => {
+      const versionProbe =
+        ChildProcess.isStandardCommand(command) && command.args.includes("--version");
+      return Effect.succeed(
         ChildProcessSpawner.makeHandle({
           // Outside the valid pid range, so PiRpc's process-group kill never lands.
           pid: ChildProcessSpawner.ProcessId(999_999_999),
-          exitCode: Effect.never,
+          exitCode: versionProbe ? Effect.succeed(ChildProcessSpawner.ExitCode(0)) : Effect.never,
           isRunning: Effect.succeed(true),
           kill: () => Effect.void,
           unref: Effect.succeed(Effect.void),
           stdin: Sink.forEach(onStdin),
-          stdout: Stream.fromQueue(stdout),
+          stdout: versionProbe
+            ? Stream.make(new TextEncoder().encode(version))
+            : Stream.fromQueue(stdout),
           stderr: Stream.empty,
           all: Stream.empty,
           getInputFd: () => Sink.drain,
           getOutputFd: () => Stream.empty,
         }),
-      ),
-    );
+      );
+    });
     return { spawner, received, thinkingRequested };
   });
 
@@ -373,5 +379,105 @@ it.effect("drops an earlier error once a later attempt succeeds", () =>
     ]).pipe(Effect.flip);
 
     assert.equal(error.detail, "Pi returned empty output.");
+  }),
+);
+
+it.effect.each([
+  { model: "demo/demo-model", thinking: "off", expected: "off", version: "0.84.3" },
+  { model: "demo/demo-model", thinking: "max", expected: "max", version: "1.4.0" },
+  { model: "demo/demo-model", thinking: "invalid", expected: undefined, version: "0.84.3" },
+  { model: "demo/demo-model", thinking: undefined, expected: undefined, version: "0.84.3" },
+  { model: "default", thinking: "off", expected: "off", version: "0.84.3" },
+  { model: "demo/demo-model", thinking: "low", expected: undefined, version: "0.84.2" },
+])(
+  "handles thinking=$thinking for $model on Pi $version",
+  ({ model, thinking, expected, version }) =>
+    Effect.gen(function* () {
+      const pi = yield* makeFakePi(
+        JSON.stringify({ subject: "Update README", body: "" }),
+        undefined,
+        undefined,
+        [],
+        undefined,
+        version,
+      );
+      const textGeneration = yield* makePiTextGeneration(
+        { enabled: true, binaryPath: "pi", launchArgs: "", customModels: [] },
+        {},
+      ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, pi.spawner));
+
+      const generation = textGeneration.generateCommitMessage({
+        cwd: process.cwd(),
+        branch: "main",
+        stagedSummary: "M README.md",
+        stagedPatch: "diff --git a/README.md b/README.md",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("pi"),
+          model,
+          thinking === undefined ? [] : [{ id: "thinking", value: thinking }],
+        ),
+      });
+      if (version === "0.84.2") {
+        const error = yield* generation.pipe(Effect.flip);
+        assert.include(error.detail, "Pi 0.84.3 or newer");
+        assert.deepEqual(pi.received, []);
+        return;
+      }
+      const result = yield* generation;
+
+      assert.equal(result.subject, "Update README");
+      assert.deepEqual(
+        pi.received.map((record) => record["type"]),
+        [
+          ...(model === "default" ? [] : ["get_available_models", "set_model"]),
+          ...(expected === undefined ? [] : ["set_thinking_level"]),
+          "prompt",
+          "get_last_assistant_text",
+        ],
+      );
+      assert.equal(
+        pi.received.find((record) => record["type"] === "set_thinking_level")?.["level"],
+        expected,
+      );
+    }),
+);
+
+it.effect("generates at Pi's default level when Pi rejects the saved thinking level", () =>
+  Effect.gen(function* () {
+    const pi = yield* makeFakePi(
+      JSON.stringify({ subject: "Update README", body: "" }),
+      undefined,
+      undefined,
+      [],
+      undefined,
+      "1.4.0",
+      'Thinking level "max" is not supported by demo/demo-model',
+    );
+    const textGeneration = yield* makePiTextGeneration(
+      { enabled: true, binaryPath: "pi", launchArgs: "", customModels: [] },
+      {},
+    ).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, pi.spawner));
+
+    const result = yield* textGeneration.generateCommitMessage({
+      cwd: process.cwd(),
+      branch: "main",
+      stagedSummary: "M README.md",
+      stagedPatch: "diff --git a/README.md b/README.md",
+      modelSelection: createModelSelection(ProviderInstanceId.make("pi"), "demo/demo-model", [
+        { id: "thinking", value: "max" },
+      ]),
+    });
+
+    assert.equal(result.subject, "Update README");
+    assert.deepEqual(
+      pi.received.map((record) => record["type"]),
+      [
+        "get_available_models",
+        "set_model",
+        "set_thinking_level",
+        "prompt",
+        "get_last_assistant_text",
+      ],
+    );
   }),
 );

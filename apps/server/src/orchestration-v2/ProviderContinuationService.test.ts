@@ -1,6 +1,7 @@
 import * as RunAdmission from "./RunAdmission.ts";
 import { assert, describe, it } from "@effect/vitest";
 import {
+  CommandId,
   MessageId,
   ProjectId,
   ProviderDriverKind,
@@ -11,6 +12,7 @@ import {
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2Notification,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -23,6 +25,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderContinuationService from "./ProviderContinuationService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 
@@ -97,10 +100,15 @@ function layerTest(input: {
   readonly admissionCheck?: RunAdmission.RunAdmission["Service"]["check"];
   readonly dispatched: Queue.Queue<unknown>;
   readonly getThreadRecords: () => Effect.Effect<OrchestrationV2ThreadProjection>;
+  readonly beforeDispatch?: (threadId: ThreadId) => Effect.Effect<void>;
 }) {
   const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
     getThreadRecords: input.getThreadRecords,
-    dispatch: (command) => Queue.offer(input.dispatched, command).pipe(Effect.as({} as never)),
+    dispatch: (command) =>
+      (
+        ("threadId" in command ? input.beforeDispatch?.(command.threadId) : undefined) ??
+        Effect.void
+      ).pipe(Effect.andThen(Queue.offer(input.dispatched, command)), Effect.as({} as never)),
   });
   const layerWorker = ProviderContinuationService.layer.pipe(
     Layer.provide(
@@ -445,6 +453,48 @@ describe("ProviderContinuationService", () => {
   );
 
   it.effect(
+    "clears a sticky continuation offer when a non-delegated wake dispatch fails generically",
+    () => {
+      return Effect.gen(function* () {
+        const cleared = yield* Deferred.make<void>();
+        const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadRecords: () => Effect.succeed(projection),
+          dispatch: (command) =>
+            Effect.fail(
+              new Orchestrator.OrchestratorDispatchError({
+                commandId: CommandId.make(String(command.commandId)),
+                commandType: command.type,
+                cause: new Error("SQLITE_FULL: database or disk is full"),
+              }),
+            ),
+        });
+        const layerWorker = ProviderContinuationService.layer.pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              RunAdmission.layerOrdinary,
+              IdAllocator.layer,
+              ProviderContinuationRequests.layer,
+              layerThreads,
+            ),
+          ),
+        );
+
+        yield* Effect.gen(function* () {
+          const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+          yield* requests.offer({
+            ...request(),
+            clearIfCurrent: () => Deferred.succeed(cleared, undefined),
+          });
+          yield* Deferred.await(cleared);
+        }).pipe(
+          Effect.provide(Layer.merge(ProviderContinuationRequests.layer, layerWorker)),
+          Effect.scoped,
+        );
+      });
+    },
+  );
+
+  it.effect(
     "drops stopped and disposed delegated completions instead of reviving them after recovery",
     () => {
       return Effect.gen(function* () {
@@ -605,6 +655,43 @@ describe("ProviderContinuationService", () => {
       );
     });
   });
+  it.effect(
+    "a wake held by another thread's parent lock does not delay other threads' wakes",
+    () => {
+      return Effect.gen(function* () {
+        const dispatched = yield* Queue.unbounded<unknown>();
+        const blockedChildId = ThreadId.make("thread-provider-continuation-blocked-child");
+        const dispatchedAt = new Map<ThreadId, number>();
+        yield* Effect.gen(function* () {
+          const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+          yield* requests.offer({ ...request(), threadId: blockedChildId });
+          yield* requests.offer(request());
+          yield* TestClock.adjust("10 minutes");
+          yield* Queue.take(dispatched);
+          yield* Queue.take(dispatched);
+          assert.equal(dispatchedAt.get(blockedChildId), 10 * 60 * 1000);
+          assert.equal(dispatchedAt.get(threadId), 0);
+        }).pipe(
+          Effect.provide(
+            layerTest({
+              dispatched,
+              getThreadRecords: () => Effect.succeed(projection),
+              // Models the child's message intake waiting on its coordinator's dispatch lock.
+              beforeDispatch: (dispatchThreadId) =>
+                (dispatchThreadId === blockedChildId
+                  ? Effect.sleep("10 minutes")
+                  : Effect.void
+                ).pipe(
+                  Effect.andThen(Clock.currentTimeMillis),
+                  Effect.map((now) => void dispatchedAt.set(dispatchThreadId, now)),
+                ),
+            }),
+          ),
+          Effect.scoped,
+        );
+      });
+    },
+  );
 });
 
 it.effect.each([false, true])(

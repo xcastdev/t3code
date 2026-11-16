@@ -2,8 +2,8 @@
 
 This fork tracks [pingdotgg/t3code](https://github.com/pingdotgg/t3code).
 
-**Last merged upstream commit:** `31eea883c7f7849ada6eb49265cb11fc64d2ecbd`
-(`fix(rewind): allow conversation-only rewind in non-git workspaces (#18379)`, 2026-11-11).
+**Last merged upstream commit:** `40dcbc5f6a8c4039f5f8f0dceb1bfa17ad0e3961`
+(`fix(web): a stopped run no longer shows the green Done badge in the sidebar (#37475)`, 2026-11-15).
 The next integration starts from this commit. Update this line and the table below
 in every integration.
 
@@ -12,6 +12,7 @@ in every integration.
 | 2026-10-27       | `e07595714a467e18c750107137d2c2e50f0c3530` | `36d4d711b79c73eb33131944f73ea4a8c6156484` | `890e89f2e7b92c5524b47278da37ffd8fefc01dc` |
 | 2026-11-02       | `36d4d711b79c73eb33131944f73ea4a8c6156484` | `47f2c8d29e981c7723467efe137ee19e91df924e` | `63e994493a87319bfd31bcd0c71d6bcfcd123ab7` |
 | 2026-11-11       | `47f2c8d29e981c7723467efe137ee19e91df924e` | `31eea883c7f7849ada6eb49265cb11fc64d2ecbd` | `bec7f5fad7167ed8e897b3d91468779216a79123` |
+| 2026-11-15       | `31eea883c7f7849ada6eb49265cb11fc64d2ecbd` | `40dcbc5f6a8c4039f5f8f0dceb1bfa17ad0e3961` | `393439fae83cb791c847f060d59d4d3c65f10f7d` |
 
 ## Rule: nothing changes without a decision
 
@@ -72,7 +73,7 @@ the upstream commit being merged, and `FORK` for the fork's `main` before the me
 revision, then run:
 
 ```sh
-vp run upstream:preservation -- BASE UP FORK HEAD --json /path/outside/repo/preservation.json
+vp exec node scripts/upstream-preservation-check.ts BASE UP FORK HEAD --json /path/outside/repo/preservation.json
 ```
 
 For each file either side changed since `BASE`, the script compares the merged tree's
@@ -138,24 +139,23 @@ perf job, so leave it out. Remove the fork-check worktree when done.
 
 ## Included upstream changes
 
-- T3 Code as an MCP server for other apps, agent sign-in approval through T3 Connect,
-  `request_secret` with secret-provider references, and managed policy templates.
-- `/clear` and fresh-session sends, scheduled-task thread modes and moving tasks between
-  threads, and auto-settling inactive threads.
-- Text generators for titles, commits and transcript cleanup, cloud and environment
-  dictation, @-mentioned models, and suggested next prompts.
-- Kiro and Cursor Origin, Claude Fable 5.2, Ultracode at any effort, and OpenCode goals,
-  todos and native job tracking.
-- The mobile navigation rework (route presets, one AppBar or SheetHeader per screen),
-  the single Welcome page, and the Labs cleanup that removed plan mode.
-- `effect/crypto` and `effect/jose` in place of `effect/Crypto` and `jose`,
-  `Schema.TaggedError` throughout, and stricter Effect diagnostics.
-- Conversation-only rewind in non-git workspaces.
-- Upstream migrations 078–081 and broad server, streaming and mobile performance work.
+- Native provider resume, recovery and steering fixes, fairer queued-run and wake
+  processing, and concurrent effects that do not stall unrelated threads.
+- Faster thread opening, history paging, delegation and Git reads; SQLite writes
+  move to a worker. Core migrations 082–096 add indexes, projection repairs and
+  Connect device authorization.
+- Web and mobile localization, agent theme editing, the native iOS image viewer,
+  improved project search, and spreadsheet preview resizing.
+- Pi session and worktree handoff repairs, live Cursor subagents and usage,
+  Antigravity goals, OpenCode server usage limits, and managed provider updates.
+- Terminal history persistence, batching, binary input and query-reply ownership;
+  checkpoint, submodule, selected-file commit and worktree cleanup fixes.
+- New Connect device approval, secret-reference validation, deferred MCP tool
+  discovery and stricter advertised arguments, remote connection recovery,
+  Windows services and keep-awake while agents work.
 
-The [upstream comparison](https://github.com/pingdotgg/t3code/compare/47f2c8d29e981c7723467efe137ee19e91df924e...31eea883c7f7849ada6eb49265cb11fc64d2ecbd)
-holds the complete history: 1,078 commits since November 2, with desktop and server
-moving from 0.1.6 to 0.1.9.
+The [upstream comparison](https://github.com/pingdotgg/t3code/compare/31eea883c7f7849ada6eb49265cb11fc64d2ecbd...40dcbc5f6a8c4039f5f8f0dceb1bfa17ad0e3961)
+contains 1,788 commits since the previous integration.
 
 ## Fork integration decisions
 
@@ -179,7 +179,9 @@ fresh-session runs stay in that thread.
 
 Feature migrations retain their independent ledger and run inside upstream's shared
 database setup, after the core migrations. The CLI takes the server's ownership lock
-when either core or feature migrations are pending.
+when either core or feature migrations are pending. Unsupported core migration
+histories remain refused before commands; read-only CLI commands do not bypass
+this guard.
 
 Image description and web search can't run on an upstream text generator; like
 review guides, they fall back to a capable coding agent. Memory extraction may run on
@@ -194,9 +196,12 @@ gateway and connections to users' own MCP servers. `pnpm-workspace.yaml` relaxes
 `@opentelemetry/api` peer range only for the OpenTelemetry SDKs that
 `@oh-my-pi/pi-coding-agent`, a `provider-omp` dev dependency, brings in.
 
-The MCP tool-list budget fell from 114,100 to 93,634 bytes with the same 88 tools:
-the advertised-schema compactor now also collapses `t3_project_work_write`'s
-intent union into one object. Inputs still decode against the full union.
+The MCP tool list grows from 88 tools and 93,634 bytes to 91 tools and 95,214 bytes.
+No fork tools are removed. Upstream adds `send_to_user`, `t3_theme_read` and
+`t3_theme_set`. Existing changes add PR pagination and filters, scheduled-task
+filtering, terminal binary/reply fields and bounded thread reads. Upstream's Gemini
+schema compactor removes non-string advertised enums; full runtime unions still
+validate Work inputs. Claude's system append is 5,930 bytes; Codex context is 7,324.
 
 Queued-run promotion follows upstream's recovery retry: an accepted promotion receipt
 no longer ends promotion, so a run that recovery returned to the queue is promoted again
@@ -214,36 +219,64 @@ Assistant chats keep their `"chat"` lineage relationship next to upstream's
 `sideChat` flag; the two are separate features. Idle-compaction modes use upstream's
 `idleCompaction` field and still read the legacy `compactIdleThreads` field.
 
+Pi memory extraction requires the exact selected thinking level, preserving
+provenance. Other background text generation uses upstream's fallback when that
+level is unavailable. Cursor native resume keeps the previously delivered managed
+instruction snapshot; a changed snapshot requires a fresh prompt.
+
+No project scratch folders hide the source-control launcher and its shortcuts,
+while linked pull-request details remain available. Real projects retain the
+fork's source-control workspace and guarded publication.
+
+Unreadable ordinary outbox effects fail and release later work, as upstream does.
+Unreadable `workflow-owner-control:` effects remain retained so managed workflow
+controls can recover when their decoder is available again.
+
+OpenCode 2 reports completed when a timed-out Stop is followed by confirmed native
+success. It reports interrupted only for a confirmed interruption. Either outcome
+keeps subsequent turns blocked until the original native turn ends.
+
 ## Validation
 
-Every workspace package, app and the evals typecheck clean; lint reports no errors and
-formatting is clean.
+Workspace packages, apps and evals typecheck without errors. Formatting and knip
+pass; lint reports warnings but no errors.
 
-The web unit suite passes, and the web browser suite passes when run in shards (a cold
-Vite dependency cache reloads browser tests mid-run on a single full run). Mobile,
-desktop, client-runtime, contracts and the provider packages pass.
+Web unit tests pass (396 files, 5,796 tests), as do all four browser shards
+(1,336 tests). Desktop, client-runtime, contracts and shared suites pass. Mobile
+passes apart from the two Work/Assistants import-cycle checks reproduced on the
+pre-merge fork.
 
-The server suite passes except tests that fail the same way on the fork before this
-merge: six Codex account tests in `CodexChatGptAuth.test.ts` and
-`CodexManagedRuntime.test.ts`, one storage-cleanup worktree case, the legacy v1 cutover
-ledger case, the provider-switch and OpenCode replay fixtures (including upstream's new
-OpenCode 2 pending-snapshot evidence), and a background-fetch case that fails only when
-`GIT_SSH_COMMAND` is set.
+All twelve provider packages typecheck. Their eleven test-bearing packages run
+1,573 tests: 1,572 pass; the OpenCode upgrade HTTP test fails identically before
+and after the merge. The provider-testing package has no tests.
 
-The mobile dependency-graph test reports import cycles among the fork's Work task and
-Assistants screens; those files are unchanged by this merge.
+The server suites ran in the prescribed two halves. Integration regressions were
+fixed and the affected files rerun. The remaining baseline failures reproduce in
+the detached fork checkout: six Codex private-listener cases, the legacy cutover
+ledger fixture, OpenCode replay and pending-snapshot evidence, the queued provider
+switch fixture, and the background-fetch test under inherited GIT_SSH_COMMAND.
+The new upstream background-wake fixture reaches its output assertions but shares
+the existing replay cleanup remainder; importing its data into the fork also
+reproduces the five unconsumed cleanup frames.
 
-The preservation check flagged 208 files: 241 upstream lines and 926 fork lines, plus 18
-whole files that were moved, deleted or dropped by decision. Review classified them as
-794 ported, 174 decision, 25 superseded, 144 noise and 26 lost. All 26 lost lines were
-upstream's server-list paging in Thread details, which is restored with its test.
+Plugin panels retain their no-frame CSP even though generic MCP apps support
+upstream blob frames.
 
-Two fork paths needed changes to stay correct on the merged runtime. Project Work run
-admission read the database while holding the event publish lane, which deadlocked
-under upstream's concurrent PR-watch sweep; the read now happens inside the commit
-transaction. Commits wake the effect worker only when they enqueue work, as upstream
-does.
+Regression checks cover atomic launch receipts and legacy recovery, retained
+admission during native resume, revoked and expired same-attempt recovery, rejected
+fork admission rollback, shared-terminal binary input and query reply ownership,
+and plugin CSP isolation alongside upstream MCP blob frames. Fork fixture schemas
+were brought forward without weakening provenance or permission guards.
 
-These checks do not replace full CI or browser, Electron, native-device and
-real-provider verification. No installation switch, deployment or live database write
-was performed.
+The per-tool MCP inventory preserves every fork tool. Registration review covers
+routes, settings, RPC schemas/groups/handlers, providers and both migration ledgers;
+the two changed layer expressions are upstream API ports. The preservation check
+reviewed 111 files: 259 upstream lines and 364 fork lines. Classifications are
+380 ported, 10 decision, 58 superseded and 175 noise, with no unexplained losses.
+
+An isolated worktree server ran migrations and recovery, served the web client
+(HTTP 200), and enforced authentication (HTTP 302); it was then stopped. No native
+device or Electron UI verification, real provider turn or paid-model eval was run.
+MCP eval unit tests and ten credential-free request constructions pass.
+
+Main has not been advanced; no deployment or live database write was performed.

@@ -3,6 +3,7 @@ import { expect } from "vite-plus/test";
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
@@ -131,7 +132,7 @@ it("rejects non-executable package lookalikes and clears runtime injection envir
     );
     expect(() => resolveInstalledOmp(NodePath.join(dir, "dist/cli.js"), {})).toThrow(/executable/);
     const env = {
-      PATH: process.env.PATH,
+      PATH: HostProcess.Environment.defaultValue().PATH,
       NODE_OPTIONS: "--import hostile",
       BUN_OPTIONS: "--preload hostile",
       BUN_PRELOAD: "hostile",
@@ -184,7 +185,7 @@ it.effect(
         NodePath.dirname(url.fileURLToPath(import.meta.resolve("@oh-my-pi/pi-coding-agent"))),
       );
       const env = {
-        PATH: process.env.PATH,
+        PATH: (yield* HostProcess.Environment).PATH,
         NODE_OPTIONS: "--import x",
         BUN_OPTIONS: "--preload x",
         BUN_PRELOAD: "x",

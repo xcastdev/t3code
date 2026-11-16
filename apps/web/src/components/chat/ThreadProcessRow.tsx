@@ -1,7 +1,8 @@
-import { LoaderCircleIcon, SquareIcon, Trash2Icon } from "lucide-react";
+import { SquareIcon, Trash2Icon } from "lucide-react";
 import { type MouseEvent, type ReactNode, useState } from "react";
 
 import { cn } from "../../lib/utils";
+import { Spinner } from "../ui/spinner";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import { THREAD_DETAILS_PANEL_ROW_CONTENT_CLASS } from "./threadDetailsPanelStyles";
@@ -115,7 +116,7 @@ function RowActionButton(props: {
         }
       >
         {pending ? (
-          <LoaderCircleIcon aria-hidden className="size-3 animate-spin" />
+          <Spinner aria-hidden size="xs" />
         ) : action.icon === "stop" ? (
           <SquareIcon aria-hidden className="size-3 fill-current" />
         ) : (

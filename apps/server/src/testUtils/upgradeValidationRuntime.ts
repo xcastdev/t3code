@@ -209,6 +209,10 @@ function makeUpgradeValidationRuntime(
         reloadSecretsAndRefresh: Effect.fn(
           "ProviderRegistry.ProviderRegistry.reloadSecretsAndRefresh",
         )(() => Effect.succeed([])),
+        applySecretAndRefresh: Effect.fn("ProviderRegistry.ProviderRegistry.applySecretAndRefresh")(
+          () =>
+            Effect.die(new UpgradeValidationDenied({ operation: "provider secret application" })),
+        ),
         refreshAfterUpdate: Effect.fn("ProviderRegistry.ProviderRegistry.refreshAfterUpdate")(() =>
           Effect.succeed([]),
         ),

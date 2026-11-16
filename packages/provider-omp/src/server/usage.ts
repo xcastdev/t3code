@@ -205,6 +205,11 @@ import * as FileSystem from "effect/FileSystem";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { ProviderHost } from "@t3tools/provider-core/server/ProviderHost";
 import type { OmpSettings } from "../settings.ts";
+class OmpUsageDirectoryError extends Schema.TaggedError<OmpUsageDirectoryError>()(
+  "OmpUsageDirectoryError",
+  { cause: Schema.Defect() },
+) {}
+
 export type OmpUsageReaderEnv = FileSystem.FileSystem | ProviderHost;
 export const ompUsageReader: ProviderUsageReader<OmpSettings, OmpUsageReaderEnv> = {
   kind: "transcripts",
@@ -227,21 +232,28 @@ export const ompUsageReader: ProviderUsageReader<OmpSettings, OmpUsageReaderEnv>
         platform,
         launchArgs: instance.config?.launchArgs ?? "",
       };
-      yield* Effect.try(() =>
-        resolveOmpUsageDirectory({
-          ...options,
-          exists: (path) => {
-            candidate = path;
-            return false;
-          },
-        }),
-      );
+      yield* Effect.try({
+        try: () =>
+          resolveOmpUsageDirectory({
+            ...options,
+            exists: (path) => {
+              candidate = path;
+              return false;
+            },
+          }),
+        catch: (cause) => new OmpUsageDirectoryError({ cause }),
+      });
       const migrated = candidate
         ? yield* fs.exists(candidate).pipe(Effect.orElseSucceed(() => false))
         : false;
-      return yield* Effect.try(() =>
-        resolveOmpUsageDirectory({ ...options, exists: (path) => path === candidate && migrated }),
-      );
+      return yield* Effect.try({
+        try: () =>
+          resolveOmpUsageDirectory({
+            ...options,
+            exists: (path) => path === candidate && migrated,
+          }),
+        catch: (cause) => new OmpUsageDirectoryError({ cause }),
+      });
     }).pipe(Effect.orElseSucceed(() => undefined));
     return [{ dir: owned }, ...(native && native !== owned ? [{ dir: native }] : [])];
   }),

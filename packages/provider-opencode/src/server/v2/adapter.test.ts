@@ -151,7 +151,11 @@ const fixture = Effect.fn("OpenCode2Test.fixture")(function* (
                 : { status: "connected" },
           })),
         };
-      } else if (url.pathname === "/api/command")
+      } else if (url.pathname === "/api/experimental/job") data = { data: [], cursor: {} };
+      else if (url.pathname === "/api/rpc/opencode.goal/get") data = { output: null };
+      else if (url.pathname === "/api/shell")
+        data = { data: [], location: { directory: "/workspace" } };
+      else if (url.pathname === "/api/command")
         data = { data: [], location: { directory: "/workspace" } };
       else if (url.pathname === "/api/model" || url.pathname === "/api/agent")
         data = { data: [], location: { directory: "/workspace" } };
@@ -257,6 +261,7 @@ const fixture = Effect.fn("OpenCode2Test.fixture")(function* (
     Effect.provideService(HttpClient.HttpClient, http),
   );
   const server = OpenCode2Server.OpenCode2Server.of({
+    forget: Effect.void,
     withConnection: (use) =>
       Effect.gen(function* () {
         const ordinal = ++connections;
@@ -272,7 +277,7 @@ const fixture = Effect.fn("OpenCode2Test.fixture")(function* (
           ),
           external: options.external ?? true,
           url: "http://opencode.test",
-          version: "2.0.28",
+          version: "2.2.6",
         });
       }).pipe(Effect.scoped),
   });
@@ -1058,7 +1063,7 @@ it.effect("OpenCode 2 cannot fence a successor when its predecessor's Stop times
     );
     yield* test.start(snapshot);
     yield* TestClock.adjust("11 seconds");
-    assert.isTrue(Exit.isFailure(yield* Fiber.join(stopping)));
+    assert.isTrue(Exit.isSuccess(yield* Fiber.join(stopping)));
     yield* test.publish(
       decodeNativeEvent({
         id: "evt_successor_end",

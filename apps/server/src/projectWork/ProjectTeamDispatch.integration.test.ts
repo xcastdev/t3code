@@ -274,10 +274,14 @@ it.effect(
       }>`SELECT thread_id,run_id FROM t3_workflow_v2_run_admissions WHERE run_id IS NOT NULL`;
       assert.deepEqual(rows, [{ thread_id: binding.threadId, run_id: binding.runId }]);
       const receipt = yield* (yield* Receipts.CommandReceiptStoreV2).getByCommandId(
-        CommandId.make(`${binding.recordId.slice(0, -8)}:initial-message`),
+        CommandId.make(binding.recordId.slice(0, -8)),
       );
       assert.isTrue(Option.isSome(receipt));
-      if (Option.isSome(receipt)) assert.equal(receipt.value.status, "accepted");
+      if (Option.isSome(receipt)) {
+        assert.equal(receipt.value.status, "accepted");
+        assert.equal(receipt.value.commandType, "thread.create");
+        assert.equal(receipt.value.threadId, binding.threadId);
+      }
     }).pipe(Effect.provide(Dispatch.layer.pipe(Layer.provideMerge(harness.base))));
   },
 );
@@ -880,7 +884,8 @@ it.effect("stopped branch naming is joined before drain and cannot mutate settle
       const dispatch = yield* Dispatch.ProjectTeamDispatch;
       yield* dispatch.dispatch(input, attribution);
       yield* Deferred.await(namingEntered);
-      const prepared = yield* awaitPreparation;
+      const prepared = yield* inspect;
+      assert.equal(prepared.projection.runs[0]?.status, "preparing");
       const runId = prepared.projection.runs[0]!.id;
       const launches = yield* Launch.ThreadLaunchService;
       const receipts = yield* Receipts.CommandReceiptStoreV2;
@@ -912,7 +917,27 @@ it.effect("stopped branch naming is joined before drain and cannot mutate settle
       const stopped = yield* inspect;
       assert.equal(stopped.binding.status, "settled");
       assert.isTrue(Option.isSome(yield* receipts.getByCommandId(drainedId)));
-      assert.equal(stopped.projection.thread.branch, prepared.projection.thread.branch);
+      assert.deepEqual(harness.removeWorktree.mock.calls, [
+        [
+          {
+            cwd: "/repo",
+            path: "/repo-worktrees/feature",
+            force: true,
+          },
+        ],
+      ]);
+      assert.isNotNull(prepared.projection.thread.branch);
+      assert.deepEqual(harness.deleteLocalBranch.mock.calls, [
+        [
+          {
+            cwd: "/repo",
+            refName: prepared.projection.thread.branch,
+            force: true,
+          },
+        ],
+      ]);
+      assert.isNull(stopped.projection.thread.branch);
+      assert.isNull(stopped.projection.thread.worktreePath);
       yield* Deferred.succeed(allowNaming, undefined);
       const afterLateResult = yield* inspect;
       assert.equal(harness.renameBranch.mock.calls.length, 0);

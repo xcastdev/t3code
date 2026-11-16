@@ -132,13 +132,18 @@ export function ProjectTerminalViewer({
     setStreamError,
   );
 
-  const writeData = useEffectEvent((data: string) => {
+  const writeData = useEffectEvent((data: string, kind?: "binary" | "reply") => {
     const terminal = stateRef.current.terminal;
     if (!writable || terminal === null) return;
     void projectTerminalEnvironment.write
       .run(registry, {
         environmentId,
-        input: { ...handle, data, expectedGeneration: terminal.generation },
+        input: {
+          ...handle,
+          data,
+          expectedGeneration: terminal.generation,
+          ...(kind ? { [kind]: true } : {}),
+        },
       })
       .then((result) => {
         if (result._tag === "Failure" && !isAtomCommandInterrupted(result))
@@ -159,6 +164,8 @@ export function ProjectTerminalViewer({
       theme: terminalThemeFromApp(mount),
       font: fontOptions(fontRef.current.family, fontRef.current.size),
       onData: (data) => writeData(data),
+      onBinary: (data) => writeData(data, "binary"),
+      onReply: (data) => writeData(data, "reply"),
       // The grid follows this window only when the user asks; observers never resize a shared PTY.
       onResize: () => undefined,
       onSelectionChange: () => undefined,

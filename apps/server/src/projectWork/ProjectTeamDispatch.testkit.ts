@@ -13,6 +13,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
+import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ProjectService from "../project/ProjectService.ts";
@@ -99,10 +100,19 @@ export function makeHarness(options: HarnessOptions) {
   const closeAndDrain = vi.fn<TerminalManager.TerminalManager["Service"]["closeAndDrain"]>(
     options.closeAndDrain ?? (() => Effect.void),
   );
+  const removeWorktree = vi.fn<GitWorkflow.GitWorkflowService["Service"]["removeWorktree"]>(
+    () => Effect.void,
+  );
+  const deleteLocalBranch = vi.fn<GitWorkflow.GitWorkflowService["Service"]["deleteLocalBranch"]>(
+    () => Effect.void,
+  );
   const renameBranch = vi.fn<GitWorkflow.GitWorkflowService["Service"]["renameBranch"]>((input) =>
     Effect.succeed({ branch: input.newBranch }),
   );
   const layerExternalServices = Layer.mergeAll(
+    Layer.mock(CheckpointStore.CheckpointStore)({
+      isGitRepository: () => Effect.succeed(true),
+    }),
     WorktreeSetupTracker.layer,
     Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({ get: () => Effect.succeed(null) }),
     Layer.mock(TerminalManager.TerminalManager)({
@@ -117,13 +127,19 @@ export function makeHarness(options: HarnessOptions) {
     Layer.mock(GitWorkflow.GitWorkflowService)({
       createWorktree,
       renameBranch,
+      currentBranch: () => Effect.succeed("main"),
+      repositoryRoot: () => Effect.succeed(project.workspaceRoot),
+      resolvePrimaryRemoteName: () => Effect.succeed("origin"),
+      resolveDefaultBranchName: () => Effect.succeed("main"),
+      listLocalBranchNames: () => Effect.succeed([]),
+      deleteLocalBranch,
       fetchWorktreeBaseCommit: () =>
         Effect.succeed({ commitSha: "remote-main-sha", remoteRefName: "origin/main" }),
       hasCommit: () => Effect.succeed(false),
       resolveWorktreeBaseRemote: () => Effect.succeed({ remoteName: "origin", branchName: "main" }),
       remoteExists: () => Effect.succeed(true),
       remoteBranchExists: () => Effect.succeed(true),
-      removeWorktree: () => Effect.void,
+      removeWorktree,
     }),
     Layer.succeed(ProjectSetupScriptRunner.ProjectSetupScriptRunner, {
       runForThread: runSetup,
@@ -146,6 +162,7 @@ export function makeHarness(options: HarnessOptions) {
       Layer.mergeAll(
         layerExternalServices,
         layerThreadManagement,
+        layerOrchestrator,
         layerReceipts,
         WorkAdmission.layer.pipe(Layer.provide(layerDatabase)),
         IdAllocator.layer,
@@ -168,5 +185,7 @@ export function makeHarness(options: HarnessOptions) {
     closeTerminal,
     closeAndDrain,
     renameBranch,
+    removeWorktree,
+    deleteLocalBranch,
   };
 }

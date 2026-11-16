@@ -6,6 +6,7 @@ import {
   PreviewAutomationUnavailableError,
   type ProviderInstanceId,
   type ProviderInteractionMode,
+  type OrchestrationV2LinkedSender,
   type RuntimeMode,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -48,6 +49,8 @@ export interface McpClientCaller {
    * another environment passing on the limits of the agent it calls for.
    */
   readonly narrowedTo?: ClientModes | undefined;
+  /** A linked environment's thread this request is made for (`T3-Sender-Thread`). */
+  readonly senderThread?: OrchestrationV2LinkedSender | undefined;
   /** An outside client's thread links go through this hosted app, as Copy thread's do. */
   readonly hostedAppUrl?: string | undefined;
 }
@@ -59,6 +62,13 @@ export interface McpClientCaller {
  * `clientModeCeiling`), so a client gains nothing by sending a broad one.
  */
 export const MODE_LIMIT_HEADER = "t3-mode-limit";
+
+/**
+ * `T3-Sender-Thread: <environmentId>/<threadId>/<title>`, each URI-encoded: the
+ * thread another environment makes a request for, so what it sends here can name
+ * it. Read only from a linked client.
+ */
+export const SENDER_THREAD_HEADER = "t3-sender-thread";
 
 export interface ClientModes {
   readonly runtimeMode: RuntimeMode;
@@ -138,6 +148,11 @@ export interface McpInvocationScope {
   readonly viewImage?: boolean;
   /** True while web search is on with a model and the caller's harness has no search of its own. */
   readonly webSearch?: boolean;
+  /**
+   * The origin this `/mcp` request reached, e.g. a T3 Connect tunnel. Hosted clients cannot
+   * see the URL they were configured with, so links they must fetch carry it. Unset in-process.
+   */
+  readonly origin?: string | undefined;
 }
 
 /**
@@ -172,11 +187,22 @@ export const hiddenFromSubagents = (): boolean => {
   return scope?.thread?.subagent !== true;
 };
 
-/** `McpSchema.EnabledWhen` for tools only some harnesses' sessions are issued, such as `checklist`. */
-export const visibleWithCapability = (capability: McpCapability) => (): boolean => {
+/**
+ * `McpSchema.EnabledWhen` for tools that act as the calling thread: a client
+ * from outside has none. Discovery only; `McpToolAccess` still refuses the
+ * call, and `toLayer` requires this on every thread-bound declaration.
+ */
+export const hiddenFromOutsideClients = (): boolean => {
   const fiber = Fiber.getCurrent();
   const scope = fiber && Context.getOrUndefined(fiber.context, McpInvocationContext);
-  return scope?.capabilities.has(capability) === true;
+  return scope === undefined || scope.thread !== undefined;
+};
+
+/** `McpSchema.EnabledWhen` for callers whose harness has no native checklist. */
+export const visibleWithChecklistCapability = (): boolean => {
+  const fiber = Fiber.getCurrent();
+  const scope = fiber && Context.getOrUndefined(fiber.context, McpInvocationContext);
+  return hiddenFromOutsideClients() && scope?.capabilities.has("checklist") === true;
 };
 
 /** `McpSchema.EnabledWhen` for tools that only serve links, hidden while the beta is off. */
@@ -190,14 +216,14 @@ export const hiddenWhileLinksOff = (): boolean => {
 export const visibleWhileViewImageOn = (): boolean => {
   const fiber = Fiber.getCurrent();
   const scope = fiber && Context.getOrUndefined(fiber.context, McpInvocationContext);
-  return scope?.viewImage === true;
+  return hiddenFromOutsideClients() && scope?.viewImage === true;
 };
 
 /** `McpSchema.EnabledWhen` for `t3_web_search`, listed only while the request scope allows it. */
 export const visibleWhileWebSearchOn = (): boolean => {
   const fiber = Fiber.getCurrent();
   const scope = fiber && Context.getOrUndefined(fiber.context, McpInvocationContext);
-  return scope?.webSearch === true;
+  return hiddenFromOutsideClients() && scope?.webSearch === true;
 };
 
 export type McpCapabilityError<C extends McpCapability> = C extends "preview"

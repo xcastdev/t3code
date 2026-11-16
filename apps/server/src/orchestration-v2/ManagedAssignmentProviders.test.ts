@@ -538,7 +538,7 @@ it.effect.each([true, false])(
           },
         },
         ProviderAdapterRegistry.layerSingle(adapter),
-        { databaseLayer: database },
+        { databaseLayer: database, runEffectWorker: false },
       );
       yield* Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;

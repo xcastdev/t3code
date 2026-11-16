@@ -43,6 +43,7 @@ function harness(
             : Option.some({
                 projectId,
                 title: "Search",
+                hasCustomTitle: false,
                 workspaceRoot: options.move && reads > 1 ? "/moved" : "/server/project",
                 defaultModelSelection: null,
                 defaultThreadEnvMode: null,

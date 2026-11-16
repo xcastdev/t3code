@@ -246,6 +246,9 @@ export const layerControlledProviders = Layer.unwrap(
           reloadSecretsAndRefresh: Effect.fn(
             "ProviderRegistry.ProviderRegistry.reloadSecretsAndRefresh",
           )(() => Effect.succeed(visible)),
+          applySecretAndRefresh: Effect.fn(
+            "ProviderRegistry.ProviderRegistry.applySecretAndRefresh",
+          )(() => Effect.die("Fixture provider secrets are disabled")),
           refreshAfterUpdate: Effect.fn("ProviderRegistry.ProviderRegistry.refreshAfterUpdate")(
             () => Effect.succeed(visible),
           ),

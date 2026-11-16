@@ -220,7 +220,7 @@ export function controlledUpgradeApplicationLayer(
       subscribeChanges: Effect.succeed(Stream.never),
     }),
     // No copied theme directories are watched; an empty fixture set is replayed to subscribers.
-    Layer.succeed(EnvironmentTheme.EnvironmentThemeService, {
+    Layer.mock(EnvironmentTheme.EnvironmentThemeService)({
       current: Effect.succeed([]),
       streamChanges: Stream.concat(Stream.make([]), Stream.never),
     }),

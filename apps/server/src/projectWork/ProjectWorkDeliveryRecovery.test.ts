@@ -225,6 +225,9 @@ it.effect(
             getDescriptor: Effect.die("unused descriptor"),
           }),
           Layer.succeed(Engine.OrchestratorV2, {
+            getMessagesById: unused,
+            getTranscriptByteFloor: unused,
+            listActiveThreads: unused,
             listActiveSubagentThreadIds: unused,
             countThreads: unused,
             listActiveShellIndex: unused,
