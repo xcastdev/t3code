@@ -1380,11 +1380,48 @@ const make = Effect.gen(function* () {
       const ownProviderThreadIds = records.providerThreads.flatMap((providerThread) =>
         providerThread.appThreadId === input.threadId ? [providerThread.id] : [],
       );
-      // Settling the target can promote a queued follow-up onto the same session; that run is
-      // not Force stop's to end. Only a newer run bound to a provider thread on this session
-      // counts. An unreadable thread counts as one, so its sessions are kept.
+      // Settlement can promote a queued follow-up before or after this check. Keep its session
+      // while admission prepares; unreadable state also keeps sessions rather than killing work.
       const throughRunOrdinal = target?.ordinal ?? 0;
+      const promotes = target !== undefined && isActiveRun(target);
       const laterRunActive = (providerSessionId: ProviderSessionId) =>
+        orchestrator.getThreadRecords(input.threadId, ["runs", "providerThreads"]).pipe(
+          Effect.map(({ thread, runs, providerThreads }) => {
+            const onSession = new Set(
+              providerThreads.flatMap((providerThread) =>
+                providerThread.providerSessionId === providerSessionId ? [providerThread.id] : [],
+              ),
+            );
+            // All adapters switch models in place; a future restart_session policy must revisit this.
+            const promotable = (run: OrchestrationV2Run) =>
+              promotes &&
+              thread.archivedAt === null &&
+              thread.deletedAt === null &&
+              run.status === "queued" &&
+              run.queueHeld !== true &&
+              run.freshContext !== true;
+            const onThisSession = (run: OrchestrationV2Run) =>
+              run.providerThreadId !== null && onSession.has(run.providerThreadId);
+            if (
+              runs.some(
+                (run) => run.ordinal > throughRunOrdinal && isActiveRun(run) && onThisSession(run),
+              )
+            )
+              return true;
+            // Promotion order is not knowable here without messages; only keep when every run that
+            // could promote next would reuse this session.
+            const next = runs.filter((run) => run.status === "queued" && run.queueHeld !== true);
+            return (
+              thread.activeProviderThreadId !== null &&
+              onSession.has(thread.activeProviderThreadId) &&
+              next.length > 0 &&
+              next.every((run) => promotable(run) && onThisSession(run))
+            );
+          }),
+          Effect.orElseSucceed(() => true),
+        );
+      // A follow-up that started on the session (even one that has since ended) owns it now.
+      const laterRunStarted = (providerSessionId: ProviderSessionId) =>
         orchestrator.getThreadRecords(input.threadId, ["runs", "providerThreads"]).pipe(
           Effect.map(({ runs, providerThreads }) => {
             const onSession = new Set(
@@ -1395,7 +1432,7 @@ const make = Effect.gen(function* () {
             return runs.some(
               (run) =>
                 run.ordinal > throughRunOrdinal &&
-                isActiveRun(run) &&
+                (isActiveRun(run) || run.startedAt !== null) &&
                 run.providerThreadId !== null &&
                 onSession.has(run.providerThreadId),
             );
@@ -1459,6 +1496,35 @@ const make = Effect.gen(function* () {
         } else if (!released.value && !(yield* laterRunActive(release.providerSessionId))) {
           shared = true;
           yield* detach(release.providerSessionId);
+        } else if (!released.value && !(yield* laterRunStarted(release.providerSessionId))) {
+          // Kept for a follow-up that had not started yet: if none started by now, Force stop
+          // still ends the process instead of leaving it to idle release.
+          yield* Effect.sleep(FORCE_STOP_RELEASE_WAIT).pipe(
+            Effect.andThen(
+              Effect.gen(function* () {
+                const others = yield* sessions.otherWorkingThreads({
+                  providerSessionId: release.providerSessionId,
+                  threadId: input.threadId,
+                });
+                if (others.length > 0) return yield* detach(release.providerSessionId);
+                return yield* sessions.releaseUnlessBusy({
+                  providerSessionId: release.providerSessionId,
+                  ownProviderThreadIds,
+                  throughRunOrdinal,
+                  keepIf: laterRunStarted(release.providerSessionId),
+                  reason: "manual_shutdown",
+                  detail: FORCE_STOP_REASON,
+                });
+              }),
+            ),
+            Effect.catchCause((cause) =>
+              Effect.logWarning("orchestration-v2.force-stop-recheck-failed", {
+                threadId: input.threadId,
+                cause,
+              }),
+            ),
+            Effect.forkIn(layerScope),
+          );
         }
       }
       return {

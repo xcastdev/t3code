@@ -1853,7 +1853,16 @@ export const layer: Layer.Layer<
                   threadId: input.threadId,
                   providerThread: turnInput.providerThread,
                 }),
-              ).pipe(Effect.orElseSucceed(() => undefined)),
+              ).pipe(
+                // The error can carry stored instruction text; log only where it happened.
+                Effect.tapError(() =>
+                  Effect.logWarning("Provider instruction delivery lookup failed", {
+                    runId,
+                    providerThreadId: turnInput.providerThread.id,
+                  }),
+                ),
+                Effect.orElseSucceed(() => undefined),
+              ),
               onInstructionsApplied: (applied: typeof instructionSnapshot) =>
                 instructionDelivery.value.recordApplied(target, applied).pipe(
                   Effect.catchCause(() =>

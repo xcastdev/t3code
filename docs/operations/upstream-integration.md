@@ -223,9 +223,10 @@ Pi memory extraction requires the exact selected thinking level, preserving
 provenance. Other background text generation uses upstream's fallback when that
 level is unavailable. Cursor native resume keeps the previously delivered managed
 instruction snapshot; a changed snapshot requires a fresh prompt. Reopened Cursor
-sessions recover delivery proof from persisted receipts only when Cursor confirms
-the corresponding native run was checkpointed. Missing proof requires a fresh
-prompt.
+sessions recover delivery proof from persisted receipts only when that run's
+checkpoint is still the checkpoint Cursor resumes from. Missing or stale proof
+requires a fresh prompt. This does not synchronize writes by another Cursor process
+between the checkpoint check and resume.
 
 No project scratch folders hide the source-control launcher and its shortcuts,
 while linked pull-request details remain available. Real projects retain the
@@ -239,7 +240,19 @@ OpenCode 2 reports completed when a timed-out Stop is followed by confirmed nati
 success. It reports interrupted only for a confirmed interruption. Either outcome
 keeps subsequent turns blocked until the original native turn ends.
 
+Force stop bridges delayed promotion only on the thread's active provider session,
+when every unheld queued run is non-fresh and bound to that session. Same-instance
+model changes remain eligible; mixed queues and older sessions use the existing
+release-and-reopen path. A retained session is checked again after ten seconds and
+released unless a follow-up has started on it. A slower promotion reopens the
+session. Already-started follow-ups keep their session and normal idle lifecycle;
+pending background work can extend that lifecycle beyond the default idle timeout. The
+delayed pass repeats shared-thread protection and detaches the stopped thread
+instead of releasing a process another thread is using.
+
 ## Validation
+
+### Initial integration (2026-11-15)
 
 Workspace packages, apps and evals typecheck without errors. Formatting and knip
 pass; lint reports warnings but no errors.
@@ -253,8 +266,9 @@ All twelve provider packages typecheck. Their eleven test-bearing packages run
 1,573 tests: 1,572 pass; the OpenCode upgrade HTTP test fails identically before
 and after the merge. The provider-testing package has no tests.
 
-The server suites ran in the prescribed two halves. Integration regressions were
-fixed and the affected files rerun. The remaining baseline failures reproduce in
+The server suites ran in the prescribed two halves. Failures identified during
+that run were fixed and the affected files rerun; the full halves were not rerun
+on the final merge tree. The recorded baseline failures reproduce in
 the detached fork checkout: six Codex private-listener cases, the legacy cutover
 ledger fixture, OpenCode replay and pending-snapshot evidence, the queued provider
 switch fixture, and the background-fetch test under inherited GIT_SSH_COMMAND.
@@ -274,12 +288,95 @@ were brought forward without weakening provenance or permission guards.
 The per-tool MCP inventory preserves every fork tool. Registration review covers
 routes, settings, RPC schemas/groups/handlers, providers and both migration ledgers;
 the two changed layer expressions are upstream API ports. The preservation check
-reviewed 111 files: 259 upstream lines and 364 fork lines. Classifications are
+reviewed 111 files at merge commit `9e97eee3ca`: 259 upstream lines and 364 fork
+lines. Classifications are
 380 ported, 10 decision, 58 superseded and 175 noise, with no unexplained losses.
 
 An isolated worktree server ran migrations and recovery, served the web client
 (HTTP 200), and enforced authentication (HTTP 302); it was then stopped. No native
 device or Electron UI verification, real provider turn or paid-model eval was run.
 MCP eval unit tests and ten credential-free request constructions pass.
+
+### Final-branch review (2026-11-16, `b5b23afa45`)
+
+The full server halves ran again: 6,950 tests outside orchestration (6,930 pass,
+7 fail, 13 skipped) and 3,214 orchestration tests (3,202 pass, 12 fail). Eighteen
+failures match the recorded baselines; one additional failure exposed a Force stop
+race that closes a promoted queued follow-up's session. All provider packages ran
+1,573 tests: 1,571 pass and 2 fail. Besides the recorded OpenCode failure, ACP
+Registry's readiness-version test times out at both this tree and pure upstream;
+the environment-sensitive cause is unknown.
+
+The preservation check at this tree reports 113 files, 261 upstream lines and 367
+fork lines. The five lines added to the historical report are ported: the extended
+InstructionDelivery service return and the Cursor test runner/session refactor.
+No additional functionality loss was found.
+
+### Review fixes (2026-11-16, working tree based on `b5b23afa45`)
+
+The deterministic Force stop regression fails before the retention fix and passes
+after it. Cursor's real local SDK store test rejects a stale proof when the agent
+checkpoint advances before its run record is patched, while still allowing an
+uncheckpointed newer run and preserving historical checkpoint queries. Adapter
+tests reject stale proof and assert the specific refusal reasons. Server tests
+cover lazy proof forwarding, typed lookup failure, missing receipt rows and newer
+unnamed turns. These are local tests, not a real provider turn or a reproduction of
+the hypothesized crash plus instruction-revert sequence.
+
+Focused server checks pass: five files / 290 tests, followed by queue/session,
+admission and Force stop checks (four files / 137 tests, with overlap). All 161
+Cursor package tests pass. Server and Cursor typechecks, scoped formatting/lint,
+knip and diff checks pass. No full client or server suites were repeated for these
+follow-up fixes; the full-branch results above remain the latest broad run.
+
+The audited code tree `331b228083b55d340fc721fdfbe4559c4e544d8c` reports
+117 files, 278 upstream lines and 367 fork lines. Compared with `b5b23afa45`,
+17 additional reported lines are accounted for: 13 ported (expanded session
+retention, checkpoint API and test harnesses) and 4 noise (rewritten comments and
+an unchanged typed-error fallback appearing at another count). Including the
+previous follow-up, totals are 398 ported, 10 decision, 58 superseded and 179 noise;
+no unexplained loss remained at that stage. Subsequent Force stop refinements are
+verified separately below.
+
+### Force stop refinement (2026-11-16, working tree based on `b5b23afa45`)
+
+Additional regressions cover explicit and follow-current model changes, mixed
+queues with a shared continuation key, already-ended targets, a reordered fresh
+context with a busy older session, and refused promotion. Five cases fail on the
+preceding implementation and pass with the refined rule; forcing the ended-target
+guard true also fails its regression case. All 57 ThreadStop and 35
+ThreadManagementService tests pass, as does server typecheck. The ten-second grace
+is tested with TestClock, including retention of a started follow-up. Background
+work is simulated; no real provider turn was run.
+
+An additional 206 queue/session/admission and managed-start tests pass (298 server
+tests across seven files, without overlap). Scoped formatting/lint, knip and the
+server typecheck pass. The gated positive cases delay promotion until Force stop
+returns, start the follow-up nine seconds later, and keep its session through the
+cleanup deadline.
+
+The audited code tree `c3e6bfd0fc969323fe7a5d8ce28efd3df0388b75` still reports
+117 files, 278 upstream lines and 367 fork lines. Three previously reported
+predicate lines are now present again; three table/capability lines are ported
+into the expanded regression harness instead. The classification totals remain
+398 ported, 10 decision, 58 superseded and 179 noise, with no unexplained loss.
+At that stage, only validation text changed after the audit.
+
+### Shared-session review follow-up (2026-11-16)
+
+The Opus review found a missing shared-thread check in delayed cleanup. A new
+regression attaches a second thread during the grace period, completes its turn,
+and persists background work in the projection. The old delayed pass kills that
+shared process; repeating `otherWorkingThreads` and detaching instead preserves
+it. All 58 ThreadStop and 35 ThreadManagementService tests pass, as do server
+typecheck and scoped formatting/lint. No further delegated review was run for
+this small safeguard.
+
+The incremental audit at code tree `574ad7ca72a2fa1fbb27974a8493620af7483621`
+rechecks the three files changed since the full audit, retaining the unchanged
+files' results. It reports 117 files, 279 upstream lines and 367 fork lines. The
+additional native-thread fixture line is ported into per-thread identifiers;
+totals are 399 ported, 10 decision, 58 superseded and 179 noise. Only this
+validation text changed after the incremental audit.
 
 Main has not been advanced; no deployment or live database write was performed.

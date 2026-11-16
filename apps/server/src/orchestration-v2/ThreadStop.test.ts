@@ -18,6 +18,7 @@ import {
   TurnItemId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -1987,15 +1988,96 @@ it.effect(
     }).pipe(Effect.provide(layerTest)),
 );
 
-it.effect.each([
+type ForceStopFollowUpCase = {
+  readonly followUp: string;
+  readonly startedBeforeRelease: boolean;
+  readonly switchesInstance?: boolean;
+  readonly freshContext?: boolean;
+  readonly gate?: boolean;
+  readonly modelChange?: "explicit" | "follow-current";
+  readonly mixedQueue?: boolean;
+  readonly targetEnded?: boolean;
+  readonly refusesPromotion?: boolean;
+  readonly preBoundary?: boolean;
+  readonly backgroundWork?: boolean;
+  readonly sharesDuringGrace?: boolean;
+};
+
+it.effect.each<ForceStopFollowUpCase>([
   { followUp: "started its turn", startedBeforeRelease: true },
   { followUp: "was promoted", startedBeforeRelease: false },
   { followUp: "switched provider instance", startedBeforeRelease: true, switchesInstance: true },
   { followUp: "has fresh context", startedBeforeRelease: true, freshContext: true },
+  {
+    followUp: "is promoted only after the release decision",
+    startedBeforeRelease: false,
+    gate: true,
+  },
+  {
+    followUp: "changes model in place",
+    startedBeforeRelease: false,
+    gate: true,
+    modelChange: "explicit",
+  },
+  {
+    followUp: "follows a changed current model",
+    startedBeforeRelease: false,
+    gate: true,
+    modelChange: "follow-current",
+  },
+  {
+    followUp: "switches instance before a pinned return",
+    startedBeforeRelease: false,
+    gate: true,
+    switchesInstance: true,
+    mixedQueue: true,
+    backgroundWork: true,
+  },
+  {
+    followUp: "remains queued after an ended target",
+    startedBeforeRelease: false,
+    refusesPromotion: true,
+    targetEnded: true,
+  },
+  {
+    followUp: "was queued before a reordered fresh context",
+    startedBeforeRelease: false,
+    gate: true,
+    preBoundary: true,
+    backgroundWork: true,
+  },
+  {
+    followUp: "never promotes",
+    startedBeforeRelease: false,
+    refusesPromotion: true,
+    backgroundWork: true,
+  },
+  {
+    followUp: "shares background work with a thread joining during the grace period",
+    startedBeforeRelease: false,
+    refusesPromotion: true,
+    sharesDuringGrace: true,
+  },
 ])(
   "Force stop keeps only the session of a queued follow-up that $followUp",
-  ({ startedBeforeRelease, switchesInstance = false, freshContext = false }) =>
+  ({
+    startedBeforeRelease,
+    switchesInstance = false,
+    freshContext = false,
+    gate,
+    modelChange,
+    mixedQueue = false,
+    targetEnded = false,
+    refusesPromotion = false,
+    preBoundary = false,
+    backgroundWork = false,
+    sharesDuringGrace = false,
+  }) =>
     Effect.gen(function* () {
+      const decided = yield* Deferred.make<void>();
+      const stopReturned = yield* Deferred.make<void>();
+      let armed = false;
+      const busySessions = new Set<ProviderSessionId>();
       const cwd = yield* checkpointWorkspace("thread-stop-force-stop-follow-up");
       const driver = adapter.driver;
       const otherInstanceId = ProviderInstanceId.make("codex-other");
@@ -2009,15 +2091,16 @@ it.effect.each([
       // Fresh context on a one-thread-per-session provider puts the follow-up on its own session.
       // The session itself reports shared threads so fresh-context cleanup leaves the stopped
       // run's session to Force stop, as pending background work would.
-      const adapterCapabilities = freshContext
-        ? {
-            ...CodexProviderCapabilitiesV2,
-            sessions: {
-              ...CodexProviderCapabilitiesV2.sessions,
-              supportsMultipleProviderThreadsPerSession: false,
-            },
-          }
-        : CodexProviderCapabilitiesV2;
+      const adapterCapabilities =
+        freshContext || preBoundary
+          ? {
+              ...CodexProviderCapabilitiesV2,
+              sessions: {
+                ...CodexProviderCapabilitiesV2.sessions,
+                supportsMultipleProviderThreadsPerSession: false,
+              },
+            }
+          : CodexProviderCapabilitiesV2;
       const liveAdapter = (
         instanceId: ProviderInstanceId,
       ): ProviderAdapter.ProviderAdapterV2["Service"] => ({
@@ -2041,12 +2124,21 @@ it.effect.each([
                 status: "ready",
                 cwd,
                 model: modelSelection.model,
-                capabilities: CodexProviderCapabilitiesV2,
+                capabilities: preBoundary ? adapterCapabilities : CodexProviderCapabilitiesV2,
                 createdAt: now,
                 updatedAt: now,
                 lastError: null,
               },
               events: Stream.fromQueue(events),
+              ...(backgroundWork
+                ? {
+                    hasPendingBackgroundWork: Effect.sync(() =>
+                      busySessions.has(input.providerSessionId),
+                    ),
+                    hasPendingBackgroundWorkForThread: () =>
+                      Effect.sync(() => busySessions.has(input.providerSessionId)),
+                  }
+                : {}),
               ensureThread: ({ threadId }) =>
                 Effect.succeed({
                   id: ProviderThreadId.make(
@@ -2057,7 +2149,11 @@ it.effect.each([
                   providerSessionId: input.providerSessionId,
                   appThreadId: threadId,
                   ownerNodeId: null,
-                  nativeThreadRef: { driver, nativeId: "native-thread", strength: "strong" },
+                  nativeThreadRef: {
+                    driver,
+                    nativeId: sharesDuringGrace ? `native:${threadId}` : "native-thread",
+                    strength: "strong",
+                  },
                   nativeConversationHeadRef: null,
                   status: "idle",
                   firstRunOrdinal: null,
@@ -2111,6 +2207,7 @@ it.effect.each([
             releaseUnlessBusy: (input) =>
               (startedBeforeRelease ? worker.drain().pipe(Effect.orDie) : Effect.void).pipe(
                 Effect.andThen(sessions.releaseUnlessBusy(input)),
+                Effect.ensuring(Deferred.succeed(decided, undefined)),
               ),
           });
         }),
@@ -2125,11 +2222,53 @@ it.effect.each([
             EffectOutbox.layer.pipe(Layer.provide(layerDatabase)),
             ProviderReplayHarness.layerWithRegistry(
               { name: "thread-stop-force-stop-follow-up" },
-              ProviderAdapterRegistry.layerFromAdapters([
-                liveAdapter(instanceId),
-                liveAdapter(otherInstanceId),
-              ]),
-              { databaseLayer: layerDatabase, runEffectWorker: false },
+              Layer.effect(
+                ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+                Effect.gen(function* () {
+                  const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
+                  return mixedQueue
+                    ? {
+                        ...registry,
+                        getMetadata: (id: ProviderInstanceId) =>
+                          registry.get(id).pipe(
+                            Effect.map((entry) => ({
+                              driver: entry.driver,
+                              continuationKey: "codex:home:shared",
+                              enabled: true,
+                              capabilities: adapterCapabilities,
+                            })),
+                          ),
+                      }
+                    : registry;
+                }),
+              ).pipe(
+                Layer.provide(
+                  ProviderAdapterRegistry.layerFromAdapters([
+                    liveAdapter(instanceId),
+                    liveAdapter(otherInstanceId),
+                  ]),
+                ),
+              ),
+              {
+                databaseLayer: layerDatabase,
+                runEffectWorker: false,
+                ...(!gate && !refusesPromotion
+                  ? {}
+                  : {
+                      wrapProjectionStore: (store: ProjectionStore.ProjectionStoreV2Shape) => ({
+                        ...store,
+                        canStartQueuedRun: (id: ThreadId) =>
+                          armed
+                            ? refusesPromotion
+                              ? Effect.succeed(false)
+                              : Deferred.await(decided).pipe(
+                                  Effect.andThen(Deferred.await(stopReturned)),
+                                  Effect.andThen(store.canStartQueuedRun(id)),
+                                )
+                            : store.canStartQueuedRun(id),
+                      }),
+                    }),
+              },
             ),
           ),
         ),
@@ -2169,6 +2308,10 @@ it.effect.each([
         yield* send(threadId, "first", "start_immediately");
         yield* worker.drain();
         yield* Fiber.join(firstRunning);
+        const first = started[0]!;
+        const stoppedSession = first.providerThread.providerSessionId!;
+        if (backgroundWork) busySessions.add(stoppedSession);
+        const changedModel = { ...modelSelection, model: "gpt-follow-up" };
         yield* orchestrator.dispatch({
           type: "message.dispatch",
           commandId: CommandId.make("send:force-stop-follow-up"),
@@ -2181,13 +2324,211 @@ it.effect.each([
             ? { modelSelection: { ...modelSelection, instanceId: otherInstanceId } }
             : {}),
           ...(freshContext ? { freshContext } : {}),
+          ...(modelChange === "explicit" ? { modelSelection: changedModel } : {}),
+          ...(modelChange === "follow-current"
+            ? { scheduledTaskId: ScheduledTaskId.make("scheduled:follow-current") }
+            : {}),
           createdBy: "user",
           creationSource: "web",
         });
 
+        if (modelChange === "follow-current") {
+          yield* orchestrator.dispatch({
+            type: "thread.model-selection.set",
+            commandId: CommandId.make("change:follow-current"),
+            threadId,
+            modelSelection: changedModel,
+          });
+          yield* worker.drain();
+        }
+        if (mixedQueue || preBoundary) {
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("send:second-follow-up"),
+            threadId,
+            messageId: MessageId.make("message:second-follow-up"),
+            text: "second follow-up",
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+            ...(mixedQueue ? { modelSelection } : { freshContext: true }),
+            createdBy: "user",
+            creationSource: "web",
+          });
+        }
+        if (preBoundary) {
+          const queued = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.filter(
+            (run) => run.status === "queued",
+          );
+          yield* orchestrator.dispatch({
+            type: "queued-run.reorder",
+            commandId: CommandId.make("reorder:fresh-first"),
+            threadId,
+            runId: queued.find((run) => run.freshContext === true)!.id,
+            beforeRunId: queued.find((run) => run.freshContext !== true)!.id,
+          });
+        }
+        if (targetEnded || preBoundary) {
+          if (targetEnded) armed = true;
+          const ended = yield* orchestrator.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "run.updated" &&
+                event.payload.id === first.runId &&
+                (event.payload.status === "waiting" || event.payload.status === "completed"),
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+            Effect.forkScoped,
+          );
+          yield* Queue.offer(eventQueues.get(stoppedSession)!, {
+            type: "turn.terminal",
+            driver,
+            providerThreadId: first.providerThread.id,
+            providerTurnId: ProviderTurnId.make(`provider-turn:${first.attemptId}`),
+            runOrdinal: first.runOrdinal,
+            status: "completed",
+            failure: null,
+            threadDisposition: "reusable",
+          });
+          yield* Fiber.join(ended);
+          yield* worker.drain();
+        }
+        if (preBoundary) {
+          const freshTurn = started[1]!;
+          assert.exists(freshTurn, "the reordered fresh run did not start");
+          assert.notEqual(freshTurn.providerThread.providerSessionId, stoppedSession);
+          const records = yield* orchestrator.getThreadRecords(threadId, [
+            "runs",
+            "providerThreads",
+          ]);
+          assert.isTrue(yield* sessions.isLive(stoppedSession));
+          assert.equal(
+            records.providerThreads.find(
+              (thread) => thread.id === records.thread.activeProviderThreadId,
+            )!.providerSessionId,
+            freshTurn.providerThread.providerSessionId,
+          );
+          assert.equal(
+            records.providerThreads.find(
+              (thread) =>
+                thread.id === records.runs.find((run) => run.status === "queued")!.providerThreadId,
+            )!.providerSessionId,
+            stoppedSession,
+          );
+        }
+        armed = true;
         const result = yield* threads.forceStopThread({ threadId });
+        if (gate && !preBoundary && !mixedQueue) {
+          assert.lengthOf(started, 1, "promotion ran before Force stop returned");
+          yield* TestClock.adjust("9 seconds");
+          assert.isTrue(yield* sessions.isLive(stoppedSession));
+        }
+        yield* Deferred.succeed(stopReturned, undefined);
         yield* worker.drain();
-
+        if (preBoundary || targetEnded || mixedQueue) {
+          assert.isFalse(
+            yield* sessions.isLive(stoppedSession),
+            "Force stop retained a session the next run cannot use",
+          );
+          if (mixedQueue) {
+            assert.equal(
+              started[1]?.providerThread.providerInstanceId,
+              otherInstanceId,
+              "the provider switch never started",
+            );
+            const records = yield* orchestrator.getThreadRecords(threadId, ["runs"]);
+            assert.isFalse(
+              records.runs.some((run) => run.queueHeld === true),
+              "Force stop held the queue",
+            );
+          }
+          if (targetEnded) assert.equal(result.outcome, "released");
+          return;
+        }
+        if (refusesPromotion) {
+          assert.isTrue(yield* sessions.isLive(stoppedSession));
+          if (sharesDuringGrace) {
+            const siblingId = ThreadId.make("thread:joining-during-grace");
+            yield* orchestrator.dispatch({
+              type: "thread.create",
+              commandId: CommandId.make("create:joining-during-grace"),
+              threadId: siblingId,
+              projectId: ProjectId.make("project:thread-stop"),
+              title: "Sibling background work",
+              modelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: cwd,
+              createdBy: "user",
+              creationSource: "web",
+            });
+            yield* send(siblingId, "sibling", "start_immediately");
+            yield* worker.drain();
+            const sibling = started[1]!;
+            assert.equal(sibling.providerThread.providerSessionId, stoppedSession);
+            const ended = yield* orchestrator.streamDomainEvents.pipe(
+              Stream.filter(
+                (event) =>
+                  event.type === "run.updated" &&
+                  event.payload.id === sibling.runId &&
+                  (event.payload.status === "waiting" || event.payload.status === "completed"),
+              ),
+              Stream.take(1),
+              Stream.runDrain,
+              Effect.forkScoped,
+            );
+            yield* Queue.offer(eventQueues.get(stoppedSession)!, {
+              type: "turn.terminal",
+              driver,
+              providerThreadId: sibling.providerThread.id,
+              providerTurnId: ProviderTurnId.make(`provider-turn:${sibling.attemptId}`),
+              runOrdinal: sibling.runOrdinal,
+              status: "completed",
+              failure: null,
+              threadDisposition: "reusable",
+            });
+            yield* Fiber.join(ended);
+            yield* worker.drain();
+            const projections = yield* ProjectionStore.ProjectionStoreV2;
+            yield* projections.apply({
+              id: EventId.make("event:sibling-background-work"),
+              type: "provider-thread.updated",
+              threadId: siblingId,
+              occurredAt: yield* DateTime.now,
+              payload: {
+                ...sibling.providerThread,
+                pendingBackgroundTasks: [{ taskId: "background-sibling", kind: "command" }],
+              },
+            });
+            const records = yield* orchestrator.getThreadRecords(siblingId, ["runs"]);
+            assert.equal(records.runs[0]!.status, "completed");
+            assert.deepEqual(
+              yield* sessions.otherWorkingThreads({ providerSessionId: stoppedSession, threadId }),
+              [siblingId],
+            );
+            yield* TestClock.adjust("10 seconds");
+            assert.isTrue(
+              yield* sessions.isLive(stoppedSession),
+              "the delayed release killed another thread's background work",
+            );
+            return;
+          }
+          yield* TestClock.adjust("10 seconds");
+          assert.isFalse(
+            yield* sessions.isLive(stoppedSession),
+            "Force stop left an unpromoted session alive after its grace period",
+          );
+          return;
+        }
+        if (gate) {
+          yield* TestClock.adjust("10 seconds");
+          assert.isTrue(
+            yield* sessions.isLive(started[1]!.providerThread.providerSessionId!),
+            "the grace recheck killed a started follow-up",
+          );
+        }
+        if (modelChange) assert.equal(started[1]!.modelSelection.model, changedModel.model);
         assert.deepEqual(
           started.map((turn) => turn.runOrdinal),
           [1, 2],

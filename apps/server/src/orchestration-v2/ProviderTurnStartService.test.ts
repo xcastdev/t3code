@@ -96,13 +96,17 @@ const normalize = (target: string) => {
   }
   return `/${parts.join("/")}`;
 };
-const layerWorktreeLocation = (worktreesDir = managedWorktreesDir) =>
+const layerWorktreeLocation = (
+  worktreesDir = managedWorktreesDir,
+  latestApplied?: InstructionDelivery.InstructionDelivery["Service"]["latestApplied"],
+) =>
   Layer.mergeAll(
     Path.layer,
     Layer.mock(InstructionDelivery.InstructionDelivery)({
       prepare: () => Effect.void,
       recordApplied: () => Effect.void,
       query: () => Effect.undefined,
+      ...(latestApplied === undefined ? {} : { latestApplied }),
     }),
     Layer.mock(ServerConfig.ServerConfig)({ worktreesDir } as ServerConfig.ServerConfig["Service"]),
     ServerSettings.layerTest(),
@@ -422,6 +426,7 @@ function makeLocalCommandHarness(input: {
   readonly writeFailure?: unknown;
   readonly failReadsAfterRunning?: boolean;
   readonly admission?: RunAdmission.RunAdmission["Service"];
+  readonly latestApplied?: InstructionDelivery.InstructionDelivery["Service"]["latestApplied"];
   readonly nativeStart?: ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"];
   readonly nativeResume?: ProviderAdapter.ProviderAdapterV2SessionRuntime["resumeTurn"];
   readonly afterOpen?: Effect.Effect<void>;
@@ -1349,7 +1354,7 @@ function makeLocalCommandHarness(input: {
         }),
         IdAllocator.layer,
         Layer.mock(TurnItemPositionStore.TurnItemPositionStoreV2)({}),
-        layerWorktreeLocation(input.worktreesDir),
+        layerWorktreeLocation(input.worktreesDir, input.latestApplied),
         input.admission === undefined
           ? RunAdmission.layerOrdinary
           : Layer.succeed(RunAdmission.RunAdmission, input.admission),
@@ -3286,6 +3291,41 @@ effectIt.effect("rejects a changed provider route while keeping the admitted sna
     expect(harness.open).not.toHaveBeenCalled();
     expect(nativeStart).not.toHaveBeenCalled();
   }),
+);
+
+effectIt.effect.each([false, true])(
+  "reads the previous instruction delivery only when the provider asks, failing=%s",
+  (failing) =>
+    Effect.gen(function* () {
+      const admission = ownedStartAdmission();
+      const proof = {
+        nativeThreadId: "native-thread",
+        nativeTurnId: "native-turn",
+        snapshot: admission.owner.configuration.instructionSnapshot!,
+      };
+      const latestApplied = vi.fn<
+        InstructionDelivery.InstructionDelivery["Service"]["latestApplied"]
+      >(() =>
+        failing
+          ? Effect.fail(new InstructionDelivery.InstructionDeliveryError({ cause: "unreadable" }))
+          : Effect.succeed(proof),
+      );
+      const started: Array<ProviderAdapter.ProviderAdapterV2TurnInput> = [];
+      const harness = makeLocalCommandHarness({
+        text: "Continue",
+        admission: admission.service,
+        latestApplied,
+        nativeStart: (turn) => Effect.sync(() => void started.push(turn)),
+      });
+      yield* harness.start;
+      expect(latestApplied).not.toHaveBeenCalled();
+      const turn = started[0]!;
+      expect(yield* turn.previousInstructionDelivery!).toEqual(failing ? undefined : proof);
+      expect(latestApplied).toHaveBeenCalledWith({
+        threadId: turn.threadId,
+        providerThread: turn.providerThread,
+      });
+    }),
 );
 
 effectIt.effect("starts admitted configuration without preparing a fresh admission", () =>

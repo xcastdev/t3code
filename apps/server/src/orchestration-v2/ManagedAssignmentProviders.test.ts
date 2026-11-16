@@ -463,11 +463,21 @@ it.effect.each([false, true])(
           Effect.provide(Layer.fresh(InstructionDelivery.layer)),
         );
         const latestTarget = { threadId, providerThread: second!.providerThread };
-        assert.deepEqual(yield* restored.latestApplied(latestTarget), {
+        const latestProof = {
           nativeThreadId: second!.providerThread.nativeThreadRef!.nativeId,
           nativeTurnId: `turn:${second!.runId}`,
           snapshot: revisionB,
-        });
+        };
+        assert.deepEqual(yield* restored.latestApplied(latestTarget), latestProof);
+        const sql = yield* SqlClient.SqlClient;
+        // A newer projected turn the provider never named is skipped, not treated as unreceipted.
+        yield* sql`INSERT INTO orchestration_v2_projection_provider_turns
+          SELECT 'unnamed-later-turn', thread_id, provider_thread_id, node_id, NULL, ordinal + 1,
+            status, started_at, completed_at, json_remove(payload_json, '$.nativeTurnRef')
+          FROM orchestration_v2_projection_provider_turns
+          WHERE provider_thread_id=${second!.providerThread.id}
+          ORDER BY ordinal DESC LIMIT 1`;
+        assert.deepEqual(yield* restored.latestApplied(latestTarget), latestProof);
         assert.isUndefined(
           yield* restored.latestApplied({
             ...latestTarget,
@@ -495,9 +505,12 @@ it.effect.each([false, true])(
             },
           }),
         );
-        const sql = yield* SqlClient.SqlClient;
         yield* sql`UPDATE t3_workflow_v2_instruction_deliveries
           SET applied_snapshot_json=NULL,state='pending' WHERE run_attempt_id=${current.runAttemptId}`;
+        assert.isUndefined(yield* restored.latestApplied(latestTarget));
+        // A latest native turn with no receipt at all does not fall back to the older one.
+        yield* sql`DELETE FROM t3_workflow_v2_instruction_deliveries
+          WHERE run_attempt_id=${current.runAttemptId}`;
         assert.isUndefined(yield* restored.latestApplied(latestTarget));
       }).pipe(Effect.provide(deliveryLayer));
     }).pipe(Effect.scoped),

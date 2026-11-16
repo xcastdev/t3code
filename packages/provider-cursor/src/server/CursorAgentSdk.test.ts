@@ -201,6 +201,33 @@ describe("CursorAgentSdkRunner", () => {
       assert.isFalse(yield* session.runCheckpointed!(), "the follow-up has no checkpoint yet");
       assert.isTrue(yield* session.runCheckpointed!(run.runId));
       assert.isFalse(yield* session.runCheckpointed!(followUp.runId));
+      // An uncheckpointed newer run leaves the older checkpoint as the one a resume loads.
+      assert.isTrue(yield* session.runCheckpointed!(run.runId, { current: true }));
+      // Cursor's onCheckpoint saves the agent's checkpoint first, then patches the run.
+      const advanceAgent = (rootBlobId: string) =>
+        Effect.promise(async () => {
+          const document = await store.agents.get({ agentId: agent.agentId });
+          await store.agents.update({
+            agent: { ...document!, latestCheckpoint: { schemaVersion: 1, rootBlobId } },
+          });
+        });
+      yield* advanceAgent("checkpoint-2");
+      // Crash between the two writes: the run record still looks uncheckpointed.
+      assert.isFalse(yield* session.runCheckpointed!(followUp.runId));
+      assert.isTrue(
+        yield* session.runCheckpointed!(run.runId),
+        "history still holds the older run",
+      );
+      assert.isFalse(yield* session.runCheckpointed!(run.runId, { current: true }));
+      yield* Effect.promise(() =>
+        platform.store.patchCheckpoint(agent.agentId, followUp.runId, {
+          blobId: "checkpoint-2",
+          storeKind: "local",
+        }),
+      );
+      assert.isFalse(yield* session.runCheckpointed!(run.runId, { current: true }));
+      assert.isTrue(yield* session.runCheckpointed!(followUp.runId, { current: true }));
+      assert.isFalse(yield* session.runCheckpointed!("missing-run", { current: true }));
       yield* session.close;
     }).pipe(Effect.provide(NodeServices.layer)),
   );

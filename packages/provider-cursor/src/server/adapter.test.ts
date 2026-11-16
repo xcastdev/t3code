@@ -1177,11 +1177,17 @@ describe("CursorAdapterV2", () => {
             agentId: "native-cursor-steer",
             listMessages: Effect.succeed([]),
             close: Effect.void,
-            runCheckpointed: (runId) =>
+            runCheckpointed: (runId, options) =>
               Effect.succeed(
                 runId === undefined
                   ? checkpointedRuns.has(`native-cursor-run-${sentMessages.length}`)
-                  : checkpointedRuns.has(runId),
+                  : checkpointedRuns.has(runId) &&
+                      // A resume loads the newest checkpoint.
+                      (options?.current !== true ||
+                        runId ===
+                          [...checkpointedRuns]
+                            .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+                            .at(-1)),
               ),
             send: (input) =>
               Effect.gen(function* () {
@@ -1435,17 +1441,25 @@ describe("CursorAdapterV2", () => {
         snapshot: instructionSnapshot,
       };
       const resumedInput = { ...resumeInput(10), providerThread: reopenedThread };
-      for (const retained of [
-        undefined,
-        { ...proof, snapshot: { ...instructionSnapshot, memoryEpoch: 1 } },
-        { ...proof, nativeThreadId: "another-native-thread" },
-        { ...proof, nativeTurnId: "uncheckpointed-run" },
-      ]) {
+      const unverified =
+        "Cursor instruction delivery could not be verified. Send a fresh prompt before resuming.";
+      for (const [retained, detail] of [
+        [undefined, unverified],
+        [
+          { ...proof, snapshot: { ...instructionSnapshot, memoryEpoch: 1 } },
+          "Cursor instruction revisions require a fresh prompt before resuming.",
+        ],
+        [{ ...proof, nativeThreadId: "another-native-thread" }, unverified],
+        [{ ...proof, nativeTurnId: "uncheckpointed-run" }, unverified],
+        // Run 7 checkpointed, but run 9's checkpoint is the one Cursor would resume from.
+        [{ ...proof, nativeTurnId: "native-cursor-run-7" }, unverified],
+      ] as const) {
         const refused = yield* reopened.resumeTurn!({
           ...resumedInput,
           previousInstructionDelivery: Effect.succeed(retained),
         }).pipe(Effect.exit);
-        assert.isTrue(Exit.isFailure(refused));
+        if (!Exit.isFailure(refused)) return yield* Effect.die("Expected Cursor resume refusal");
+        assert.nestedPropertyVal(Cause.squash(refused.cause), "cause.detail", detail);
         assert.lengthOf(sentMessages, 9);
       }
       yield* reopened.resumeTurn!({

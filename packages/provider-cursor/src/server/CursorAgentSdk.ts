@@ -135,8 +135,12 @@ export interface CursorAgentSdkSession {
   /**
    * Whether a run (the latest when omitted) saved a checkpoint of its own. Cursor keeps a stopped
    * run only from its first checkpoint on; before that the conversation lacks the run's request.
+   * With current, the run's checkpoint must still be the checkpoint a resume loads.
    */
-  readonly runCheckpointed?: (runId?: string) => Effect.Effect<boolean, CursorAgentSdkRunnerError>;
+  readonly runCheckpointed?: (
+    runId?: string,
+    options?: { readonly current?: boolean },
+  ) => Effect.Effect<boolean, CursorAgentSdkRunnerError>;
   readonly close: Effect.Effect<void, CursorAgentSdkRunnerError>;
 }
 
@@ -809,7 +813,7 @@ export const makeCursorAgentSdkRunner = Effect.fn("makeCursorAgentSdkRunner")(fu
             return usage === undefined || usage.maxTokens === 0 ? undefined : usage;
           }),
         ),
-        runCheckpointed: (runId) =>
+        runCheckpointed: (runId, options) =>
           Effect.tryPromise({
             try: async () => {
               const { store } = await storeView();
@@ -830,7 +834,14 @@ export const makeCursorAgentSdkRunner = Effect.fn("makeCursorAgentSdkRunner")(fu
                 } while (cursor !== undefined);
               }
               const checkpoint = run?.latestCheckpointRef?.blobId;
-              return checkpoint !== undefined && checkpoint !== run?.startCheckpointRef?.blobId;
+              if (checkpoint === undefined || checkpoint === run?.startCheckpointRef?.blobId) {
+                return false;
+              }
+              // A resume loads the agent's latest checkpoint, which a newer run may have replaced.
+              if (options?.current !== true) return true;
+              return (
+                (await store.getAgent(agent.agentId))?.latestCheckpointRef?.blobId === checkpoint
+              );
             },
             catch: (cause) => runnerError(cause, "agent.run.get"),
           }),

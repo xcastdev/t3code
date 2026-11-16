@@ -2740,8 +2740,8 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
                 ? known
                 : { orchestration: turnInput.runOrdinal > 1, device: false };
             const interrupted = yield* Ref.get(interruptedPrompt);
-            const runCheckpointed = (runId?: string) =>
-              agent.session.runCheckpointed?.(runId) ?? Effect.succeed(false);
+            const runCheckpointed = (runId?: string, options?: { readonly current?: boolean }) =>
+              agent.session.runCheckpointed?.(runId, options) ?? Effect.succeed(false);
             const dropped =
               interrupted?.agent === agent.nativeThreadId &&
               !(yield* runCheckpointed(interrupted.runId))
@@ -2778,7 +2778,7 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
               const retained = yield* turnInput.previousInstructionDelivery ?? Effect.undefined;
               if (
                 retained?.nativeThreadId === agent.nativeThreadId &&
-                (yield* runCheckpointed(retained.nativeTurnId))
+                (yield* runCheckpointed(retained.nativeTurnId, { current: true }))
               ) {
                 previousSnapshot = retained.snapshot;
               }
