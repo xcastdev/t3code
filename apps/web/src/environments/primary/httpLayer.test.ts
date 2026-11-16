@@ -1,11 +1,15 @@
-import type { DesktopBridge } from "@t3tools/contracts";
+import { type DesktopBridge, EnvironmentId } from "@t3tools/contracts";
+import { makeEnvironmentHttpApiClient } from "@t3tools/client-runtime/rpc";
 import { afterEach, describe, expect, it, vi } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Cause from "effect/Cause";
 import * as Fiber from "effect/Fiber";
 import { HttpClient } from "effect/http";
 
 import { __resetDesktopPrimaryAuthForTests } from "./desktopAuth";
 import * as PrimaryEnvironmentHttpLayer from "./httpLayer";
+import { __resetDesktopPrimaryAttachmentForTests } from "./target";
 
 function createSignal<A>() {
   let resolve!: (value: A) => void;
@@ -18,6 +22,7 @@ function createSignal<A>() {
 describe("primary environment HTTP layer", { concurrent: false }, () => {
   afterEach(() => {
     __resetDesktopPrimaryAuthForTests();
+    __resetDesktopPrimaryAttachmentForTests();
     Reflect.deleteProperty(globalThis, "window");
     vi.unstubAllGlobals();
   });
@@ -41,6 +46,62 @@ describe("primary environment HTTP layer", { concurrent: false }, () => {
       const request = new Request(fetchMock.mock.calls[0]?.[0], fetchMock.mock.calls[0]?.[1]);
       expect(request.credentials).toBe("include");
       expect(request.headers.get("authorization")).toBeNull();
+    }).pipe(Effect.provide(PrimaryEnvironmentHttpLayer.layerForCurrentOrigin()));
+  });
+
+  it.effect.each([
+    { destination: "the attached server", baseUrl: "http://127.0.0.1:4773", allowed: true },
+    { destination: "another origin", baseUrl: "http://127.0.0.1:4774", allowed: false },
+  ])("checks the resolved API URL before authorizing $destination", ({ baseUrl, allowed }) => {
+    const attached = {
+      httpBaseUrl: "http://127.0.0.1:4773",
+      wsBaseUrl: "ws://127.0.0.1:4773",
+      environmentId: EnvironmentId.make("environment-attached"),
+      attachmentRevision: "revision-1",
+    };
+    const getBearer = vi.fn(async () => "attached-bearer");
+    const fetchMock = vi.fn().mockResolvedValue(
+      Response.json({
+        authenticated: true,
+        auth: {
+          policy: "remote-reachable",
+          bootstrapMethods: ["one-time-token"],
+          sessionMethods: ["bearer-access-token"],
+          sessionCookieName: "t3_session",
+        },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("window", {
+      location: { origin: "t3code://app" },
+      desktopBridge: {
+        getLocalEnvironmentEnabled: () => true,
+        getLocalEnvironmentBootstraps: () => [
+          { id: "primary", label: "Attached", ownership: "attached", ...attached },
+        ],
+        getLocalEnvironmentBearerToken: getBearer,
+      },
+    });
+    return Effect.gen(function* () {
+      const client = yield* makeEnvironmentHttpApiClient(baseUrl);
+      const result = yield* client.auth.session({ headers: {} }).pipe(Effect.exit);
+      if (!allowed) {
+        if (!Exit.isFailure(result))
+          return yield* Effect.die("Expected destination mismatch refusal");
+        expect(Cause.squash(result.cause)).toMatchObject({
+          _tag: "DesktopAttachedCredentialTargetMismatchError",
+        });
+        expect(getBearer).not.toHaveBeenCalled();
+        expect(fetchMock).not.toHaveBeenCalled();
+        return;
+      }
+      const session = yield* result;
+      expect(session.authenticated).toBe(true);
+      const request = new Request(fetchMock.mock.calls[0]?.[0], fetchMock.mock.calls[0]?.[1]);
+      expect(request.url).toBe(`${baseUrl}/api/auth/session`);
+      expect(request.headers.get("authorization")).toBe("Bearer attached-bearer");
+      expect(request.credentials).toBe("omit");
+      expect(getBearer).toHaveBeenCalledWith(attached);
     }).pipe(Effect.provide(PrimaryEnvironmentHttpLayer.layerForCurrentOrigin()));
   });
 

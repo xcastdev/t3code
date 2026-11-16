@@ -19,17 +19,23 @@ function isSameOriginBrowserPrimary(): boolean {
 }
 
 function withPrimaryBearerToken(client: HttpClient.HttpClient): HttpClient.HttpClient {
-  return client.pipe(
-    HttpClient.mapRequestEffect((request) =>
-      // An attached server's token is bound to the endpoint this request already targets.
-      Effect.promise(() =>
-        readDesktopPrimaryBearerToken(attachedTargetForRequestUrl(request.url) ?? "managed"),
-      ).pipe(
-        Effect.map((bearerToken) =>
-          bearerToken ? HttpClientRequest.bearerToken(request, bearerToken) : request,
+  // API clients append base-URL preprocessing; bind credentials only after it has run.
+  return HttpClient.makeWith(
+    (requestEffect) =>
+      client.postprocess(
+        requestEffect.pipe(
+          Effect.flatMap((request) =>
+            Effect.promise(() =>
+              readDesktopPrimaryBearerToken(attachedTargetForRequestUrl(request.url) ?? "managed"),
+            ).pipe(
+              Effect.map((bearerToken) =>
+                bearerToken ? HttpClientRequest.bearerToken(request, bearerToken) : request,
+              ),
+            ),
+          ),
         ),
       ),
-    ),
+    client.preprocess,
   );
 }
 
