@@ -51,6 +51,9 @@ the upstream commit being merged, and `FORK` for the fork's `main` before the me
      file.
    - Take upstream's `pnpm-lock.yaml` and regenerate it with `vp i`. Regenerate
      `apps/web/src/routeTree.gen.ts`; never hand-merge generated files.
+   - Take upstream's `.github/workflows/` and run `.github/fork/use-github-runners.sh`.
+     The fork runs CI on GitHub-hosted runners, because Blacksmith needs a GitHub
+     organization and this fork belongs to a personal account.
 5. **Find what Git did not mark.** After the markers are gone, look for:
    - fork code that still uses a removed dependency or API;
    - fork code that breaks a renamed or new lint rule or Effect diagnostic;
