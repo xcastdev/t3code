@@ -393,6 +393,8 @@ export default defineConfig(({ command }) => {
       watch: { exclude: rolldownWatchExclude },
       ...(devProxyTarget
         ? {
+            // Let the backend answer preflights instead of ending them before the proxy.
+            cors: { preflightContinue: true },
             // Share prefixes with the backend catch-all so the proxy and 404 lists cannot drift.
             proxy: Object.fromEntries(
               DEV_PROXIED_PATH_PREFIXES.map((prefix) => [
