@@ -689,12 +689,12 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
     }),
     Layer.mock(ProjectionStore.ProjectionStoreV2)({
       ...options.projections,
-      getSettlementCandidates: (threadId) =>
+      getSettlementCandidates: (threadId, optionsForRead) =>
         Ref.update(candidateReads, (reads) => [...reads, threadId]).pipe(
           Effect.andThen(Ref.updateAndGet(snapshotReadCount, (count) => count + 1)),
           Effect.tap((count) => Queue.offer(snapshotReads, count)),
           Effect.andThen(
-            options.projections?.getSettlementCandidates(threadId) ??
+            options.projections?.getSettlementCandidates(threadId, optionsForRead) ??
               Ref.get(snapshots).pipe(
                 Effect.map((snapshot) =>
                   threadId === undefined
@@ -989,6 +989,133 @@ describe("ThreadSettlementServiceV2 worker", () => {
       ),
   );
 
+  it.effect.each([true, false])(
+    "settles Home subagents by their own project idle rules through the stored parent (enabled=%s)",
+    (enabled) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* TestClock.setTime(Date.parse(NOW));
+          const store = yield* ProjectionStore.ProjectionStoreV2;
+          const agentProject = ProjectId.make("home-project");
+          const disabledProject = ProjectId.make("disabled-project");
+          const home = {
+            ...appThread("permanent-home", null),
+            projectId: agentProject,
+            createdAt: DateTime.subtract(DateTime.makeUnsafe(NOW), { days: 10 }),
+          };
+          const normalParent = {
+            ...appThread("normal-parent", null),
+            autoSettleDisabledAt: DateTime.makeUnsafe(NOW),
+          };
+          const chat = {
+            ...appThread("home-chat", null),
+            projectId: agentProject,
+            autoSettleDisabledAt: DateTime.makeUnsafe(NOW),
+            lineage: {
+              rootThreadId: home.id,
+              parentThreadId: home.id,
+              relationshipToParent: "chat" as const,
+            },
+          };
+          const child = (
+            id: string,
+            parent: OrchestrationV2AppThread,
+            overrides: Partial<OrchestrationV2AppThread> = {},
+          ): OrchestrationV2AppThread => ({
+            ...appThread(id, null),
+            createdAt: DateTime.subtract(DateTime.makeUnsafe(NOW), { days: 10 }),
+            lineage: {
+              rootThreadId: parent.lineage.rootThreadId,
+              parentThreadId: parent.id,
+              relationshipToParent: "subagent",
+            },
+            ...overrides,
+          });
+          const old = child("old-home-child", home);
+          const recent = child("recent-home-child", home, {
+            projectId: agentProject,
+            createdAt: DateTime.subtract(DateTime.makeUnsafe(NOW), { days: 1 }),
+          });
+          for (const thread of [
+            home,
+            normalParent,
+            chat,
+            old,
+            recent,
+            child("normal-child", normalParent),
+            child("nested-home-child", chat, { projectId: agentProject }),
+            child("disabled-home-child", home, { projectId: disabledProject }),
+            child("pinned-home-child", home, { pinnedAt: DateTime.makeUnsafe(NOW) }),
+          ]) {
+            yield* store.apply({
+              type: "thread.created",
+              id: EventId.make(`created:${thread.id}`),
+              threadId: thread.id,
+              occurredAt: thread.createdAt,
+              payload: thread,
+            });
+          }
+          const closedChildren: ThreadId[] = [];
+          for (const type of ["thread.deleted", "thread.archived", "thread.settled"] as const) {
+            const parent = { ...home, id: ThreadId.make(type) };
+            const closedChild = child(`child:${type}`, parent);
+            for (const thread of [parent, closedChild]) {
+              yield* store.apply({
+                type: "thread.created",
+                id: EventId.make(`created:${thread.id}`),
+                threadId: thread.id,
+                occurredAt: thread.createdAt,
+                payload: thread,
+              });
+            }
+            yield* store.apply({
+              type,
+              id: EventId.make(`closed:${parent.id}`),
+              threadId: parent.id,
+              occurredAt: DateTime.makeUnsafe(NOW),
+              payload: {
+                ...parent,
+                deletedAt: type === "thread.deleted" ? DateTime.makeUnsafe(NOW) : null,
+                archivedAt: type === "thread.archived" ? DateTime.makeUnsafe(NOW) : null,
+                settledOverride: type === "thread.settled" ? "settled" : null,
+                settledAt: type === "thread.settled" ? DateTime.makeUnsafe(NOW) : null,
+              },
+            });
+            closedChildren.push(closedChild.id);
+          }
+          const fixture = yield* makeHarness({
+            snapshot: makeSnapshot(
+              [],
+              [
+                makeProject(),
+                { ...makeProject(agentProject), assistantId: AssistantId.make("home-owner") },
+                makeProject(disabledProject),
+              ],
+            ),
+            projections: store,
+            settings: {
+              ...DEFAULT_SERVER_SETTINGS,
+              sidebarAutoSettleAfterDays: null,
+              sidebarAutoSettleOnMerge: false,
+              projectSettingsOverrides: enabled
+                ? {
+                    [PROJECT_ID]: { sidebarAutoSettleAfterDays: 2 },
+                    [agentProject]: { sidebarAutoSettleAfterDays: 2 },
+                  }
+                : {},
+            },
+          });
+          yield* Effect.gen(function* () {
+            const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
+            yield* startHarness(service, fixture.activation, fixture.snapshotReads);
+            expect(
+              (yield* Ref.get(fixture.commands)).map((command) => command.threadId).toSorted(),
+            ).toEqual([...closedChildren, ...(enabled ? [old.id] : [])].toSorted());
+          }).pipe(Effect.provide(fixture.layer));
+        }).pipe(Effect.provide(projectionStoreSql)),
+      ),
+  );
+
   it.effect("stops settling the rest of a sweep once auto-settlement is turned off", () =>
     Effect.gen(function* () {
       yield* TestClock.setTime(Date.parse(NOW));
@@ -1249,9 +1376,9 @@ describe("ThreadSettlementServiceV2 worker", () => {
           },
           projections: {
             ...store,
-            getSettlementCandidates: (threadId) =>
+            getSettlementCandidates: (threadId, optionsForRead) =>
               Effect.gen(function* () {
-                const candidates = yield* store.getSettlementCandidates(threadId);
+                const candidates = yield* store.getSettlementCandidates(threadId, optionsForRead);
                 if (blockNextSweep) {
                   blockNextSweep = false;
                   yield* Deferred.succeed(sweepStarted, undefined);

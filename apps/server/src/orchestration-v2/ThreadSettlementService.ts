@@ -351,19 +351,25 @@ export const make = Effect.gen(function* () {
     if (mergedPullRequest !== null) yield* pauseQuietReads();
     const settings = yield* settingsService.getSettings;
     const automaticSettlementEnabled = autoSettlementConfigured(settings);
-    const threads = yield* projections.getSettlementCandidates(threadId);
-    if (threads.length === 0) return;
     const projectShells = yield* projectStore.listShells();
+    const threads = yield* projections.getSettlementCandidates(threadId, {
+      assistantProjectIds: projectShells
+        .filter((project) => project.assistantId !== undefined)
+        .map((project) => project.id),
+    });
+    if (threads.length === 0) return;
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
     const projects = new Map(projectShells.map((project) => [project.id, project]));
     for (const [key, readAtMs] of quietOpenReadAt) {
       if (nowMs - readAtMs >= QUIET_SYNC_INTERVAL_MS) quietOpenReadAt.delete(key);
     }
+    const settlesWithParent = (thread: ProjectionStore.ProjectionSettlementCandidate) =>
+      thread.lineage.relationshipToParent === "subagent" && !thread.parentIsAssistantHome;
     // Merge events resweep all candidates because unlinked threads settle through branch lookup.
     // An agent's Home is its backing project's root thread and never settles.
     const candidates = threads.filter(
       (thread) =>
-        (automaticSettlementEnabled || thread.lineage.relationshipToParent === "subagent") &&
+        (automaticSettlementEnabled || settlesWithParent(thread)) &&
         isAutoSettlementCandidate(thread, nowMs) &&
         !(
           thread.lineage.parentThreadId === null &&
@@ -374,9 +380,8 @@ export const make = Effect.gen(function* () {
     // Runs per candidate thread, thousands per sweep on busy servers; the sweep owns the span.
     const settleThread = Effect.fnUntraced(
       function* (thread: (typeof candidates)[number], pullRequest: SettlementPullRequest | null) {
-        if (thread.lineage.relationshipToParent === "subagent") {
-          // The store returns a subagent only once its parent is done, so it
-          // settles with the parent and never runs its own lookup.
+        if (settlesWithParent(thread)) {
+          // Ordinary subagents become candidates only once their parent is done.
           const uuid = yield* random.uuidV4();
           yield* orchestrator.dispatch({
             type: "thread.auto-settle",
@@ -427,7 +432,7 @@ export const make = Effect.gen(function* () {
     const lookupCandidates = (yield* Effect.forEach(
       candidates,
       (thread) => {
-        if (thread.lineage.relationshipToParent === "subagent") return settleThread(thread, null);
+        if (settlesWithParent(thread)) return settleThread(thread, null);
         const projectSettings = resolveProjectSettings(settings, thread.projectId).settings;
         // Skip no-op decisions; actual settlement still reads fresh settings before dispatch.
         const settledAt = resolveAutoSettlementAt({

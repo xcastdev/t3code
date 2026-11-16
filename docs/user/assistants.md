@@ -11,8 +11,9 @@ filter in the sidebar header to show only some assistants, or only one environme
 in a conversation to stop its active work.
 
 Home always carries the assistant's name and stays open: it cannot be renamed, settled or archived.
-Chats can. Select the assistant's name in the conversation header for **Configure**, its overview,
-**Memory**, **Routines** and **New chat**.
+Chats can. Subagents launched from Home follow their own project's automatic-settlement settings
+for idle time and merged pull requests. Select the assistant's name in the conversation header
+for **Configure**, its overview, **Memory**, **Routines** and **New chat**.
 
 The composer's model, effort, speed, permissions and plan mode change only the conversation you are
 in, on the assistant's provider. To change the defaults, use **Configure**; conversations still on

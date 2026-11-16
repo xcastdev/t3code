@@ -235,6 +235,7 @@ export type ProjectionSettlementCandidate = Pick<
 > &
   Pick<OrchestrationV2AppThread, "lastSnoozeWakeAt"> & {
     readonly latestUserAuthoredMessageAt: DateTime.Utc | null;
+    readonly parentIsAssistantHome?: true;
   };
 
 const ProjectionCheckpointContext = Schema.Struct({
@@ -637,6 +638,7 @@ export interface ProjectionStoreV2Shape {
   ) => Effect.Effect<number | null, ProjectionStoreV2Error>;
   readonly getSettlementCandidates: (
     threadId?: ThreadId,
+    options?: { readonly assistantProjectIds: ReadonlyArray<ProjectId> },
   ) => Effect.Effect<ReadonlyArray<ProjectionSettlementCandidate>, ProjectionStoreV2Error>;
   readonly getThreadsWithPullRequests: (
     threadId?: ThreadId,
@@ -1173,7 +1175,7 @@ type SettlementThreadRow = Pick<
   | "latest_run_completed_at"
   | "latest_user_message_at"
   | "latest_user_authored_message_at"
->;
+> & { readonly parent_is_assistant_home: number };
 
 type ShellRunItemCountRow = {
   readonly thread_id: string;
@@ -8275,12 +8277,25 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       return { providerThreadsByThreadId, pendingTurnItemsByThreadId };
     });
 
-    const getSettlementCandidates: ProjectionStoreV2Shape["getSettlementCandidates"] = (threadId) =>
-      sql
+    const getSettlementCandidates: ProjectionStoreV2Shape["getSettlementCandidates"] = (
+      threadId,
+      options,
+    ) => {
+      const parentIsAssistantHome = sql`
+        json_extract(t.payload_json, '$.lineage.relationshipToParent') = 'subagent'
+        AND parent.thread_id IS NOT NULL
+        AND parent.deleted_at IS NULL
+        AND json_extract(parent.payload_json, '$.archivedAt') IS NULL
+        AND json_extract(parent.payload_json, '$.settledOverride') IS NOT 'settled'
+        AND json_extract(parent.payload_json, '$.lineage.parentThreadId') IS NULL
+        AND ${sql.in("parent.project_id", options?.assistantProjectIds ?? [])}
+      `;
+      return sql
         .withTransaction(
           Effect.gen(function* () {
             const rows = yield* sql<SettlementThreadRow>`
             SELECT t.thread_id, t.payload_json,
+              ${parentIsAssistantHome} AS parent_is_assistant_home,
               r.run_id AS latest_run_id,
               r.status AS latest_run_status,
               r.requested_at AS latest_run_requested_at,
@@ -8304,6 +8319,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 LIMIT 1
               ) AS latest_user_authored_message_at
             FROM orchestration_v2_projection_threads t
+            LEFT JOIN orchestration_v2_projection_threads parent
+              ON parent.thread_id = json_extract(t.payload_json, '$.lineage.parentThreadId')
             LEFT JOIN orchestration_v2_projection_runs r ON r.run_id = (
               SELECT latest.run_id FROM orchestration_v2_projection_runs latest
               WHERE latest.thread_id = t.thread_id
@@ -8318,13 +8335,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               AND json_extract(t.payload_json, '$.autoSettleDisabledAt') IS NULL
               AND (
                 json_extract(t.payload_json, '$.lineage.relationshipToParent') IS NOT 'subagent'
-                OR NOT EXISTS (
-                  SELECT 1 FROM orchestration_v2_projection_threads parent
-                  WHERE parent.thread_id = json_extract(t.payload_json, '$.lineage.parentThreadId')
-                    AND parent.deleted_at IS NULL
-                    AND json_extract(parent.payload_json, '$.archivedAt') IS NULL
-                    AND json_extract(parent.payload_json, '$.settledOverride') IS NOT 'settled'
-                )
+                OR ${parentIsAssistantHome}
+                OR parent.thread_id IS NULL
+                OR parent.deleted_at IS NOT NULL
+                OR json_extract(parent.payload_json, '$.archivedAt') IS NOT NULL
+                OR json_extract(parent.payload_json, '$.settledOverride') = 'settled'
               )
               AND NOT EXISTS (
                 SELECT 1 FROM orchestration_v2_projection_runs active
@@ -8368,6 +8383,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   row.latest_run_id === null ? null : RunId.make(row.latest_run_id);
                 return {
                   ...thread,
+                  ...(row.parent_is_assistant_home === 1
+                    ? { parentIsAssistantHome: true as const }
+                    : {}),
                   pinnedAt: thread.pinnedAt ?? null,
 
                   autoSettleDisabledAt: thread.autoSettleDisabledAt ?? null,
@@ -8416,6 +8434,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           }),
         )
         .pipe(Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })));
+    };
 
     const getOpenRemoteDelegatedTasks: ProjectionStoreV2Shape["getOpenRemoteDelegatedTasks"] = sql<{
       readonly thread_id: string;

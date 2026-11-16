@@ -1,3 +1,5 @@
+import { AssistantRoutineGateway } from "../assistants/AssistantRoutineGateway.ts";
+import { AssistantRoutineToolkit } from "./toolkits/assistantRoutines/tools.ts";
 import * as RunAdmission from "../orchestration-v2/RunAdmission.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
@@ -316,6 +318,7 @@ const layerRecordingTools = (calls: Array<unknown>) => {
     ThreadToolkit.tools.t3_queue,
     PreviewControlsToolkit.tools.t3_preview_list,
     ProjectToolkit.tools.t3_thread_launch,
+    AssistantRoutineToolkit.tools.t3_assistant_routines_write,
   );
   const record = McpToolAccess.reads((params: unknown) =>
     Effect.sync(() => calls.push(params)).pipe(
@@ -336,6 +339,7 @@ const layerRecordingTools = (calls: Array<unknown>) => {
       t3_queue: record,
       t3_preview_list: record,
       t3_thread_launch: record,
+      t3_assistant_routines_write: record,
     }),
   ).pipe(
     Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
@@ -343,6 +347,8 @@ const layerRecordingTools = (calls: Array<unknown>) => {
       Layer.mergeAll(
         McpToolAccessTestkit.liveThreadsLayer,
         RunAdmission.layerOrdinary,
+        Layer.mock(AssistantRoutineGateway)({}),
+        Layer.mock(ThreadManagementService.ThreadManagementService)({}),
         Layer.mock(OrchestratorMcpService.OrchestratorMcpService)({}),
         Layer.mock(ProjectService.ProjectService)({}),
         Layer.mock(PreviewManager.PreviewManager)({}),
@@ -709,21 +715,53 @@ it.effect("rejects arguments a tool does not declare instead of dropping them", 
   }).pipe(Effect.provide(layerRecordingTools(calls)));
 });
 
-it.effect("accepts a nested key the merged advertised schema shows", () => {
-  const calls: Array<unknown> = [];
-  return Effect.gen(function* () {
-    yield* Effect.exit(
-      callTool("t3_thread_launch", {
-        title: "Root",
-        projectId: "project-1",
-        message: "say hi",
-        workspaceStrategy: { type: "root", baseRef: "main" },
-      }),
-    );
+it.effect(
+  "accepts advertised nested keys and union-root inputs, rejecting undeclared top-level keys",
+  () => {
+    const calls: Array<unknown> = [];
+    return Effect.gen(function* () {
+      yield* Effect.exit(
+        callTool("t3_thread_launch", {
+          title: "Root",
+          projectId: "project-1",
+          message: "say hi",
+          workspaceStrategy: { type: "root", baseRef: "main" },
+        }),
+      );
 
-    expect(calls).toHaveLength(1);
-  }).pipe(Effect.provide(layerRecordingTools(calls)));
-});
+      const runNow = {
+        environmentId,
+        assistantId: "assistant-1",
+        operation: "run-now",
+        taskId: "routine-1",
+        commandId: "run-routine-1",
+      };
+      const setEnabled = {
+        environmentId,
+        assistantId: "assistant-1",
+        operation: "set-enabled",
+        taskId: "routine-1",
+        enabled: false,
+        expectedRevision: 0,
+      };
+      yield* callTool("t3_assistant_routines_write", runNow);
+      yield* callTool("t3_assistant_routines_write", setEnabled);
+      const refused = yield* callTool("t3_assistant_routines_write", {
+        ...runNow,
+        bogus: true,
+      }).pipe(Effect.flip);
+      const invalidBranch = yield* callTool("t3_assistant_routines_write", {
+        ...setEnabled,
+        expectedRevision: -1,
+      }).pipe(Effect.flip);
+
+      expect(calls).toHaveLength(3);
+      expect(calls.slice(1)).toEqual([runNow, setEnabled]);
+      expect(refused.message).toContain('Unknown argument "bogus"');
+      expect(invalidBranch.message).toContain("expectedRevision");
+    }).pipe(Effect.provide(layerRecordingTools(calls)));
+  },
+);
 
 it.effect(
   "clamps t3_thread_read page sizes above their maximum instead of rejecting the call",

@@ -578,18 +578,13 @@ const decodeAsAdvertised = <Tools extends Record<string, Tool.Any>>(
   toolkit: Toolkit.Toolkit<Tools>,
 ): Toolkit.Toolkit<Tools> =>
   Toolkit.make(
-    ...Object.values(toolkit.tools).map((tool) => {
-      const decoded = tool.setParameters(
+    ...Object.values(toolkit.tools).map((tool) =>
+      tool.setParameters(
         advertisedArgumentsOnly(tool).pipe(
           Schema.decodeTo(Schema.toCodecJson(tool.parametersSchema)),
         ),
-      );
-      if (Tool.getJsonSchema(decoded).type === "object") return decoded;
-      // MCP requires an object root; the original codec still validates each union branch.
-      return Object.assign(Tool.dynamic(tool.name), decoded, {
-        jsonSchema: advertisedJsonSchema(tool),
-      });
-    }),
+      ),
+    ),
   ) as unknown as Toolkit.Toolkit<Tools>;
 
 const parameterValidationMessage = (error: unknown) =>

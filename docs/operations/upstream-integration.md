@@ -216,8 +216,10 @@ compaction note no longer names the model, because upstream's shared message dro
 that parameter.
 
 Assistant chats keep their `"chat"` lineage relationship next to upstream's
-`sideChat` flag; the two are separate features. Idle-compaction modes use upstream's
-`idleCompaction` field and still read the legacy `compactIdleThreads` field.
+`sideChat` flag; the two are separate features. Direct subagents of an assistant Home
+follow their own project's idle and merge settlement settings while Home stays open.
+Idle-compaction modes use upstream's `idleCompaction` field and still read the legacy
+`compactIdleThreads` field.
 
 Pi memory extraction requires the exact selected thinking level, preserving
 provenance. Other background text generation uses upstream's fallback when that
