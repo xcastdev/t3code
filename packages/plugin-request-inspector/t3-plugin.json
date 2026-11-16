@@ -2,7 +2,7 @@
   "manifestVersion": 1,
   "id": "request-inspector",
   "name": "Request Inspector",
-  "version": "0.2.14",
+  "version": "0.2.15",
   "hostApi": "1.2",
   "author": "T3 Tools",
   "description": "Runs local mitmproxy proxies, records the HTTP traffic you route through them, and lets you search, export, decode, and replay it.",
