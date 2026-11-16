@@ -11,6 +11,7 @@ import {
   pluginPanelKey,
   type PluginPanelKey,
 } from "@t3tools/client-runtime/plugins/commands";
+import { waitForEnvironmentConnection } from "@t3tools/client-runtime/state/connections";
 import { runAtomCommand, squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
   PluginRequestError,
@@ -42,6 +43,8 @@ import {
   usePluginPanelInstall,
   type PluginPanelInstall,
 } from "~/plugins/pluginInstalls";
+import { pickFileInCommandPalette } from "~/commandPaletteBus";
+import { environmentCatalog } from "~/connection/catalog";
 import { readProjects, readThreadShells } from "~/state/entities";
 import { pluginEnvironment } from "~/state/plugins";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -341,6 +344,10 @@ export function PluginPanelView(props: {
       services.attach(request, props.chatTarget, attachSource),
     saveFile: saveToDevice,
     writeClipboard: copyToClipboard,
+    pickFile: () =>
+      install.kind === "environment"
+        ? pickFileInCommandPalette(install.environmentId)
+        : Promise.reject(new Error("Only a plugin installed on an environment can choose files.")),
     chatTargets: (query: string) =>
       install.kind === "environment"
         ? selectPluginChatTargets(
@@ -425,6 +432,7 @@ export function PluginPanelSurface(props: {
         const chat = chatHint();
         const mutates =
           manifest.backend?.operations.find((entry) => entry.name === operation)?.mutates ?? true;
+        await waitForEnvironmentConnection(registry, environmentCatalog.stateAtom(environmentId));
         const result = await runAtomCommand(
           registry,
           mutates ? pluginEnvironment.mutate : pluginEnvironment.query,

@@ -31,6 +31,23 @@ export const RECORDING_DETAILS = {
   replaysPending: "This recording has replays in progress. Delete it after they finish.",
 } as const;
 
+export const IMPORT_DETAILS = {
+  source:
+    "Pass either path (a flow file on the T3 machine) or uploadId (from import_upload_write), not both.",
+  relativePath: "path must be absolute, or start with ~/.",
+  notAFile: "There is no readable file at that path on the T3 machine.",
+  uploadMissing: "The upload no longer exists. Upload the file again.",
+  uploadSize: "The first chunk of an upload must give the file's total size in bytes.",
+  uploadTooLarge:
+    "The file is larger than half the inspector's storage budget (or 1 GiB). Import it by its path on the T3 machine, or raise maxDiskBytes in the inspector's settings.",
+  limit: "2 imports are already running. Wait for one to finish.",
+  missing: "No import is known for this recording. The inspector forgets imports when it restarts.",
+  noFlows: "The file holds no HTTP flows.",
+  deleted: "The recording was deleted during the import.",
+  exited: "mitmdump exited before the import finished.",
+  proxyBusy: "This proxy has an import running. Wait for it, or delete its recording to stop it.",
+} as const;
+
 export const NSS_DETAILS = {
   unsupported: "Browser certificate databases are managed on Linux only.",
   certutilMissing:

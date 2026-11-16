@@ -84,6 +84,7 @@ function setup(
   );
   const saveFile = vi.fn(async (_file: PluginSaveFile) => "saved" as const);
   const writeClipboard = vi.fn(async (_text: string) => undefined);
+  const pickFile = vi.fn(async (): Promise<string | null> => "/home/user/captures/session.mitm");
 
   const bridge = makePluginBridge({
     manifest: decodeManifest(options.manifest ?? baseManifest),
@@ -120,6 +121,7 @@ function setup(
     attach,
     saveFile,
     writeClipboard,
+    pickFile,
     chatTargets: () => ({ threads: [], projects: [] }),
     ...options.overrides,
   });
@@ -145,6 +147,7 @@ function setup(
     attach,
     saveFile,
     writeClipboard,
+    pickFile,
     subscriptions,
     request,
     initialize,
@@ -494,6 +497,23 @@ describe("makePluginBridge", () => {
       message: "Copying was blocked. Wait a few seconds, then click or tap in the panel again.",
     },
     {
+      name: "file.pick without the capability",
+      capabilities: ["file.save"],
+      method: "t3/file.pick",
+      params: {},
+      activated: true,
+      reason: "capability-denied",
+    },
+    {
+      name: "file.pick without activation",
+      capabilities: ["file.pick"],
+      method: "t3/file.pick",
+      params: {},
+      activated: false,
+      message:
+        "Choosing a file was blocked. Wait a few seconds, then click or tap in the panel again.",
+    },
+    {
       name: "clipboard.write over maxPayloadBytes",
       capabilities: ["clipboard.write"],
       method: "t3/clipboard.write",
@@ -502,7 +522,7 @@ describe("makePluginBridge", () => {
       reason: "too-large",
     },
   ])("refuses $name", async ({ capabilities, method, params, activated, reason, message }) => {
-    const { request, initialize, saveFile, writeClipboard } = setup({
+    const { request, initialize, saveFile, writeClipboard, pickFile } = setup({
       manifest: { ...baseManifest, capabilities },
     });
     await initialize();
@@ -511,6 +531,7 @@ describe("makePluginBridge", () => {
     if (message !== undefined) expect(error.message).toBe(message);
     expect(saveFile).not.toHaveBeenCalled();
     expect(writeClipboard).not.toHaveBeenCalled();
+    expect(pickFile).not.toHaveBeenCalled();
   });
 
   it("file.save joins appended chunks, refuses overruns and short commits, frees on abort, and lets a new begin replace an abandoned save", async () => {
@@ -610,6 +631,18 @@ describe("makePluginBridge", () => {
     await initialize();
     expect((await request("t3/clipboard.write", { text: "Cookie: a=1" }, true)).result).toEqual({});
     expect(writeClipboard).toHaveBeenCalledWith("Cookie: a=1");
+  });
+
+  it("file.pick answers with the host's chosen path, or null when the user cancels", async () => {
+    const { request, initialize, pickFile } = setup({
+      manifest: { ...baseManifest, capabilities: ["file.pick"] },
+    });
+    await initialize();
+    expect((await request("t3/file.pick", {}, true)).result).toEqual({
+      path: "/home/user/captures/session.mitm",
+    });
+    pickFile.mockResolvedValueOnce(null);
+    expect((await request("t3/file.pick", {}, true)).result).toEqual({ path: null });
   });
 
   it("chat.targets.list passes the query and caps each list at maxChatTargets", async () => {

@@ -1,6 +1,10 @@
 import type { EnvironmentId, PullRequestLinkedThreadsResult } from "@t3tools/contracts";
 
-import { dispatchCommandPalette, isCommandPaletteMounted } from "./commandPaletteStore";
+import {
+  beginFilePick,
+  dispatchCommandPalette,
+  isCommandPaletteMounted,
+} from "./commandPaletteStore";
 
 export interface CommandPaletteLinkedThreads {
   readonly environmentId: EnvironmentId;
@@ -32,6 +36,12 @@ export function openCommandPalette(detail: CommandPaletteOpenDetail = {}): void 
   } else {
     dispatchCommandPalette({ _tag: "SetOpen", open: true });
   }
+}
+
+/** Lets the user browse `environmentId` and choose a file; null when they close the palette. */
+export function pickFileInCommandPalette(environmentId: EnvironmentId): Promise<string | null> {
+  if (!isCommandPaletteMounted()) return Promise.resolve(null);
+  return beginFilePick(environmentId);
 }
 
 /** True while the palette popup is on screen, including its closing animation. */

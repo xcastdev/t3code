@@ -50,7 +50,8 @@ plugin that this client cannot host, so the server's version cannot decide it. C
 That needs the record to decode, so manifest `capabilities` are open strings on the wire and
 `decodePluginManifest` rejects an unknown one only when the host claims the manifest's `hostApi`.
 Host API 1.0 clients decoded capabilities as a closed list: they cannot read a registry holding a
-manifest that declares `file.save` or `clipboard.write`, and must update.
+manifest that declares `file.save` or `clipboard.write`, and must update. `file.pick` needs host
+API 1.2, so a plugin that declares it shows "update the app" on 1.1 clients.
 
 ## Backend packaging
 
@@ -91,6 +92,12 @@ When a size is declared it is enforced on `append` and `commit`. A new `begin` d
 panel abandoned. Mobile cannot see whether the share sheet was dismissed, so its commit always
 reports `saved`. `chat.targets.list` needs `chat.attach` or `chat.reference` but no activation,
 so a target picker can fill as it opens.
+
+`file.pick` lets a panel ask for a path on its environment without a backend operation that
+lists directories. Web and desktop open the command palette in a pick-file mode on the install's
+environment (`filesystem.browse` with `includeFiles`). The pick settles as cancelled whenever the
+palette's intent changes, so closing it or opening another pick never leaves the panel waiting.
+Mobile has no palette and refuses the request.
 
 ## Long-running mutations and replay
 

@@ -12,7 +12,7 @@ export const PLUGIN_LIMITS = {
   maxChatTargets: 50,
 } as const;
 
-export const PLUGIN_HOST_API = { major: 1, minor: 1 } as const;
+export const PLUGIN_HOST_API = { major: 1, minor: 2 } as const;
 
 const PLUGIN_ID_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 const PLUGIN_OPERATION_NAME_PATTERN = /^[a-z][a-z0-9_]{0,31}$/;
@@ -127,6 +127,7 @@ export const PluginCapability = Schema.Literals([
   "chat.reference",
   "file.save",
   "clipboard.write",
+  "file.pick",
 ]);
 export type PluginCapability = typeof PluginCapability.Type;
 

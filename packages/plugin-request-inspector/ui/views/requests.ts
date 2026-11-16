@@ -13,6 +13,7 @@ import {
 import { bytesLabel, compareIdsDesc, h, isRecord, statusClass, timeLabel } from "../dom.ts";
 import * as detailView from "./detail.ts";
 import { openExportDialog } from "./exportDialog.ts";
+import { openImportDialog } from "./importDialog.ts";
 
 interface Filter {
   query: string;
@@ -295,6 +296,11 @@ export const mount = (root: HTMLElement, app: App): (() => void) => {
     { type: "button", hidden: true },
     "Delete recording",
   ) as HTMLButtonElement;
+  const importButton = h(
+    "button",
+    { type: "button", title: "Add a .mitm or HAR file as a recording" },
+    "Import…",
+  ) as HTMLButtonElement;
   const selectToggle = h(
     "button",
     {
@@ -342,6 +348,7 @@ export const mount = (root: HTMLElement, app: App): (() => void) => {
         host,
         recording,
         deleteRecording,
+        importButton,
       ),
     ),
     h(
@@ -752,6 +759,29 @@ export const mount = (root: HTMLElement, app: App): (() => void) => {
     for (const id of ids.slice(0, MAX_SEND_TO_REPLAYER)) app.sendToReplayer.emit(id);
   };
   sendToReplayer.addEventListener("click", () => send(replayTargets()));
+  importButton.addEventListener("click", () => {
+    openImportDialog(app, {
+      onStarted: (started) => {
+        if (scopeProxyId !== null && scopeProxyId !== started.proxyId) {
+          proxies.select(started.proxyId);
+        }
+        filter = { ...filter, recordingId: started.recordingId };
+        renderRecordingOptions();
+        loadRecordings();
+        resubscribeRequests();
+        persistence.soon();
+      },
+      onSettled: (settled) => {
+        if (settled.imported === 0 && filter.recordingId === settled.recordingId) {
+          filter = { ...filter, recordingId: "" };
+          renderRecordingOptions();
+          resubscribeRequests();
+          persistence.soon();
+        }
+        loadRecordings();
+      },
+    });
+  });
   exportButton.addEventListener("click", () => {
     openExportDialog(app, { filter: { ...scopeParams(), ...filterParams() } });
   });

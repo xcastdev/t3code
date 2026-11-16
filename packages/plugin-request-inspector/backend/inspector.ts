@@ -23,7 +23,13 @@ import {
   type ProxyLink,
   resolveProxy,
 } from "../shared/proxyResolution.ts";
-import { decodeBody, type DraftStore, makeBodyReader, makeDraftStore } from "./bodies.ts";
+import {
+  decodeBody,
+  type DraftKind,
+  type DraftStore,
+  makeBodyReader,
+  makeDraftStore,
+} from "./bodies.ts";
 import {
   type CertFs,
   type CertRunner,
@@ -38,6 +44,7 @@ import { DECODE_LIMITS, decodeChain, parseDecodeSteps } from "./decode.ts";
 import {
   compileProxyHosts,
   type MitmHandlers,
+  type MitmImportDone,
   MITMDUMP_HINT,
   makeMitm,
   type MitmProcess,
@@ -50,6 +57,7 @@ import {
 import { requestOrigin } from "./origin.ts";
 import {
   EXPORT_DETAILS,
+  IMPORT_DETAILS,
   invalidHostPatternDetail,
   MISSING_DETAILS,
   mustBeDetail,
@@ -130,6 +138,15 @@ const MAX_EXPORT_READ_BYTES = 128 * KiB;
 const MAX_FORMATTED_HEADER_CHARS = 192 * KiB;
 const MAX_NSS_DBS = 64;
 const CONFDIR = "mitmproxy";
+const MAX_RUNNING_IMPORTS = 2;
+const MAX_KEPT_IMPORTS = 32;
+const UPLOADS: DraftKind = {
+  prefix: "upload-",
+  maxBytes: 1024 * MiB,
+  maxDrafts: 2,
+  tooLargeDetail: IMPORT_DETAILS.uploadTooLarge,
+  missingDetail: IMPORT_DETAILS.uploadMissing,
+};
 const EXPORT_CREATOR = { name: "T3 Request Inspector", version: "0.2.1" } as const;
 
 export interface InspectorConfig {
@@ -216,9 +233,41 @@ type ProxyState =
   | { readonly state: "starting" }
   | { readonly state: "failed"; readonly detail: string };
 
+type ImportState = "running" | "completed" | "failed";
+
+/** One flow file being read into a recording. Kept in memory only, like the processes. */
+interface ImportJob {
+  readonly recordingId: number;
+  readonly proxyId: number;
+  readonly name: string;
+  state: ImportState;
+  imported: number;
+  /** Flows of other kinds (TCP, UDP, DNS) the inspector does not store. */
+  skipped: number;
+  /** HTTP flows not stored: the storage budget or maxRequestsPerRecording was reached. */
+  dropped: number;
+  detail?: string;
+  readonly finished: Promise<void>;
+  readonly stop: () => Promise<void>;
+  /** Ends a running import whose recording was deleted. */
+  readonly cancel: () => void;
+}
+
+const importView = (job: ImportJob) => ({
+  recordingId: String(job.recordingId),
+  proxyId: String(job.proxyId),
+  name: job.name,
+  state: job.state,
+  imported: job.imported,
+  skipped: job.skipped,
+  dropped: job.dropped,
+  ...(job.detail === undefined ? {} : { detail: job.detail }),
+});
+
 interface Session {
   readonly store: InspectorStore;
   readonly drafts: DraftStore;
+  readonly uploads: DraftStore;
   readonly readBody: ReturnType<typeof makeBodyReader>;
   readonly replay: ReplayService;
   readonly mitm: ReturnType<typeof makeMitm>;
@@ -862,6 +911,9 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
   const report = deps.reportStatus ?? reportStatus;
   let session: Session | undefined;
   const running = new Map<number, ProxyEntry>();
+  const imports = new Map<number, ImportJob>();
+  /** import_flows calls past the slot check whose job is not in `imports` yet. */
+  const startingImports = new Map<Promise<unknown>, number>();
   const states = new Map<number, ProxyState>();
   const runtimeListeners = new Set<(proxyId: number) => void>();
   let missingReported = false;
@@ -1081,6 +1133,154 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
       .exclusive((lane) => lane.stopRecording(recordingId, now()))
       .catch(() => log("Recording the end of a recording failed."));
     notify(proxyId);
+  };
+
+  /** The file a path or upload import reads, its default name, and what to delete afterwards. */
+  const importSource = (raw: Input) => {
+    const path = optionalString(raw, "path");
+    const uploadId = optionalString(raw, "uploadId");
+    if ((path === undefined) === (uploadId === undefined)) throw invalid(IMPORT_DETAILS.source);
+    if (uploadId !== undefined) {
+      const { uploads, store } = current();
+      if (uploads.path(uploadId) === undefined) {
+        throw new InspectorRefusal("not-found", IMPORT_DETAILS.uploadMissing);
+      }
+      return {
+        name: "Uploaded flows",
+        take: () => {
+          const file = uploads.take(uploadId) as string;
+          const cleanup = () => {
+            NodeFS.rmSync(file, { force: true });
+            store.exclusive((lane) => lane.noteFileWrite()).catch(() => undefined);
+          };
+          return { file, cleanup };
+        },
+      };
+    }
+    const home = deps.home ?? NodeOS.homedir();
+    const trimmed = (path as string).trim();
+    const file =
+      trimmed === "~" || trimmed.startsWith("~/") ? NodePath.join(home, trimmed.slice(1)) : trimmed;
+    if (!NodePath.isAbsolute(file)) throw invalid(IMPORT_DETAILS.relativePath);
+    try {
+      if (!NodeFS.statSync(file).isFile()) throw new Error("Not a file.");
+      NodeFS.accessSync(file, NodeFS.constants.R_OK);
+    } catch {
+      throw new InspectorRefusal("not-found", IMPORT_DETAILS.notAFile);
+    }
+    return { name: NodePath.basename(file), take: () => ({ file, cleanup: () => undefined }) };
+  };
+
+  /** Starts mitmdump on `file` and resolves once it runs; the import then goes on by itself. */
+  const startImport = async (
+    proxyId: number,
+    name: string,
+    file: string,
+    cleanup: () => void,
+  ): Promise<ImportJob> => {
+    const { store, mitm, config, log } = current();
+    const recording = await store.exclusive((lane) =>
+      lane.addImportedRecording({ proxyId, createdAt: now(), name }),
+    );
+    const recordingId = recording.id;
+    let reportDone: (done: MitmImportDone | "deleted") => void = () => undefined;
+    const done = new Promise<MitmImportDone | "deleted">((resolve) => {
+      reportDone = resolve;
+    });
+    let settle: () => void = () => undefined;
+    const job: ImportJob = {
+      recordingId,
+      proxyId,
+      name,
+      state: "running",
+      imported: 0,
+      skipped: 0,
+      dropped: 0,
+      finished: new Promise<void>((resolve) => {
+        settle = resolve;
+      }),
+      stop: async () => {
+        await started.stop();
+        await job.finished;
+      },
+      cancel: () => reportDone("deleted"),
+    };
+    const started = mitm.start(
+      { kind: "import", path: file },
+      {
+        onFlow: async (flow) => {
+          if (job.imported >= config.maxRequestsPerRecording) {
+            job.dropped += 1;
+            await store.exclusive((lane) => lane.noteDroppedFlow(recordingId));
+            return;
+          }
+          const result = await store
+            .insertFlow({ ...flow, recordingId })
+            .catch(async (): Promise<FlowWriteResult> => {
+              // The store counts its own refusals; a thrown write must be counted here.
+              await store
+                .exclusive((lane) => lane.noteDroppedFlow(recordingId))
+                .catch(() => undefined);
+              return { ok: false, reason: "storage-full" };
+            });
+          if (result.ok) job.imported += 1;
+          else if (result.reason === "not-found") reportDone("deleted");
+          else job.dropped += 1;
+        },
+        onTunnel: async () => undefined,
+        onReplayResult: async () => undefined,
+        onImportDone: async (result) => reportDone(result),
+      },
+    );
+    let process: MitmProcess;
+    try {
+      process = await withStartupDeadline(started.ready, started.stop);
+    } catch (error) {
+      await store.exclusive((lane) => lane.deleteRecording(recordingId)).catch(() => undefined);
+      settle();
+      return startFailure(error);
+    }
+    markRunning();
+
+    const finish = async () => {
+      const outcome = await Promise.race([done, process.exited.then(() => "exited" as const)]);
+      await started.stop();
+      if (outcome === "deleted") {
+        job.detail = IMPORT_DETAILS.deleted;
+      } else {
+        if (outcome !== "exited") job.skipped = outcome.skipped;
+        const error = outcome === "exited" ? IMPORT_DETAILS.exited : outcome.error;
+        const detail = error ?? (job.imported === 0 ? IMPORT_DETAILS.noFlows : undefined);
+        if (detail !== undefined) job.detail = detail;
+        await store
+          .exclusive((lane) =>
+            job.imported === 0
+              ? lane.deleteRecording(recordingId)
+              : void lane.finishImportedRecording(recordingId),
+          )
+          .catch(() => log("Closing an imported recording failed."));
+      }
+      job.state = job.detail === undefined ? "completed" : "failed";
+    };
+    void finish()
+      .catch(async () => {
+        job.state = "failed";
+        job.detail ??= IMPORT_DETAILS.exited;
+        await store
+          .exclusive((lane) => void lane.finishImportedRecording(recordingId))
+          .catch(() => undefined);
+      })
+      .finally(() => {
+        cleanup();
+        settle();
+      });
+
+    imports.set(recordingId, job);
+    for (const [id, kept] of imports) {
+      if (imports.size <= MAX_KEPT_IMPORTS) break;
+      if (kept.state !== "running") imports.delete(id);
+    }
+    return job;
   };
 
   const onProxyClosed = async (entry: ProxyEntry) => {
@@ -1571,6 +1771,12 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
         const { store } = current();
         const proxyId = parseId(objectInput(input).proxyId, "proxy");
         if (running.has(proxyId)) throw new InspectorRefusal("conflict", PROXY_DETAILS.running);
+        if (
+          [...startingImports.values()].includes(proxyId) ||
+          [...imports.values()].some((job) => job.proxyId === proxyId && job.state === "running")
+        ) {
+          throw new InspectorRefusal("conflict", IMPORT_DETAILS.proxyBusy);
+        }
         const deleted = await store.exclusive((lane) => lane.deleteProxy(proxyId, now()));
         return { proxyId: String(proxyId), deletedAt: deleted.deletedAt ?? now() };
       }),
@@ -1680,6 +1886,7 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
       const { store } = current();
       const recordingId = parseId(objectInput(input).recordingId, "recording");
       await store.exclusive((lane) => lane.deleteRecording(recordingId));
+      imports.get(recordingId)?.cancel();
       return { recordingId: String(recordingId) };
     },
     search_requests: async (input, ctx) => {
@@ -1971,6 +2178,78 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
       }
       return current().replay.get(replayId, { waitMs, signal: ctx.signal });
     },
+    import_flows: async (input, ctx) => {
+      const raw = objectInput(input);
+      const source = importSource(raw);
+      const proxyId = resolveProxyId(raw, ctx);
+      liveProxy(proxyId);
+      const name = optionalName(raw, "name", 128) ?? source.name.slice(0, 128);
+      const active = [...imports.values()].filter((job) => job.state === "running").length;
+      if (active + startingImports.size >= MAX_RUNNING_IMPORTS) {
+        throw new InspectorRefusal("conflict", IMPORT_DETAILS.limit);
+      }
+      const { file, cleanup } = source.take();
+      const start = startImport(proxyId, name, file, cleanup);
+      startingImports.set(start, proxyId);
+      try {
+        return importView(await start);
+      } catch (error) {
+        cleanup();
+        throw error;
+      } finally {
+        startingImports.delete(start);
+      }
+    },
+    get_import: async (input, ctx) => {
+      const raw = objectInput(input);
+      const job = imports.get(parseId(raw.recordingId, "recording"));
+      if (job === undefined) throw new InspectorRefusal("not-found", IMPORT_DETAILS.missing);
+      const waitMs = optionalInteger(raw, "waitMs") ?? 0;
+      if (waitMs < 0 || waitMs > REPLAY_LIMITS.maxWaitMs) {
+        throw invalid(`waitMs must be between 0 and ${REPLAY_LIMITS.maxWaitMs}.`);
+      }
+      if (job.state === "running" && waitMs > 0 && !ctx.signal.aborted) {
+        await new Promise<void>((resolve) => {
+          const cancel = timer.after(waitMs, resolve);
+          ctx.signal.addEventListener("abort", () => resolve(), { once: true });
+          void job.finished.then(() => {
+            cancel();
+            resolve();
+          });
+        });
+      }
+      return importView(job);
+    },
+    import_upload_write: async (input) => {
+      const raw = objectInput(input);
+      const uploadId = optionalString(raw, "uploadId");
+      const base64 = optionalString(raw, "base64");
+      if (base64 === undefined) throw invalid("base64 is required.");
+      const { uploads, config } = current();
+      if (uploadId === undefined) {
+        // Refused before any chunk is admitted, so a file that cannot fit prunes nothing.
+        const size = optionalInteger(raw, "size");
+        if (size === undefined || size < 1) throw invalid(IMPORT_DETAILS.uploadSize);
+        if (size > Math.min(UPLOADS.maxBytes, Math.floor(config.maxDiskBytes / 2))) {
+          throw invalid(IMPORT_DETAILS.uploadTooLarge);
+        }
+      }
+      const result = await uploads.write({
+        ...(uploadId === undefined ? {} : { draftId: uploadId }),
+        offset: optionalInteger(raw, "offset") ?? -1,
+        base64,
+      });
+      return { uploadId: result.draftId, size: result.size };
+    },
+    import_upload_discard: async (input) => {
+      const { store, uploads } = current();
+      const uploadId = optionalString(objectInput(input), "uploadId");
+      if (uploadId === undefined) throw invalid("uploadId is required.");
+      if (uploads.path(uploadId) !== undefined) {
+        await store.exclusive((lane) => uploads.remove(lane, uploadId));
+      }
+      return { uploadId };
+    },
     body_draft_write: async (input) => {
       const raw = objectInput(input);
       const draftId = optionalString(raw, "draftId");
@@ -2045,6 +2324,7 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
         ...(deps.onStorageStep === undefined ? {} : { onStorageStep: deps.onStorageStep }),
       });
       const drafts = makeDraftStore(store);
+      const uploads = makeDraftStore(store, UPLOADS);
       const mitm = makeMitm({
         dataDir: ctx.dataDir,
         addonSource: deps.addonSource,
@@ -2068,6 +2348,7 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
       session = {
         store,
         drafts,
+        uploads,
         readBody: makeBodyReader(store),
         replay,
         mitm,
@@ -2088,7 +2369,11 @@ export function createInspectorBackend(deps: InspectorDeps): PluginBackendDefini
     onStop: async () => {
       const active = session;
       if (active === undefined) return;
-      await Promise.all([...running.values()].map((entry) => stopEntry(entry, "stop")));
+      await Promise.allSettled(startingImports.keys());
+      await Promise.all([
+        ...[...running.values()].map((entry) => stopEntry(entry, "stop")),
+        ...[...imports.values()].filter((job) => job.state === "running").map((job) => job.stop()),
+      ]);
       await active.replay.stop();
       active.store.close();
       session = undefined;

@@ -2,8 +2,8 @@
   "manifestVersion": 1,
   "id": "request-inspector",
   "name": "Request Inspector",
-  "version": "0.2.13",
-  "hostApi": "1.1",
+  "version": "0.2.14",
+  "hostApi": "1.2",
   "author": "T3 Tools",
   "description": "Runs local mitmproxy proxies, records the HTTP traffic you route through them, and lets you search, export, decode, and replay it.",
   "ui": {
@@ -517,6 +517,115 @@
         },
         "mutates": true,
         "agent": true
+      },
+      {
+        "name": "import_flows",
+        "title": "Import flow file",
+        "description": "Imports a saved flow file (a mitmproxy .mitm dump, or HAR) into a new recording named after the file, so search_requests, get_request, export_requests and replays work on its requests. path is a file on the machine running T3 Code: absolute, or starting with ~/. The import runs in the background: this returns the recordingId with state running; call get_import with waitMs to wait for it. Only HTTP and WebSocket flows are kept, with bodies cut at maxBodyBytes as in a live recording. Omit proxyId to file the recording under the default proxy. Needs mitmdump on PATH.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "uploadId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "description": "From import_upload_write; the panel uses it. Pass path or uploadId, not both."
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 128,
+              "description": "The recording's name. Defaults to the file name."
+            },
+            "proxyId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32,
+              "description": "Omit to use the default proxy: this thread's most recently linked one, else this project's."
+            }
+          },
+          "additionalProperties": false
+        },
+        "mutates": true,
+        "agent": true
+      },
+      {
+        "name": "get_import",
+        "title": "Get import",
+        "description": "Returns an import's state (running, completed or failed), how many requests it imported, how many non-HTTP flows (TCP, UDP, DNS) it skipped, how many HTTP flows the storage budget or maxRequestsPerRecording dropped, and a detail when it failed. A failed import can still have imported requests when the file ends in unreadable data. With waitMs, waits up to that long for it to finish, so you need no polling loop. Deleting the recording cancels a running import.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "recordingId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "waitMs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 20000,
+              "default": 0
+            }
+          },
+          "required": ["recordingId"],
+          "additionalProperties": false
+        },
+        "mutates": false,
+        "agent": true
+      },
+      {
+        "name": "import_upload_write",
+        "title": "Write import upload",
+        "description": "Writes one chunk of a flow file uploaded from the panel. Omit uploadId and give the file's total size to start a new upload, then pass the returned uploadId to import_flows.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "uploadId": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "size": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "base64": {
+              "type": "string",
+              "maxLength": 174764
+            }
+          },
+          "required": ["offset", "base64"],
+          "additionalProperties": false
+        },
+        "mutates": true,
+        "agent": false
+      },
+      {
+        "name": "import_upload_discard",
+        "title": "Discard import upload",
+        "description": "Deletes an upload that will not be imported.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "uploadId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            }
+          },
+          "required": ["uploadId"],
+          "additionalProperties": false
+        },
+        "mutates": true,
+        "agent": false
       },
       {
         "name": "search_requests",
@@ -1311,5 +1420,5 @@
       }
     ]
   },
-  "capabilities": ["chat.attach", "chat.reference", "file.save", "clipboard.write"]
+  "capabilities": ["chat.attach", "chat.reference", "file.save", "clipboard.write", "file.pick"]
 }

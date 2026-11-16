@@ -20,6 +20,7 @@ import { exportBodyInput } from "./inspector.ts";
 import { CONTROL_ENV } from "./mitm.ts";
 import {
   EXPORT_DETAILS,
+  IMPORT_DETAILS,
   MISSING_DETAILS,
   noDefaultProxyDetail,
   PROXY_DETAILS,
@@ -336,6 +337,147 @@ describe("inspector proxies", () => {
       target: { kind: "thread", id: "thread-known" },
     });
     expect(await listed()).toEqual({ defaultProxyId: null, linked: [] });
+  });
+});
+
+describe("inspector imports", () => {
+  interface ImportView {
+    readonly recordingId: string;
+    readonly name: string;
+    readonly state: string;
+    readonly imported: number;
+    readonly skipped: number;
+    readonly detail?: string;
+  }
+
+  it("an upload imports through a listen-less mitmdump into a named recording, and is deleted once the import ends", async () => {
+    const { harness, fake } = await setup();
+    await using _harness = harness;
+    const bytes = Buffer.from("not really a dump, the fake mitmdump never reads it");
+    const firstChunk = { offset: 0, base64: bytes.subarray(0, 10).toString("base64") };
+    expect(await detailOf(harness.call("import_upload_write", firstChunk))).toBe(
+      IMPORT_DETAILS.uploadSize,
+    );
+    // Half the default 512 MiB budget is the most an upload may declare.
+    expect(
+      await detailOf(
+        harness.call("import_upload_write", { ...firstChunk, size: 256 * 1024 * 1024 + 1 }),
+      ),
+    ).toBe(IMPORT_DETAILS.uploadTooLarge);
+    const first = (await harness.call("import_upload_write", {
+      ...firstChunk,
+      size: bytes.byteLength,
+    })) as { readonly uploadId: string };
+    await harness.call("import_upload_write", {
+      uploadId: first.uploadId,
+      offset: 10,
+      base64: bytes.subarray(10).toString("base64"),
+    });
+
+    const started = (await harness.call("import_flows", {
+      uploadId: first.uploadId,
+      name: "checkout.mitm",
+      proxyId: "1",
+    })) as ImportView;
+    expect(started).toMatchObject({ name: "checkout.mitm", state: "running" });
+    const spawn = await fake.nextSpawn(0);
+    expect(spawn.args.slice(0, 2)).toEqual(["--set", "server=false"]);
+    const file = spawn.env[CONTROL_ENV.importPath] as string;
+    expect(NodeFS.readFileSync(file).equals(bytes)).toBe(true);
+
+    spawn.send({ ...flowRecord({ path: "/cart" }), startedAt: 1_600_000_000_000 });
+    spawn.send({ type: "importDone", skipped: 2, error: null });
+    const done = (await harness.call("get_import", {
+      recordingId: started.recordingId,
+      waitMs: 20_000,
+    })) as ImportView;
+    expect(done).toMatchObject({ state: "completed", imported: 1, skipped: 2 });
+    expect(spawn.signals).toContain("SIGTERM");
+    expect(NodeFS.existsSync(file)).toBe(false);
+    const recordings = (await harness.call("list_recordings", { proxyId: "1" })) as {
+      readonly items: ReadonlyArray<{ readonly name?: string; readonly startedAt: number }>;
+    };
+    expect(recordings.items).toMatchObject([
+      { name: "checkout.mitm", startedAt: 1_600_000_000_000 },
+    ]);
+    expect(
+      await detailOf(harness.call("import_flows", { uploadId: first.uploadId, proxyId: "1" })),
+    ).toBe(IMPORT_DETAILS.uploadMissing);
+  });
+
+  it.each([
+    // An import never prunes its own requests to make room for later ones.
+    { limit: "the storage budget", config: { maxDiskBytes: 14 * 1024 * 1024 } },
+    { limit: "maxRequestsPerRecording", config: { maxRequestsPerRecording: 1 } },
+  ])("flows past $limit are dropped and counted on the recording", async ({ config }) => {
+    const MiB = 1024 * 1024;
+    const { harness, fake } = await setup({
+      deps: { configOverrides: { maxBodyBytes: 16 * MiB, ...config } },
+    });
+    await using _harness = harness;
+    const dump = NodePath.join(NodePath.dirname(harness.dataDir), "big.mitm");
+    NodeFS.writeFileSync(dump, "flows");
+    const started = (await harness.call("import_flows", {
+      path: dump,
+      proxyId: "1",
+    })) as ImportView;
+    const spawn = await fake.nextSpawn(0);
+    const body = { data: Buffer.alloc(10 * MiB, 97).toString("base64"), truncated: false };
+    for (const path of ["/a", "/b", "/c"]) spawn.send({ ...flowRecord({ path }), body });
+    spawn.send({ type: "importDone", skipped: 0, error: null });
+
+    const done = (await harness.call("get_import", {
+      recordingId: started.recordingId,
+      waitMs: 20_000,
+    })) as ImportView & { readonly dropped: number };
+    expect(done).toMatchObject({ state: "completed", imported: 1, dropped: 2 });
+    const recordings = (await harness.call("list_recordings", { proxyId: "1" })) as {
+      readonly items: ReadonlyArray<{
+        readonly requestCount: number;
+        readonly droppedFlows: number;
+      }>;
+    };
+    expect(recordings.items).toMatchObject([{ requestCount: 1, droppedFlows: 2 }]);
+  });
+
+  it("only two imports run at once, even when they start together", async () => {
+    const { harness, fake } = await setup();
+    await using _harness = harness;
+    const dump = NodePath.join(NodePath.dirname(harness.dataDir), "same.mitm");
+    NodeFS.writeFileSync(dump, "flows");
+    const results = await Promise.allSettled(
+      [1, 2, 3].map(() => harness.call("import_flows", { path: dump, proxyId: "1" })),
+    );
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(2);
+    expect(fake.spawns).toHaveLength(2);
+    for (const spawn of fake.spawns) spawn.send({ type: "importDone", skipped: 0, error: null });
+  });
+
+  it("deleting the recording stops a running import, and its proxy cannot be deleted meanwhile", async () => {
+    const { harness, fake } = await setup();
+    await using _harness = harness;
+    const dump = NodePath.join(NodePath.dirname(harness.dataDir), "long.mitm");
+    NodeFS.writeFileSync(dump, "flows");
+    const started = (await harness.call("import_flows", {
+      path: dump,
+      proxyId: "1",
+    })) as ImportView;
+    const spawn = await fake.nextSpawn(0);
+    expect(spawn.env[CONTROL_ENV.importPath]).toBe(dump);
+    const stored = harness.nextBatch("requests", {}, (items) => items.length > 0);
+    spawn.send(flowRecord({ path: "/one" }));
+    await (await stored).stop();
+
+    expect(await detailOf(harness.call("delete_proxy", { proxyId: "1" }))).toBe(
+      IMPORT_DETAILS.proxyBusy,
+    );
+    await harness.call("delete_recording", { recordingId: started.recordingId });
+    const done = (await harness.call("get_import", {
+      recordingId: started.recordingId,
+      waitMs: 20_000,
+    })) as ImportView;
+    expect(done).toMatchObject({ state: "failed", detail: IMPORT_DETAILS.deleted });
+    expect(spawn.signals).toContain("SIGTERM");
   });
 });
 

@@ -77,6 +77,7 @@ export type SearchOverlayMode = "command" | "files" | "content";
 
 export type CommandPaletteOpenIntent =
   | { readonly kind: "add-project" | "new-thread-in" | "new-agent-chat" | "change-theme" }
+  | { readonly kind: "pick-file"; readonly environmentId: EnvironmentId }
   | {
       readonly kind: "search";
       readonly query: string;
@@ -106,6 +107,7 @@ export type CommandPaletteUiAction =
   | { readonly _tag: "OpenNewThreadIn" }
   | { readonly _tag: "OpenNewAgentChat" }
   | { readonly _tag: "OpenChangeTheme" }
+  | { readonly _tag: "OpenPickFile"; readonly environmentId: EnvironmentId }
   | {
       readonly _tag: "OpenChildSearch";
       readonly mode: "files" | "content";
@@ -165,6 +167,8 @@ export function reduceCommandPaletteUiState(
       return openWithIntent({ kind: "new-agent-chat" });
     case "OpenChangeTheme":
       return openWithIntent({ kind: "change-theme" });
+    case "OpenPickFile":
+      return openWithIntent({ kind: "pick-file", environmentId: action.environmentId });
   }
 }
 
@@ -737,6 +741,8 @@ export function buildBrowseGroups(input: {
   directoryIcon: ReactNode;
   browseUp: () => void | Promise<void>;
   browseTo: (name: string) => void | Promise<void>;
+  /** Set when choosing a file: file entries hand their path to `pick`, which closes the palette. */
+  pickFile?: { readonly icon: ReactNode; readonly pick: (fullPath: string) => void };
 }): CommandPaletteGroup[] {
   const items: CommandPaletteActionItem[] = [];
 
@@ -755,6 +761,22 @@ export function buildBrowseGroups(input: {
   }
 
   for (const entry of input.browseEntries) {
+    const { pickFile } = input;
+    if (pickFile !== undefined && entry.kind === "file") {
+      items.push({
+        kind: "action",
+        value: `browse:${entry.fullPath}`,
+        searchTerms: [input.browseQuery, entry.fullPath, entry.name],
+        title: entry.name,
+        icon: pickFile.icon,
+        // `pick` settles before it closes; a closing palette would settle the pick as cancelled.
+        keepOpen: true,
+        run: async () => {
+          pickFile.pick(entry.fullPath);
+        },
+      });
+      continue;
+    }
     items.push({
       kind: "action",
       value: `browse:${entry.fullPath}`,
@@ -768,7 +790,9 @@ export function buildBrowseGroups(input: {
     });
   }
 
-  return [{ value: "directories", label: "Directories", items }];
+  return input.pickFile === undefined
+    ? [{ value: "directories", label: "Directories", items }]
+    : [{ value: "files", label: "Choose a file", items }];
 }
 
 export function filterPinnedBrowseEntries(input: {

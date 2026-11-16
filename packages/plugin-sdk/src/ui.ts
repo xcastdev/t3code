@@ -82,6 +82,12 @@ export interface T3PluginClient {
   ) => Promise<"saved" | "cancelled">;
   /** Needs a click or key press and the `clipboard.write` capability. */
   readonly copyText: (text: string) => Promise<void>;
+  /**
+   * Opens the host's file browser on the plugin's environment and resolves with the chosen
+   * absolute path, or null when the user cancels. Needs a click or key press, the `file.pick`
+   * capability, and host API 1.2. Mobile hosts refuse it.
+   */
+  readonly pickFile: () => Promise<string | null>;
   /** Threads and projects in the plugin's environment, at most 50 of each. */
   readonly listChatTargets: (query?: string) => Promise<PluginChatTargets>;
 }
@@ -333,6 +339,10 @@ function connect(): Promise<T3PluginClient> {
       saveFile,
       copyText: async (text) => {
         await request("t3/clipboard.write", { text });
+      },
+      pickFile: async () => {
+        const result = await request("t3/file.pick", {});
+        return isRecord(result) && typeof result.path === "string" ? result.path : null;
       },
       listChatTargets: async (query) => {
         const targets = await request("t3/chat.targets.list", query === undefined ? {} : { query });

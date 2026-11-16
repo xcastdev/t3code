@@ -1103,6 +1103,33 @@ it.layer(layerTest, { excludeTestServices: true })("WorkspaceEntries", (it) => {
       }),
     );
 
+    it.effect("lists files, symlinked ones included, only on request, after the directories", () =>
+      Effect.gen(function* () {
+        const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
+        const path = yield* Path.Path;
+        const cwd = yield* makeTempDir({ prefix: "t3code-workspace-browse-files-" });
+        yield* writeTextFile(cwd, "alpha.mitm", "");
+        yield* writeTextFile(cwd, "zeta/flows.mitm", "");
+        yield* Effect.promise(() =>
+          NodeFSP.symlink(path.join(cwd, "zeta", "flows.mitm"), path.join(cwd, "linked.mitm")),
+        );
+        const cwdWithSeparator = yield* appendSeparator(cwd);
+
+        const directories = yield* workspaceEntries.browse({ partialPath: cwdWithSeparator });
+        const withFiles = yield* workspaceEntries.browse({
+          partialPath: cwdWithSeparator,
+          includeFiles: true,
+        });
+
+        expect(directories.entries).toEqual([{ name: "zeta", fullPath: path.join(cwd, "zeta") }]);
+        expect(withFiles.entries).toEqual([
+          { name: "zeta", fullPath: path.join(cwd, "zeta"), kind: "directory" },
+          { name: "alpha.mitm", fullPath: path.join(cwd, "alpha.mitm"), kind: "file" },
+          { name: "linked.mitm", fullPath: path.join(cwd, "linked.mitm"), kind: "file" },
+        ]);
+      }),
+    );
+
     it.effect("marks only a missing directory as missing when browsing fails", () =>
       Effect.gen(function* () {
         const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;

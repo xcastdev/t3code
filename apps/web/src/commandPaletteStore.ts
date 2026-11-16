@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import type { EnvironmentId } from "@t3tools/contracts";
 import { create } from "zustand";
 
 import {
@@ -16,6 +17,32 @@ const INITIAL_STATE: CommandPaletteUiState = {
 };
 
 export const useCommandPaletteStore = create<CommandPaletteUiState>(() => INITIAL_STATE);
+
+let pendingFilePick: ((path: string | null) => void) | null = null;
+
+/** Hands the open file pick its result; a later call or a closed palette has nothing to settle. */
+export function settleFilePick(path: string | null): void {
+  const resolve = pendingFilePick;
+  pendingFilePick = null;
+  resolve?.(path);
+}
+
+/** Opens the palette to choose a file on `environmentId`. Resolves null when it closes unpicked. */
+export function beginFilePick(environmentId: EnvironmentId): Promise<string | null> {
+  settleFilePick(null);
+  return new Promise((resolve) => {
+    pendingFilePick = resolve;
+    dispatchCommandPalette({ _tag: "OpenPickFile", environmentId });
+  });
+}
+
+// Closing the palette, or another kind of intent replacing the pick, ends it unpicked. A new
+// pick settled the old one in beginFilePick, before its own resolver took the slot.
+useCommandPaletteStore.subscribe((state, previous) => {
+  if (previous.openIntent?.kind === "pick-file" && state.openIntent?.kind !== "pick-file") {
+    settleFilePick(null);
+  }
+});
 
 let returnFocus: { element: HTMLElement | null; href: string; focusRequest: number } | null = null;
 

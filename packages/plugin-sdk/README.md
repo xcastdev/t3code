@@ -22,22 +22,22 @@ Pack it with `packPlugin(dir, "dist/my-plugin-1.0.0.t3plugin")` from `@t3tools/p
 
 ## Manifest (`t3-plugin.json`)
 
-| Field                   | Meaning                                                                                                                                                 |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `manifestVersion`       | Always `1`.                                                                                                                                             |
-| `id`                    | 2 to 23 chars, lowercase letters and digits in hyphen-separated segments (`request-inspector`).                                                         |
-| `name`, `author`        | Shown to the user. `author` is who the user trusts on install.                                                                                          |
-| `version`               | Semver. An update is an explicit package replacement.                                                                                                   |
-| `hostApi`               | `"1.1"` (or `"1.0"`). Compatible when the major matches and the minor is at most the host's.                                                            |
-| `ui.panels`             | `{ id, title, entry, icon? }`. `entry` is a relative `.html` path.                                                                                      |
-| `ui.commands`           | `{ id, title, opens: { panel } }`. Users bind keys to `plugin.<id>.<commandId>`.                                                                        |
-| `backend.entry`         | Relative `.cjs` path the backend is bundled to, such as `backend/index.cjs`.                                                                            |
-| `backend.operations`    | `{ name, title, description, inputSchema, mutates, agent }`. `agent: true` exposes it as an agent tool, which needs `inputSchema.type === "object"`.    |
-| `backend.topics`        | `{ name }` subscription topics.                                                                                                                         |
-| `backend.resources`     | `{ name, title, operation }`, read by agents as `t3-plugin://<id>/<name>` through a non-mutating operation.                                             |
-| `backend.prerequisites` | `{ executable, hint }`. T3 checks `PATH` before starting the backend and shows `hint` when one is missing.                                              |
-| `settings`              | `client` and `environment` fields (`string`, `number`, `boolean`, `enum`, `secret`). The backend receives environment values as `config` and `secrets`. |
-| `capabilities`          | `chat.attach` (insert text), `chat.reference` (attach references), `file.save` (download a file), `clipboard.write`. The last two need host API 1.1.    |
+| Field                   | Meaning                                                                                                                                                                   |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `manifestVersion`       | Always `1`.                                                                                                                                                               |
+| `id`                    | 2 to 23 chars, lowercase letters and digits in hyphen-separated segments (`request-inspector`).                                                                           |
+| `name`, `author`        | Shown to the user. `author` is who the user trusts on install.                                                                                                            |
+| `version`               | Semver. An update is an explicit package replacement.                                                                                                                     |
+| `hostApi`               | `"1.2"` (or an older `"1.x"`). Compatible when the major matches and the minor is at most the host's.                                                                     |
+| `ui.panels`             | `{ id, title, entry, icon? }`. `entry` is a relative `.html` path.                                                                                                        |
+| `ui.commands`           | `{ id, title, opens: { panel } }`. Users bind keys to `plugin.<id>.<commandId>`.                                                                                          |
+| `backend.entry`         | Relative `.cjs` path the backend is bundled to, such as `backend/index.cjs`.                                                                                              |
+| `backend.operations`    | `{ name, title, description, inputSchema, mutates, agent }`. `agent: true` exposes it as an agent tool, which needs `inputSchema.type === "object"`.                      |
+| `backend.topics`        | `{ name }` subscription topics.                                                                                                                                           |
+| `backend.resources`     | `{ name, title, operation }`, read by agents as `t3-plugin://<id>/<name>` through a non-mutating operation.                                                               |
+| `backend.prerequisites` | `{ executable, hint }`. T3 checks `PATH` before starting the backend and shows `hint` when one is missing.                                                                |
+| `settings`              | `client` and `environment` fields (`string`, `number`, `boolean`, `enum`, `secret`). The backend receives environment values as `config` and `secrets`.                   |
+| `capabilities`          | `chat.attach` (insert text), `chat.reference` (attach references), `file.save` (download a file), `clipboard.write` (both need host API 1.1), `file.pick` (host API 1.2). |
 
 Packing fails with the validator's message when the manifest is invalid.
 
@@ -73,6 +73,7 @@ const stop = t3.subscribe("ticks", {}, (event) => {
 - `attach({ kind: "text", text })` needs a click or key press and the `chat.attach` capability. The user confirms the destination.
 - `saveFile(name, mimeType, data)` saves a file on the device that shows the panel, at most 32 MiB. It needs a click or key press and the `file.save` capability. `data` is a string, bytes, or a stream (`() => AsyncIterable<Uint8Array>`). Call it from the click handler: the save starts before the stream is read, so a slow export still counts as clicked. Give `{ size, chunks }` when you know the size and the host checks it. It resolves to `"saved"` or `"cancelled"`, but `"cancelled"` is best-effort: the mobile share sheet reports `"saved"` even when dismissed.
 - `copyText(text)` needs a click or key press and the `clipboard.write` capability.
+- `pickFile()` opens the command palette on the plugin's environment so the user can browse to a file, and resolves with its absolute path, or `null` when they close the palette. It needs a click or key press, the `file.pick` capability, and an environment install. Mobile refuses it, so offer another way in there (check `t3.context.platform`).
 - `listChatTargets(query?)` returns up to 50 threads and 50 projects in the plugin's environment, for pickers.
 - `t3.hostApi` is the host's bridge version. Clients refuse to show a panel whose manifest `hostApi` is newer than theirs.
 - Panels must be self-contained. `src=` or `href=` attributes that point at relative paths fail packing. Put code in `ui/<panel>.ts` and inline images as `data:` URLs.

@@ -9,6 +9,7 @@ import * as RcMap from "effect/RcMap";
 import * as Schema from "effect/Schema";
 
 import type {
+  FilesystemBrowseEntry,
   FilesystemBrowseInput,
   FilesystemBrowseResult,
   ProjectEntry,
@@ -231,23 +232,48 @@ export const make = Effect.gen(function* () {
 
       const showHidden = endsWithSeparator || prefix.startsWith(".");
       const lowerPrefix = prefix.toLowerCase();
-      const entries: Array<{ readonly name: string; readonly fullPath: string }> = [];
-      for (const dirent of dirents) {
-        if (
-          dirent.isDirectory() &&
+      const includeFiles = input.includeFiles === true;
+      const visible = dirents.filter(
+        (dirent) =>
           dirent.name.toLowerCase().startsWith(lowerPrefix) &&
-          (showHidden || !dirent.name.startsWith("."))
-        ) {
-          entries.push({
-            name: dirent.name,
-            fullPath: path.join(parentPath, dirent.name),
-          });
+          (showHidden || !dirent.name.startsWith(".")),
+      );
+      const entries: Array<FilesystemBrowseEntry> = [];
+      if (!includeFiles) {
+        for (const dirent of visible) {
+          if (dirent.isDirectory()) {
+            entries.push({ name: dirent.name, fullPath: path.join(parentPath, dirent.name) });
+          }
         }
+      } else {
+        // A picked file is often a link to a capture elsewhere, so links resolve to their target.
+        const kinds = yield* Effect.forEach(
+          visible,
+          (dirent): Effect.Effect<{ isDirectory(): boolean; isFile(): boolean } | null> =>
+            dirent.isSymbolicLink()
+              ? Effect.promise(() =>
+                  NodeFSP.stat(path.join(parentPath, dirent.name)).catch(() => null),
+                )
+              : Effect.succeed(dirent),
+          { concurrency: 16 },
+        );
+        visible.forEach((dirent, index) => {
+          const target = kinds[index];
+          const fullPath = path.join(parentPath, dirent.name);
+          if (target?.isDirectory())
+            entries.push({ name: dirent.name, fullPath, kind: "directory" });
+          else if (target?.isFile()) entries.push({ name: dirent.name, fullPath, kind: "file" });
+        });
       }
 
       return {
         parentPath,
-        entries: entries.toSorted((left, right) => left.name.localeCompare(right.name)),
+        // Directories first, so a file listing still reads like a folder tree.
+        entries: entries.toSorted(
+          (left, right) =>
+            Number(left.kind === "file") - Number(right.kind === "file") ||
+            left.name.localeCompare(right.name),
+        ),
       };
     },
   );

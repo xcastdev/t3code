@@ -371,6 +371,13 @@ export interface NewRecording {
   readonly name?: string;
 }
 
+/** A recording filled from a flow file rather than a running proxy; it is closed from the start. */
+export interface NewImportedRecording {
+  readonly proxyId: number;
+  readonly createdAt: number;
+  readonly name: string;
+}
+
 export interface NewExport {
   readonly id: string;
   readonly createdAt: number;
@@ -400,6 +407,10 @@ export interface StoreLane {
   readonly startRecording: (input: NewRecording) => RecordingRecord;
   readonly stopRecording: (recordingId: number, stoppedAt: number) => RecordingRecord | undefined;
   readonly deleteRecording: (recordingId: number) => void;
+  /** Pruning never takes this recording's records until `finishImportedRecording`. */
+  readonly addImportedRecording: (input: NewImportedRecording) => RecordingRecord;
+  /** Makes the recording prunable again and moves its start and stop to its first and last request. */
+  readonly finishImportedRecording: (recordingId: number) => RecordingRecord | undefined;
   /** Records a file already written under `exportsDir`, deleting the oldest past the cap. */
   readonly addExport: (input: NewExport) => ExportRecord;
   /** Counts a flow dropped without a write, for example over maxRequestsPerRecording. */
@@ -888,9 +899,19 @@ export function openInspectorStore(options: InspectorStoreOptions): InspectorSto
     insertRecording: db.prepare(`
       INSERT INTO recordings (seq, started_at, listen_host, listen_port, proxy_id, name)
       VALUES (?, ?, ?, ?, ?, ?) RETURNING id`),
+    insertClosedRecording: db.prepare(`
+      INSERT INTO recordings (seq, started_at, stopped_at, listen_host, listen_port, proxy_id, name)
+      VALUES (?, ?, ?, '', 0, ?, ?) RETURNING id`),
     stopRecording: db.prepare(
       "UPDATE recordings SET seq = ?, stopped_at = ? WHERE id = ? AND stopped_at IS NULL",
     ),
+    fitImportedRecording: db.prepare(`
+      UPDATE recordings SET seq = ?,
+        started_at = (SELECT min(started_at) FROM requests WHERE recording_id = recordings.id),
+        stopped_at = (SELECT max(coalesce(ended_at, started_at)) FROM requests
+          WHERE recording_id = recordings.id)
+      WHERE id = ? AND stopped_at IS NOT NULL
+        AND EXISTS (SELECT 1 FROM requests WHERE recording_id = recordings.id)`),
     deleteRecordingRow: db.prepare("DELETE FROM recordings WHERE id = ?"),
     recording: db.prepare(`${recordingSelect()} WHERE rec.id = ?`),
     recordings: db.prepare(`${recordingSelect()} ORDER BY rec.id DESC`),
@@ -954,6 +975,8 @@ export function openInspectorStore(options: InspectorStoreOptions): InspectorSto
   const listeners = new Set<(change: StoreChange) => void>();
   const lane = new Lane();
   const droppedFlows = new Map<number, number>();
+  /** Imported recordings still being filled; an import must not prune its own earlier records. */
+  const importing = new Set<number>();
   let checkpointIncomplete = false;
   let closed = false;
 
@@ -1304,7 +1327,7 @@ export function openInspectorStore(options: InspectorStoreOptions): InspectorSto
       for (const row of rows) {
         if (covered >= shortfall && victims.length > 0) return;
         const id = num(row.id);
-        if (keep.has(id)) continue;
+        if (keep.has(id) || importing.has(num(row.recording_id))) continue;
         victims.push(id);
         recordings.add(num(row.recording_id));
         covered += num(row.stored_bytes);
@@ -1721,6 +1744,35 @@ export function openInspectorStore(options: InspectorStoreOptions): InspectorSto
       return recording;
     });
 
+  const addImportedRecording = (input: NewImportedRecording): RecordingRecord =>
+    writeEmitting((tx, changes) => {
+      liveProxy(input.proxyId);
+      const id = num(
+        statements.insertClosedRecording.get(
+          tx.nextSeq(),
+          input.createdAt,
+          input.createdAt,
+          input.proxyId,
+          input.name,
+        )?.id,
+      );
+      importing.add(id);
+      const recording = getRecording(id) as RecordingRecord;
+      changes.push({ type: "recording", recording });
+      return recording;
+    });
+
+  const finishImportedRecording = (recordingId: number) =>
+    writeEmitting((tx, changes) => {
+      importing.delete(recordingId);
+      if (statements.fitImportedRecording.run(tx.nextSeq(), recordingId).changes === 0) {
+        return undefined;
+      }
+      const recording = getRecording(recordingId) as RecordingRecord;
+      changes.push({ type: "recording", recording });
+      return recording;
+    });
+
   const deleteRecording = (recordingId: number) => {
     const recording = getRecording(recordingId);
     if (recording === undefined) throw new InspectorRefusal("not-found", MISSING_DETAILS.recording);
@@ -1736,6 +1788,7 @@ export function openInspectorStore(options: InspectorStoreOptions): InspectorSto
       for (const id of ids) deleteRequestInTx(tx, changes, id);
       statements.deleteRecordingRow.run(recordingId);
       droppedFlows.delete(recordingId);
+      importing.delete(recordingId);
       changes.push({
         type: "recording-removed",
         id: recordingId,
@@ -1794,6 +1847,8 @@ export function openInspectorStore(options: InspectorStoreOptions): InspectorSto
         startRecording: guard(startRecording),
         stopRecording: guard(stopRecording),
         deleteRecording: guard(deleteRecording),
+        addImportedRecording: guard(addImportedRecording),
+        finishImportedRecording: guard(finishImportedRecording),
         addExport: guard(addExport),
         noteDroppedFlow: guard(recordDrop),
         noteFileWrite: guard(() => step({ kind: "write" })),

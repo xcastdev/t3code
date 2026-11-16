@@ -26,6 +26,7 @@ export const CONTROL_ENV = {
   record: "T3_INSPECTOR_RECORD",
   hosts: "T3_INSPECTOR_HOSTS",
   upstreamAuth: "T3_INSPECTOR_UPSTREAM_AUTH",
+  importPath: "T3_INSPECTOR_IMPORT",
 } as const;
 
 export const DEFAULT_LISTEN_PORT = 8080;
@@ -36,6 +37,7 @@ const MAX_HELLO_BYTES = 1024;
 // A flow line carries two bodies of at most 16 MiB each as base64.
 const MAX_LINE_BYTES = 64 * 1024 * 1024;
 const OUTPUT_TAIL_BYTES = 2048;
+const MAX_IMPORT_ERROR_CHARS = 300;
 const ADDRESS_IN_USE = /address already in use/i;
 
 export type MitmStartFailure = "missing-prerequisite" | "port-in-use" | "not-started";
@@ -180,7 +182,8 @@ export interface ReplayUpstream {
 
 export type MitmMode =
   | { readonly kind: "capture"; readonly proxy: ProxyRuntimeOptions }
-  | { readonly kind: "replay"; readonly upstream?: ReplayUpstream };
+  | { readonly kind: "replay"; readonly upstream?: ReplayUpstream }
+  | { readonly kind: "import"; readonly path: string };
 
 /** The argv-relevant part of a mode, with the listen port resolved. Never carries credentials. */
 export type MitmArgsMode =
@@ -191,7 +194,8 @@ export type MitmArgsMode =
       readonly mode: ProxyMode;
       readonly hosts: ProxyHosts;
     }
-  | { readonly kind: "replay"; readonly upstreamUrl?: string };
+  | { readonly kind: "replay"; readonly upstreamUrl?: string }
+  | { readonly kind: "import" };
 
 export function mitmdumpArgs(
   mode: MitmArgsMode,
@@ -209,6 +213,7 @@ export function mitmdumpArgs(
     "-s",
     addonPath,
   ];
+  if (mode.kind === "import") return ["--set", "server=false", ...common];
   if (mode.kind === "replay") {
     const upstream =
       mode.upstreamUrl === undefined ? [] : ["--mode", `upstream:${mode.upstreamUrl}`];
@@ -340,10 +345,17 @@ export function parseTunnelRecord(value: unknown): MitmTunnel | undefined {
   };
 }
 
+/** The end of an import: flows of other kinds skipped, and why reading stopped early. */
+export interface MitmImportDone {
+  readonly skipped: number;
+  readonly error?: string;
+}
+
 export interface MitmHandlers {
   readonly onFlow: (flow: MitmFlow) => Promise<void>;
   readonly onTunnel: (tunnel: MitmTunnel) => Promise<void>;
   readonly onReplayResult: (result: MitmReplayResult) => Promise<void>;
+  readonly onImportDone?: (done: MitmImportDone) => Promise<void>;
 }
 
 export interface MitmProcess extends ReplayChannel {
@@ -681,6 +693,13 @@ export function makeMitm(options: MitmOptions) {
           } else {
             pending?.resolve();
           }
+        } else if (message.type === "importDone") {
+          await handlers.onImportDone?.({
+            skipped: isCount(message.skipped) ? message.skipped : 0,
+            ...(typeof message.error === "string"
+              ? { error: message.error.slice(0, MAX_IMPORT_ERROR_CHARS) }
+              : {}),
+          });
         } else if (message.type === "replayResult" && typeof message.replayId === "string") {
           if (typeof message.error === "string") {
             await handlers.onReplayResult({ replayId: message.replayId, error: message.error });
@@ -792,6 +811,12 @@ export function makeMitm(options: MitmOptions) {
       const executable = resolveExecutable("mitmdump", options.searchPath ?? process.env.PATH);
       if (executable === undefined) {
         throw new MitmStartError("missing-prerequisite", MITMDUMP_HINT);
+      }
+      if (mode.kind === "import") {
+        return launch(executable, await prepare(), {
+          args: { kind: "import" },
+          env: { [CONTROL_ENV.importPath]: mode.path },
+        });
       }
       if (mode.kind === "replay") {
         const addonPath = await prepare();
