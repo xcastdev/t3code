@@ -14,7 +14,7 @@ permissions:
 jobs:
   budget:
     name: Agent context budget
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     env:
       BUDGET: apps/server/src/provider/agentContextBudget.json
