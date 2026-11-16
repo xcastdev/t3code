@@ -377,10 +377,20 @@ const make = Effect.gen(function* () {
         const current = yield* readPreference;
         if (current.mode !== "attached")
           return yield* new DesktopAttachedCredentialUnavailableError();
+        const target = credential.includes("://")
+          ? yield* resolveDesktopAttachPairingTarget(credential)
+          : null;
+        if (
+          target !== null &&
+          (target.httpBaseUrl !== current.httpBaseUrl || target.wsBaseUrl !== current.wsBaseUrl)
+        )
+          return yield* new DesktopAttachPairingUrlError({
+            reason: "Use a pairing link for the attached server address.",
+          });
         const before = yield* descriptor(current.httpBaseUrl);
         if (before.environmentId !== current.environmentId)
           return yield* new DesktopAttachedIdentityMismatchError();
-        const session = yield* exchange(current.httpBaseUrl, credential);
+        const session = yield* exchange(current.httpBaseUrl, target?.credential ?? credential);
         const missingScopes = missingAdministrativeScopes(session.scope);
         if (missingScopes.length)
           return yield* new DesktopAttachAdministrativeScopeError({ missingScopes });

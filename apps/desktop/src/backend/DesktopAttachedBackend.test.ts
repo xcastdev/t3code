@@ -55,6 +55,7 @@ const fixture = Effect.gen(function* () {
   const entered = yield* Deferred.make<void>();
   const release = yield* Deferred.make<void>();
   const authorizations = yield* Ref.make<Array<{ port: string; bearer: string | undefined }>>([]);
+  const exchanges = yield* Ref.make<Array<{ port: string; credential: string | null }>>([]);
   const identity = yield* Ref.make("attached-environment");
   const encrypted = yield* Ref.make<string[]>([]);
   const requests = yield* Ref.make<string[]>([]);
@@ -91,6 +92,15 @@ const fixture = Effect.gen(function* () {
           { port, bearer: request.headers.authorization },
         ]);
       yield* Ref.update(requests, (items) => [...items, path]);
+      if (path === "/oauth/token") {
+        if (request.body._tag !== "Uint8Array")
+          return yield* Effect.die("Expected token exchange form");
+        const form = new URLSearchParams(new TextDecoder().decode(request.body.body));
+        yield* Ref.update(exchanges, (items) => [
+          ...items,
+          { port, credential: form.get("subject_token") },
+        ]);
+      }
       const body =
         path === "/oauth/token"
           ? {
@@ -162,6 +172,7 @@ const fixture = Effect.gen(function* () {
     entered,
     release,
     authorizations,
+    exchanges,
   };
 });
 
@@ -180,7 +191,28 @@ describe("DesktopAttachedBackend ownership and credentials", () => {
           assert.notInclude(JSON.stringify(yield* settings.get), "fake-bearer");
           assert.deepEqual(yield* Ref.get(f.encrypted), ["fake-bearer-4773"]);
           assert.equal((yield* attached.probe).environmentId, "attached-environment");
-          yield* attached.refreshCredential("renewed-owner");
+          for (const { credential, expected } of [
+            { credential: "renewed-owner", expected: "renewed-owner" },
+            {
+              credential: " http://127.0.0.1:4773/pair#token=fragment-owner ",
+              expected: "fragment-owner",
+            },
+            {
+              credential: "http://127.0.0.1:4773/pair?token=query-owner",
+              expected: "query-owner",
+            },
+          ]) {
+            const before = yield* attached.getState;
+            yield* attached.refreshCredential(credential);
+            assert.deepEqual((yield* Ref.get(f.exchanges)).at(-1), {
+              port: "4773",
+              credential: expected,
+            });
+            const after = yield* attached.getState;
+            if (before.mode !== "attached" || after.mode !== "attached")
+              return yield* Effect.die("Expected attachment");
+            assert.notEqual(after.attachmentRevision, before.attachmentRevision);
+          }
           assert.equal((yield* attached.probe).environmentId, "attached-environment");
           yield* settings.setLocalEnvironmentEnabled(false);
           assert.equal((yield* attached.getState).mode, "attached");
@@ -190,13 +222,23 @@ describe("DesktopAttachedBackend ownership and credentials", () => {
       }),
   );
   it.effect(
-    "rejects a replacement server before sending the saved bearer or refreshing credentials",
+    "rejects a different pairing target or replacement server before sending credentials",
     () =>
       Effect.gen(function* () {
         const f = yield* fixture;
         yield* Effect.gen(function* () {
           const attached = yield* Attached.DesktopAttachedBackend;
           yield* attached.attach("http://127.0.0.1:4773/pair#token=fake-owner");
+          const original = yield* attached.getState;
+          yield* Ref.set(f.requests, []);
+          assert.equal(
+            (yield* Effect.flip(
+              attached.refreshCredential("http://127.0.0.1:4774/pair#token=foreign-owner"),
+            ))._tag,
+            "DesktopAttachPairingUrlError",
+          );
+          assert.deepEqual(yield* Ref.get(f.requests), []);
+          assert.deepEqual(yield* attached.getState, original);
           yield* Ref.set(f.identity, "replacement-environment");
           yield* Ref.set(f.requests, []);
           assert.equal(
