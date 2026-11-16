@@ -1,6 +1,7 @@
 import {
   OrchestrationV2InstructionSnapshot,
   type OrchestrationV2ProviderCapabilities,
+  type OrchestrationV2ProviderThread,
   type ProviderSessionId,
   type ProviderThreadId,
   type RunAttemptId,
@@ -17,6 +18,7 @@ import { SkillCatalogService } from "../skills/SkillCatalogService.ts";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as EventSink from "./EventSink.ts";
+import type { ProviderAdapterV2InstructionDelivery } from "@t3tools/provider-core/server/ProviderAdapter";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
@@ -66,6 +68,10 @@ export class InstructionDelivery extends Context.Service<
       input: InstructionTarget,
       applied: OrchestrationV2InstructionSnapshot,
     ) => Effect.Effect<void, InstructionDeliveryError>;
+    readonly latestApplied: (input: {
+      readonly threadId: ThreadId;
+      readonly providerThread: OrchestrationV2ProviderThread;
+    }) => Effect.Effect<ProviderAdapterV2InstructionDelivery | undefined, InstructionDeliveryError>;
     readonly query: (input: { readonly runAttemptId: RunAttemptId }) => Effect.Effect<
       | {
           readonly state: "pending" | "applied" | "blocked";
@@ -212,6 +218,51 @@ const make = Effect.gen(function* () {
     },
     Effect.mapError((cause) => new InstructionDeliveryError({ cause })),
   );
-  return InstructionDelivery.of({ prepare, recordApplied, query });
+  const latestApplied = Effect.fn("InstructionDelivery.latestApplied")(
+    function* (input: {
+      readonly threadId: ThreadId;
+      readonly providerThread: OrchestrationV2ProviderThread;
+    }) {
+      const nativeThread = input.providerThread.nativeThreadRef;
+      if (nativeThread?.nativeId == null) return undefined;
+      // An unacknowledged latest turn must not fall back to an older delivery receipt.
+      const rows = yield* sql<{
+        native_turn_id: string;
+        native_turn_driver: string;
+        state: string | null;
+        applied_snapshot_json: string | null;
+      }>`SELECT
+        json_extract(turn.payload_json, '$.nativeTurnRef.nativeId') AS native_turn_id,
+        json_extract(turn.payload_json, '$.nativeTurnRef.driver') AS native_turn_driver,
+        delivery.state, delivery.applied_snapshot_json
+        FROM orchestration_v2_projection_provider_threads AS thread
+        JOIN orchestration_v2_projection_provider_turns AS turn
+          ON turn.provider_thread_id=thread.provider_thread_id AND turn.thread_id=thread.thread_id
+        LEFT JOIN t3_workflow_v2_instruction_deliveries AS delivery
+          ON delivery.run_attempt_id=turn.run_attempt_id
+          AND delivery.provider_thread_id=thread.provider_thread_id AND delivery.thread_id=thread.thread_id
+        WHERE thread.thread_id=${input.threadId} AND thread.provider_thread_id=${input.providerThread.id}
+          AND thread.provider_instance_id=${input.providerThread.providerInstanceId}
+          AND thread.driver=${input.providerThread.driver}
+          AND json_extract(thread.payload_json, '$.nativeThreadRef.nativeId')=${nativeThread.nativeId}
+          AND json_extract(thread.payload_json, '$.nativeThreadRef.driver')=${nativeThread.driver}
+          AND json_extract(turn.payload_json, '$.nativeTurnRef.nativeId') IS NOT NULL
+        ORDER BY turn.ordinal DESC LIMIT 1`;
+      const row = rows[0];
+      if (
+        row?.state !== "applied" ||
+        row.applied_snapshot_json === null ||
+        row.native_turn_driver !== nativeThread.driver
+      )
+        return undefined;
+      return {
+        nativeThreadId: nativeThread.nativeId,
+        nativeTurnId: row.native_turn_id,
+        snapshot: yield* decodeSnapshot(row.applied_snapshot_json),
+      };
+    },
+    Effect.mapError((cause) => new InstructionDeliveryError({ cause })),
+  );
+  return InstructionDelivery.of({ prepare, recordApplied, query, latestApplied });
 });
 export const layer = Layer.effect(InstructionDelivery, make);

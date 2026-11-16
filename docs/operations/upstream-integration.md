@@ -222,7 +222,10 @@ Assistant chats keep their `"chat"` lineage relationship next to upstream's
 Pi memory extraction requires the exact selected thinking level, preserving
 provenance. Other background text generation uses upstream's fallback when that
 level is unavailable. Cursor native resume keeps the previously delivered managed
-instruction snapshot; a changed snapshot requires a fresh prompt.
+instruction snapshot; a changed snapshot requires a fresh prompt. Reopened Cursor
+sessions recover delivery proof from persisted receipts only when Cursor confirms
+the corresponding native run was checkpointed. Missing proof requires a fresh
+prompt.
 
 No project scratch folders hide the source-control launcher and its shortcuts,
 while linked pull-request details remain available. Real projects retain the

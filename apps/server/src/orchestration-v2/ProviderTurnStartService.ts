@@ -1848,6 +1848,12 @@ export const layer: Layer.Layer<
             const instructedInput = {
               ...turnInput,
               instructionSnapshot,
+              previousInstructionDelivery: Effect.suspend(() =>
+                instructionDelivery.value.latestApplied({
+                  threadId: input.threadId,
+                  providerThread: turnInput.providerThread,
+                }),
+              ).pipe(Effect.orElseSucceed(() => undefined)),
               onInstructionsApplied: (applied: typeof instructionSnapshot) =>
                 instructionDelivery.value.recordApplied(target, applied).pipe(
                   Effect.catchCause(() =>

@@ -20,6 +20,7 @@ import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as InstructionDelivery from "./InstructionDelivery.ts";
 import { SkillCatalogService } from "../skills/SkillCatalogService.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -458,6 +459,46 @@ it.effect.each([false, true])(
           resourceRevision: replaceRuntime ? "resources-successor" : "resources-b",
           memoryEpoch: 0,
         });
+        const restored = yield* InstructionDelivery.InstructionDelivery.pipe(
+          Effect.provide(Layer.fresh(InstructionDelivery.layer)),
+        );
+        const latestTarget = { threadId, providerThread: second!.providerThread };
+        assert.deepEqual(yield* restored.latestApplied(latestTarget), {
+          nativeThreadId: second!.providerThread.nativeThreadRef!.nativeId,
+          nativeTurnId: `turn:${second!.runId}`,
+          snapshot: revisionB,
+        });
+        assert.isUndefined(
+          yield* restored.latestApplied({
+            ...latestTarget,
+            threadId: ThreadId.make("another-thread"),
+          }),
+        );
+        assert.isUndefined(
+          yield* restored.latestApplied({
+            ...latestTarget,
+            providerThread: {
+              ...second!.providerThread,
+              nativeThreadRef: {
+                ...second!.providerThread.nativeThreadRef!,
+                nativeId: "another-native-thread",
+              },
+            },
+          }),
+        );
+        assert.isUndefined(
+          yield* restored.latestApplied({
+            ...latestTarget,
+            providerThread: {
+              ...second!.providerThread,
+              providerInstanceId: ProviderInstanceId.make("another-instance"),
+            },
+          }),
+        );
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`UPDATE t3_workflow_v2_instruction_deliveries
+          SET applied_snapshot_json=NULL,state='pending' WHERE run_attempt_id=${current.runAttemptId}`;
+        assert.isUndefined(yield* restored.latestApplied(latestTarget));
       }).pipe(Effect.provide(deliveryLayer));
     }).pipe(Effect.scoped),
 );

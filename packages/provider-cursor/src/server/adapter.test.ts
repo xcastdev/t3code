@@ -30,6 +30,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Stream from "effect/Stream";
+import * as Scope from "effect/Scope";
 import { vi } from "vite-plus/test";
 
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
@@ -1169,58 +1170,63 @@ describe("CursorAdapterV2", () => {
         interactionMode: "default",
         cwd: workspace,
       });
+      const runner = {
+        assertComplete: Effect.void,
+        open: () =>
+          Effect.succeed({
+            agentId: "native-cursor-steer",
+            listMessages: Effect.succeed([]),
+            close: Effect.void,
+            runCheckpointed: (runId) =>
+              Effect.succeed(
+                runId === undefined
+                  ? checkpointedRuns.has(`native-cursor-run-${sentMessages.length}`)
+                  : checkpointedRuns.has(runId),
+              ),
+            send: (input) =>
+              Effect.gen(function* () {
+                if (input.resume === true) resumedRuns.push(sentMessages.length + 1);
+                sentMessages.push(
+                  typeof input.message === "string" ? input.message : input.message.text,
+                );
+                const runId = `native-cursor-run-${sentMessages.length}`;
+                const ended = yield* Deferred.make<"finished" | "cancelled">();
+                runEnds.push(ended);
+                return {
+                  agentId: "native-cursor-steer",
+                  runId,
+                  // Cursor drops a cancelled run's prompt from the agent's conversation.
+                  wait: Deferred.await(ended).pipe(
+                    Effect.map((status) => ({
+                      id: runId,
+                      requestId: `native-request-${sentMessages.length}`,
+                      status,
+                      model: { id: "composer-2.5" },
+                      durationMs: 1,
+                    })),
+                  ),
+                  cancel: Deferred.succeed(ended, "cancelled"),
+                };
+              }),
+          }),
+      } satisfies CursorAgentSdk.CursorAgentSdkRunner["Service"];
       const adapter = yield* makeCursorAdapterV2({
         instanceId,
         environment: { HOME: workspace },
       }).pipe(
-        Effect.provideService(CursorAgentSdk.CursorAgentSdkRunner, {
-          assertComplete: Effect.void,
-          open: () =>
-            Effect.succeed({
-              agentId: "native-cursor-steer",
-              listMessages: Effect.succeed([]),
-              close: Effect.void,
-              runCheckpointed: (runId) =>
-                Effect.succeed(
-                  runId === undefined
-                    ? checkpointedRuns.has(`native-cursor-run-${sentMessages.length}`)
-                    : checkpointedRuns.has(runId),
-                ),
-              send: (input) =>
-                Effect.gen(function* () {
-                  if (input.resume === true) resumedRuns.push(sentMessages.length + 1);
-                  sentMessages.push(
-                    typeof input.message === "string" ? input.message : input.message.text,
-                  );
-                  const runId = `native-cursor-run-${sentMessages.length}`;
-                  const ended = yield* Deferred.make<"finished" | "cancelled">();
-                  runEnds.push(ended);
-                  return {
-                    agentId: "native-cursor-steer",
-                    runId,
-                    // Cursor drops a cancelled run's prompt from the agent's conversation.
-                    wait: Deferred.await(ended).pipe(
-                      Effect.map((status) => ({
-                        id: runId,
-                        requestId: `native-request-${sentMessages.length}`,
-                        status,
-                        model: { id: "composer-2.5" },
-                        durationMs: 1,
-                      })),
-                    ),
-                    cancel: Deferred.succeed(ended, "cancelled"),
-                  };
-                }),
-            }),
-        }),
+        Effect.provideService(CursorAgentSdk.CursorAgentSdkRunner, runner),
         Effect.provide(TestProviderHost.layer({ cwd: workspace })),
       );
-      const runtime = yield* adapter.openSession({
-        threadId,
-        providerSessionId: ProviderSessionId.make("cursor-steer-session"),
-        modelSelection,
-        runtimePolicy,
-      });
+      const firstSessionScope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(firstSessionScope, Exit.void));
+      const runtime = yield* adapter
+        .openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("cursor-steer-session"),
+          modelSelection,
+          runtimePolicy,
+        })
+        .pipe(Effect.provideService(Scope.Scope, firstSessionScope));
       const providerThread = yield* runtime.ensureThread({
         threadId,
         modelSelection,
@@ -1403,6 +1409,55 @@ describe("CursorAdapterV2", () => {
       yield* interruptRunning;
       yield* runtime.resumeTurn!(resumeInput(9));
       assert.deepEqual(resumedRuns, [5, 6, 8, 9]);
+
+      checkpointedRuns.add("native-cursor-run-9");
+      yield* interruptRunning;
+      yield* Scope.close(firstSessionScope, Exit.void);
+      const reopened = yield* makeCursorAdapterV2({
+        instanceId,
+        environment: { HOME: workspace },
+      }).pipe(
+        Effect.provideService(CursorAgentSdk.CursorAgentSdkRunner, runner),
+        Effect.provide(TestProviderHost.layer({ cwd: workspace })),
+        Effect.flatMap((adapter) =>
+          adapter.openSession({
+            threadId,
+            providerSessionId: ProviderSessionId.make("cursor-reopened-session"),
+            modelSelection,
+            runtimePolicy,
+          }),
+        ),
+      );
+      const reopenedThread = yield* reopened.resumeThread({ providerThread });
+      const proof = {
+        nativeThreadId: "native-cursor-steer",
+        nativeTurnId: "native-cursor-run-9",
+        snapshot: instructionSnapshot,
+      };
+      const resumedInput = { ...resumeInput(10), providerThread: reopenedThread };
+      for (const retained of [
+        undefined,
+        { ...proof, snapshot: { ...instructionSnapshot, memoryEpoch: 1 } },
+        { ...proof, nativeThreadId: "another-native-thread" },
+        { ...proof, nativeTurnId: "uncheckpointed-run" },
+      ]) {
+        const refused = yield* reopened.resumeTurn!({
+          ...resumedInput,
+          previousInstructionDelivery: Effect.succeed(retained),
+        }).pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(refused));
+        assert.lengthOf(sentMessages, 9);
+      }
+      yield* reopened.resumeTurn!({
+        ...resumedInput,
+        previousInstructionDelivery: Effect.succeed(proof),
+      });
+      assert.strictEqual(sentMessages[9], "");
+      assert.deepEqual(resumedRuns, [5, 6, 8, 9, 10]);
+      assert.deepEqual(
+        yield* reopened.getAppliedInstructions!({ providerThread: reopenedThread }),
+        instructionSnapshot,
+      );
     }).pipe(
       Effect.scoped,
       Effect.provide(

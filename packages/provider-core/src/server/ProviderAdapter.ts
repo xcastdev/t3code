@@ -544,7 +544,18 @@ export interface ProviderAdapterV2EnsureThreadInput {
   readonly forceNewNativeThread?: boolean;
 }
 
+export interface ProviderAdapterV2InstructionDelivery {
+  readonly nativeThreadId: string;
+  readonly nativeTurnId: string;
+  readonly snapshot: OrchestrationV2InstructionSnapshot;
+}
+
 export interface ProviderAdapterV2TurnInput {
+  /** Persisted delivery for the latest accepted native turn, verified again against the provider checkpoint. */
+  readonly previousInstructionDelivery?: Effect.Effect<
+    ProviderAdapterV2InstructionDelivery | undefined
+  >;
+
   readonly onInstructionsApplied?: (
     snapshot: OrchestrationV2InstructionSnapshot,
   ) => Effect.Effect<void>;

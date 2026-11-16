@@ -2766,18 +2766,33 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
               });
             }
             const deliveredSnapshot = deliveredInstructions.get(turnInput.providerThread.id);
+            let previousSnapshot =
+              deliveredSnapshot?.nativeThreadId === agent.nativeThreadId
+                ? deliveredSnapshot.snapshot
+                : undefined;
             if (
               resume !== undefined &&
-              !sameInstructionSnapshot(
-                instructionSnapshot,
-                deliveredSnapshot?.nativeThreadId === agent.nativeThreadId
-                  ? deliveredSnapshot.snapshot
-                  : undefined,
-              )
+              previousSnapshot === undefined &&
+              instructionSnapshot !== undefined
+            ) {
+              const retained = yield* turnInput.previousInstructionDelivery ?? Effect.undefined;
+              if (
+                retained?.nativeThreadId === agent.nativeThreadId &&
+                (yield* runCheckpointed(retained.nativeTurnId))
+              ) {
+                previousSnapshot = retained.snapshot;
+              }
+            }
+            if (
+              resume !== undefined &&
+              !sameInstructionSnapshot(instructionSnapshot, previousSnapshot)
             ) {
               return yield* new ProviderAdapter.ProviderAdapterProtocolError({
                 driver: CursorAgentSdk.CURSOR_PROVIDER,
-                detail: "Cursor instruction revisions require a fresh prompt before resuming.",
+                detail:
+                  previousSnapshot === undefined
+                    ? "Cursor instruction delivery could not be verified. Send a fresh prompt before resuming."
+                    : "Cursor instruction revisions require a fresh prompt before resuming.",
               });
             }
             const { message, prompt } =
