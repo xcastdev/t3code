@@ -69,6 +69,7 @@ import {
   CheckIcon,
   ChevronRightIcon,
   CornerLeftUpIcon,
+  FileIcon,
   FileSearchIcon,
   FolderGit2Icon,
   FolderIcon,
@@ -184,6 +185,7 @@ import { resolvePastedPath } from "@t3tools/shared/path";
 import {
   dispatchCommandPalette,
   getCommandPaletteReturnFocus,
+  settleFilePick,
   useCommandPaletteMount,
   useCommandPaletteStore,
 } from "../commandPaletteStore";
@@ -325,6 +327,12 @@ function openIntentView(intent: CommandPaletteOpenIntent | null): CommandPalette
         addonIcon: <PaletteIcon className={ADDON_ICON_CLASS} />,
         groups: [{ value: "themes", label: "Change theme", items: [] }],
       };
+    case "pick-file":
+      return {
+        addonIcon: <FileIcon className={ADDON_ICON_CLASS} />,
+        groups: [],
+        initialQuery: "~/",
+      };
     case "search":
     case undefined:
       return null;
@@ -462,7 +470,7 @@ function OpenCommandPaletteDialog(props: {
   const [searchState, dispatchSearch] = useReducer(reduceCommandPaletteSearchState, null, () => {
     const view = props.initialContext ? null : openIntentView(props.openIntent);
     return view
-      ? { query: "", views: [{ view, parentQuery: "" }] }
+      ? { query: view.initialQuery ?? "", views: [{ view, parentQuery: "" }] }
       : createCommandPaletteSearchState(initialSearch.query);
   });
   const { query, views: viewStack } = searchState;
@@ -564,8 +572,12 @@ function OpenCommandPaletteDialog(props: {
   const threadSearchQuery = currentView === null && !isActionsOnly ? deferredQuery : "";
   const [browseGeneration, setBrowseGeneration] = useState(0);
   const [browseNavigation] = useState(createBrowseNavigationCoordinator);
+  // Read once: the intent clears while the palette animates closed.
+  const [pickFileIntent] = useState(() =>
+    props.openIntent?.kind === "pick-file" ? props.openIntent : null,
+  );
   const [addProjectEnvironmentId, setAddProjectEnvironmentId] = useState<EnvironmentId | null>(
-    null,
+    () => pickFileIntent?.environmentId ?? null,
   );
   const [isPickingProjectFolder, setIsPickingProjectFolder] = useState(false);
   const [addProjectCloneFlow, setAddProjectCloneFlow] = useState<AddProjectCloneFlow | null>(null);
@@ -663,7 +675,9 @@ function OpenCommandPaletteDialog(props: {
         ? desktopLocalBackendId(environment.entry.target)?.startsWith("wsl:") === true
         : false;
     }) ?? null;
-  const browseEnvironmentId = addProjectEnvironmentId ?? defaultAddProjectEnvironmentId;
+  // A pick browses only the environment it was asked about.
+  const browseEnvironmentId =
+    pickFileIntent?.environmentId ?? addProjectEnvironmentId ?? defaultAddProjectEnvironmentId;
   const canCreateProject = useEnvironmentScope(browseEnvironmentId, AuthOrchestrationOperateScope);
   const browseEnvironment =
     environments.find((environment) => environment.environmentId === browseEnvironmentId) ?? null;
@@ -782,6 +796,7 @@ function OpenCommandPaletteDialog(props: {
           input: {
             partialPath: browsePath.directoryPath,
             ...(currentProjectCwdForBrowse ? { cwd: currentProjectCwdForBrowse } : {}),
+            ...(pickFileIntent ? { includeFiles: true } : {}),
           },
         })
       : null,
@@ -824,6 +839,7 @@ function OpenCommandPaletteDialog(props: {
       input: {
         partialPath,
         ...(cwd ? { cwd } : {}),
+        ...(pickFileIntent ? { includeFiles: true } : {}),
       },
     });
   };
@@ -1017,6 +1033,10 @@ function OpenCommandPaletteDialog(props: {
   });
 
   function popView(): void {
+    if (pickFileIntent !== null && viewStack.length <= 1) {
+      setOpen(false);
+      return;
+    }
     browseNavigation.invalidate();
     setAddProjectCloneFlow(null);
     setNewProjectFlow(null);
@@ -2038,44 +2058,50 @@ function OpenCommandPaletteDialog(props: {
 
   const isLinkedThreadSearch =
     linkedThreadSearch?.linkedThreads !== undefined && deferredQuery === linkedThreadSearch.query;
-  const filteredGroups = filterCommandPaletteGroups({
-    activeGroups,
-    query: deferredQuery,
-    isInSubmenu: currentView !== null,
-    ...(deferredQuery.trim().length > 0
-      ? {
-          allOptions: {
-            rootGroups,
-            nestedItems: buildNestedSearchItems(actionItems, deferredQuery),
-          },
-        }
-      : {}),
-    projectSearchItems: projectSearchItems,
-    settingsSearchItems,
-    threadSearchItems:
-      isLinkedThreadSearch && linkedThreadSearch?.linkedThreads
-        ? buildLinkedThreadActionItems({
-            ...linkedThreadSearch.linkedThreads,
-            threads: visibleLinkedThreads(
-              linkedThreadSearch.linkedThreads.threads,
-              linkedThreadSearch.linkedThreads.environmentId,
-              linkedThreadRefs,
-              hiddenKeys,
-              hidingAnywhere,
-            ),
-            query: linkedThreadSearch.query,
-            icon: <MessageSquareIcon className={ITEM_ICON_CLASS} />,
-            runThread: async (thread) => {
-              await navigate({
-                to: "/$environmentId/$threadId",
-                params: buildThreadRouteParams(scopeThreadRef(thread.environmentId, thread.id)),
-              });
-            },
-          })
-        : allThreadItems,
-    threadMessageItems: isLinkedThreadSearch ? [] : threadMessageItems,
-    now: searchNow,
-  });
+  // A pick offers only its browse rows: root results would lead into other flows and environments.
+  const filteredGroups =
+    pickFileIntent !== null
+      ? []
+      : filterCommandPaletteGroups({
+          activeGroups,
+          query: deferredQuery,
+          isInSubmenu: currentView !== null,
+          ...(deferredQuery.trim().length > 0
+            ? {
+                allOptions: {
+                  rootGroups,
+                  nestedItems: buildNestedSearchItems(actionItems, deferredQuery),
+                },
+              }
+            : {}),
+          projectSearchItems: projectSearchItems,
+          settingsSearchItems,
+          threadSearchItems:
+            isLinkedThreadSearch && linkedThreadSearch?.linkedThreads
+              ? buildLinkedThreadActionItems({
+                  ...linkedThreadSearch.linkedThreads,
+                  threads: visibleLinkedThreads(
+                    linkedThreadSearch.linkedThreads.threads,
+                    linkedThreadSearch.linkedThreads.environmentId,
+                    linkedThreadRefs,
+                    hiddenKeys,
+                    hidingAnywhere,
+                  ),
+                  query: linkedThreadSearch.query,
+                  icon: <MessageSquareIcon className={ITEM_ICON_CLASS} />,
+                  runThread: async (thread) => {
+                    await navigate({
+                      to: "/$environmentId/$threadId",
+                      params: buildThreadRouteParams(
+                        scopeThreadRef(thread.environmentId, thread.id),
+                      ),
+                    });
+                  },
+                })
+              : allThreadItems,
+          threadMessageItems: isLinkedThreadSearch ? [] : threadMessageItems,
+          now: searchNow,
+        });
 
   const handleAddProjectForEnvironment = async (input: {
     readonly environmentId: EnvironmentId;
@@ -2477,6 +2503,11 @@ function OpenCommandPaletteDialog(props: {
     }
   }
 
+  const pickFilePath = (fullPath: string): void => {
+    settleFilePick(fullPath);
+    setOpen(false);
+  };
+
   const browseTo = async (name: string): Promise<void> => {
     const nextQuery = pinnedCloneDirectoryName
       ? getCloneDestinationBrowsePath({
@@ -2527,6 +2558,9 @@ function OpenCommandPaletteDialog(props: {
     directoryIcon: <FolderIcon className={ITEM_ICON_CLASS} />,
     browseUp,
     browseTo,
+    ...(pickFileIntent
+      ? { pickFile: { icon: <FileIcon className={ITEM_ICON_CLASS} />, pick: pickFilePath } }
+      : {}),
   });
   const cloneDestinationBrowseGroups = browseGroups.map((group) =>
     group.value === "directories" ? { ...group, label: "Select where to clone" } : group,
@@ -2682,8 +2716,10 @@ function OpenCommandPaletteDialog(props: {
   const inputPlaceholder =
     newProjectFlow !== null
       ? "Project name"
-      : (remoteProjectInputPlaceholder(addProjectCloneFlow) ??
-        getCommandPaletteInputPlaceholder(paletteMode));
+      : pickFileIntent !== null && isBrowsing
+        ? "Enter a file path (e.g. ~/captures/session.mitm)"
+        : (remoteProjectInputPlaceholder(addProjectCloneFlow) ??
+          getCommandPaletteInputPlaceholder(paletteMode));
   const isSubmenu = paletteMode === "submenu" || paletteMode === "submenu-browse";
   const hasHighlightedBrowseItem = highlightedItemValue?.startsWith("browse:") ?? false;
   const canWriteSourceControl = useEnvironmentScope(
@@ -2697,6 +2733,7 @@ function OpenCommandPaletteDialog(props: {
   const canCloneProject = canWriteSourceControl && canCreateClonedProject;
   const isCloneDestinationStep = addProjectCloneFlow?.step === "confirm";
   const canSubmitBrowsePath =
+    pickFileIntent === null &&
     isBrowsing &&
     !relativePathNeedsActiveProject &&
     canCreateProject &&
@@ -2736,6 +2773,7 @@ function OpenCommandPaletteDialog(props: {
     !isRemoteProjectPending;
   const fileManagerName = getLocalFileManagerName(navigator.platform);
   const canOpenProjectFromFileManager =
+    pickFileIntent === null &&
     isBrowsing &&
     browseEnvironmentId !== null &&
     (browseEnvironmentId === primaryEnvironmentId ||
@@ -2855,6 +2893,22 @@ function OpenCommandPaletteDialog(props: {
       return;
     }
 
+    if (
+      pickFileIntent !== null &&
+      isBrowsing &&
+      event.key === "Enter" &&
+      !hasHighlightedBrowseItem &&
+      exactBrowseEntry != null &&
+      !event.nativeEvent.isComposing &&
+      event.keyCode !== 229
+    ) {
+      (event as typeof event & { preventBaseUIHandler?: () => void }).preventBaseUIHandler?.();
+      event.preventDefault();
+      if (exactBrowseEntry.kind === "file") pickFilePath(exactBrowseEntry.fullPath);
+      else void browseTo(exactBrowseEntry.name);
+      return;
+    }
+
     const shouldSubmitBrowsePath =
       canSubmitBrowsePath &&
       event.key === "Enter" &&
@@ -2892,7 +2946,14 @@ function OpenCommandPaletteDialog(props: {
       const completion = highlightedEntry
         ? { name: highlightedEntry.name, isComplete: true }
         : getFilesystemBrowseTabCompletion(visibleBrowseEntries, browsePath.filterQuery);
-      if (completion?.isComplete) {
+      const completesFile =
+        completion?.isComplete === true &&
+        visibleBrowseEntries.find((entry) => entry.name === completion.name)?.kind === "file";
+      if (completesFile && completion) {
+        // A file is the end of the path: complete its name without browsing into it.
+        setHighlightedItemValue(null);
+        setQuery(`${getBrowseDirectoryPath(query)}${completion.name}`);
+      } else if (completion?.isComplete) {
         void browseTo(completion.name);
       } else if (completion && !pinnedCloneDirectoryName) {
         setHighlightedItemValue(null);
@@ -3115,7 +3176,7 @@ function OpenCommandPaletteDialog(props: {
           void submitAddProjectCloneFlow();
         }}
       />
-    ) : isBrowsing ? (
+    ) : isBrowsing && pickFileIntent === null ? (
       <CommandPaletteSubmitButton
         id={submitButtonId}
         label={isCloneDestinationStep && isRemoteProjectPending ? "Cloning" : submitActionLabel}

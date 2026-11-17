@@ -238,6 +238,7 @@ describe("mitmdumpArgs", () => {
       ],
     },
     { name: "replay", mode: { kind: "replay" }, args: ["--set", "server=false", ...COMMON] },
+    { name: "import", mode: { kind: "import" }, args: ["--set", "server=false", ...COMMON] },
     {
       name: "replay through an upstream",
       mode: { kind: "replay", upstreamUrl: "https://10.0.0.2:3128" },

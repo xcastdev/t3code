@@ -8,6 +8,9 @@ Host lists arrive as regex sources compiled by shared/hostPatterns.ts, so there 
 implementation. Both lists go into mitmproxy's ignore_hosts (no TLS is terminated for either);
 this addon decides which ignored connections to record. The worker puts the startup lists on
 argv and upstream auth in a config file, because mitmproxy listens before this addon runs.
+
+With T3_INSPECTOR_IMPORT set, the process listens for nothing: it streams the HTTP flows of that
+file as flow records, then sends importDone and waits for the worker to stop it.
 """
 
 import asyncio
@@ -19,6 +22,8 @@ import sys
 import time
 
 from mitmproxy import connection, ctx, http
+from mitmproxy import io as flow_io
+from mitmproxy.exceptions import FlowReadException
 from mitmproxy.addons.upstream_auth import parse_upstream_auth
 from mitmproxy.proxy import mode_specs
 from mitmproxy.proxy.layers.tls import parse_client_hello
@@ -26,6 +31,7 @@ from mitmproxy.proxy.layers.tls import parse_client_hello
 REPLAY_ID = "t3_inspector_replay_id"
 READ_LIMIT = 8 * 1024 * 1024
 MAX_HELLO_BYTES = 64 * 1024
+MAX_IMPORT_ERROR_CHARS = 300
 
 
 def _b64(data):
@@ -116,6 +122,35 @@ class Inspector:
         self._send({"type": "hello", "token": os.environ["T3_INSPECTOR_CONTROL_TOKEN"]})
         await self._drain()
         self.reader_task = asyncio.create_task(self._read(reader))
+        import_path = os.environ.get("T3_INSPECTOR_IMPORT")
+        if import_path:
+            self.import_task = asyncio.create_task(self._import(import_path))
+
+    async def _import(self, path):
+        skipped = 0
+        error = None
+        try:
+            with open(path, "rb") as source:
+                for flow in flow_io.FlowReader(source).stream():
+                    if self.writer is None:
+                        return
+                    if isinstance(flow, http.HTTPFlow):
+                        self._send(self._record(flow))
+                        await self._drain()
+                    else:
+                        skipped += 1
+        except FlowReadException as read_error:
+            # Some messages quote the bad record, so only a short one without it is passed on.
+            message = str(read_error)
+            error = (
+                "The file holds a record that is not a flow."
+                if "loaded=" in message or len(message) > MAX_IMPORT_ERROR_CHARS
+                else message
+            )
+        except Exception as read_error:
+            error = f"The file could not be read ({type(read_error).__name__})."
+        self._send({"type": "importDone", "skipped": skipped, "error": error})
+        await self._drain()
 
     def _apply_hosts(self, passthrough, ignored):
         self.passthrough = _compile(passthrough)

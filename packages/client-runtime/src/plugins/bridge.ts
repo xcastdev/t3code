@@ -62,6 +62,8 @@ export interface PluginBridgeOptions {
   ) => Promise<"inserted" | "cancelled">;
   readonly saveFile: (file: PluginSaveFile) => Promise<"saved" | "cancelled">;
   readonly writeClipboard: (text: string) => Promise<void>;
+  /** Lets the user choose a file on the install's environment; null when they cancel. */
+  readonly pickFile: () => Promise<string | null>;
   /** Threads and projects in the install's environment; the bridge caps each list. */
   readonly chatTargets: (query: string) => PluginChatTargets | Promise<PluginChatTargets>;
 }
@@ -456,7 +458,10 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
   };
 
   // Web also refuses panel clicks within seconds of input elsewhere in T3, so a retry must wait.
-  const requireActivation = (activated: boolean, action: "Attaching" | "Copying" | "Saving") => {
+  const requireActivation = (
+    activated: boolean,
+    action: "Attaching" | "Copying" | "Saving" | "Choosing a file",
+  ) => {
     if (!activated) {
       throw bridgeFailure(
         REQUEST_FAILED,
@@ -614,6 +619,12 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
           throw refusal("too-large");
         }
         answer(id, () => options.writeClipboard(text).then(() => ({})));
+        return;
+      }
+      case "t3/file.pick": {
+        if (!manifest.capabilities.includes("file.pick")) throw refusal("capability-denied");
+        requireActivation(activated, "Choosing a file");
+        answer(id, () => options.pickFile().then((path) => ({ path })));
         return;
       }
       case "t3/chat.targets.list": {

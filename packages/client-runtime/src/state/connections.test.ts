@@ -5,7 +5,8 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { Atom, AtomRegistry } from "effect/reactivity";
+import { AsyncResult, Atom, AtomRegistry } from "effect/reactivity";
+import { vi } from "vite-plus/test";
 
 import {
   AVAILABLE_CONNECTION_STATE,
@@ -15,7 +16,7 @@ import {
 import * as EnvironmentRegistry from "../connection/registry.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import type * as RpcSession from "../rpc/session.ts";
-import { createEnvironmentCatalogAtoms } from "./connections.ts";
+import { createEnvironmentCatalogAtoms, waitForEnvironmentConnection } from "./connections.ts";
 
 const ENVIRONMENT_ID = EnvironmentId.make("catalog-environment");
 
@@ -115,4 +116,76 @@ describe("environment catalog atoms", () => {
       ).not.toBe(first);
     }),
   );
+});
+
+describe("waitForEnvironmentConnection", () => {
+  it.each([
+    { name: "already connected", start: "connected", then: undefined, settles: true },
+    { name: "connected later", start: "connecting", then: "connected", settles: true },
+    {
+      name: "offline, so a request fails at once",
+      start: "offline",
+      then: undefined,
+      settles: true,
+    },
+    { name: "blocked", start: "blocked", then: undefined, settles: true },
+    // A supervisor state, unlike the atom's placeholder: the environment is not trying to connect.
+    { name: "available but not connecting", start: "available", then: undefined, settles: true },
+    {
+      name: "its next retry is after the deadline",
+      start: "backoff",
+      retryAt: 60_000,
+      then: undefined,
+      settles: true,
+    },
+    {
+      name: "still connecting when the wait runs out",
+      start: "backoff",
+      then: undefined,
+      settles: false,
+    },
+  ] as const)("resolves when $name", async (row) => {
+    vi.useFakeTimers({ now: 0 });
+    try {
+      const retryAt = "retryAt" in row ? row.retryAt : null;
+      const state = (phase: SupervisorConnectionState["phase"]) =>
+        AsyncResult.success({ ...AVAILABLE_CONNECTION_STATE, phase, retryAt });
+      const registry = AtomRegistry.make();
+      const atom = Atom.make(state(row.start));
+      let resolved = false;
+      const waited = waitForEnvironmentConnection(registry, atom, 10_000).then(() => {
+        resolved = true;
+      });
+      await Promise.resolve();
+      expect(resolved).toBe(row.start !== "connecting" && row.settles);
+      if (row.then !== undefined) registry.set(atom, state(row.then));
+      if (!row.settles) await vi.advanceTimersByTimeAsync(10_000);
+      await waited;
+      expect(resolved).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits through the atom's placeholder until the supervisor reports", async () => {
+    vi.useFakeTimers();
+    try {
+      const registry = AtomRegistry.make();
+      const atom = Atom.make(AsyncResult.success(AVAILABLE_CONNECTION_STATE));
+      let resolved = false;
+      const waited = waitForEnvironmentConnection(registry, atom, 10_000).then(() => {
+        resolved = true;
+      });
+      await Promise.resolve();
+      expect(resolved).toBe(false);
+      registry.set(
+        atom,
+        AsyncResult.success({ ...AVAILABLE_CONNECTION_STATE, phase: "connected" }),
+      );
+      await waited;
+      expect(resolved).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

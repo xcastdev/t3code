@@ -133,6 +133,7 @@ describe("PluginPanelFrame", () => {
             attach: async () => "inserted",
             saveFile: async () => "saved",
             writeClipboard: async () => {},
+            pickFile: async () => null,
             chatTargets: () => ({ threads: [], projects: [] }),
           }}
           destination={{ kind: "client" }}
@@ -182,6 +183,7 @@ describe("PluginPanelFrame", () => {
             attach: async () => "inserted",
             saveFile: async () => "saved",
             writeClipboard,
+            pickFile: async () => null,
             chatTargets: () => ({ threads: [], projects: [] }),
           }}
           destination={{ kind: "client" }}
@@ -229,6 +231,7 @@ describe("PluginPanelFrame", () => {
             attach: async () => "inserted",
             saveFile: async () => "saved",
             writeClipboard,
+            pickFile: async () => null,
             chatTargets: () => ({ threads: [], projects: [] }),
           }}
           destination={{ kind: "client" }}

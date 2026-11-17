@@ -10,6 +10,7 @@ import {
   pluginPanelKey,
   type PluginPanelKey,
 } from "@t3tools/client-runtime/plugins/commands";
+import { waitForEnvironmentConnection } from "@t3tools/client-runtime/state/connections";
 import { runAtomCommand, squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
   PluginRequestError,
@@ -28,6 +29,7 @@ import { AppBar } from "../../components/ui/AppBar";
 import { Button } from "../../components/ui/Button";
 import * as Dialog from "../../components/ui/Dialog";
 import { EmptyState } from "../../components/ui/EmptyState";
+import { environmentCatalog } from "../../connection/catalog";
 import { beginForegroundHandoff } from "../../lib/foreground-handoff";
 import { uuidv4 } from "../../lib/uuid";
 import { useAssetUrlState } from "../../state/assets";
@@ -322,6 +324,8 @@ function PluginPanelSurface(props: {
       const mutates =
         manifestValue.backend?.operations.find((entry) => entry.name === operation)?.mutates ??
         true;
+      // A system picker or share sheet backgrounds the app, which reconnects on return.
+      await waitForEnvironmentConnection(registry, environmentCatalog.stateAtom(environmentId));
       const result = await runAtomCommand(
         registry,
         mutates ? pluginEnvironment.mutate : pluginEnvironment.query,
@@ -382,6 +386,8 @@ function PluginPanelSurface(props: {
       attachPluginRequestToChat({ request, chat, manifest, destination }),
     saveFile: shareSavedFile,
     writeClipboard: copyToClipboard,
+    pickFile: () =>
+      Promise.reject(new Error("Choosing a file on the environment is not available on mobile.")),
     chatTargets: (query: string) =>
       install.kind === "environment"
         ? selectPluginChatTargets(

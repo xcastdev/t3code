@@ -49,6 +49,19 @@ and lets you search, export, decode, and replay it. Install [mitmproxy](https://
 a recording on it. You can run several proxies at once. Leave the port on auto to use the first
 free one.
 
+**Import saved flows.** Choose **Import…** in the Requests view to add a mitmproxy `.mitm` dump
+or a HAR file as a new recording, named after the file, under the proxy you pick. **Upload from
+this device** picks a file on the device you are using. **Choose on** the environment's machine
+opens the command palette to browse that machine's files, so nothing is uploaded; on mobile, type
+the file's path instead (`~/` works). An upload can be at most half the storage budget; choose a
+larger file on the environment's machine instead. Large files
+import in the background, and the recording fills in as they do. Only HTTP and WebSocket flows are
+kept; TCP, UDP, and DNS flows are skipped. Imported bodies are cut at the same size limit as
+recorded ones, and imports count against the storage budget: when it is full, an import
+keeps what it has read and drops the rest. A HAR file is loaded into memory whole on the
+environment's machine, so for very large captures prefer a `.mitm` dump. Delete the recording to stop an
+import.
+
 **Link a proxy to a chat.** Link a proxy to a chat or a project, and agents there use it without
 being told which. A chat or project can link several proxies; the most recently linked one is the
 default, and linking a proxy again makes it the default. An agent can still use any other proxy by

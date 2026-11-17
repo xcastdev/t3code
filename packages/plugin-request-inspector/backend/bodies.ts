@@ -162,18 +162,43 @@ export interface DraftStore {
   readonly write: (input: DraftWriteInput) => Promise<{ draftId: string; size: number }>;
   readonly path: (draftId: string) => string | undefined;
   readonly size: (draftId: string) => number | undefined;
+  /**
+   * Hands the draft's file to the caller: eviction no longer touches it, and the caller deletes
+   * it (worker start clears any left behind).
+   */
+  readonly take: (draftId: string) => string | undefined;
   /** Deletes one draft. Call while holding the lane. */
   readonly remove: (lane: StoreLane, draftId: string) => void;
   /** Deletes every draft (worker start). Call while holding the lane. */
   readonly clear: (lane: StoreLane) => void;
 }
 
-/** Body drafts under `drafts/`: at most 4 of at most 16 MiB, least recently written evicted. */
-export function makeDraftStore(store: InspectorStore): DraftStore {
+export interface DraftKind {
+  /** File name prefix under `drafts/`, so kinds never share a file. */
+  readonly prefix: string;
+  readonly maxBytes: number;
+  readonly maxDrafts: number;
+  readonly tooLargeDetail: string;
+  readonly missingDetail: string;
+}
+
+export const BODY_DRAFTS: DraftKind = {
+  prefix: "",
+  maxBytes: BODY_LIMITS.maxDraftBytes,
+  maxDrafts: BODY_LIMITS.maxDrafts,
+  tooLargeDetail: "A body draft is at most 16 MiB.",
+  missingDetail: DRAFT_MISSING_DETAIL,
+};
+
+/**
+ * Chunked uploads under `drafts/`, body drafts by default: at most 4 of at most 16 MiB, least
+ * recently written evicted. They count against the storage budget like everything else.
+ */
+export function makeDraftStore(store: InspectorStore, kind: DraftKind = BODY_DRAFTS): DraftStore {
   const dir = store.draftsDir;
   // Insertion order is write recency: a write moves its draft to the end.
   const drafts = new Map<string, number>();
-  const fileOf = (draftId: string) => NodePath.join(dir, `${draftId}.bin`);
+  const fileOf = (draftId: string) => NodePath.join(dir, `${kind.prefix}${draftId}.bin`);
 
   const deleteDraft = (draftId: string) => {
     drafts.delete(draftId);
@@ -186,16 +211,16 @@ export function makeDraftStore(store: InspectorStore): DraftStore {
         throw new InspectorRefusal("invalid-input", "offset must be a non-negative integer.");
       }
       if (input.draftId !== undefined && !DRAFT_ID_PATTERN.test(input.draftId)) {
-        throw new InspectorRefusal("not-found", DRAFT_MISSING_DETAIL);
+        throw new InspectorRefusal("not-found", kind.missingDetail);
       }
       const chunk = decodeBase64Chunk(input.base64);
-      if (input.offset + chunk.byteLength > BODY_LIMITS.maxDraftBytes) {
-        throw new InspectorRefusal("invalid-input", "A body draft is at most 16 MiB.");
+      if (input.offset + chunk.byteLength > kind.maxBytes) {
+        throw new InspectorRefusal("invalid-input", kind.tooLargeDetail);
       }
       return store.exclusive((lane) => {
         const existing = input.draftId === undefined ? undefined : drafts.get(input.draftId);
         if (input.draftId !== undefined && existing === undefined) {
-          throw new InspectorRefusal("not-found", DRAFT_MISSING_DETAIL);
+          throw new InspectorRefusal("not-found", kind.missingDetail);
         }
         const current = existing ?? 0;
         if (input.offset > current) {
@@ -210,7 +235,7 @@ export function makeDraftStore(store: InspectorStore): DraftStore {
         }
         const draftId = input.draftId ?? NodeCrypto.randomBytes(8).toString("hex");
         if (input.draftId === undefined) {
-          const excess = drafts.size - BODY_LIMITS.maxDrafts + 1;
+          const excess = drafts.size - kind.maxDrafts + 1;
           for (const id of [...drafts.keys()].slice(0, Math.max(0, excess))) deleteDraft(id);
         }
         NodeFS.mkdirSync(dir, { recursive: true });
@@ -228,6 +253,10 @@ export function makeDraftStore(store: InspectorStore): DraftStore {
     },
     path: (draftId) => (drafts.has(draftId) ? fileOf(draftId) : undefined),
     size: (draftId) => drafts.get(draftId),
+    take: (draftId) => {
+      if (!drafts.delete(draftId)) return undefined;
+      return fileOf(draftId);
+    },
     remove: (lane, draftId) => {
       deleteDraft(draftId);
       lane.noteFileWrite();

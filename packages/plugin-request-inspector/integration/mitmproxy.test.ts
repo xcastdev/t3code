@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - Real-mitmdump tests for the packed inspector.
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeZlib from "node:zlib";
@@ -17,6 +18,7 @@ import {
   deferred,
   HELLO_ONLY_ADDON,
   freePort,
+  mitmdumpPython,
   openMitmRuntime,
   openPackedInspector,
   openTlsServer,
@@ -116,7 +118,193 @@ const headerPairs = (raw: ReadonlyArray<string>): Array<readonly [string, string
     index % 2 === 0 ? [[value, raw[index + 1] as string] as const] : [],
   );
 
+/** Writes a .mitm dump with mitmproxy's own writer: one POST with duplicate headers, one TCP flow. */
+const writeDump = (path: string) => {
+  const script = `
+import sys
+from mitmproxy import http, io
+from mitmproxy.test import tflow
+flow = tflow.tflow(resp=True)
+flow.request.method = "POST"
+flow.request.headers = http.Headers([(b"X-Dup", b"first"), (b"X-Dup", b"second")])
+flow.request.content = bytes(range(256))
+with open(sys.argv[1], "wb") as out:
+    writer = io.FlowWriter(out)
+    writer.add(flow)
+    writer.add(tflow.ttcpflow())
+`;
+  const result = NodeChildProcess.spawnSync(mitmdumpPython(), ["-I", "-c", script, path], {
+    encoding: "utf8",
+  });
+  if (result.status !== 0) throw new Error(`Writing the dump failed: ${result.stderr}`);
+};
+
+interface ImportView {
+  readonly recordingId: string;
+  readonly name: string;
+  readonly state: string;
+  readonly imported: number;
+  readonly skipped: number;
+  readonly dropped: number;
+  readonly detail?: string;
+}
+
 describe("request inspector with a real mitmdump", () => {
+  it("import_flows reads a .mitm dump into a recording named after it, keeping repeated headers, binary bodies and the flows' own times", async () => {
+    await using inspector = await openPackedInspector();
+    const dump = NodePath.join(NodePath.dirname(inspector.dataDir), "session.mitm");
+    writeDump(dump);
+
+    const started = (await inspector.worker.invoke("import_flows", { path: dump, proxyId: "1" })
+      .result) as ImportView;
+    expect(started).toMatchObject({ name: "session.mitm", state: "running" });
+    const done = (await inspector.worker.invoke("get_import", {
+      recordingId: started.recordingId,
+      waitMs: 20_000,
+    }).result) as ImportView;
+    expect(done).toMatchObject({ state: "completed", imported: 1, skipped: 1, dropped: 0 });
+
+    const page = (await inspector.worker.invoke("search_requests", {
+      recordingId: started.recordingId,
+    }).result) as {
+      readonly items: ReadonlyArray<{ readonly id: string; readonly method: string }>;
+    };
+    expect(page.items.map((item) => item.method)).toEqual(["POST"]);
+    const requestId = (page.items[0] as { readonly id: string }).id;
+    const detail = (await inspector.worker.invoke("get_request", { requestId }).result) as {
+      readonly startedAt: number;
+      readonly request: { readonly headers: ReadonlyArray<readonly [string, string]> };
+    };
+    expect(detail.request.headers).toEqual([
+      ["X-Dup", "first"],
+      ["X-Dup", "second"],
+      ["content-length", "256"],
+    ]);
+    const body = (await inspector.worker.invoke("read_body", {
+      requestId,
+      side: "request",
+      offset: 0,
+      length: 131072,
+    }).result) as { readonly base64: string };
+    expect(Buffer.from(body.base64, "base64").equals(BINARY_BODY)).toBe(true);
+
+    const recordings = (await inspector.worker.invoke("list_recordings", { proxyId: "1" })
+      .result) as {
+      readonly items: ReadonlyArray<{ readonly id: string; readonly startedAt: number }>;
+    };
+    expect(recordings.items.find((item) => item.id === started.recordingId)?.startedAt).toBe(
+      detail.startedAt,
+    );
+    await processExit(inspector.mitmdumpPids().at(-1) as number);
+  });
+
+  it("import_flows reads a HAR export: method, URL, bodies, status and the entry's start time", async () => {
+    await using inspector = await openPackedInspector();
+    const harPath = NodePath.join(NodePath.dirname(inspector.dataDir), "checkout.har");
+    const entry = {
+      startedDateTime: "2026-11-02T10:00:00.000Z",
+      time: 12,
+      request: {
+        method: "POST",
+        url: "https://api.acme.dev/v1/checkout?cart=c_42",
+        httpVersion: "HTTP/1.1",
+        headers: [{ name: "Content-Type", value: "application/json" }],
+        queryString: [{ name: "cart", value: "c_42" }],
+        cookies: [],
+        headersSize: -1,
+        bodySize: 15,
+        postData: { mimeType: "application/json", text: '{"cart":"c_42"}' },
+      },
+      response: {
+        status: 500,
+        statusText: "Internal Server Error",
+        httpVersion: "HTTP/1.1",
+        headers: [{ name: "Content-Type", value: "application/json" }],
+        cookies: [],
+        content: { size: 12, mimeType: "application/json", text: '{"ok":false}' },
+        redirectURL: "",
+        headersSize: -1,
+        bodySize: 12,
+      },
+      cache: {},
+      timings: { send: 0, wait: 12, receive: 0 },
+    };
+    NodeFS.writeFileSync(
+      harPath,
+      JSON.stringify({
+        log: { version: "1.2", creator: { name: "t", version: "1" }, entries: [entry] },
+      }),
+    );
+
+    const started = (await inspector.worker.invoke("import_flows", { path: harPath, proxyId: "1" })
+      .result) as ImportView;
+    const done = (await inspector.worker.invoke("get_import", {
+      recordingId: started.recordingId,
+      waitMs: 20_000,
+    }).result) as ImportView;
+    expect(done).toMatchObject({ state: "completed", imported: 1 });
+    const page = (await inspector.worker.invoke("search_requests", {
+      recordingId: started.recordingId,
+    }).result) as {
+      readonly items: ReadonlyArray<{
+        readonly id: string;
+        readonly method: string;
+        readonly host: string;
+        readonly path: string;
+        readonly status: number;
+        readonly startedAt: number;
+      }>;
+    };
+    expect(page.items).toMatchObject([
+      {
+        method: "POST",
+        host: "api.acme.dev",
+        path: "/v1/checkout?cart=c_42",
+        status: 500,
+        startedAt: Date.parse(entry.startedDateTime),
+      },
+    ]);
+    const requestId = (page.items[0] as { readonly id: string }).id;
+    const bodyText = async (side: "request" | "response") => {
+      const body = (await inspector.worker.invoke("read_body", {
+        requestId,
+        side,
+        offset: 0,
+        length: 131072,
+      }).result) as { readonly base64: string };
+      return Buffer.from(body.base64, "base64").toString("utf8");
+    };
+    expect(await bodyText("request")).toBe('{"cart":"c_42"}');
+    expect(await bodyText("response")).toBe('{"ok":false}');
+  });
+
+  it.each([
+    { name: "text", contents: "these are notes, not flows\n", detail: "Invalid data format." },
+    // mitmproxy quotes this record in its error; the import must not pass file contents on.
+    {
+      name: "a record that is not a flow",
+      contents: "5:QQQQQ,",
+      detail: "The file holds a record that is not a flow.",
+    },
+  ])("a file of $name fails the import and leaves no recording", async ({ contents, detail }) => {
+    await using inspector = await openPackedInspector();
+    const notADump = NodePath.join(NodePath.dirname(inspector.dataDir), "notes.mitm");
+    NodeFS.writeFileSync(notADump, contents);
+
+    const started = (await inspector.worker.invoke("import_flows", {
+      path: notADump,
+      proxyId: "1",
+    }).result) as ImportView;
+    const done = (await inspector.worker.invoke("get_import", {
+      recordingId: started.recordingId,
+      waitMs: 20_000,
+    }).result) as ImportView;
+    expect(done).toMatchObject({ state: "failed", imported: 0, detail });
+    const recordings = (await inspector.worker.invoke("list_recordings", { proxyId: "1" })
+      .result) as { readonly items: ReadonlyArray<unknown> };
+    expect(recordings.items).toEqual([]);
+  });
+
   it("addon shuts mitmdump down when its control socket closes", async () => {
     await using inspector = await openPackedInspector();
     await startRecording(inspector);

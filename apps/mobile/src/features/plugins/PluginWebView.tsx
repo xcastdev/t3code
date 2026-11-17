@@ -96,6 +96,7 @@ export function PluginWebView(props: {
       attach: (request, activated) => options().attach(request, activated),
       saveFile: (file) => options().saveFile(file),
       writeClipboard: (text) => options().writeClipboard(text),
+      pickFile: () => options().pickFile(),
       chatTargets: (query) => options().chatTargets(query),
     });
     bridgeRef.current = bridge;

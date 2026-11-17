@@ -54,7 +54,7 @@ const MAX_EXPORT_IDS = 500;
 const READ_EXPORT_BYTES = 131072;
 
 const styles = `
-dialog.export {
+dialog.sheet {
   width: min(440px, calc(100vw - 24px));
   padding: 0;
   border: 1px solid var(--border);
@@ -62,21 +62,21 @@ dialog.export {
   background: var(--bg);
   color: var(--text);
 }
-dialog.export::backdrop {
+dialog.sheet::backdrop {
   background: rgba(0, 0, 0, 0.45);
 }
-dialog.export form {
+dialog.sheet form {
   display: flex;
   flex-direction: column;
   gap: 12px;
   padding: 14px 16px;
 }
-dialog.export h2 {
+dialog.sheet h2 {
   margin: 0;
   font-size: 14px;
   font-weight: 600;
 }
-dialog.export fieldset {
+dialog.sheet fieldset {
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -84,12 +84,12 @@ dialog.export fieldset {
   padding: 0;
   border: 0;
 }
-dialog.export legend {
+dialog.sheet legend {
   margin-bottom: 4px;
   color: var(--text-muted);
   font-size: 12px;
 }
-dialog.export .status {
+dialog.sheet .status {
   min-height: 1.4em;
   font-size: 12px;
   overflow-wrap: anywhere;
@@ -97,6 +97,13 @@ dialog.export .status {
 `;
 
 let stylesInjected = false;
+
+/** Styles for `dialog.sheet`, the panel's modal dialogs. */
+export const injectSheetStyles = () => {
+  if (stylesInjected) return;
+  injectStyles(styles);
+  stylesInjected = true;
+};
 
 const fileStamp = () => new Date().toISOString().slice(0, 19).replaceAll(":", "-");
 
@@ -117,10 +124,7 @@ const summary = (result: ExportResult) =>
 
 /** Opens the export dialog over the panel. It removes itself when closed. */
 export function openExportDialog(app: App, options: ExportDialogOptions = {}): void {
-  if (!stylesInjected) {
-    injectStyles(styles);
-    stylesInjected = true;
-  }
+  injectSheetStyles();
   const { client } = app;
   const checked = [...app.checked.get()];
   const filter = options.filter;
@@ -155,7 +159,7 @@ export function openExportDialog(app: App, options: ExportDialogOptions = {}): v
   const closeButton = h("button", { type: "button", class: "ghost" }, "Close") as HTMLButtonElement;
   const dialog = h(
     "dialog",
-    { class: "export", "aria-label": "Export requests" },
+    { class: "sheet", "aria-label": "Export requests" },
     h(
       "form",
       { method: "dialog" },

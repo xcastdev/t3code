@@ -2,19 +2,28 @@ import { describe, expect, it, vi } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
 import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
 import { DEFAULT_CLIENT_SETTINGS } from "@t3tools/contracts/settings";
-import { AuthOrchestrationOperateScope, AuthSourceControlWriteScope } from "@t3tools/contracts";
+import {
+  AuthOrchestrationOperateScope,
+  AuthSourceControlWriteScope,
+  EnvironmentId,
+} from "@t3tools/contracts";
 import { act, render } from "../../test/render";
 import { CommandPalette } from "./CommandPalette";
-import { openCommandPalette } from "../commandPaletteBus";
+import { openCommandPalette, pickFileInCommandPalette } from "../commandPaletteBus";
 import { primaryServerKeybindingsAtom } from "../state/server";
 
 const scopes = vi.hoisted(() => ({
   denied: undefined as string | undefined,
   sourceControl: undefined as unknown,
+  browse: undefined as unknown,
+  browseAtoms: new Set<unknown>(),
+  browseTargets: [] as Array<{ readonly environmentId: unknown; readonly input: unknown }>,
 }));
-const setup = (deniedScope?: string, sourceControl?: unknown) => {
+const setup = (deniedScope?: string, sourceControl?: unknown, browse?: unknown) => {
   scopes.denied = deniedScope;
   scopes.sourceControl = sourceControl;
+  scopes.browse = browse;
+  scopes.browseTargets = [];
 };
 const githubAvailable = {
   versionControlSystems: [],
@@ -119,13 +128,30 @@ vi.mock("../state/session", async (original) => ({
   useEnvironmentScope: (_environmentId: unknown, scope: string) => scope !== scopes.denied,
   readEnvironmentScope: () => true,
 }));
-vi.mock("../state/filesystem", async (original) => ({
-  ...(await original<typeof import("../state/filesystem")>()),
-  useFilesystemReadAccess: () => ({ canReadFiles: true, isPending: false, error: null }),
-}));
+vi.mock("../state/filesystem", async (original) => {
+  const actual = await original<typeof import("../state/filesystem")>();
+  const browse = actual.filesystemEnvironment.browse;
+  return {
+    ...actual,
+    filesystemEnvironment: {
+      ...actual.filesystemEnvironment,
+      // Marks browse queries so the query mock below can answer them with `scopes.browse`.
+      browse: Object.assign((target: Parameters<typeof browse>[0]) => {
+        scopes.browseTargets.push(target);
+        const atom = browse(target);
+        scopes.browseAtoms.add(atom);
+        return atom;
+      }, browse),
+    },
+    useFilesystemReadAccess: () => ({ canReadFiles: true, isPending: false, error: null }),
+  };
+});
 vi.mock("../state/query", async (original) => ({
   ...(await original<typeof import("../state/query")>()),
-  useEnvironmentQuery: () => ({ data: scopes.sourceControl, isLoading: false }),
+  useEnvironmentQuery: (atom: unknown) =>
+    scopes.browseAtoms.has(atom)
+      ? { data: scopes.browse ?? null, isPending: false }
+      : { data: scopes.sourceControl, isLoading: false },
 }));
 vi.mock("./settings/useAvailableSettingsSearchItems", () => ({
   useAvailableSettingsSearchItems: () => [],
@@ -243,4 +269,91 @@ it("tells screen readers whether a new project will be published", async () => {
   await expect.element(option).toHaveAttribute("aria-checked", "false");
   await option.click();
   await expect.element(option).toHaveAttribute("aria-checked", "true");
+});
+
+describe("pick-file", () => {
+  const environmentId = EnvironmentId.make("env-files");
+  const listing = {
+    parentPath: "/home/user/captures",
+    entries: [
+      { name: "old", fullPath: "/home/user/captures/old", kind: "directory" },
+      { name: "session.mitm", fullPath: "/home/user/captures/session.mitm", kind: "file" },
+    ],
+  };
+
+  it.each([
+    { how: "clicking it", choose: () => page.getByText("session.mitm", { exact: true }).click() },
+    {
+      how: "typing its path and pressing Enter",
+      choose: async () => {
+        await page.getByRole("combobox").fill("~/captures/session.mitm");
+        await userEvent.keyboard("{Enter}");
+      },
+    },
+  ])("lists files and resolves with the one chosen by $how", async ({ choose }) => {
+    setup(undefined, undefined, listing);
+    await using _screen = await render(<CommandPalette>{null}</CommandPalette>);
+    let picked: Promise<string | null> = Promise.resolve(null);
+    await act(() => {
+      picked = pickFileInCommandPalette(environmentId);
+    });
+    await expect.element(page.getByRole("combobox")).toHaveValue("~/");
+    await expect.element(page.getByText("old", { exact: true })).toBeInTheDocument();
+    // Picking a file never adds a project.
+    await expect.element(page.getByRole("button", { name: /Add/ })).not.toBeInTheDocument();
+    await choose();
+    await expect(picked).resolves.toBe("/home/user/captures/session.mitm");
+    await expect.element(page.getByRole("combobox")).not.toBeInTheDocument();
+    expect(scopes.browseTargets).toContainEqual({
+      environmentId,
+      input: expect.objectContaining({ includeFiles: true }),
+    });
+  });
+
+  it("offers nothing outside the pick, so it never browses another environment", async () => {
+    setup(undefined, undefined, listing);
+    await using _screen = await render(<CommandPalette>{null}</CommandPalette>);
+    await act(() => {
+      void pickFileInCommandPalette(environmentId);
+    });
+    await expect.element(page.getByRole("combobox")).toHaveValue("~/");
+    await page.getByRole("combobox").fill("add project");
+    await expect.element(page.getByText("Add project", { exact: true })).not.toBeInTheDocument();
+    expect(scopes.browseTargets.map((target) => target.environmentId)).toEqual(
+      scopes.browseTargets.map(() => environmentId),
+    );
+  });
+
+  it("a second pick ends the first unpicked and takes the user's choice itself", async () => {
+    setup(undefined, undefined, listing);
+    await using _screen = await render(<CommandPalette>{null}</CommandPalette>);
+    let first: Promise<string | null> = Promise.resolve("unset");
+    let second: Promise<string | null> = Promise.resolve("unset");
+    await act(() => {
+      first = pickFileInCommandPalette(environmentId);
+    });
+    await act(() => {
+      second = pickFileInCommandPalette(environmentId);
+    });
+    await expect(first).resolves.toBeNull();
+    await page.getByText("session.mitm", { exact: true }).click();
+    await expect(second).resolves.toBe("/home/user/captures/session.mitm");
+  });
+
+  it.each([
+    { how: "pressing Escape", leave: () => userEvent.keyboard("{Escape}") },
+    // Leaving the pick view must not strand the pick in the root palette on another environment.
+    { how: "clearing the path", leave: () => page.getByRole("combobox").fill("") },
+  ])("closes unpicked on $how", async ({ leave }) => {
+    setup(undefined, undefined, listing);
+    await using _screen = await render(<CommandPalette>{null}</CommandPalette>);
+    let picked: Promise<string | null> = Promise.resolve("unset");
+    await act(() => {
+      picked = pickFileInCommandPalette(environmentId);
+    });
+    await expect.element(page.getByRole("combobox")).toHaveValue("~/");
+    await leave();
+    await expect.element(page.getByRole("combobox")).not.toBeInTheDocument();
+    await expect(picked).resolves.toBeNull();
+  });
 });

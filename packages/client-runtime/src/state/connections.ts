@@ -2,11 +2,11 @@ import type { EnvironmentId as EnvironmentIdType } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { AsyncResult, Atom } from "effect/reactivity";
+import { AsyncResult, Atom, type AtomRegistry } from "effect/reactivity";
 
 import * as EnvironmentRegistry from "../connection/registry.ts";
 import type { ConnectionCatalogEntry } from "../connection/catalog.ts";
-import { AVAILABLE_CONNECTION_STATE } from "../connection/model.ts";
+import { AVAILABLE_CONNECTION_STATE, type SupervisorConnectionState } from "../connection/model.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import {
   PullRequestRoutingPermissions,
@@ -209,4 +209,50 @@ export function createEnvironmentCatalogAtoms<R, E>(
     retryNow,
     setEnabled,
   };
+}
+
+/**
+ * Resolves once the environment is connected, so a request is sent after a reconnect (a mobile
+ * app returning from another app) instead of failing on the missing session. It resolves early
+ * when no connection is coming in time (offline, blocked, not desired, or retrying after the
+ * deadline), and after `timeoutMs`; the request then reports its own error.
+ */
+export function waitForEnvironmentConnection(
+  registry: AtomRegistry.AtomRegistry,
+  state: Atom.Atom<AsyncResult.AsyncResult<SupervisorConnectionState, unknown>>,
+  timeoutMs = 10_000,
+): Promise<void> {
+  // @effect-diagnostics-next-line globalDate:off - Compared with the supervisor's wall-clock retryAt.
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let unsubscribe = () => {};
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      unsubscribe();
+      resolve();
+    };
+    const check = () => {
+      const value = AsyncResult.getOrElse(registry.get(state), () => null);
+      if (value === null) return;
+      const { phase, retryAt } = value;
+      if (
+        phase === "connected" ||
+        phase === "offline" ||
+        phase === "blocked" ||
+        // The atom starts on this placeholder before the supervisor reports, so it is not idle.
+        (phase === "available" && value !== AVAILABLE_CONNECTION_STATE) ||
+        (phase === "backoff" && retryAt !== null && retryAt > deadline)
+      ) {
+        settle();
+      }
+    };
+    unsubscribe = registry.subscribe(state, check);
+    check();
+    // @effect-diagnostics-next-line globalTimers:off - Called by plugin hosts outside an Effect runtime.
+    if (!settled) timer = setTimeout(settle, timeoutMs);
+  });
 }
