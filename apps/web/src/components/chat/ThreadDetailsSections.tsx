@@ -45,33 +45,19 @@ import { useKnownTerminalSessions } from "~/state/terminalSessions";
 import { threadEnvironment } from "~/state/threads";
 import { useAtomCommand } from "~/state/use-atom-command";
 
+import { Button } from "../ui/button";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
-import { formatContextWindowCompactionMessage } from "./compaction.logic";
 import { ThreadDetailsControl } from "./ThreadDetailsControl";
+import { ThreadDetailsRing } from "./ThreadDetailsRing";
 import { ThreadDetailsSection, ThreadDetailsSummary } from "./ThreadDetailsSection";
-import type { RunWorkSummary } from "./runWorkSummary";
 import { latestTodoList } from "./ThreadDetailsSections.logic";
 import { ThreadProcessRow } from "./ThreadProcessRow";
 import { ThreadServerRows } from "./ThreadServersPanel";
 import {
   THREAD_DETAILS_PANEL_ICON_CLASS,
-  THREAD_DETAILS_PANEL_LABEL_CLASS,
   THREAD_DETAILS_PANEL_ROW_CONTENT_CLASS,
 } from "./threadDetailsPanelStyles";
-
-function SectionNote(props: { readonly children: string }) {
-  return <p className="px-2.5 py-1 text-2xs text-muted-foreground">{props.children}</p>;
-}
-
-function StatRow(props: { readonly label: string; readonly value: string }) {
-  return (
-    <div className="flex items-center justify-between gap-3 px-2.5 text-xs leading-5">
-      <span className="text-muted-foreground">{props.label}</span>
-      <span className="font-medium text-foreground/85 tabular-nums">{props.value}</span>
-    </div>
-  );
-}
 
 export interface ThreadDetailsContextProps {
   readonly snapshot: ContextWindowSnapshot | null;
@@ -79,7 +65,6 @@ export interface ThreadDetailsContextProps {
   readonly onCompact?: (() => void) | undefined;
   readonly compactDisabled: boolean;
   readonly compactDisabledReason: string | null;
-  readonly latestRunWork: RunWorkSummary | null;
 }
 
 export function ThreadDetailsContextSection(
@@ -93,8 +78,12 @@ export function ThreadDetailsContextSection(
         { label: "Cached", value: usage.cachedInputTokens },
         { label: "Output", value: usage.outputTokens },
         { label: "Reasoning", value: usage.reasoningOutputTokens },
-      ].filter((entry): entry is { label: string; value: number } => entry.value !== null)
+      ].filter((entry): entry is { label: string; value: number } => !!entry.value)
     : [];
+  const stats =
+    usage && breakdown.length > 0
+      ? [...breakdown, { label: "Total", value: usage.usedTokens }]
+      : [];
   return (
     <ThreadDetailsSection
       headingId="thread-details-context-heading"
@@ -103,9 +92,23 @@ export function ThreadDetailsContextSection(
       collapsedSummary={
         usage ? (
           <ThreadDetailsSummary>
-            {usage.maxTokens !== null
-              ? `${Math.round(percentage)}% used`
-              : `${formatContextWindowTokens(usage.usedTokens)} tokens`}
+            {usage.maxTokens !== null ? (
+              <>
+                <ThreadDetailsRing
+                  percent={Math.round(percentage)}
+                  color={
+                    percentage > 90 ? "var(--color-destructive)" : "var(--color-muted-foreground)"
+                  }
+                  label={`Context window: ${Math.round(percentage)}% used`}
+                />
+                <span>
+                  {formatContextWindowTokens(usage.usedTokens)}/
+                  {formatContextWindowTokens(usage.maxTokens ?? null)}
+                </span>
+              </>
+            ) : (
+              `${formatContextWindowTokens(usage.usedTokens)} tokens`
+            )}
           </ThreadDetailsSummary>
         ) : null
       }
@@ -115,90 +118,83 @@ export function ThreadDetailsContextSection(
         ) : null
       }
     >
-      {usage === null ? (
-        <SectionNote>No context usage reported yet.</SectionNote>
-      ) : (
-        <div className="flex flex-col gap-1.5">
-          <div className="flex items-baseline justify-between gap-3 px-2.5">
-            <span className="text-lg font-semibold text-foreground tabular-nums">
-              {usage.maxTokens !== null
-                ? `${Math.round(percentage)}%`
-                : formatContextWindowTokens(usage.usedTokens)}
-            </span>
-            <span className="text-xs text-muted-foreground tabular-nums">
-              {usage.maxTokens !== null
-                ? `${formatContextWindowTokens(usage.usedTokens)} / ${formatContextWindowTokens(usage.maxTokens ?? null)} tokens`
-                : "tokens used"}
-            </span>
-          </div>
-          {usage.maxTokens !== null ? (
-            <div
-              className="mx-2.5 h-1.5 overflow-hidden rounded-full bg-muted/60"
-              role="progressbar"
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-valuenow={Math.round(percentage)}
-              aria-label="Context window usage"
-            >
-              <div
-                className={cn(
-                  "h-full rounded-full",
-                  percentage > 90 ? "bg-destructive" : "bg-muted-foreground/70",
-                )}
-                style={{ width: `${percentage}%` }}
-              />
+      <div className="flex flex-col gap-2 px-2.5">
+        {usage === null ? (
+          <p className="text-2xs text-muted-foreground">No context usage reported yet.</p>
+        ) : (
+          <>
+            <div className="flex flex-col gap-1">
+              <div className="flex items-baseline justify-between gap-3 text-xs tabular-nums">
+                <span className="font-semibold text-foreground">
+                  {usage.maxTokens !== null
+                    ? `${Math.round(percentage)}%`
+                    : formatContextWindowTokens(usage.usedTokens)}
+                </span>
+                <span className="text-muted-foreground">
+                  {usage.maxTokens !== null
+                    ? `${formatContextWindowTokens(usage.usedTokens)} / ${formatContextWindowTokens(usage.maxTokens ?? null)}`
+                    : "tokens used"}
+                </span>
+              </div>
+              {usage.maxTokens !== null ? (
+                <div
+                  className="h-1 overflow-hidden rounded-full bg-muted/60"
+                  role="progressbar"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={Math.round(percentage)}
+                  aria-label="Context window usage"
+                >
+                  <div
+                    className={cn(
+                      "h-full rounded-full",
+                      percentage > 90 ? "bg-destructive" : "bg-muted-foreground/70",
+                    )}
+                    style={{ width: `${percentage}%` }}
+                  />
+                </div>
+              ) : null}
             </div>
-          ) : null}
-          {breakdown.map((entry) => (
-            <StatRow
-              key={entry.label}
-              label={entry.label}
-              value={formatContextWindowTokens(entry.value)}
-            />
-          ))}
-          {usage.compactsAutomatically ? (
-            <SectionNote>
-              {formatContextWindowCompactionMessage(usage.autoCompactThreshold)}
-            </SectionNote>
-          ) : null}
-        </div>
-      )}
-      {props.latestRunWork ? (
-        <div className="flex flex-col gap-0.5 px-2.5 py-1 text-2xs leading-4">
-          <span className="text-muted-foreground">
-            Latest turn{props.latestRunWork.effort ? ` · ${props.latestRunWork.effort}` : ""}
-          </span>
-          <span className="font-medium text-foreground/85 tabular-nums">
-            {props.latestRunWork.label}
-          </span>
-          <span className="text-muted-foreground">{props.latestRunWork.retentionLabel}</span>
-        </div>
-      ) : null}
-      {props.onCompact ? (
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <ThreadDetailsControl
-                variant="ghost"
-                size="sm"
-                part="row"
-                aria-disabled={props.compactDisabled || undefined}
-                onClick={() => {
-                  if (!props.compactDisabled) props.onCompact?.();
-                }}
-              />
-            }
-          >
-            <Minimize2Icon className={THREAD_DETAILS_PANEL_ICON_CLASS} aria-hidden />
-            <span className={cn("flex-1 text-left", THREAD_DETAILS_PANEL_LABEL_CLASS)}>
+            {stats.length > 0 ? (
+              <dl
+                className="m-0 grid gap-2 text-2xs leading-4 tabular-nums"
+                style={{ gridTemplateColumns: `repeat(${stats.length}, minmax(0, 1fr))` }}
+              >
+                {stats.map((entry) => (
+                  <div key={entry.label} className="min-w-0">
+                    <dt className="truncate text-muted-foreground">{entry.label}</dt>
+                    <dd className="m-0 font-medium text-foreground/85">
+                      {formatContextWindowTokens(entry.value)}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            ) : null}
+          </>
+        )}
+        {props.onCompact ? (
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  variant="outline"
+                  size="xs"
+                  aria-disabled={props.compactDisabled || undefined}
+                  onClick={() => {
+                    if (!props.compactDisabled) props.onCompact?.();
+                  }}
+                />
+              }
+            >
+              <Minimize2Icon aria-hidden />
               Compact context
-            </span>
-          </TooltipTrigger>
-          {props.compactDisabled && props.compactDisabledReason ? (
-            <TooltipPopup side="left">{props.compactDisabledReason}</TooltipPopup>
-          ) : null}
-        </Tooltip>
-      ) : null}
+            </TooltipTrigger>
+            {props.compactDisabled && props.compactDisabledReason ? (
+              <TooltipPopup side="left">{props.compactDisabledReason}</TooltipPopup>
+            ) : null}
+          </Tooltip>
+        ) : null}
+      </div>
     </ThreadDetailsSection>
   );
 }

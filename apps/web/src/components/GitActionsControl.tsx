@@ -941,6 +941,65 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
   );
 }
 
+/** The Changes row's line totals: the branch diff preview when files are readable, else git status. */
+export function useChangesTotals(input: {
+  readonly activeThreadRef: ScopedThreadRef | null;
+  readonly gitCwd: string | null;
+  readonly status: VcsStatusResult | null | undefined;
+  readonly workspaceMutationId: string | null;
+  readonly enabled: boolean;
+}) {
+  const { activeThreadRef, gitCwd, workspaceMutationId } = input;
+  const activeEnvironmentId = activeThreadRef?.environmentId ?? null;
+  const gitStatusForActions = input.status;
+  const changesBaseRef = useDiffPanelStore((state) =>
+    selectThreadBranchBaseRef(state, activeThreadRef),
+  );
+  const ignoreWhitespaceSetting = useClientSettings((settings) => settings.diffIgnoreWhitespace);
+  const ignoreWhitespace =
+    useDiffPanelSessionStore((state) => state.ignoreWhitespace) ?? ignoreWhitespaceSetting;
+  const { canReadFiles } = useFilesystemReadAccess(activeEnvironmentId);
+  // Same input as the Diff panel's branch query, so both read one cached result. Status
+  // totals join the revision because edits, pulls and resets outside a turn leave the mutation
+  // id as is.
+  const changesRevision = gitStatusForActions
+    ? JSON.stringify([
+        workspaceMutationId,
+        gitStatusForActions.refName,
+        gitStatusForActions.workingTree.insertions,
+        gitStatusForActions.workingTree.deletions,
+        gitStatusForActions.branchChanges?.baseRef,
+        gitStatusForActions.branchChanges?.insertions,
+        gitStatusForActions.branchChanges?.deletions,
+      ])
+    : null;
+  const changesPreview = useEnvironmentQuery(
+    input.enabled &&
+      canReadFiles &&
+      changesRevision !== null &&
+      activeEnvironmentId !== null &&
+      gitCwd !== null
+      ? revisionedQuery(
+          reviewEnvironment.diffPreview({
+            environmentId: activeEnvironmentId,
+            input: {
+              cwd: gitCwd,
+              ...(changesBaseRef ? { baseRef: changesBaseRef } : {}),
+              ignoreWhitespace,
+              metadataOnly: true,
+              sourceKind: "branch-range",
+            },
+          }),
+          changesRevision,
+        )
+      : null,
+  );
+  return resolveChangesTotals(
+    gitStatusForActions,
+    changesPreview.data?.sources.find((source) => source.kind === "branch-range"),
+  );
+}
+
 export default function GitActionsControl({
   gitCwd,
   activeThreadRef,
@@ -1074,53 +1133,13 @@ export default function GitActionsControl({
   const isRepo = gitStatus?.isRepo ?? true;
   const hasPrimaryRemote = gitStatus?.hasPrimaryRemote ?? false;
   const gitStatusForActions = gitStatus;
-  const changesBaseRef = useDiffPanelStore((state) =>
-    selectThreadBranchBaseRef(state, activeThreadRef),
-  );
-  const ignoreWhitespaceSetting = useClientSettings((settings) => settings.diffIgnoreWhitespace);
-  const ignoreWhitespace =
-    useDiffPanelSessionStore((state) => state.ignoreWhitespace) ?? ignoreWhitespaceSetting;
-  const { canReadFiles } = useFilesystemReadAccess(activeEnvironmentId);
-  // Same input as the Diff panel's branch query, so both read one cached result. Status
-  // totals join the revision because edits, pulls and resets outside a turn leave the mutation
-  // id as is.
-  const changesRevision = gitStatusForActions
-    ? JSON.stringify([
-        workspaceMutationId,
-        gitStatusForActions.refName,
-        gitStatusForActions.workingTree.insertions,
-        gitStatusForActions.workingTree.deletions,
-        gitStatusForActions.branchChanges?.baseRef,
-        gitStatusForActions.branchChanges?.insertions,
-        gitStatusForActions.branchChanges?.deletions,
-      ])
-    : null;
-  const changesPreview = useEnvironmentQuery(
-    showChanges &&
-      isRepo &&
-      canReadFiles &&
-      changesRevision !== null &&
-      activeEnvironmentId !== null &&
-      gitCwd !== null
-      ? revisionedQuery(
-          reviewEnvironment.diffPreview({
-            environmentId: activeEnvironmentId,
-            input: {
-              cwd: gitCwd,
-              ...(changesBaseRef ? { baseRef: changesBaseRef } : {}),
-              ignoreWhitespace,
-              metadataOnly: true,
-              sourceKind: "branch-range",
-            },
-          }),
-          changesRevision,
-        )
-      : null,
-  );
-  const resolvedChangesTotals = resolveChangesTotals(
-    gitStatusForActions,
-    changesPreview.data?.sources.find((source) => source.kind === "branch-range"),
-  );
+  const resolvedChangesTotals = useChangesTotals({
+    activeThreadRef,
+    gitCwd,
+    status: gitStatusForActions,
+    workspaceMutationId,
+    enabled: showChanges && isRepo,
+  });
   const changesTotals = resolvedChangesTotals ?? { insertions: 0, deletions: 0 };
   const changesBreakdown = resolvedChangesTotals?.breakdown ?? null;
   const changesBaseLabel = resolvedChangesTotals

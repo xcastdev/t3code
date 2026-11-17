@@ -4183,11 +4183,14 @@ export default function ChatView(props: ChatViewProps) {
                     onCompact: activeContextWindow ? onComposerCompactContextStable : undefined,
                     compactDisabled,
                     compactDisabledReason,
-                    latestRunWork,
                   }}
                   providers={providerStatuses}
                   usageLimitSources={serverConfig?.usageLimitSources ?? EMPTY_USAGE_LIMIT_SOURCES}
                   providerInstanceId={activeProviderInstanceId}
+                  usageProviderInstanceId={
+                    (pendingHandoffSelectionUsable ? pendingHandoffSelection?.instanceId : null) ??
+                    activeProviderInstanceId
+                  }
                   branch={activeThreadBranch}
                   plans={serverProjection?.plans ?? EMPTY_PLANS}
                   runs={serverProjection?.runs ?? EMPTY_RUNS}

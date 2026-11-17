@@ -156,11 +156,11 @@ function Panel({ fixture }: { fixture: ReturnType<typeof setup> }) {
           modelDisplayName: null,
           compactDisabled: true,
           compactDisabledReason: null,
-          latestRunWork: null,
         }}
         providers={[]}
         usageLimitSources={[]}
         providerInstanceId={null}
+        usageProviderInstanceId={null}
         branch={null}
         plans={[]}
         runs={[]}

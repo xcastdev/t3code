@@ -45,3 +45,6 @@ export const THREAD_DETAILS_PANEL_SPLIT_SECONDARY_CLASS = `${THREAD_DETAILS_PANE
 // The split hairline shows only while the pair is in use, so resting rows read as plain rows.
 export const THREAD_DETAILS_PANEL_SPLIT_SEPARATOR_CLASS =
   "h-4 w-px shrink-0 bg-transparent group-hover/details-split:bg-border/65 group-has-[[data-popup-open]]/details-split:bg-border/65";
+
+/** A row whose main button stretches over it (`after:absolute after:inset-0`) so other controls can sit inside. */
+export const THREAD_DETAILS_PANEL_STRETCHED_ROW_CLASS = `relative flex items-center ${THREAD_DETAILS_PANEL_CONTROL_CLASS} ${THREAD_DETAILS_PANEL_HALF_HOVER_SURFACE_CLASS}`;

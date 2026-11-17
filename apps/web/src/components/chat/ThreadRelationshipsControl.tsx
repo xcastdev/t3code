@@ -3,7 +3,6 @@ import { threadKey } from "@t3tools/client-runtime/state/entities";
 import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import { ThreadHoverCardPopup } from "../ThreadHoverCard";
 import { ThreadDetailsSection } from "./ThreadDetailsSection";
-import { SectionHeaderStatus } from "../ui/collapsible-section-header";
 import { SubagentTooltipContent } from "./SubagentTooltipContent";
 import { PullRequestGlyph } from "../pullRequest/pullRequestIcons";
 import { scopedThreadKey, scopeThreadRef } from "@t3tools/client-runtime/environment";
@@ -55,6 +54,9 @@ import {
   PlusIcon,
   SquareIcon,
   UnplugIcon,
+  CheckIcon,
+  XIcon,
+  MessageCircleQuestionIcon,
 } from "lucide-react";
 import { useRef, useState, type ReactNode } from "react";
 
@@ -86,12 +88,15 @@ import { resolveThreadOpenRoute } from "../../lib/sideChatPane";
 
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import { useLocalStorage } from "../../hooks/useLocalStorage";
+import * as Schema from "effect/Schema";
 import { toastManager } from "../ui/toast";
 import { Spinner } from "../ui/spinner";
 import { cn } from "~/lib/utils";
 import {
   THREAD_DETAILS_PANEL_CHEVRON_CLASS,
   THREAD_DETAILS_PANEL_ICON_CLASS,
+  THREAD_DETAILS_PANEL_STRETCHED_ROW_CLASS,
   THREAD_DETAILS_PANEL_LABEL_CLASS,
   THREAD_DETAILS_PANEL_SPLIT_GROUP_CLASS,
   THREAD_DETAILS_PANEL_ROW_CONTENT_CLASS,
@@ -150,29 +155,71 @@ const lineageRowStatus = (row: LineageRow) =>
 const isFinishedAgentStatus = (status: string | null | undefined) =>
   ["completed", "failed", "error", "cancelled", "interrupted", "idle"].includes(status ?? "");
 
+const isFailedAgentStatus = (status: string | null | undefined) =>
+  status === "failed" || status === "error";
+
+// Failed agents marked seen on this device fold into "Previous agents"; the oldest marks drop first.
+const SEEN_FAILED_AGENTS_KEY = "t3code:thread-details:seen-failed-agents";
+const MAX_SEEN_FAILURES = 500;
+const SeenFailures = Schema.Array(Schema.String);
+const NO_SEEN_FAILURES: ReadonlyArray<string> = [];
+
 function ThreadLineageGroup<Row extends LineageRow>(props: {
   readonly label: string | null;
   readonly rows: ReadonlyArray<Row>;
   readonly expanded: boolean;
+  /** Failures not yet seen; the badge's ✕ dismisses them without opening each agent. */
+  readonly unseenFailed?: number;
+  readonly onDismissFailed?: () => void;
   readonly children: (rows: ReadonlyArray<Row>) => ReactNode;
 }) {
   const [expanded, setExpanded] = useState(props.expanded);
   const [visibleCount, setVisibleCount] = useState(THREAD_LINEAGE_INITIAL_COUNT);
   const { visibleRows, hiddenCount } = resolveThreadLineageWindow(props.rows, visibleCount);
-  const failedCount = props.rows.filter((row) => {
-    const status = lineageRowStatus(row);
-    return status === "failed" || status === "error";
-  }).length;
+  const unseenFailed = props.unseenFailed ?? 0;
   if (props.rows.length === 0) return null;
   return (
     <div>
       {props.label ? (
-        <ThreadDetailsControl aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>
-          <BotIcon aria-hidden className={THREAD_DETAILS_PANEL_ICON_CLASS} />
-          <span className={cn(THREAD_DETAILS_PANEL_LABEL_CLASS, "min-w-0 flex-1 truncate")}>
-            {props.label}
-          </span>
-          {failedCount > 0 ? <SectionHeaderStatus>{failedCount} failed</SectionHeaderStatus> : null}
+        <div className={THREAD_DETAILS_PANEL_STRETCHED_ROW_CLASS}>
+          <button
+            type="button"
+            aria-expanded={expanded}
+            onClick={() => setExpanded(!expanded)}
+            className="flex min-w-0 flex-1 items-center gap-2.5 text-left outline-none after:absolute after:inset-0 after:rounded-lg focus-visible:after:ring-2 focus-visible:after:ring-inset focus-visible:after:ring-ring"
+          >
+            <BotIcon aria-hidden className={THREAD_DETAILS_PANEL_ICON_CLASS} />
+            <span className={cn(THREAD_DETAILS_PANEL_LABEL_CLASS, "min-w-0 flex-1 truncate")}>
+              {props.label}
+            </span>
+          </button>
+          {unseenFailed > 0 ? (
+            props.onDismissFailed ? (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      type="button"
+                      aria-label={`Dismiss ${unseenFailed} failed`}
+                      onClick={props.onDismissFailed}
+                      className="group/failed-badge relative z-10 -me-1 flex shrink-0 items-center gap-0.5 rounded-full py-0.5 ps-1 pe-1.5 text-2xs font-medium text-destructive-foreground tabular-nums outline-none hover:bg-destructive/12 focus-visible:bg-destructive/12 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring pointer-coarse:bg-destructive/12"
+                    />
+                  }
+                >
+                  <XIcon
+                    aria-hidden
+                    className="size-3 opacity-0 group-hover/failed-badge:opacity-100 group-focus-visible/failed-badge:opacity-100 pointer-coarse:opacity-100"
+                  />
+                  {unseenFailed} failed
+                </TooltipTrigger>
+                <TooltipPopup side="left">Dismiss</TooltipPopup>
+              </Tooltip>
+            ) : (
+              <span className="shrink-0 text-2xs font-medium text-destructive-foreground tabular-nums">
+                {unseenFailed} failed
+              </span>
+            )
+          ) : null}
           {expanded ? null : (
             <span className="shrink-0 text-xs font-normal tabular-nums text-muted-foreground">
               {props.rows.length}
@@ -186,7 +233,7 @@ function ThreadLineageGroup<Row extends LineageRow>(props: {
               !expanded && "-rotate-90",
             )}
           />
-        </ThreadDetailsControl>
+        </div>
       ) : null}
       {expanded ? (
         <ThreadLineageRowList
@@ -265,12 +312,13 @@ function RemoteSubagentRow(props: {
   readonly agent: RemoteSubagent;
   readonly provider: ServerProvider | undefined;
   readonly anyInstanceBadge: boolean;
+  readonly failureSeen: boolean;
 }) {
   const navigate = useNavigate();
   const environment = useEnvironment(props.agent.remoteChild.environmentId);
   const { remoteChild } = props.agent;
   const status = props.agent.status;
-  const failed = status === "failed";
+  const failed = isFailedAgentStatus(status) && !props.failureSeen;
   const title = relationshipThreadTitle({
     title: props.agent.title ?? "Subagent",
     isSubagent: true,
@@ -436,6 +484,11 @@ export function ThreadRelationshipsPanel(props: {
   readonly showSideChats: boolean;
 }) {
   const ref = scopeThreadRef(props.environmentId, props.threadId);
+  const [seenFailures, setSeenFailures] = useLocalStorage(
+    SEEN_FAILED_AGENTS_KEY,
+    NO_SEEN_FAILURES,
+    SeenFailures,
+  );
   const projection = useQuietThreadProjection(ref)?.projection ?? null;
   const providersByEnvironment = useEnvironmentProviders();
   const settings = useAtomValue(serverEnvironment.settingsValueAtom(props.environmentId));
@@ -595,6 +648,14 @@ export function ThreadRelationshipsPanel(props: {
       .map((remote) => ({ remote })),
     ({ remote }) => (isFinishedAgentStatus(remote.status) ? "remotePrevious" : "remoteActive"),
   );
+  const failedKey = (row: LineageRow) =>
+    `${props.environmentId}:${"remote" in row ? row.remote.id : row.threadId}`;
+  const unseenFailures = [...previous, ...remotePrevious].filter(
+    (row) => isFailedAgentStatus(lineageRowStatus(row)) && !seenFailures.includes(failedKey(row)),
+  );
+  const markFailuresSeen = (keys: ReadonlyArray<string>) =>
+    setSeenFailures((current) => [...current, ...keys].slice(-MAX_SEEN_FAILURES));
+  const showsFailure = (row: LineageRow) => unseenFailures.includes(row);
   const groups: ReadonlyArray<{
     id: string;
     label: string | null;
@@ -630,7 +691,15 @@ export function ThreadRelationshipsPanel(props: {
       // Disconnect lives in this heading, so a thread with only side chats still shows it.
       (canDetach && sideChats.length > 0));
   const sideChatsVisible = props.showSideChats && sideChats.length > 0;
-  const runningSideChats = sideChats.filter(({ edge }) => edge.status === "running").length;
+  const sideChatStates = sideChats.map((row) => {
+    if (graph.nodes.get(row.threadId)?.thread?.pendingRuntimeRequest) return "input";
+    const status = threadRelationshipRowStatus(graph, row);
+    if (isFailedAgentStatus(status)) return "failed";
+    return isFinishedAgentStatus(status) ? "done" : "running";
+  });
+  const sideChatCount = (state: (typeof sideChatStates)[number]) =>
+    sideChatStates.filter((entry) => entry === state).length;
+  const finishedCount = previous.length + remotePrevious.length - unseenFailures.length;
 
   if (!lineageVisible && !sideChatsVisible) {
     return null;
@@ -731,7 +800,10 @@ export function ThreadRelationshipsPanel(props: {
         ? null
         : (graph.nodes.get(mergeTargetThreadId)?.thread?.title ?? null);
 
-  const renderRelationshipRow = ({ threadId, edge }: ThreadRelationshipWalkRow) => {
+  const renderRelationshipRow = (
+    { threadId, edge }: ThreadRelationshipWalkRow,
+    failureSeen = false,
+  ) => {
     const node = graph.nodes.get(threadId);
     const isSubagent = edge.kind === "subagent";
     const isMergeTarget = threadId === mergeTargetThreadId;
@@ -740,6 +812,8 @@ export function ThreadRelationshipsPanel(props: {
       (isParent && threadId === parentRef?.threadId
         ? (node?.thread?.activityRunStatus ?? parentNativeStatus)
         : undefined) ?? threadRelationshipRowStatus(graph, { threadId, edge });
+    // A seen failure keeps its label but loses the red dot and text.
+
     const RelationshipIcon = isParent
       ? CornerLeftUpIcon
       : isSubagent
@@ -755,7 +829,15 @@ export function ThreadRelationshipsPanel(props: {
     const workflowGroup =
       projectedAgent === undefined ? undefined : workflowGroupsById.get(projectedAgent.id);
     const agent = workflowGroup ? projectedAgent : currentSubagent(projectedAgent, node?.thread);
-    const failed = rowStatus === "failed" || rowStatus === "error";
+    const failed = isFailedAgentStatus(rowStatus) && !failureSeen;
+    const needsInput = !isParent && Boolean(node?.thread?.pendingRuntimeRequest);
+    const seeFailure = () => {
+      if (failed) markFailuresSeen([`${props.environmentId}:${threadId}`]);
+    };
+    const openRow = () => {
+      seeFailure();
+      openThread(threadId);
+    };
     const canStop =
       agent &&
       (agent.origin === "app_owned" ||
@@ -789,6 +871,8 @@ export function ThreadRelationshipsPanel(props: {
       workflowGroup?.workflow.status === "running" &&
       agent?.origin === "provider_native" &&
       providerDriver === "claudeAgent";
+    const showsElapsed =
+      agent !== undefined && (deriveSubagentElapsedMs(agent, 0) !== null || canStopWorkflow);
     const trailingVisibilityClass = (workflowGroup ? canStopWorkflow : canStop)
       ? "group-hover:opacity-0 group-focus-within:opacity-0 pointer-coarse:opacity-0 [@media(hover:none)]:opacity-0"
       : "";
@@ -834,10 +918,11 @@ export function ThreadRelationshipsPanel(props: {
         {agent ? null : (
           <ArrowRightIcon className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
         )}
-        {agent && !failed && (deriveSubagentElapsedMs(agent, 0) !== null || canStopWorkflow) ? (
+        {agent && showsElapsed ? (
           <span
-            className={`shrink-0 text-2xs font-normal tabular-nums text-muted-foreground ${canStopWorkflow ? "min-w-6 text-end" : ""} ${trailingVisibilityClass}`}
+            className={`flex shrink-0 items-center text-2xs font-normal tabular-nums ${failed ? "text-destructive-foreground" : "text-muted-foreground"} ${canStopWorkflow ? "min-w-6 justify-end" : ""} ${trailingVisibilityClass}`}
           >
+            {failed ? <span className="sr-only">Failed, </span> : null}
             <AgentElapsed agent={agent} compact />
           </span>
         ) : !isMergeTarget ? (
@@ -845,10 +930,10 @@ export function ThreadRelationshipsPanel(props: {
             className={
               workflowGroup
                 ? "sr-only"
-                : `shrink-0 text-2xs ${failed ? "text-destructive" : "text-muted-foreground"} ${trailingVisibilityClass}`
+                : `shrink-0 text-2xs ${failed ? "text-destructive" : needsInput ? "text-warning-foreground" : "text-muted-foreground"} ${trailingVisibilityClass}`
             }
           >
-            {threadRelationshipStatusLabel(rowStatus)}
+            {needsInput ? "Needs input" : threadRelationshipStatusLabel(rowStatus)}
           </span>
         ) : null}
       </>
@@ -862,7 +947,7 @@ export function ThreadRelationshipsPanel(props: {
               size="sm"
               variant="ghost"
               part={workflowGroup ? "primary" : "row"}
-              onClick={() => openThread(threadId)}
+              onClick={openRow}
             />
           }
         >
@@ -902,7 +987,7 @@ export function ThreadRelationshipsPanel(props: {
                     variant="ghost"
                     part="primary"
                     aria-label={`${threadTitle} ${threadRelationshipStatusLabel(rowStatus)}`}
-                    onClick={() => openThread(threadId)}
+                    onClick={openRow}
                   />
                 }
               >
@@ -984,41 +1069,42 @@ export function ThreadRelationshipsPanel(props: {
       {lineageVisible ? (
         <ThreadDetailsSection
           headingId="thread-details-lineage-heading"
-          title={runningCount > 0 ? `Agents · ${runningCount} running` : "Agents"}
-          // A lone "Previous agents" row names itself; the heading returns for status or actions.
-          showHeading={
-            runningCount > 0 ||
-            canDetach ||
-            related.length > 0 ||
-            active.length > 0 ||
-            remoteActive.length > 0 ||
-            delegatedFrom !== undefined
+          title="Agents"
+          collapsedSummary={
+            <AgentStatusBadges
+              running={runningCount}
+              failed={unseenFailures.length}
+              done={finishedCount}
+            />
           }
           data-thread-relationships-panel
           actions={
-            canDetach ? (
-              <Menu>
-                <MenuTrigger
-                  render={
-                    <ThreadDetailsControl
-                      size="icon-xs"
-                      variant="ghost"
-                      part="icon"
-                      aria-label="More thread actions"
-                      disabled={busyAction !== null}
-                    />
-                  }
-                >
-                  <MoreHorizontalIcon className="size-3.5" />
-                </MenuTrigger>
-                <MenuPopup align="end" className="min-w-60 max-w-(--available-width)">
-                  <MenuItem onClick={() => void detach()}>
-                    <UnplugIcon className="size-3.5" />
-                    Disconnect agent session
-                  </MenuItem>
-                </MenuPopup>
-              </Menu>
-            ) : null
+            <>
+              <AgentStatusBadges running={runningCount} />
+              {canDetach ? (
+                <Menu>
+                  <MenuTrigger
+                    render={
+                      <ThreadDetailsControl
+                        size="icon-xs"
+                        variant="ghost"
+                        part="icon"
+                        aria-label="More thread actions"
+                        disabled={busyAction !== null}
+                      />
+                    }
+                  >
+                    <MoreHorizontalIcon className="size-3.5" />
+                  </MenuTrigger>
+                  <MenuPopup align="end" className="min-w-60 max-w-(--available-width)">
+                    <MenuItem onClick={() => void detach()}>
+                      <UnplugIcon className="size-3.5" />
+                      Disconnect agent session
+                    </MenuItem>
+                  </MenuPopup>
+                </Menu>
+              ) : null}
+            </>
           }
         >
           {delegatedFrom === undefined ? null : (
@@ -1031,13 +1117,23 @@ export function ThreadRelationshipsPanel(props: {
             </ThreadLineageRowList>
           )}
           {groups.map((group) => (
-            <ThreadLineageGroup key={`${scopedThreadKey(ref)}:${group.id}`} {...group}>
+            <ThreadLineageGroup
+              key={`${scopedThreadKey(ref)}:${group.id}`}
+              {...group}
+              {...(group.id === "previous"
+                ? {
+                    unseenFailed: unseenFailures.length,
+                    onDismissFailed: () => markFailuresSeen(unseenFailures.map(failedKey)),
+                  }
+                : {})}
+            >
               {(visibleRows) =>
                 visibleRows.map((row) =>
                   "remote" in row ? (
                     <RemoteSubagentRow
                       key={row.remote.id}
                       agent={row.remote}
+                      failureSeen={!showsFailure(row)}
                       // Its provider instance belongs to the environment it runs in.
                       provider={providersByEnvironment
                         .get(row.remote.remoteChild.environmentId)
@@ -1045,7 +1141,7 @@ export function ThreadRelationshipsPanel(props: {
                       anyInstanceBadge={hasInstanceBadge(providerEntries)}
                     />
                   ) : (
-                    renderRelationshipRow(row)
+                    renderRelationshipRow(row, !showsFailure(row))
                   ),
                 )
               }
@@ -1056,7 +1152,18 @@ export function ThreadRelationshipsPanel(props: {
       {sideChatsVisible ? (
         <ThreadDetailsSection
           headingId="thread-details-side-chats-heading"
-          title={runningSideChats > 0 ? `Side chats · ${runningSideChats} running` : "Side chats"}
+          title="Side chats"
+          collapsedSummary={
+            <AgentStatusBadges
+              running={sideChatCount("running")}
+              input={sideChatCount("input")}
+              failed={sideChatCount("failed")}
+              done={sideChatCount("done")}
+            />
+          }
+          actions={
+            <AgentStatusBadges running={sideChatCount("running")} input={sideChatCount("input")} />
+          }
           data-thread-side-chats-panel
         >
           <ThreadLineageGroup
@@ -1065,10 +1172,61 @@ export function ThreadRelationshipsPanel(props: {
             rows={sideChats}
             expanded
           >
-            {(visibleRows) => visibleRows.map(renderRelationshipRow)}
+            {(visibleRows) => visibleRows.map((row) => renderRelationshipRow(row))}
           </ThreadLineageGroup>
         </ThreadDetailsSection>
       ) : null}
     </>
+  );
+}
+
+/** Running, waiting, failed and finished agents or chats as colored counts. */
+function AgentStatusBadges(props: {
+  readonly running: number;
+  /** Waiting on an approval or an answer from the user. */
+  readonly input?: number;
+  readonly failed?: number;
+  readonly done?: number;
+}) {
+  const input = props.input ?? 0;
+  const failed = props.failed ?? 0;
+  const done = props.done ?? 0;
+  if (props.running === 0 && input === 0 && failed === 0 && done === 0) return null;
+  return (
+    <span className="flex shrink-0 items-center gap-2.5 text-2xs font-medium tabular-nums">
+      {props.running > 0 ? (
+        <span
+          className="flex items-center gap-1 text-info-foreground"
+          aria-label={`${props.running} running`}
+        >
+          <span aria-hidden className="size-1.5 rounded-full bg-current" />
+          {props.running}
+        </span>
+      ) : null}
+      {input > 0 ? (
+        <span
+          className="flex items-center gap-1 text-warning-foreground"
+          aria-label={`${input} waiting for input`}
+        >
+          <MessageCircleQuestionIcon aria-hidden className="size-3" />
+          {input}
+        </span>
+      ) : null}
+      {failed > 0 ? (
+        <span
+          className="flex items-center gap-1 text-destructive-foreground"
+          aria-label={`${failed} failed`}
+        >
+          <XIcon aria-hidden className="size-3" />
+          {failed}
+        </span>
+      ) : null}
+      {done > 0 ? (
+        <span className="flex items-center gap-1 text-muted-foreground" aria-label={`${done} done`}>
+          <CheckIcon aria-hidden className="size-3" />
+          {done}
+        </span>
+      ) : null}
+    </span>
   );
 }

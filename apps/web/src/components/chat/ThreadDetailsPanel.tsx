@@ -4,22 +4,26 @@ import type {
   OrchestrationV2PendingBackgroundTask,
   ProjectId,
   ProviderInstanceId,
+  ScopedThreadRef,
   ServerProvider,
   ThreadId,
   UsageLimitSourceSnapshots,
 } from "@t3tools/contracts";
 
+import { formatDiffCount } from "@t3tools/client-runtime/diff-count";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { isScratchProject } from "@t3tools/client-runtime/state/projects";
 
 import type { ComposerThreadTarget, DraftId } from "../../composerDraftStore";
 import { type EnvMode } from "../BranchToolbar.logic";
 import { BranchToolbar } from "../BranchToolbar";
-import BaseGitActionsControl from "../GitActionsControl";
+import BaseGitActionsControl, { useChangesTotals } from "../GitActionsControl";
 import { GitBranchIcon, SlidersHorizontalIcon } from "lucide-react";
 import { lazy, memo, Suspense, useState, type ComponentProps, type MouseEvent } from "react";
 import { useClientSettings } from "../../hooks/useSettings";
 import { useProject, useServerConfigs } from "../../state/entities";
+import { useEnvironmentQuery } from "../../state/query";
+import { vcsEnvironment } from "../../state/vcs";
 import { ThreadDetailsThreadPrRows } from "./ThreadDetailsPrRows";
 import { cn } from "../../lib/utils";
 import { Menu, MenuPopup } from "../ui/menu";
@@ -87,12 +91,60 @@ export interface ThreadDetailsPanelProps extends Pick<
   providers: readonly ServerProvider[];
   usageLimitSources: UsageLimitSourceSnapshots;
   providerInstanceId: ProviderInstanceId | null;
+  /** The composer's pick, which a pending handoff moves off the running provider. */
+  usageProviderInstanceId: ProviderInstanceId | null;
   branch: string | null;
   plans: ThreadStructure["plans"];
   runs: ThreadStructure["runs"];
   pendingBackgroundTasks: ReadonlyArray<OrchestrationV2PendingBackgroundTask>;
   /** An agent's home chat gets a status and schedule view instead of the project's. */
   agent?: ThreadDetailsAgent | null;
+}
+
+/** Branch plus the same line totals the expanded Changes row shows. */
+function VersionControlSummary(props: {
+  readonly threadRef: ScopedThreadRef;
+  readonly gitCwd: string | null;
+  readonly workspaceMutationId: string | null;
+  readonly branch: string | null;
+}) {
+  const { data: status } = useEnvironmentQuery(
+    props.gitCwd === null
+      ? null
+      : vcsEnvironment.status({
+          environmentId: props.threadRef.environmentId,
+          input: { cwd: props.gitCwd },
+        }),
+  );
+  const totals = useChangesTotals({
+    activeThreadRef: props.threadRef,
+    gitCwd: props.gitCwd,
+    status,
+    workspaceMutationId: props.workspaceMutationId,
+    enabled: status?.isRepo ?? false,
+  });
+  const hasChanges = totals !== null && (totals.insertions > 0 || totals.deletions > 0);
+  if (!props.branch && !hasChanges) return null;
+  return (
+    <ThreadDetailsSummary>
+      {hasChanges ? (
+        <span className="flex shrink-0 items-baseline gap-1.5 font-mono">
+          <span className="text-diff-addition-foreground">
+            +{formatDiffCount(totals.insertions)}
+          </span>
+          <span className="text-diff-deletion-foreground">
+            -{formatDiffCount(totals.deletions)}
+          </span>
+        </span>
+      ) : null}
+      {props.branch ? (
+        <>
+          <GitBranchIcon className="size-3 shrink-0" aria-hidden />
+          <span className="truncate font-mono">{props.branch}</span>
+        </>
+      ) : null}
+    </ThreadDetailsSummary>
+  );
 }
 
 export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
@@ -208,7 +260,7 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                   environmentId={props.environmentId}
                   providers={props.providers}
                   usageLimitSources={props.usageLimitSources}
-                  providerInstanceId={props.providerInstanceId}
+                  providerInstanceId={props.usageProviderInstanceId}
                 />
               </Suspense>
             </ThreadDetailsAutoCollapse>
@@ -224,7 +276,7 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                     environmentId={props.environmentId}
                     providers={props.providers}
                     usageLimitSources={props.usageLimitSources}
-                    providerInstanceId={props.providerInstanceId}
+                    providerInstanceId={props.usageProviderInstanceId}
                   />
                 </Suspense>
               </ThreadDetailsAutoCollapse>
@@ -236,12 +288,12 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                   headingId="thread-details-version-control-heading"
                   title="Version Control"
                   collapsedSummary={
-                    props.branch ? (
-                      <ThreadDetailsSummary>
-                        <GitBranchIcon className="size-3 shrink-0" aria-hidden />
-                        <span className="truncate font-mono">{props.branch}</span>
-                      </ThreadDetailsSummary>
-                    ) : null
+                    <VersionControlSummary
+                      threadRef={activeThreadRef}
+                      gitCwd={offersGit && props.isGitRepo ? props.gitCwd : null}
+                      workspaceMutationId={props.workspaceMutationId}
+                      branch={props.branch}
+                    />
                   }
                 >
                   <div className="flex flex-col">
