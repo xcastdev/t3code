@@ -21,7 +21,7 @@ import {
 } from "../../navigationHistory";
 import { primaryServerKeybindingsAtom } from "../../state/server";
 import { cn } from "../../lib/utils";
-import { usePullRequestsSupported } from "../../state/environments";
+import { useIssuesSupported, usePullRequestsSupported } from "../../state/environments";
 import { T3Wordmark } from "../T3Wordmark";
 import {
   resolveEnvironmentIdentificationPillLabel,
@@ -54,6 +54,8 @@ import { openPluginPanel } from "../../plugins/openPluginPanel";
 import { useEnabledPluginInstalls } from "../../plugins/pluginInstalls";
 import type { SidebarView } from "./SidebarThreadHeader";
 import { readPullRequestListPreferences } from "../pullRequest/pullRequestListPreferences";
+import { readIssueListPreferences } from "../issue/issueListPreferences";
+import { IssueGlyph } from "../issue/issuePresentation";
 import { isSidebarUtilityPage, useNavigateToMainApp } from "./mainAppLocation";
 import { SidebarThreadUndoNotice } from "./SidebarThreadUndoNotice";
 import { SidebarProviderUpdatePill } from "./SidebarProviderUpdatePill";
@@ -338,6 +340,7 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu(props: {
     select: (location) => isSidebarUtilityPage(location.pathname),
   });
   const pullRequestsSupported = usePullRequestsSupported();
+  const issuesSupported = useIssuesSupported();
   const closeMobileSidebar = () => {
     if (isMobile) {
       setOpenMobile(false);
@@ -353,6 +356,10 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu(props: {
   const handleWorkClick = () => {
     closeMobileSidebar();
     void navigate({ to: "/work" });
+  };
+  const handleIssuesClick = () => {
+    closeMobileSidebar();
+    void navigate({ to: "/issues", search: readIssueListPreferences() });
   };
   const handleSettingsClick = () => {
     closeMobileSidebar();
@@ -391,6 +398,13 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu(props: {
               icon={<PullRequestGlyph.pullRequest />}
               label="Pull requests"
               onClick={handlePullRequestsClick}
+            />
+          ) : null}
+          {issuesSupported ? (
+            <SidebarUtilityItem
+              icon={<IssueGlyph.issue />}
+              label="Issues"
+              onClick={handleIssuesClick}
             />
           ) : null}
           {showProjectTools ? <SidebarWorkItem onClick={handleWorkClick} /> : null}

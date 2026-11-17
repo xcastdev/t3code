@@ -2,7 +2,13 @@
 # Points this fork's workflows at GitHub-hosted runners: Blacksmith needs a GitHub organization,
 # and this fork is a personal account. Idempotent; re-run it after each upstream integration.
 set -euo pipefail
-cd "$(dirname "$0")/../workflows"
+cd "$(dirname "$0")/.."
+shopt -s globstar nullglob
+files=(workflows/*.yml actions/**/*.yml)
+
+# Keep the portable mirror failover action independent of the runner vendor.
+sed -i -e 's/Blacksmith/runner/g' -e 's/blacksmith-ubuntu-mirrors/t3-ubuntu-mirrors/g' \
+  actions/setup-apt-mirrors/action.yml
 
 # Arm before plain Ubuntu: "ubuntu-2404" is a prefix of "ubuntu-2404-arm".
 # macOS 27 has no "macos-27" label on GitHub; its image is named for its Xcode.
@@ -15,9 +21,9 @@ sed -i -E \
   -e 's/blacksmith-[0-9]+vcpu-windows-2025/windows-2025/g' \
   -e 's#/etc/apt/blacksmith-ubuntu-mirrors\.txt ##g' \
   -e 's#uses: useblacksmith/stickydisk@[0-9a-f]+( \# v[0-9.]+)?#uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 \# v6.1.0#g' \
-  ./*.yml
+  "${files[@]}"
 
-if grep -nE 'blacksmith' ./*.yml | grep -v '# blacksmith-'; then
+if grep -nE 'blacksmith' "${files[@]}" | grep -v '# blacksmith-'; then
   echo "Blacksmith references remain; extend this script." >&2
   exit 1
 fi

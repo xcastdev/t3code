@@ -5,6 +5,7 @@ import {
 } from "@t3tools/client-runtime/plugins/client-packages";
 import { pluginPanelKey } from "@t3tools/client-runtime/plugins/commands";
 import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
+import { attachmentUploadError } from "@t3tools/client-runtime/state/attachment-uploads";
 import { runAttachmentUploadCycle } from "@t3tools/client-runtime/state/attachments";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import type {
@@ -20,6 +21,7 @@ import { useRouter } from "@tanstack/react-router";
 import { EllipsisIcon, UploadIcon } from "lucide-react";
 import { useContext, useRef, useState, type ReactNode } from "react";
 import { AsyncResult } from "effect/reactivity";
+import * as Effect from "effect/Effect";
 
 import { clientPluginStore } from "../../plugins/clientPluginStore";
 import { openPluginPanel } from "../../plugins/openPluginPanel";
@@ -441,34 +443,38 @@ function EnvironmentPlugins(props: { readonly environment: EnvironmentPresentati
   const [busy, setBusy] = useState(false);
 
   const upload = async (file: File): Promise<string | null> => {
-    const result = await runAttachmentUploadCycle({
-      registry,
-      createUploadUrl: attachmentEnvironment.createUploadUrl,
-      remove: attachmentEnvironment.remove,
-      environmentId,
-      upload: {
-        type: "file",
-        name: file.name,
-        mimeType: PLUGIN_PACKAGE_MIME,
-        sizeBytes: file.size,
-      },
-      resolveUploadUrl: (relativeUrl) => {
-        const connection = readPreparedConnection(environmentId);
-        return connection ? resolveAssetUrl(connection.httpBaseUrl, relativeUrl) : null;
-      },
-      transport: (url) => {
-        const controller = new AbortController();
-        const done = fetch(url, {
-          method: "POST",
-          body: file,
-          headers: { "Content-Type": PLUGIN_PACKAGE_MIME },
-          signal: controller.signal,
-        }).then((response) => {
-          if (!response.ok) throw new Error(`Upload rejected (${response.status})`);
-        });
-        return { done, abort: () => controller.abort() };
-      },
-    });
+    const result = await Effect.runPromise(
+      runAttachmentUploadCycle({
+        registry,
+        createUploadUrl: attachmentEnvironment.createUploadUrl,
+        remove: attachmentEnvironment.remove,
+        environmentId,
+        upload: {
+          type: "file",
+          name: file.name,
+          mimeType: PLUGIN_PACKAGE_MIME,
+          sizeBytes: file.size,
+        },
+        resolveUploadUrl: (relativeUrl) => {
+          const connection = readPreparedConnection(environmentId);
+          return connection ? resolveAssetUrl(connection.httpBaseUrl, relativeUrl) : null;
+        },
+        transport: (url) =>
+          Effect.tryPromise({
+            try: async (signal) => {
+              // @effect-diagnostics-next-line globalFetchInEffect:off -- Upload slots use the browser fetch transport, like composer attachments.
+              const response = await fetch(url, {
+                method: "POST",
+                body: file,
+                headers: { "Content-Type": PLUGIN_PACKAGE_MIME },
+                signal,
+              });
+              if (!response.ok) throw new Error(`Upload rejected (${response.status})`);
+            },
+            catch: attachmentUploadError,
+          }),
+      }),
+    );
     if (result.status === "uploaded") return result.attachmentId;
     if (result.status === "failed") {
       reportError(

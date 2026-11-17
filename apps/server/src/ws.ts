@@ -288,6 +288,8 @@ import * as UsageService from "./usage/UsageService.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import * as TriageService from "./triage/TriageService.ts";
 import * as PullRequestService from "./pullRequest/PullRequestService.ts";
+import * as IssueService from "./issue/IssueService.ts";
+import * as IssueTrackerConnections from "./issue/IssueTrackerConnections.ts";
 import * as PullRequestReviewGuideService from "./pullRequest/PullRequestReviewGuideService.ts";
 import { listLinkedPullRequestThreads } from "./pullRequest/linkedThreads.ts";
 import { pullRequestSyncKey } from "./pullRequest/pullRequestSyncKey.ts";
@@ -856,6 +858,21 @@ const pullRequestRpcMethods = [
   WS_METHODS.pullRequestsLabelCandidates,
   WS_METHODS.pullRequestsSetLabels,
 ] as const;
+const issueRpcMethods = [
+  WS_METHODS.issuesList,
+  WS_METHODS.issuesDetail,
+  WS_METHODS.issuesComments,
+  WS_METHODS.issuesTemplates,
+  WS_METHODS.issuesCandidates,
+  WS_METHODS.issuesCreate,
+  WS_METHODS.issuesComment,
+  WS_METHODS.issuesUpdate,
+  WS_METHODS.issuesSetState,
+  WS_METHODS.issuesReact,
+  WS_METHODS.issueTrackersList,
+  WS_METHODS.issueTrackersConnect,
+  WS_METHODS.issueTrackersBindProject,
+] as const;
 const pluginRpcMethods = [
   WS_METHODS.pluginsList,
   WS_METHODS.pluginsSubscribeRegistry,
@@ -883,6 +900,7 @@ const PluginServerWsRpcGroup = ServerWsRpcGroup.omit(
 );
 export const CoreServerWsRpcGroup = ServerWsRpcGroup.omit(
   ...pullRequestRpcMethods,
+  ...issueRpcMethods,
   ...pluginRpcMethods,
   ...resourceRpcMethods,
   WS_METHODS.mcpCatalogSessionSubscribeForThread,
@@ -929,6 +947,12 @@ export const PullRequestServerWsRpcGroup = ServerWsRpcGroup.omit(
       tag,
     ): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, (typeof pullRequestRpcMethods)[number]> =>
       !(pullRequestRpcMethods as ReadonlyArray<string>).includes(tag),
+  ),
+);
+const IssueServerWsRpcGroup = ServerWsRpcGroup.omit(
+  ...[...ServerWsRpcGroup.requests.keys()].filter(
+    (tag): tag is Exclude<keyof typeof RPC_REQUIRED_SCOPES, (typeof issueRpcMethods)[number]> =>
+      !(issueRpcMethods as ReadonlyArray<string>).includes(tag),
   ),
 );
 const catalogRpcMethods = [
@@ -2217,6 +2241,8 @@ const layerCoreWsRpc = (
       const secretRequests = yield* SecretRequests.SecretRequests;
       const guestShares = yield* GuestShareService.GuestShareService;
       const pullRequests = yield* PullRequestService.PullRequestService;
+      const issues = yield* IssueService.IssueService;
+      const issueTrackers = yield* IssueTrackerConnections.IssueTrackerConnections;
       const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
       const pullRequestSync = yield* PullRequestSyncReactor.PullRequestSyncReactor;
       const deviceService = yield* DeviceService.DeviceService;
@@ -3009,6 +3035,13 @@ const layerCoreWsRpc = (
                         message: cause.message,
                         cause,
                       }),
+                    ThreadLaunchBranchExistsError: (cause) =>
+                      new OrchestrationV2ThreadLaunchError({
+                        commandId: input.commandId,
+                        projectId: input.projectId,
+                        message: cause.message,
+                        cause,
+                      }),
                     ThreadLaunchBranchConflictError: (cause) =>
                       new OrchestrationV2ThreadLaunchError({
                         commandId: input.commandId,
@@ -3709,6 +3742,7 @@ const layerCoreWsRpc = (
             if (
               input.resource._tag === "attachment" ||
               input.resource._tag === "native-app-icon" ||
+              input.resource._tag === "environment-theme-background" ||
               input.resource._tag === "tool-output-image" ||
               input.resource._tag === "provider-output-artifact" ||
               input.resource._tag === "plugin-panel" ||
@@ -4331,9 +4365,25 @@ const layerCoreWsRpc = (
         [WS_METHODS.pullRequestsSetLabels]: (input) =>
           withPullRequestViewer(input, pullRequests.setLabels(input)),
       });
-      return Context.merge(
+      const issueHandlers = IssueServerWsRpcGroup.of({
+        [WS_METHODS.issuesList]: (input) => issues.list(input),
+        [WS_METHODS.issuesDetail]: (input) => issues.detail(input),
+        [WS_METHODS.issuesComments]: (input) => issues.comments(input),
+        [WS_METHODS.issuesTemplates]: (input) => issues.templates(input),
+        [WS_METHODS.issuesCandidates]: (input) => issues.candidates(input),
+        [WS_METHODS.issuesCreate]: (input) => issues.create(input),
+        [WS_METHODS.issuesComment]: (input) => issues.comment(input),
+        [WS_METHODS.issuesUpdate]: (input) => issues.update(input),
+        [WS_METHODS.issuesSetState]: (input) => issues.setState(input),
+        [WS_METHODS.issuesReact]: (input) => issues.react(input),
+        [WS_METHODS.issueTrackersList]: () => issueTrackers.list,
+        [WS_METHODS.issueTrackersConnect]: (input) => issueTrackers.connect(input),
+        [WS_METHODS.issueTrackersBindProject]: (input) => issueTrackers.bindProject(input),
+      });
+      return Context.mergeAll(
         yield* CoreServerWsRpcGroup.toHandlers(handlers),
         yield* PullRequestServerWsRpcGroup.toHandlers(pullRequestHandlers),
+        yield* IssueServerWsRpcGroup.toHandlers(issueHandlers),
       );
     }),
   );
@@ -4664,6 +4714,8 @@ export const layer = Layer.unwrap(
     const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
     const npmRelease = yield* NpmRelease.NpmRelease;
     const pullRequests = yield* PullRequestService.PullRequestService;
+    const issues = yield* IssueService.IssueService;
+    const issueTrackers = yield* IssueTrackerConnections.IssueTrackerConnections;
     const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
     const peerLinks = yield* PeerLinks.PeerLinks;
     const peerLinkRequests = yield* PeerLinkRequests.PeerLinkRequests;
@@ -4768,6 +4820,10 @@ export const layer = Layer.unwrap(
               Layer.provide(Layer.succeed(ServerSelfUpdate.ServerSelfUpdate, serverSelfUpdate)),
               // Share server-lifetime PR caches so WS mutations invalidate every client's HTTP diffs.
               Layer.provide(Layer.succeed(PullRequestService.PullRequestService, pullRequests)),
+              Layer.provide(Layer.succeed(IssueService.IssueService, issues)),
+              Layer.provide(
+                Layer.succeed(IssueTrackerConnections.IssueTrackerConnections, issueTrackers),
+              ),
               Layer.provide(OtlpEndpointCheck.layer),
               Layer.provide(
                 Layer.succeed(

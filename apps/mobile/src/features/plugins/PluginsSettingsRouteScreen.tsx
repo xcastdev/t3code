@@ -5,6 +5,7 @@ import {
   type ClientPluginRecord,
 } from "@t3tools/client-runtime/plugins/client-packages";
 import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
+import { attachmentUploadError } from "@t3tools/client-runtime/state/attachment-uploads";
 import { runAttachmentUploadCycle } from "@t3tools/client-runtime/state/attachments";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import type {
@@ -13,6 +14,7 @@ import type {
   PluginInstallRecord,
   PluginManifest,
 } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import { AsyncResult, type AtomRegistry } from "effect/reactivity";
 import { useContext, useState } from "react";
@@ -77,42 +79,43 @@ async function uploadPluginPackage(
   picked: PickedPackage,
 ): Promise<string> {
   const { File, UploadType } = await import("expo-file-system");
-  const result = await runAttachmentUploadCycle({
-    registry,
-    createUploadUrl: attachmentEnvironment.createUploadUrl,
-    remove: attachmentEnvironment.remove,
-    environmentId,
-    upload: {
-      type: "file",
-      name: picked.name,
-      mimeType: PLUGIN_PACKAGE_MIME,
-      sizeBytes: picked.size,
-    },
-    resolveUploadUrl: (relativeUrl) => {
-      const connection = appAtomRegistry.get(
-        environmentSession.preparedConnectionValueAtom(environmentId),
-      );
-      return Option.isNone(connection)
-        ? null
-        : resolveAssetUrl(connection.value.httpBaseUrl, relativeUrl);
-    },
-    transport: (url) => {
-      const controller = new AbortController();
-      const done = new File(picked.uri)
-        .upload(url, {
-          httpMethod: "POST",
-          uploadType: UploadType.BINARY_CONTENT,
-          headers: { "Content-Type": PLUGIN_PACKAGE_MIME },
-          signal: controller.signal,
-        })
-        .then((response) => {
-          if (response.status < 200 || response.status >= 300) {
-            throw new Error(`Upload rejected (${response.status})`);
-          }
-        });
-      return { done, abort: () => controller.abort() };
-    },
-  });
+  const result = await Effect.runPromise(
+    runAttachmentUploadCycle({
+      registry,
+      createUploadUrl: attachmentEnvironment.createUploadUrl,
+      remove: attachmentEnvironment.remove,
+      environmentId,
+      upload: {
+        type: "file",
+        name: picked.name,
+        mimeType: PLUGIN_PACKAGE_MIME,
+        sizeBytes: picked.size,
+      },
+      resolveUploadUrl: (relativeUrl) => {
+        const connection = appAtomRegistry.get(
+          environmentSession.preparedConnectionValueAtom(environmentId),
+        );
+        return Option.isNone(connection)
+          ? null
+          : resolveAssetUrl(connection.value.httpBaseUrl, relativeUrl);
+      },
+      transport: (url) =>
+        Effect.tryPromise({
+          try: async (signal) => {
+            const response = await new File(picked.uri).upload(url, {
+              httpMethod: "POST",
+              uploadType: UploadType.BINARY_CONTENT,
+              headers: { "Content-Type": PLUGIN_PACKAGE_MIME },
+              signal,
+            });
+            if (response.status < 200 || response.status >= 300) {
+              throw new Error(`Upload rejected (${response.status})`);
+            }
+          },
+          catch: attachmentUploadError,
+        }),
+    }),
+  );
   if (result.status === "uploaded") return result.attachmentId;
   throw result.status === "failed" && result.error instanceof Error
     ? result.error

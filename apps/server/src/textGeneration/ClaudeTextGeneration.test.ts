@@ -64,6 +64,7 @@ function withFakeClaudeEnv<A, E, R>(
     exitCode?: number;
     stderr?: string;
     argsMustContain?: string;
+    expectedTools?: string;
     argsMustNotContain?: string;
     stdinMustContain?: string;
     configDirMustBe?: string;
@@ -85,6 +86,7 @@ function withFakeClaudeEnv<A, E, R>(
         : undefined,
       T3_FAKE_CLAUDE_EXIT_CODE: input.exitCode === undefined ? undefined : String(input.exitCode),
       T3_FAKE_CLAUDE_STDERR: input.stderr,
+      T3_FAKE_CLAUDE_EXPECTED_TOOLS: input.expectedTools,
       T3_FAKE_CLAUDE_ARGS_MUST_CONTAIN: input.argsMustContain,
       T3_FAKE_CLAUDE_ARGS_MUST_NOT_CONTAIN: input.argsMustNotContain,
       T3_FAKE_CLAUDE_STDIN_MUST_CONTAIN: input.stdinMustContain,
@@ -155,6 +157,7 @@ it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
           },
         }),
         cwdMustNotBe: process.cwd(),
+        expectedTools: "WebSearch,WebFetch",
         argsMustContain:
           "--tools WebSearch,WebFetch --allowedTools WebSearch,WebFetch --disallowedTools mcp__* --disable-slash-commands",
         stdinMustContain: "Focus on release status.",
@@ -177,6 +180,30 @@ it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
         }),
     ),
   );
+  it.effect("loads only user settings when generating review guides", () =>
+    withFakeClaudeEnv(
+      {
+        output: JSON.stringify({ structured_output: { stops: [] } }),
+        argsMustContain: "--setting-sources user",
+        expectedTools: "Read,Grep,Glob,Bash",
+      },
+      (textGeneration) =>
+        textGeneration.generateReviewGuide({
+          cwd: process.cwd(),
+          number: 12,
+          title: "Review a change",
+          description: "",
+          baseBranch: "main",
+          baseCommit: "base",
+          settledReview: "",
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("claudeAgent"),
+            SYNTHETIC_CLAUDE_CAPABLE_MODEL,
+          ),
+        }),
+    ),
+  );
+
   it.effect(
     "keeps canonical built-in capabilities when a custom model collides with its alias",
     () =>
@@ -255,7 +282,7 @@ it.layer(layerClaudeTextGenerationTest)("ClaudeTextGeneration", (it) => {
     withFakeClaudeEnv(
       {
         output: JSON.stringify({ structured_output: { title: "Reconnect failures" } }),
-        stdinMustContain: "Additional instructions:\nUse two to four words.",
+        stdinMustContain: "Title instructions from the user:\nUse two to four words.",
       },
       (textGeneration) =>
         textGeneration.generateThreadTitle({

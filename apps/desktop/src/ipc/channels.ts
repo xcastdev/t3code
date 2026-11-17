@@ -147,3 +147,5 @@ export const REFRESH_PRIMARY_BACKEND_CREDENTIAL_CHANNEL =
   "desktop:refresh-primary-backend-credential";
 export const USE_MANAGED_PRIMARY_BACKEND_CHANNEL = "desktop:use-managed-primary-backend";
 export const RESTART_AUDIO_SERVICE_CHANNEL = "desktop:restart-audio-service";
+
+export const START_FILE_DRAG_CHANNEL = "desktop:start-file-drag";

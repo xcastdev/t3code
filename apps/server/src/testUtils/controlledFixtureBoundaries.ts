@@ -1,3 +1,5 @@
+import { IssueService } from "../issue/IssueService.ts";
+import { IssueTrackerConnections } from "../issue/IssueTrackerConnections.ts";
 import * as Layer from "effect/Layer";
 import * as DocumentText from "../provider/DocumentText.ts";
 import * as GuestShareService from "../guest/GuestShareService.ts";
@@ -88,6 +90,8 @@ export const layerControlledFixtureBoundaries = Layer.mergeAll(
   Layer.mock(TextCatalog.ManagedTextResourceCatalogService)({}),
   Layer.mock(ResourceAuthority.ResourceMutationAuthority)({}),
   Layer.mock(IssueSearch.IssueSearchService)({}),
+  Layer.mock(IssueService)({}),
+  Layer.mock(IssueTrackerConnections)({}),
   Layer.mock(WorkspacePaths.WorkspacePaths)({}),
   Layer.mock(TraceDiagnostics.TraceDiagnostics)({}),
   Layer.mock(ProjectFaviconResolver.ProjectFaviconResolver)({}),

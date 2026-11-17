@@ -556,6 +556,43 @@ describe("rightPanelStore", () => {
     ).toEqual(["work:tasks", "work:team", "work-task:task-1"]);
   });
 
+  it("reloads and reopens issue tabs alongside Work tabs", async () => {
+    const store = useRightPanelStore.getState();
+    const target = {
+      environmentId: "server-a",
+      projectId: "project-a",
+      tracker: "github",
+      host: "GITHUB.COM",
+      scope: "acme/api",
+      key: "42",
+      url: "https://github.com/acme/api/issues/42",
+    };
+    store.openWork(refA, "tasks");
+    store.openIssue(refA, target);
+    store.openIssue(refA, { ...target, host: "github.com" });
+    const opened = selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA)!;
+    expect(opened).toMatchObject({ ...target, kind: "issue", host: "github.com" });
+    await reloadRightPanelStore();
+    expect(selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA)).toEqual(
+      opened,
+    );
+    useRightPanelStore.getState().closeSurface(refA, opened.id);
+    await useClosedViewStore.persist.rehydrate();
+    const closed = useClosedViewStore.getState().entries[0]!;
+    expect(closed).toMatchObject({ kind: "panel-tab", surface: opened });
+    await expect(
+      reopenClosedView(closed, {
+        workspaceAvailable: true,
+        openPreview: () => {
+          throw new Error("An issue tab must not create a browser session");
+        },
+      }),
+    ).resolves.toBe(true);
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA).surfaces,
+    ).toEqual([{ id: "work:tasks", kind: "work", view: "tasks" }, opened]);
+  });
+
   it("drops Work tabs it can't show during migration", () => {
     const migrated = migratePersistedRightPanelState({
       byThreadKey: {
@@ -723,6 +760,7 @@ describe("rightPanelStore", () => {
       migratePersistedRightPanelState({
         byThreadKey: {
           "env-1:pull-requests-panel": panelState,
+          "env-1:issues-panel": panelState,
           "env-1:thread-A": panelState,
         },
       }),

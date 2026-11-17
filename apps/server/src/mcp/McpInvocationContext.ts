@@ -24,6 +24,7 @@ const ALL_MCP_CAPABILITIES = [
   "terminal",
   // T3's checklist tool, for harnesses whose agent has no checklist of its own.
   "checklist",
+  "issues",
 ] as const;
 export type McpCapability = (typeof ALL_MCP_CAPABILITIES)[number];
 

@@ -13,9 +13,11 @@ if (permissionIndex === -1 || argv[permissionIndex + 1] !== "dontAsk") {
   fail("text generation must deny permission prompts", 12);
 }
 const toolsIndex = argv.indexOf("--tools");
-// Web search is the one operation that gets tools: Claude's web tools and nothing else.
-if (toolsIndex === -1 || !["", "WebSearch,WebFetch"].includes(argv[toolsIndex + 1])) {
-  fail("text generation must receive an explicit empty or web-only tool set", 6);
+if (
+  toolsIndex === -1 ||
+  argv[toolsIndex + 1] !== (process.env.T3_FAKE_CLAUDE_EXPECTED_TOOLS ?? "")
+) {
+  fail("text generation did not receive the expected tool set", 6);
 }
 if (
   argv[toolsIndex + 1] === "WebSearch,WebFetch" &&

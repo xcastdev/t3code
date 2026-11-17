@@ -93,7 +93,7 @@ const INVESTIGATING_DRIVERS = new Set(["codex", "claudeAgent"]);
 // Text generators only complete prompts; these operations need an agent's tools.
 const AGENT_ONLY_OPERATIONS: Partial<Record<TextGenerationOp, string>> = {
   generateReviewGuide:
-    "Review guides need a coding agent that can read the checkout. None is ready. Pick Codex or Claude as the review guide model in Settings → Source control.",
+    "Review guides need a coding agent that can read the checkout. None is ready. Pick Codex or Claude as the review guide model in Settings → Source control & issues.",
   describeImage:
     "Looking at images needs a vision model from a coding agent. None is ready. Choose a Codex or OpenCode vision model.",
   webSearch:

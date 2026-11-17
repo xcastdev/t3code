@@ -166,6 +166,9 @@ export async function reopenClosedView(
     case "work-task":
       panels.openWorkTask(ref, surface.taskId, surface.title);
       break;
+    case "issue":
+      panels.openIssue(ref, surface);
+      break;
     case "side-chat":
       panels.openSideChat(ref, surface.threadId);
       break;

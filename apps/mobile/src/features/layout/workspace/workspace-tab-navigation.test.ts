@@ -6,6 +6,7 @@ import {
   workspaceSelectionsIn,
   workspaceTabColumns,
   workspaceTabNavigationState,
+  workspaceTabPage,
 } from "./workspace-tab-navigation";
 
 const home = { key: "home", name: "Home" };
@@ -19,6 +20,17 @@ const pullRequest = {
   name: "PullRequest",
   params: { environmentId: "env", projectId: "project", repository: "o/r", number: 7 },
 };
+const issue = {
+  key: "issue",
+  name: "Issue",
+  params: {
+    environmentId: "env",
+    projectId: "project",
+    tracker: "github",
+    scope: "o/r",
+    issueKey: "7",
+  },
+};
 const settings = { key: "settings", name: "Settings" };
 const requireFromNative = NodeModule.createRequire(
   NodeModule.createRequire(import.meta.url).resolve("@react-navigation/native/package.json"),
@@ -31,7 +43,7 @@ const { StackRouter } = NodeModule.createRequire(
 )("@react-navigation/routers") as {
   readonly StackRouter: typeof import("@react-navigation/native").StackRouter;
 };
-const available = { thread: () => true, pullRequest: () => true };
+const available = { thread: () => true, pullRequest: () => true, issue: () => true };
 const names = (state: { routes: readonly { name: string }[] }) =>
   state.routes.map((route) => route.name);
 
@@ -95,7 +107,11 @@ describe("opening a workspace tab", () => {
 
   it("opens the remembered page beside the list with columns, and the list without", () => {
     const state = { routes: [home, thread] };
-    const selections = { threads: thread.params, pullRequests: pullRequest.params };
+    const selections = {
+      threads: thread.params,
+      pullRequests: pullRequest.params,
+      issues: issue.params,
+    };
     expect(names(workspaceTabNavigationState(state, "pullRequests", selections, columns))).toEqual([
       "Home",
       "PullRequest",
@@ -108,6 +124,13 @@ describe("opening a workspace tab", () => {
         }),
       ),
     ).toEqual(["Home"]);
+    expect(names(workspaceTabNavigationState(state, "issues", selections, columns))).toEqual([
+      "Home",
+      "Issue",
+    ]);
+    expect(names(workspaceTabNavigationState(state, "work", selections, columns))).toEqual([
+      "Home",
+    ]);
     expect(names(workspaceTabNavigationState(state, "settings", {}, columns))).toEqual([
       "Home",
       "Settings",
@@ -118,6 +141,12 @@ describe("opening a workspace tab", () => {
         workspaceTabNavigationState(state, "settings", { settings: "SettingsMicrophone" }, columns),
       ),
     ).toEqual(["Home", "Settings", "SettingsVoice"]);
+    // A hidden tab renders its page under the key that opening the tab later uses.
+    for (const tab of ["pullRequests", "issues", "settings"] as const) {
+      expect(workspaceTabNavigationState(state, tab, selections, columns).routes.at(-1)?.key).toBe(
+        workspaceTabPage(state, tab, selections, columns)?.key,
+      );
+    }
   });
 
   it("keeps the route that is already open, so re-selecting a tab doesn't rebuild it", () => {
@@ -172,7 +201,7 @@ describe("opening a workspace tab", () => {
   });
 
   it("falls back to the list for a chat that no longer exists, or an unknown Settings page", () => {
-    const missing = { thread: () => false, pullRequest: () => true };
+    const missing = { thread: () => false, pullRequest: () => true, issue: () => true };
     expect(
       names(
         workspaceTabNavigationState(

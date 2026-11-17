@@ -2,8 +2,8 @@
 
 This fork tracks [pingdotgg/t3code](https://github.com/pingdotgg/t3code).
 
-**Last merged upstream commit:** `40dcbc5f6a8c4039f5f8f0dceb1bfa17ad0e3961`
-(`fix(web): a stopped run no longer shows the green Done badge in the sidebar (#37475)`, 2026-11-15).
+**Last merged upstream commit:** `6ef2c05410b43a06eea6493a0dc66c1c92f5592f`
+(`fix(server): t3_thread_send_attachments says why a send was refused (#38058)`, 2026-11-17).
 The next integration starts from this commit. Update this line and the table below
 in every integration.
 
@@ -13,6 +13,7 @@ in every integration.
 | 2026-11-02       | `36d4d711b79c73eb33131944f73ea4a8c6156484` | `47f2c8d29e981c7723467efe137ee19e91df924e` | `63e994493a87319bfd31bcd0c71d6bcfcd123ab7` |
 | 2026-11-11       | `47f2c8d29e981c7723467efe137ee19e91df924e` | `31eea883c7f7849ada6eb49265cb11fc64d2ecbd` | `bec7f5fad7167ed8e897b3d91468779216a79123` |
 | 2026-11-15       | `31eea883c7f7849ada6eb49265cb11fc64d2ecbd` | `40dcbc5f6a8c4039f5f8f0dceb1bfa17ad0e3961` | `393439fae83cb791c847f060d59d4d3c65f10f7d` |
+| 2026-11-17       | `40dcbc5f6a8c4039f5f8f0dceb1bfa17ad0e3961` | `6ef2c05410b43a06eea6493a0dc66c1c92f5592f` | `93ffae9b0350dd67dfd90b727c703ab28d63a0d1` |
 
 ## Rule: nothing changes without a decision
 
@@ -142,23 +143,27 @@ perf job, so leave it out. Remove the fork-check worktree when done.
 
 ## Included upstream changes
 
-- Native provider resume, recovery and steering fixes, fairer queued-run and wake
-  processing, and concurrent effects that do not stall unrelated threads.
-- Faster thread opening, history paging, delegation and Git reads; SQLite writes
-  move to a worker. Core migrations 082–096 add indexes, projection repairs and
-  Connect device authorization.
-- Web and mobile localization, agent theme editing, the native iOS image viewer,
-  improved project search, and spreadsheet preview resizing.
-- Pi session and worktree handoff repairs, live Cursor subagents and usage,
-  Antigravity goals, OpenCode server usage limits, and managed provider updates.
-- Terminal history persistence, batching, binary input and query-reply ownership;
-  checkpoint, submodule, selected-file commit and worktree cleanup fixes.
-- New Connect device approval, secret-reference validation, deferred MCP tool
-  discovery and stricter advertised arguments, remote connection recovery,
-  Windows services and keep-awake while agents work.
+- Issues on web and mobile, with GitHub, GitLab, Azure DevOps, Forgejo and Linear
+  trackers, thread links, agent tools, filters and saved views. PRs also gain saved views.
+- Native forks of running Claude threads, missing-session and startup recovery,
+  ACP kept-history recovery, Pi extension continuity and OpenCode Stop/goal fixes.
+- Background reports survive failed turns; follow-ups wait only for their own
+  background work, and completed one-time scheduled tasks are removed.
+- Destination-bound secrets, MCP retry authorization, provider approval boundaries,
+  canonical HTML dependency validation and stream cancellation.
+- Theme backgrounds, optional terminal close confirmation, configurable interactive
+  shells, removable default shortcuts, continuous dictation across thread switches,
+  snapshot copying and native streaming transcription settings.
+- Shared Effect attachment uploads and mobile outbox delivery; mobile navigation,
+  scrolling, composer and Android usage widget improvements.
+- Bounded thread and active-shell reads, checkpoint/reflog optimizations, usage-history
+  retention and no-op migration lock avoidance. Core migrations 097–098 add tracker
+  bindings and active-shell indexes.
+- Desktop file dragging, launcher/update/SSH fixes, sparse worktrees, translation
+  checks, shared mobile build actions and Linux package compatibility fixes.
 
-The [upstream comparison](https://github.com/pingdotgg/t3code/compare/31eea883c7f7849ada6eb49265cb11fc64d2ecbd...40dcbc5f6a8c4039f5f8f0dceb1bfa17ad0e3961)
-contains 1,788 commits since the previous integration.
+The [upstream comparison](https://github.com/pingdotgg/t3code/compare/40dcbc5f6a8c4039f5f8f0dceb1bfa17ad0e3961...6ef2c05410b43a06eea6493a0dc66c1c92f5592f)
+contains 218 commits since the previous integration.
 
 ## Fork integration decisions
 
@@ -167,6 +172,25 @@ memory, managed resources, shared project terminals, Home Assistant notification
 plugins, the native OMP provider and attachment to an independently owned desktop
 backend remain part of the fork. Their clients use the updated upstream navigation,
 settings and mobile route structure.
+
+Issues and Work coexist in navigation, panels and closed-view history. Mobile keeps
+Work beside upstream's shared Pulls/Issues slot; both native clients register all
+sections. The fork's GitHub issue search and explicit `#issue:`/`#iss:` composer
+mentions remain available beside upstream's tracker APIs and thread links.
+
+Upstream's shared mobile build action uses GitHub cache and ordinary Ubuntu sources.
+The runner conversion also covers composite actions, preserves portable APT mirror
+failover, and retains the fork's native OMP policy CI job.
+
+Upstream's Claude startup retries and native fork/resume recovery retain managed
+instruction delivery proofs and admission checks. ACP kept-history recovery and
+unsent-image replay coexist with the same guards. The shared lock retains both
+upstream's keyed runner and the fork's nonblocking lock used by Force stop.
+
+Plugin panels retain their no-frame CSP and provider artifacts retain ownership
+checks. HTML file previews use upstream's scroll restoration without taking the
+MCP/plugin bootstrap path. Plugin archive uploads use the new Effect transport on
+web and mobile, retaining typed failures and cancellation.
 
 The context-window meter was removed with upstream's Labs cleanup. The fork's
 "Latest turn" work summary it carried now sits in the Thread details Context section.
@@ -199,12 +223,11 @@ gateway and connections to users' own MCP servers. `pnpm-workspace.yaml` relaxes
 `@opentelemetry/api` peer range only for the OpenTelemetry SDKs that
 `@oh-my-pi/pi-coding-agent`, a `provider-omp` dev dependency, brings in.
 
-The MCP tool list grows from 88 tools and 93,634 bytes to 91 tools and 95,214 bytes.
-No fork tools are removed. Upstream adds `send_to_user`, `t3_theme_read` and
-`t3_theme_set`. Existing changes add PR pagination and filters, scheduled-task
-filtering, terminal binary/reply fields and bounded thread reads. Upstream's Gemini
-schema compactor removes non-string advertised enums; full runtime unions still
-validate Work inputs. Claude's system append is 5,930 bytes; Codex context is 7,324.
+The MCP tool list grows from 91 tools and 95,214 bytes to 99 tools and 97,623 bytes.
+No fork tools are removed. Eight issue tools account for 2,408 bytes; the existing
+`t3_theme_set` schema's CSS limit grows from 50,000 to 100,000 characters, adding
+one byte. All other existing tool names, descriptions and input schemas are
+unchanged. Claude's system append remains 5,930 bytes and Codex context 7,324.
 
 Queued-run promotion follows upstream's recovery retry: an accepted promotion receipt
 no longer ends promotion, so a run that recovery returned to the queue is promoted again
@@ -385,3 +408,51 @@ totals are 399 ported, 10 decision, 58 superseded and 179 noise. Only this
 validation text changed after the incremental audit.
 
 Main has not been advanced; no deployment or live database write was performed.
+
+### Integration through `6ef2c05410` (2026-11-17)
+
+All 46 workspace packages/apps, including evals, typecheck. Formatting, lint,
+knip and the new translation-catalog check pass. The five fork labels absent
+from upstream's catalogs were generated and translated in all eight locales.
+Runner conversion is shell-valid and idempotent across 33 workflow/action files;
+the credential-free native OMP policy proof passes without inference.
+
+Web unit tests pass (5,887 tests), as do all four browser shards (1,390 tests).
+Mobile passes 3,725 tests; desktop 1,221; client-runtime 2,382; contracts 250;
+shared 1,907 with three skipped. Provider packages run 1,602 tests: 1,601 pass
+and the OpenCode in-place upgrade HTTP test fails identically at the pre-merge
+fork. The five issue-tracker adapter test files also pass all 28 tests.
+
+The full server halves ran: orchestration passes all 3,278 tests. Outside
+orchestration, 7,021 pass, seven fail and 13 skip. All seven failures reproduce
+at `93ffae9b03`: two Codex chat-auth and four managed-runtime cases cannot start
+the private token listener, and the non-interactive background Git fetch case
+does not capture its SSH environment. No new test failure remains unexplained.
+The temporary baseline checkout was removed after reproduction.
+
+The preservation audit at code/documentation tree
+`6f40e3410aeccf8b7434b17b5c4818227bfd21c1` reports 35 files, 56 upstream lines
+and 89 fork lines. The 145 classifications are 94 ported, seven existing runner
+policy decisions, 20 syntax/count artifacts and 24 superseded integration-summary
+lines. No whole changed file or intended behavior was left unexplained. The audit
+caught a missing OMP CI job, which was restored before this tree was measured.
+
+Registration checks retain every fork route, RPC method and settings field. The
+provider registry and separate feature-migration wiring are unchanged. Per-tool
+MCP inventories retain all 91 existing tools and add eight issue tools; only the
+existing theme tool's CSS limit changes. The measured budget test passes.
+
+Independent source review found an Issues header reporting an open panel after
+its last tab closed; the page now derives visibility from its selected surface.
+Focused panel/history tests and web typecheck pass after that correction.
+Other clean-merge repairs port plugin upload transports to Effect, retain Issues
+in mobile detail restoration, and split Issues RPC handlers into a sibling group
+to preserve inferred CLI requirements. Both sides' behavior is retained; no new
+maintainer choice was needed.
+
+The isolated worktree server starts and recovers, serves the web client and
+environment descriptor (HTTP 200), and rejects an unauthenticated orchestration
+read (HTTP 401). MCP eval unit tests and a credential-free request dry run pass.
+Browser verification is the component suite; no full-client visual pass, native
+device build/test, paid model eval or real provider turn was performed. Main has
+not been advanced; nothing was pushed or deployed, and live userdata was not written.

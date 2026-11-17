@@ -274,6 +274,7 @@ export const makeClaudeTextGeneration = Effect.fn("makeClaudeTextGeneration")(fu
                   "mcp__*",
                 ]
               : ["--tools", ""]),
+          ...(investigate ? ["--setting-sources", "user"] : []),
           "--disable-slash-commands",
           ...(noSessionPersistence ? [NO_SESSION_PERSISTENCE] : []),
           // managed-mcp.json already isolates servers and makes Claude reject this flag.
