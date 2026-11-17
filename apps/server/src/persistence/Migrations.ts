@@ -216,7 +216,7 @@ const makeMigrationLoader = (throughId?: number) =>
     ),
   );
 
-const FIRST_V2_MIGRATION_ID = 55;
+export const FIRST_V2_MIGRATION_ID = 55;
 
 export function skippedV2Migrations(
   recorded: ReadonlyArray<{ readonly id: number; readonly name: string }>,

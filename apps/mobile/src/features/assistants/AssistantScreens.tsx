@@ -5,14 +5,12 @@ import {
   prepareAssistantLifecycleMutation,
   prepareAssistantStop,
   type AssistantConfigurationDraft,
-  type AssistantSelection,
 } from "@t3tools/client-runtime/state/assistants";
 import {
   AssistantId,
   EnvironmentId,
   UnknownUnionMember,
   type AssistantConfiguration,
-  type AssistantDetail,
   type AssistantLifecycleInput,
   type AssistantSummary,
   type ModelSelection,
@@ -39,6 +37,7 @@ import { WorkBlock, WorkFormActions, WorkText } from "../work/WorkParts";
 import { AgentMemorySection } from "./AssistantMemory";
 import { AgentResourceBindings } from "./AssistantResources";
 import { AgentRoutinesSection } from "./AssistantRoutines";
+import { agentBlockedReason, type MobileAgentContext } from "./assistantContext";
 import {
   INTERACTION_MODE_LABELS,
   RUNTIME_MODE_LABELS,
@@ -61,7 +60,6 @@ import {
   useAssistantWriter,
   useCursorPages,
   useMountedRef,
-  type AssistantWriter,
 } from "./useAssistants";
 
 function useScrollInsets() {
@@ -256,21 +254,6 @@ const SECTIONS: ReadonlyArray<{ value: AgentSection; label: string }> = [
   { value: "memory", label: "Memory" },
   { value: "routines", label: "Routines" },
 ];
-
-export interface MobileAgentContext {
-  readonly environmentId: EnvironmentId;
-  readonly detail: AssistantDetail;
-  readonly connected: boolean;
-  readonly epoch: string | null;
-  readonly selection: AssistantSelection | null;
-  readonly latestSelection: () => AssistantSelection | null;
-  readonly writer: AssistantWriter;
-}
-
-export function agentBlockedReason(context: MobileAgentContext, allowed: boolean) {
-  if (!context.connected || context.selection === null) return "Reconnect to make changes.";
-  return allowed ? null : "This connection isn't allowed to do that.";
-}
 
 export function SettingsAgentRouteScreen({
   route,

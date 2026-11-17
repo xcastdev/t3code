@@ -37,7 +37,7 @@ import { useProjects } from "../../state/entities";
 import { useEnvironmentQuery } from "../../state/query";
 import { WorkBlock, WorkFormActions, WorkText } from "../work/WorkParts";
 import { AgentInput } from "./AssistantParts";
-import { agentBlockedReason, type MobileAgentContext } from "./AssistantScreens";
+import { agentBlockedReason, type MobileAgentContext } from "./assistantContext";
 import { useAssistantRoster, useCursorPages } from "./useAssistants";
 
 const PAGE = 32;

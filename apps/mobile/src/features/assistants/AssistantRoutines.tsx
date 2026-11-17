@@ -29,7 +29,7 @@ import {
   type RoutineDraft,
 } from "@t3tools/client-runtime/assistant-presentation";
 import { AgentInput, TONE_PREFIX } from "./AssistantParts";
-import { agentBlockedReason, type MobileAgentContext } from "./AssistantScreens";
+import { agentBlockedReason, type MobileAgentContext } from "./assistantContext";
 import { newAssistantCommandId, useCursorPages, useMountedRef } from "./useAssistants";
 
 const PAGE = 32;

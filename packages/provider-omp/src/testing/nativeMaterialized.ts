@@ -48,7 +48,7 @@ const readSync=fs.readFileSync;fs.readFileSync=function(path,...args){check(path
       env,
       encoding: "utf8",
     });
-    NodeAssert.equal(result.status, 0, result.stdout + result.stderr);
+    NodeAssert.equal(result.status, 0, `${result.error ?? ""}${result.stdout}${result.stderr}`);
     return JSON.parse(result.stdout) as { loader: string; launcher: string };
   };
   const assets = materialize();

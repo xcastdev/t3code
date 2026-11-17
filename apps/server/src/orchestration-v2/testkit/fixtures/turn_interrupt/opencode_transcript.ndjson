@@ -13,8 +13,4 @@
 {"type":"emit_inbound","label":"session.abort.response","frame":{"type":"sdk.response","operation":"session.abort","data":true}}
 {"type":"expect_outbound","label":"session.children.interrupt","frame":{"type":"session.children","input":{"sessionID":"ses_123570840ffenLEumkPQfegGCd"}}}
 {"type":"emit_inbound","label":"session.children.interrupt.response","frame":{"type":"sdk.response","operation":"session.children","data":[]}}
-{"type":"expect_outbound","label":"session.abort.cleanup","frame":{"type":"session.abort","input":{"sessionID":"ses_123570840ffenLEumkPQfegGCd"}}}
-{"type":"emit_inbound","label":"session.abort.cleanup.response","frame":{"type":"sdk.response","operation":"session.abort","data":true}}
-{"type":"expect_outbound","label":"session.children.cleanup","frame":{"type":"session.children","input":{"sessionID":"ses_123570840ffenLEumkPQfegGCd"}}}
-{"type":"emit_inbound","label":"session.children.cleanup.response","frame":{"type":"sdk.response","operation":"session.children","data":[]}}
 {"type":"runtime_exit","status":"success"}

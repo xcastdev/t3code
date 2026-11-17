@@ -2636,6 +2636,8 @@ describe("orchestration v2 provider switching", () => {
           (session) => session.providerInstanceId === CODEX_MODEL_SELECTION.instanceId,
         );
         assert.isDefined(activeSession);
+        // EventSink drops session events whose runtime id doesn't match the stored session's.
+        const { instructionRuntimeId: _runtimeId, ...deadSession } = activeSession!;
         const now = yield* DateTime.now;
         yield* eventSink.write({
           events: [
@@ -2646,7 +2648,7 @@ describe("orchestration v2 provider switching", () => {
               providerInstanceId: CODEX_MODEL_SELECTION.instanceId,
               occurredAt: now,
               payload: {
-                ...activeSession!,
+                ...deadSession,
                 id: ProviderSessionId.make(`provider-session:queued-provider-switch:${status}`),
                 status,
               },

@@ -21,9 +21,15 @@ try {
     ? NodeFS.realpathSync(python)
     : NodeChildProcess.spawnSync("which", [python], { encoding: "utf8" }).stdout.trim();
   if (!pythonPath) throw new Error("Python interpreter not found");
+  // The materialized-asset proof runs `node`, which CI images don't put in /usr/bin.
+  const nodePath = NodeChildProcess.spawnSync("which", ["node"], {
+    encoding: "utf8",
+  }).stdout.trim();
+  if (!nodePath) throw new Error("node not found");
   const env = {
     PATH: [
       NodePath.dirname(process.execPath),
+      NodePath.dirname(nodePath),
       NodePath.dirname(pythonPath),
       "/usr/bin",
       "/bin",

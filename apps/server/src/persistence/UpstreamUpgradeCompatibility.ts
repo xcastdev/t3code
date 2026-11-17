@@ -2,7 +2,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
-import { migrationManifest } from "./Migrations.ts";
+import { FIRST_V2_MIGRATION_ID, migrationManifest } from "./Migrations.ts";
 import { assertWorkflowFeatureCompatibility } from "./WorkflowFeatureMigrations.ts";
 
 export class UpstreamUpgradeCompatibilityError extends Schema.TaggedError<UpstreamUpgradeCompatibilityError>()(
@@ -89,7 +89,11 @@ export const assertUpstreamUpgradeCompatibility = Effect.gen(function* () {
     return;
   for (const [index, row] of rows.entries()) {
     const expected = migrationManifest[index];
-    if (!expected || row.migration_id !== expected[0] || row.name !== expected[1]) {
+    if (!expected || row.migration_id !== expected[0]) {
+      return yield* new UpstreamUpgradeCompatibilityError({ reason: "ledger-history" });
+    }
+    // Below the V2 boundary a site-local name is tolerated, as upstream's migrator does.
+    if (row.name !== expected[1] && expected[0] >= FIRST_V2_MIGRATION_ID) {
       return yield* new UpstreamUpgradeCompatibilityError({ reason: "ledger-history" });
     }
   }

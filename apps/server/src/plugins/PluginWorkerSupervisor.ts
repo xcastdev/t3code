@@ -36,8 +36,9 @@ const REQUEST_TIMEOUT = Duration.seconds(30);
 // onStart runs the plugin's data migrations, which may outlast an ordinary call.
 const INITIALIZE_TIMEOUT = Duration.seconds(120);
 const STOP_GRACE = Duration.seconds(5);
-// A grandchild that left the process group can hold stderr open after the worker exits.
-const STDERR_DRAIN = Duration.seconds(1);
+// A grandchild that left the process group can hold stderr open after the worker exits. The
+// wait still has to cover draining a busy worker's last output on a loaded machine.
+const STDERR_DRAIN = Duration.seconds(5);
 const DETAIL_MAX_CHARS = 1024;
 const LOG_MAX_LINES = 1000;
 const LOG_MAX_BYTES = 256 * 1024;
