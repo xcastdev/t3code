@@ -75,7 +75,7 @@ jobs:
   production:
     name: EAS ${{ inputs.profile || 'production' }} ${{ github.event_name == 'push' && 'auto' || inputs.mode }}
     if: github.repository == 'pingdotgg/t3code'
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     # Serialize runs so OTAs publish in merge order. GitHub keeps at most one
     # queued job per group, so a burst of merges collapses into one run of the
     # newest commit — intermediate commits don't need their own OTA.
@@ -484,7 +484,7 @@ jobs:
     needs: production
     # Skipped when the production job failed: no store build after a failed OTA.
     if: needs.production.outputs.android_build == 'true'
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     concurrency:
       group: mobile-android-store-build
@@ -551,7 +551,7 @@ jobs:
 
       - name: Mount build cache
         if: steps.record.outputs.built != 'true'
-        uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26 # v1.7.2
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           key: ${{ github.repository }}-android-store-build
           path: ~/.cache/t3-android-store
@@ -563,7 +563,7 @@ jobs:
           rm -rf "$EAS_LOCAL_BUILD_WORKINGDIR"
           # No daemon: nothing should hold the sticky disk open when it is committed.
           printf 'org.gradle.caching=true\norg.gradle.daemon=false\n' > "$GRADLE_USER_HOME/gradle.properties"
-          sudo sed -i 's|http://|https://|g' /etc/apt/blacksmith-ubuntu-mirrors.txt /etc/apt/sources.list.d/ubuntu.sources
+          sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update -qq && sudo apt-get install -y -qq ccache
           ccache --zero-stats
 
@@ -688,7 +688,7 @@ jobs:
     needs: production
     # Skipped when the production job failed: no store build after a failed OTA.
     if: needs.production.outputs.ios_build == 'true'
-    runs-on: blacksmith-12vcpu-macos-27
+    runs-on: xcode-27
     timeout-minutes: 60
     concurrency:
       group: mobile-ios-store-build
