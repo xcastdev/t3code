@@ -18,7 +18,6 @@ import {
   type ProjectTeamRecordRead,
   type ProjectWorkCriterionRead,
   type ProjectWorkRelationshipRead,
-  type ProjectWorkTaskContext,
 } from "@t3tools/contracts";
 import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import { useState } from "react";
@@ -52,7 +51,6 @@ import {
   useWorkReview,
   useWorkWriter,
   workWriteBlockedReason,
-  type WorkWriter,
 } from "./useWork";
 import { useWorkRecords, workRecordsBlockedReason } from "./useWorkRecords";
 import { planIntegrationRefs } from "./workPresentation";
@@ -74,6 +72,7 @@ import {
   TaskWorkers,
   executionState,
 } from "./WorkTaskSections";
+import type { Surface } from "./workSurface";
 import {
   deriveWorkTask,
   gateResponses,
@@ -82,7 +81,6 @@ import {
   shortHash,
   workStateLabel,
   type WorkApprovalStep,
-  type WorkTaskModel,
 } from "./workModel";
 
 type Props = StaticScreenProps<{
@@ -90,18 +88,6 @@ type Props = StaticScreenProps<{
   readonly projectId: string;
   readonly taskId: string;
 }>;
-
-export interface Surface {
-  readonly scope: ProjectWorkScope;
-  readonly current: ProjectWorkSelection;
-  readonly context: ProjectWorkTaskContext;
-  readonly model: WorkTaskModel;
-  /** The task's complete team record set at the reviewed revision. */
-  readonly records: ReadonlyArray<ProjectTeamRecordRead>;
-  readonly writer: WorkWriter;
-  readonly blocked: string | null;
-  readonly onOpenTask: (taskId: ProjectWorkTaskId) => void;
-}
 
 export const guidedFields = (surface: Surface, selected: ProjectWorkSelection) => ({
   commandId: newCommandId(),

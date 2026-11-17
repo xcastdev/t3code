@@ -24,7 +24,7 @@ import { uuidv4 } from "../../lib/uuid";
 import { useWorkProviderCatalog } from "./useWorkProviderCatalog";
 import { workRouteLabel } from "./workLogic";
 import { WorkBlock, WorkFormActions, WorkInput, WorkReadNotice, WorkText } from "./WorkParts";
-import type { Surface } from "./WorkTaskScreen";
+import type { Surface } from "./workSurface";
 import { newCommandId, useWorkRead, useWorkReview } from "./useWork";
 import { useWorkRecords, workRecordsBlockedReason } from "./useWorkRecords";
 import { gateResponses, shortHash, workStateLabel } from "./workModel";

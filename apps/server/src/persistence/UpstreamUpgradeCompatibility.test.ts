@@ -56,7 +56,7 @@ it.effect.each([
       if (scenario === "ahead")
         yield* sql`INSERT INTO effect_sql_migrations(migration_id,name) VALUES (999,'Unknown')`;
       if (scenario === "name")
-        yield* sql`UPDATE effect_sql_migrations SET name = 'Foreign' WHERE migration_id = 1`;
+        yield* sql`UPDATE effect_sql_migrations SET name = 'Foreign' WHERE migration_id = 55`;
       if (scenario === "gap") yield* sql`DELETE FROM effect_sql_migrations WHERE migration_id = 2`;
       if (scenario === "reserved") yield* sql`CREATE TABLE t3_workflow_v2_foreign (secret TEXT)`;
       if (scenario === "reserved-uppercase")
