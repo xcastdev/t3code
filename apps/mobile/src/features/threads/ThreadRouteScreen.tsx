@@ -132,6 +132,7 @@ import { useStartSideChat } from "./useStartSideChat";
 import { useThreadStatusAnnouncements } from "./useThreadStatusAnnouncements";
 import type { ThreadInspectorMode, ThreadInspectorTarget } from "./thread-inspector-navigation";
 import { useSelectWorkspaceDetail } from "../layout/workspace/useSelectWorkspaceDetail";
+import { useThreadMergeBack } from "./use-thread-merge-back";
 
 function firstRouteParam(value: string | string[] | undefined): string | null {
   const first = Array.isArray(value) ? value[0] : value;
@@ -459,37 +460,16 @@ function ThreadRouteContent(
   const navigation = useNavigation();
   const selectDetail = useSelectWorkspaceDetail();
   const openPullRequest = useOpenPullRequest();
-  const mergeBack = useAtomCommand(threadEnvironment.mergeBack, "merge thread back");
-  const mergeBackTargetThreadId = resolveMergeBackTargetThreadId(selectedThreadDetail);
-  const mergeBackRun =
-    selectedThreadDetail === null ? null : resolveLatestMergeBackRun(selectedThreadDetail);
-  const mergeBackBusyRef = useRef(false);
-  const handleMergeBack = async () => {
-    if (
-      mergeBackBusyRef.current ||
-      !selectedThread ||
-      mergeBackTargetThreadId === null ||
-      mergeBackRun === null
-    ) {
-      return;
-    }
-    mergeBackBusyRef.current = true;
-    const result = await mergeBack({
-      environmentId: selectedThread.environmentId,
-      input: {
-        sourceThreadId: selectedThread.id,
-        targetThreadId: mergeBackTargetThreadId,
-        runId: mergeBackRun.id,
-        creationSource: "mobile",
-      },
-    });
-    mergeBackBusyRef.current = false;
-    if (result._tag !== "Success") return;
-    selectDetail({
-      name: "Thread",
-      params: { environmentId: selectedThread.environmentId, threadId: mergeBackTargetThreadId },
-    });
-  };
+  const handleMergeBack = useThreadMergeBack({
+    environmentId: selectedThread?.environmentId ?? null,
+    threadId: selectedThread?.id ?? null,
+    targetThreadId: resolveMergeBackTargetThreadId(selectedThreadDetail),
+    runId:
+      selectedThreadDetail === null
+        ? null
+        : (resolveLatestMergeBackRun(selectedThreadDetail)?.id ?? null),
+    onMerged: (target) => selectDetail({ name: "Thread", params: target }),
+  });
   const params = props.route.params ?? {};
   const environmentIdRaw = firstRouteParam(params.environmentId);
   const environmentId = environmentIdRaw ? EnvironmentId.make(environmentIdRaw) : null;
@@ -810,10 +790,7 @@ function ThreadRouteContent(
     threadId: threadId ?? "",
     onOpenFilesInspector: selectedThreadCwd !== null ? handleOpenFilesInspector : undefined,
     onOpenGitInspector: handleOpenGitInspector,
-    onMergeBack:
-      mergeBackTargetThreadId !== null && mergeBackRun !== null
-        ? () => void handleMergeBack()
-        : undefined,
+    onMergeBack: handleMergeBack,
     currentBranch: selectedThread?.branch ?? null,
     gitStatus: gitStatus.data,
     gitOperationLabel: gitState.gitOperationLabel,

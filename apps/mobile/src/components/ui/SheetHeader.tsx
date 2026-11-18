@@ -54,6 +54,7 @@ function NativeSheetHeader(props: SheetHeaderProps) {
       <NativeStackScreenOptions
         options={{
           title: props.title,
+          ...(props.titleContent === undefined ? {} : { headerTitle: () => props.titleContent }),
           headerBackVisible: false,
           unstable_headerSubtitle: props.subtitle,
         }}
@@ -179,9 +180,11 @@ function InlineSheetHeader(props: SheetHeaderProps) {
     <View className="flex-row items-center gap-3 px-4 pt-3 pb-3">
       {close}
       <View className="min-w-0 flex-1 gap-1">
-        <AppText numberOfLines={1} className="text-base font-t3-bold text-foreground">
-          {props.title}
-        </AppText>
+        {props.titleContent ?? (
+          <AppText numberOfLines={1} className="text-base font-t3-bold text-foreground">
+            {props.title}
+          </AppText>
+        )}
         {props.subtitle ? (
           <AppText
             numberOfLines={1}

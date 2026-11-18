@@ -12,6 +12,7 @@ import { WorkspaceEmptyDetail } from "../WorkspaceEmptyDetail";
 import { ScreenContent } from "../../../components/ui/ScreenContent";
 import { useAndroidControlSizing } from "../../../components/ui/useAndroidControlSizing";
 import { HomeRouteScreen } from "../../home/HomeRouteScreen";
+import { HomeAgentsRouteScreen } from "../../home/HomeAgentsRouteScreen";
 import { PullRequestsScreen } from "../../pull-requests/PullRequestsScreen";
 import { WorkTab } from "../../work/WorkTab";
 import { ListSearchToolbar } from "./ListSearchToolbar.android";
@@ -48,7 +49,7 @@ function WorkspaceRoot() {
       ? workspace.bottomClearance
       : floatingTabsEnabled
         ? insets.bottom + FLOATING_TABS.bottom + FLOATING_TABS.edge + fabSize
-        : workspace.state.selectedTab === "threads"
+        : workspace.state.selectedTab === "threads" || workspace.state.selectedTab === "agents"
           ? fabClearance + 16
           : 16,
   };
@@ -97,6 +98,8 @@ function WorkspaceRoot() {
                 renderTab={(tab) =>
                   tab === "threads" ? (
                     <HomeRouteScreen />
+                  ) : tab === "agents" ? (
+                    <HomeAgentsRouteScreen />
                   ) : tab === "work" ? (
                     layout.usesSplitView ? (
                       <>

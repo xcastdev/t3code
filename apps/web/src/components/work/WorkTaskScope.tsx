@@ -29,7 +29,7 @@ import {
   WorkRow,
   WorkSection,
 } from "./WorkLayout";
-import { buildProtectedRevision } from "./workLogic";
+import { buildProtectedRevision } from "@t3tools/client-runtime/project-work-logic";
 import { shortHash, workStateLabel, workStateVariant } from "./workModel";
 import { WorkTaskLink, WorkTaskPicker } from "./WorkTaskRefs";
 import { guidedFields, newCommandId, useWorkReview, type WorkTaskSurface } from "./workTaskSurface";

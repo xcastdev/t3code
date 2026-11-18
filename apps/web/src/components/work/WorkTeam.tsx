@@ -57,7 +57,7 @@ import {
   syncModelPolicies,
   teamProviderOf,
   type TeamConfigurationValues,
-} from "./workLogic";
+} from "@t3tools/client-runtime/project-work-logic";
 import { workStateLabel } from "./workModel";
 import { newCommandId } from "./workTaskSurface";
 

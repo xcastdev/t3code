@@ -89,6 +89,13 @@ import { resolveThreadOpenRoute } from "../../lib/sideChatPane";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { useLocalStorage } from "../../hooks/useLocalStorage";
+import {
+  countThreadDetailsStatuses,
+  isFailedAgentStatus,
+  isFinishedAgentStatus,
+  markFailedAgentsSeen,
+  threadDetailsStatusBucket,
+} from "@t3tools/client-runtime/state/thread-details";
 import * as Schema from "effect/Schema";
 import { toastManager } from "../ui/toast";
 import { Spinner } from "../ui/spinner";
@@ -152,15 +159,8 @@ type LineageRow = ThreadRelationshipWalkRow | { readonly remote: RemoteSubagent 
 const lineageRowStatus = (row: LineageRow) =>
   "remote" in row ? row.remote.status : row.edge.status;
 
-const isFinishedAgentStatus = (status: string | null | undefined) =>
-  ["completed", "failed", "error", "cancelled", "interrupted", "idle"].includes(status ?? "");
-
-const isFailedAgentStatus = (status: string | null | undefined) =>
-  status === "failed" || status === "error";
-
 // Failed agents marked seen on this device fold into "Previous agents"; the oldest marks drop first.
 const SEEN_FAILED_AGENTS_KEY = "t3code:thread-details:seen-failed-agents";
-const MAX_SEEN_FAILURES = 500;
 const SeenFailures = Schema.Array(Schema.String);
 const NO_SEEN_FAILURES: ReadonlyArray<string> = [];
 
@@ -654,7 +654,7 @@ export function ThreadRelationshipsPanel(props: {
     (row) => isFailedAgentStatus(lineageRowStatus(row)) && !seenFailures.includes(failedKey(row)),
   );
   const markFailuresSeen = (keys: ReadonlyArray<string>) =>
-    setSeenFailures((current) => [...current, ...keys].slice(-MAX_SEEN_FAILURES));
+    setSeenFailures((current) => markFailedAgentsSeen(current, keys));
   const showsFailure = (row: LineageRow) => unseenFailures.includes(row);
   const groups: ReadonlyArray<{
     id: string;
@@ -691,14 +691,14 @@ export function ThreadRelationshipsPanel(props: {
       // Disconnect lives in this heading, so a thread with only side chats still shows it.
       (canDetach && sideChats.length > 0));
   const sideChatsVisible = props.showSideChats && sideChats.length > 0;
-  const sideChatStates = sideChats.map((row) => {
-    if (graph.nodes.get(row.threadId)?.thread?.pendingRuntimeRequest) return "input";
-    const status = threadRelationshipRowStatus(graph, row);
-    if (isFailedAgentStatus(status)) return "failed";
-    return isFinishedAgentStatus(status) ? "done" : "running";
-  });
-  const sideChatCount = (state: (typeof sideChatStates)[number]) =>
-    sideChatStates.filter((entry) => entry === state).length;
+  const sideChatCounts = countThreadDetailsStatuses(
+    sideChats.map((row) =>
+      threadDetailsStatusBucket({
+        status: threadRelationshipRowStatus(graph, row),
+        needsInput: Boolean(graph.nodes.get(row.threadId)?.thread?.pendingRuntimeRequest),
+      }),
+    ),
+  );
   const finishedCount = previous.length + remotePrevious.length - unseenFailures.length;
 
   if (!lineageVisible && !sideChatsVisible) {
@@ -1155,14 +1155,14 @@ export function ThreadRelationshipsPanel(props: {
           title="Side chats"
           collapsedSummary={
             <AgentStatusBadges
-              running={sideChatCount("running")}
-              input={sideChatCount("input")}
-              failed={sideChatCount("failed")}
-              done={sideChatCount("done")}
+              running={sideChatCounts.running}
+              input={sideChatCounts.input}
+              failed={sideChatCounts.failed}
+              done={sideChatCounts.done}
             />
           }
           actions={
-            <AgentStatusBadges running={sideChatCount("running")} input={sideChatCount("input")} />
+            <AgentStatusBadges running={sideChatCounts.running} input={sideChatCounts.input} />
           }
           data-thread-side-chats-panel
         >

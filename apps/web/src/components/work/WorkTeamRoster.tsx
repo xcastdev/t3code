@@ -8,12 +8,12 @@ import { WorkSection, WorkMeta, WorkEmpty } from "./WorkLayout";
 import { WorkRecordsNotice, WorkNotice } from "./WorkNotice";
 import { WorkTaskLink } from "./WorkTaskRefs";
 import { useWorkTeamRoster } from "./useWorkTeamRoster";
-import { recordedTeamConfiguration } from "./workLogic";
+import { recordedTeamConfiguration } from "@t3tools/client-runtime/project-work-logic";
 import { PencilIcon } from "lucide-react";
 
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { useWorkProviderCatalog } from "./useWorkProviderCatalog";
-import { workRouteLabel } from "./workLogic";
+import { workRouteLabel } from "@t3tools/client-runtime/project-work-logic";
 import { workStateLabel } from "./workModel";
 
 const MEMORY_LABELS = { none: "No memory", project: "Project", shared: "Shared" } as const;

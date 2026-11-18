@@ -19,7 +19,6 @@ export function useComposerPopoverHost() {
 /** Mount inside KeyboardStickyView for Android gestures. Hide explicitly because portal content outlives its subtree. */
 export function ComposerPopoverHost(props: {
   readonly hidden: boolean;
-  readonly inFlow?: boolean;
   readonly popoverHeight: SharedValue<number>;
   readonly children: ReactNode;
 }) {
@@ -34,7 +33,7 @@ export function ComposerPopoverHost(props: {
         ref={hostRef}
         collapsable={false}
         pointerEvents="box-none"
-        className={props.inFlow ? undefined : "absolute inset-0"}
+        className="absolute inset-0"
         onLayout={props.hidden ? undefined : () => setLayoutVersion((version) => version + 1)}
       >
         {props.children}

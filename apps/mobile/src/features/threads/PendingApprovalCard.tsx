@@ -30,6 +30,7 @@ const DEFAULT_APPROVAL_OPTIONS: ReadonlyArray<ProviderApprovalOption> = [
   { decision: "decline", label: "Decline" },
 ];
 
+/** The approval's detail and answers; the live bar's request slot carries its title. */
 export function PendingApprovalCard(props: PendingApprovalCardProps) {
   const options: ReadonlyArray<ProviderApprovalOption> =
     props.approval.options ?? DEFAULT_APPROVAL_OPTIONS;
@@ -38,15 +39,12 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
   const disabled = !canRespond || props.respondingApprovalId === props.approval.requestId;
   const [explanationOpen, setExplanationOpen] = useState(false);
   return (
-    <View className="gap-2.5 rounded-[20px] border border-border bg-card-alt p-4">
-      <Text className="font-t3-bold text-2xs uppercase tracking-[1.1px] text-foreground-secondary">
-        Approval needed
-      </Text>
-      <Text className="font-t3-bold text-lg text-foreground">
-        {props.approval.appName ?? props.approval.requestKind}
-      </Text>
+    <View className="gap-2.5">
       {props.approval.detail ? (
-        <Text className="font-sans text-sm leading-normal text-foreground-secondary">
+        <Text
+          selectable
+          className="rounded-xl bg-subtle px-3 py-2 font-mono text-xs leading-normal text-foreground-secondary"
+        >
           {props.approval.detail}
         </Text>
       ) : null}

@@ -39,8 +39,9 @@ public final class T3NativeControlsModule: Module {
 
     View(T3SidebarTabBarView.self) {
       ViewName("SidebarTabBar")
-      Events("onSelectionChange", "onCompose")
+      Events("onSelectionChange", "onCompose", "onComposeMenuAction")
       Prop("tabs") { (view: T3SidebarTabBarView, value: [String]) in view.tabs = value }
+      Prop("composeMenu") { (view: T3SidebarTabBarView, value: [[String: Any]]) in view.composeMenu = value }
       Prop("selectedTab") { (view: T3SidebarTabBarView, value: String) in view.selectedTab = value }
       Prop("selectedColor") { (view: T3SidebarTabBarView, value: UIColor) in view.selectedColor = value }
       Prop("showsCompose") { (view: T3SidebarTabBarView, value: Bool) in view.showsCompose = value }

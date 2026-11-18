@@ -15,7 +15,7 @@ import {
   ListPlusIcon,
 } from "lucide-react";
 import { useEnvironmentIdentificationMode } from "~/hooks/useSettings";
-import { formatContextWindowTokens } from "~/lib/contextWindow";
+import { formatContextWindowTokens } from "@t3tools/client-runtime/state/context-window";
 import { cn, isMacPlatform } from "~/lib/utils";
 import { useShortcutModifierState } from "../../shortcutModifierState";
 import { StageBackdropButtonArt, useSidebarStageBackdropVariant } from "../SidebarStageBackdrop";

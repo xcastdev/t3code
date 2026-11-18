@@ -6,11 +6,15 @@ import {
 } from "@t3tools/client-runtime/project-work";
 import {
   CommandId,
+  PROJECT_TEAM_PRESETS,
   type ProjectTeamRecordRead,
+  type ProjectWorkTaskId,
   type ProviderOptionDescriptor,
 } from "@t3tools/contracts";
 import { useState } from "react";
 import { View } from "react-native";
+
+import { AppText as Text } from "../../components/ui/AppText";
 
 import { ListActionRow } from "../../components/ui/ListActionRow";
 import { ListChoiceRow } from "../../components/ui/ListChoiceRow";
@@ -19,9 +23,25 @@ import { ListToggleRow } from "../../components/ui/ListToggleRow";
 import { NumberField } from "../../components/ui/NumberField";
 import { SegmentedControl } from "../../components/ui/SegmentedControl";
 import { useEnvironmentServerConfig } from "../../state/entities";
-import { WorkBlock, WorkFormActions, WorkInput, WorkRecordsNotice, WorkText } from "./WorkParts";
+import {
+  WorkBlock,
+  WorkFormActions,
+  WorkInput,
+  WorkRecordsNotice,
+  WorkTaskLink,
+  WorkText,
+} from "./WorkParts";
 import { newCommandId, type WorkWriter } from "./useWork";
-import { useWorkRecords, workRecordsBlockedReason } from "./useWorkRecords";
+import { workRecordsBlockedReason } from "./useWorkRecords";
+import { useWorkTeamRoster, type WorkRosterMember } from "./useWorkTeamRoster";
+import {
+  WorkHeading,
+  WorkMemberAvatar,
+  WorkStatRow,
+  WorkStatTile,
+  WorkStatusChip,
+  WorkTagChip,
+} from "./WorkStatus";
 import {
   buildTeamConfigurationIntent,
   emptyTeamConfiguration,
@@ -35,10 +55,9 @@ import {
   type TeamConfigurationValues,
   type TeamProfile,
   withTeamEffort,
-} from "./workLogic";
+} from "@t3tools/client-runtime/project-work-logic";
 import { WorkAvatarEditor } from "./WorkAvatarEditor";
 import { useWorkProviderCatalog } from "./useWorkProviderCatalog";
-import { WorkAgentAvatar } from "./WorkAgentAvatar";
 import { workStateLabel } from "./workModel";
 
 const VALIDATION_COMMAND_ID = CommandId.make("validation");
@@ -70,25 +89,13 @@ type DraftView =
 export function WorkTeamSection({
   scope,
   writer,
+  onOpenTask,
 }: {
   scope: ProjectWorkScope;
   writer: WorkWriter;
+  onOpenTask: (taskId: ProjectWorkTaskId) => void;
 }) {
-  const limits = useWorkRecords(scope.environmentId, {
-    projectId: scope.projectId,
-    operation: "foundation-records",
-    recordKind: "limits",
-  });
-  const roles = useWorkRecords(scope.environmentId, {
-    projectId: scope.projectId,
-    operation: "foundation-records",
-    recordKind: "role-revision",
-  });
-  const members = useWorkRecords(scope.environmentId, {
-    projectId: scope.projectId,
-    operation: "foundation-records",
-    recordKind: "member",
-  });
+  const { limits, roles, members, roster } = useWorkTeamRoster(scope);
   const serverConfig = useEnvironmentServerConfig(scope.environmentId);
   const [draft, setDraft] = useState<Draft | null>(null);
   const key = "team:configure";
@@ -176,107 +183,127 @@ export function WorkTeamSection({
   const dirty =
     draft !== null &&
     (draft.recorded === null || JSON.stringify(draft.values) !== JSON.stringify(draft.recorded));
-  const providerName = (id: string) => {
-    const entry = providers.find((item) => item.instanceId === id);
-    return entry ? (entry.displayName ?? entry.instanceId) : `${id} (unavailable)`;
-  };
   /** Provider, model and effort, e.g. "Claude · Claude Opus 5.5 · High". */
-  const routeLabel = (
-    providerInstanceId: string,
-    profile: Pick<TeamProfile, "model" | "options">,
-  ) => workRouteLabel(catalog, { providerInstanceId, ...profile });
+  const memberRoute = (profile: NonNullable<WorkRosterMember["profile"]>) =>
+    workRouteLabel(catalog, {
+      // Roles from before members chose a provider ran on their model's team policy.
+      providerInstanceId:
+        profile.providerInstanceId ??
+        records
+          .flatMap((record) => (record.kind === "limits" && "model" in record ? [record] : []))
+          .filter((record) => record.model === profile.model)
+          // A disabled team keeps its policies disabled; the newest still names its provider.
+          .sort((a, b) => b.generation - a.generation)[0]?.providerInstanceId,
+      model: profile.model,
+      options: profile.options,
+    });
+  const editing = draft !== null && draft.view.kind !== "toggle";
+  const working = roster.filter((member) => member.activity.state === "running").length;
+  const canAct = draft === null && recorded !== null && recorded.kind !== "unreadable";
 
   return (
-    <>
+    <View className="gap-3">
+      <WorkHeading
+        title="Team"
+        trailing={
+          configured && !editing ? (
+            <WorkStatusChip
+              state={configured.enabled ? "active" : "paused"}
+              tone={configured.enabled ? "success" : "outline"}
+              label={configured.enabled ? "Enabled" : "Disabled"}
+              icon={null}
+            />
+          ) : undefined
+        }
+      />
       <WorkRecordsNotice set={limits} subject="team limits" />
       <WorkRecordsNotice set={roles} subject="role profiles" />
       <WorkRecordsNotice set={members} subject="team members" />
-      <ListSection
-        title="Team"
-        footer="Enabling a team doesn't start anything. Managed workers stay off until execution is available."
-      >
-        <WorkBlock>
-          {recorded === null ? (
-            <WorkText muted>Loading team…</WorkText>
-          ) : recorded.kind === "none" ? (
-            <WorkText>No team is configured for this project.</WorkText>
-          ) : recorded.kind === "unreadable" ? (
-            <WorkText muted>{recorded.reason}</WorkText>
-          ) : (
+      {recorded === null ? null : recorded.kind === "none" && !editing ? (
+        <View className="rounded-2xl border border-dashed border-border px-4 py-3">
+          <WorkText muted>
+            Meet Quinn, Iris, Sage, Otto, Vera and Wren. Set up a provider and models, then override
+            any name or role instructions.
+          </WorkText>
+        </View>
+      ) : recorded.kind === "unreadable" ? (
+        <WorkText muted>{recorded.reason}</WorkText>
+      ) : recorded.kind === "configured" && !editing ? (
+        <View className="gap-2">
+          <WorkStatRow>
+            {LIMIT_FIELDS.slice(0, 2).map(([field, label]) => (
+              <WorkStatTile key={field} value={recorded.values[field] ?? 0} label={label} />
+            ))}
+          </WorkStatRow>
+          <WorkStatRow>
+            {LIMIT_FIELDS.slice(2).map(([field, label]) => (
+              <WorkStatTile key={field} value={recorded.values[field] ?? 0} label={label} />
+            ))}
+          </WorkStatRow>
+        </View>
+      ) : null}
+      {canAct ? (
+        <ListSection footer="Enabling a team doesn't start anything. Workers start only from approved tasks.">
+          {configured ? (
             <>
-              <WorkText>
-                {recorded.values.enabled ? "Enabled" : "Disabled"} ·{" "}
-                {[
-                  ...new Set(
-                    recorded.values.profiles.map((profile) =>
-                      providerName(teamProviderOf(recorded.values, profile)),
-                    ),
-                  ),
-                ].join(" · ")}{" "}
-                · generation {recorded.generation}
-              </WorkText>
-              {recorded.values.profiles.map((profile) => (
-                <View key={profile.role} className="flex-row items-center gap-3">
-                  <WorkAgentAvatar
-                    role={profile.role}
-                    name={profile.name ?? profile.role}
-                    avatar={profile.avatar}
-                  />
-                  <View className="min-w-0 flex-1">
-                    <WorkText>{profile.name ?? workStateLabel(profile.role)}</WorkText>
-                    <WorkText muted>
-                      {workStateLabel(profile.role)} ·{" "}
-                      {routeLabel(teamProviderOf(recorded.values, profile), profile)} ·{" "}
-                      {MEMORY_LABELS[profile.memoryAccess]} memory
-                    </WorkText>
-                  </View>
-                </View>
-              ))}
-            </>
-          )}
-        </WorkBlock>
-        {draft === null && recorded !== null && recorded.kind !== "unreadable" ? (
-          <>
-            {configured ? (
               <ListActionRow
+                icon="slider.horizontal.3"
+                label="Edit team settings"
+                {...(blocked ? { description: blocked } : {})}
+                disabled={blocked !== null}
+                onPress={() => open({ kind: "settings" })}
+              />
+              <ListActionRow
+                icon={configured.enabled ? "pause" : "play"}
                 label={configured.enabled ? "Disable team…" : "Enable team…"}
                 {...(blocked ? { description: blocked } : {})}
                 disabled={blocked !== null}
                 onPress={() => open({ kind: "toggle" })}
               />
-            ) : null}
-            {configured ? (
-              <>
-                {configured.profiles.map((profile) => (
-                  <ListActionRow
-                    key={profile.role}
-                    icon="pencil"
-                    label={`Edit ${profile.name ?? workStateLabel(profile.role)}`}
-                    {...(blocked ? { description: blocked } : {})}
-                    disabled={blocked !== null}
-                    onPress={() => open({ kind: "member", role: profile.role })}
-                  />
-                ))}
-                <ListActionRow
-                  icon="slider.horizontal.3"
-                  label="Team settings"
-                  {...(blocked ? { description: blocked } : {})}
-                  disabled={blocked !== null}
-                  onPress={() => open({ kind: "settings" })}
-                />
-              </>
-            ) : (
-              <ListActionRow
-                icon="pencil"
-                label="Set up team"
-                {...(blocked ? { description: blocked } : {})}
-                disabled={blocked !== null}
-                onPress={() => open({ kind: "setup" })}
-              />
-            )}
-          </>
-        ) : null}
-      </ListSection>
+            </>
+          ) : (
+            <ListActionRow
+              icon="person.badge.plus"
+              label="Set up team"
+              {...(blocked ? { description: blocked } : {})}
+              disabled={blocked !== null}
+              onPress={() => open({ kind: "setup" })}
+            />
+          )}
+        </ListSection>
+      ) : null}
+      {configured && !editing && roster.length > 0 ? (
+        <WorkHeading
+          title="Members"
+          count={roster.length}
+          trailing={
+            <Text textRole="label" className="text-foreground-muted">
+              {working} working
+            </Text>
+          }
+        />
+      ) : null}
+      {configured && !editing
+        ? roster.map((member) => (
+            <MemberCard
+              key={member.recordId}
+              member={member}
+              scope={scope}
+              route={member.profile ? memberRoute(member.profile) : "Unavailable"}
+              onOpenTask={onOpenTask}
+              {...(blocked === null && draft === null
+                ? {
+                    onEdit: () => {
+                      const profile = configured.profiles.find(
+                        (entry) => entry.role === member.role,
+                      );
+                      if (profile) open({ kind: "member", role: profile.role });
+                    },
+                  }
+                : {})}
+            />
+          ))
+        : null}
       {draft !== null ? (
         <>
           {draft.view.kind === "toggle" ? (
@@ -323,7 +350,111 @@ export function WorkTeamSection({
           />
         </>
       ) : null}
-    </>
+    </View>
+  );
+}
+
+const countLabel = (count: number, noun: string) => `${count} ${noun}${count === 1 ? "" : "s"}`;
+
+/** One member: who, what they do, how they run, and the task they hold. */
+function MemberCard(props: {
+  readonly member: WorkRosterMember;
+  readonly scope: ProjectWorkScope;
+  readonly route: string;
+  readonly onOpenTask: (taskId: ProjectWorkTaskId) => void;
+  readonly onEdit?: () => void;
+}) {
+  const { member } = props;
+  const profile = member.profile;
+  const specialty =
+    PROJECT_TEAM_PRESETS[member.role as keyof typeof PROJECT_TEAM_PRESETS]?.specialty;
+  const facts = [
+    ["Model", props.route],
+    [
+      "Memory",
+      profile
+        ? `${MEMORY_LABELS[profile.memoryAccess as keyof typeof MEMORY_LABELS] ?? workStateLabel(profile.memoryAccess)}`
+        : "Unknown",
+    ],
+    ...(profile
+      ? [
+          [
+            "Access",
+            [
+              countLabel(profile.tools.length, "tool"),
+              countLabel(profile.skills.length, "skill"),
+              `depth ${profile.delegationDepth}`,
+            ].join(" · "),
+          ] as const,
+        ]
+      : []),
+  ] as const;
+  return (
+    <ListSection>
+      <View className="gap-3 px-4 pt-4 pb-3">
+        <View className="flex-row items-start gap-3">
+          <WorkMemberAvatar
+            role={member.role}
+            name={member.name}
+            avatar={member.avatar}
+            size={44}
+          />
+          <View className="min-w-0 flex-1 gap-0.5">
+            <View className="flex-row items-center gap-2">
+              <Text
+                textRole="body"
+                numberOfLines={1}
+                className="shrink font-t3-bold text-foreground"
+              >
+                {member.name}
+              </Text>
+              {member.coordinator ? <WorkTagChip label="Leads" /> : null}
+            </View>
+            <Text textRole="footnote" numberOfLines={1} className="text-foreground-muted">
+              {workStateLabel(member.role)}
+            </Text>
+          </View>
+          <WorkStatusChip
+            state={member.activity.state}
+            label={member.activity.label}
+            tone={member.activity.tone}
+          />
+        </View>
+        {specialty ? (
+          <Text textRole="footnote" numberOfLines={2} className="text-foreground-muted">
+            {specialty}
+          </Text>
+        ) : null}
+        <View className="gap-1 border-t border-separator pt-3">
+          {facts.map(([label, value]) => (
+            <View key={label} className="flex-row gap-3">
+              <Text textRole="label" className="w-16 text-foreground-tertiary">
+                {label}
+              </Text>
+              <Text textRole="label" numberOfLines={1} className="min-w-0 flex-1 text-foreground">
+                {value}
+              </Text>
+            </View>
+          ))}
+        </View>
+      </View>
+      {member.taskId ? (
+        <WorkTaskLink
+          scope={props.scope}
+          taskId={member.taskId as ProjectWorkTaskId}
+          onOpen={props.onOpenTask}
+        />
+      ) : (
+        <View className="border-t border-separator px-4 py-3">
+          <Text textRole="footnote" className="text-foreground-tertiary">
+            No task
+          </Text>
+        </View>
+      )}
+      {props.onEdit ? (
+        <ListActionRow icon="pencil" label={`Edit ${member.name}`} onPress={props.onEdit} />
+      ) : null}
+    </ListSection>
   );
 }
 

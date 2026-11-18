@@ -45,7 +45,7 @@ import { WorkField, WorkFormStatus, WorkMeta, WorkRow } from "./WorkLayout";
 import { WorkNotice, WorkPager, WorkRecordsNotice } from "./WorkNotice";
 import { workWriteBlockedReason } from "./useWorkRead";
 import { useWorkPage, useWorkRecords, workRecordsBlockedReason } from "./useWorkRecords";
-import { knowledgeLineage } from "./workLogic";
+import { knowledgeLineage } from "@t3tools/client-runtime/project-work-logic";
 import type { WorkWriter } from "./useWorkWriter";
 import { workStateLabel } from "./workModel";
 import { WorkStatusGlyph } from "./WorkStatus";

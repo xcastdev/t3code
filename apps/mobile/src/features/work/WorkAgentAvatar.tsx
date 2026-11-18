@@ -13,8 +13,12 @@ import Animated, {
 import Svg, { Circle, G, Path, Rect } from "react-native-svg";
 import { withUniwind } from "uniwind";
 import { AppText } from "../../components/ui/AppText";
-import { projectIconColorClassNames, projectMonogram } from "../../lib/projectIcon";
-import type { TeamRole } from "./workLogic";
+import {
+  projectAutoMonogram,
+  projectIconColorClassNames,
+  projectMonogram,
+} from "../../lib/projectIcon";
+import type { TeamRole } from "@t3tools/client-runtime/project-work-logic";
 
 const ThemedSvg = withUniwind(Svg);
 const AnimatedG = Animated.createAnimatedComponent(G);
@@ -55,7 +59,8 @@ export function WorkAgentAvatar({
   size = 40,
   preview = 0,
 }: {
-  role: TeamRole;
+  /** A team role's preset colors; without one the name picks them, as for projects. */
+  role?: TeamRole;
   name: string;
   avatar: ProjectTeamAvatar | null | undefined;
   size?: number;
@@ -76,14 +81,19 @@ export function WorkAgentAvatar({
   const eyes = useAnimatedProps(() => ({
     transform: `translate(20 20) scale(1 ${interpolate(progress.value, [0, 0.4, 0.45, 0.52, 0.65, 1], [1, 1, 0.1, 0.1, 1, 1])}) translate(-20 -20)`,
   }));
-  const preset = PROJECT_TEAM_PRESETS[role];
-  const colors = projectIconColorClassNames(preset.color);
+  const preset = role === undefined ? null : PROJECT_TEAM_PRESETS[role];
+  const nameGlyph = projectAutoMonogram(name);
+  const colors = projectIconColorClassNames(
+    preset?.color ?? (nameGlyph?.kind === "monogram" ? nameGlyph.color : "blue"),
+  );
   const monogram =
-    !name.trim() || name === role
-      ? preset.roleMonogram
-      : name === preset.name
-        ? preset.monogram
-        : projectMonogram(name);
+    preset === null
+      ? projectMonogram(name)
+      : !name.trim() || name === role
+        ? preset.roleMonogram
+        : name === preset.name
+          ? preset.monogram
+          : projectMonogram(name);
   const face = avatar ? agentFace(avatar) : null;
   return (
     <View

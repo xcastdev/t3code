@@ -47,10 +47,10 @@ import {
   type WorkProposalKind,
   type WorkMessageAction,
   type WorkQuestionRecord,
-} from "./workPresentation";
+} from "@t3tools/client-runtime/project-work-presentation";
 import { guidedFields, teamFields, useWorkReview, type WorkTaskSurface } from "./workTaskSurface";
 import { useWorkProviderCatalog } from "./useWorkProviderCatalog";
-import { workRouteLabel } from "./workLogic";
+import { workRouteLabel } from "@t3tools/client-runtime/project-work-logic";
 
 /**
  * Workers, questions and messages for one task. Starting a worker is its own

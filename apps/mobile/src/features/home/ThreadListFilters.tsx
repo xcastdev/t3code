@@ -9,19 +9,24 @@ import type {
 
 export function ThreadListFilters(props: {
   readonly environments: ReadonlyArray<HomeListFilterMenuEnvironment>;
-  readonly projects: ReadonlyArray<HomeListFilterMenuProject>;
   readonly selectedEnvironmentId: EnvironmentId | null;
-  readonly selectedProjectKey: string | null;
   readonly onEnvironmentChange: (environmentId: EnvironmentId | null) => void;
-  readonly onProjectChange: (projectKey: string | null) => void;
+  /** Threads also filter by project; agents have none. */
+  readonly project?: {
+    readonly projects: ReadonlyArray<HomeListFilterMenuProject>;
+    readonly selectedProjectKey: string | null;
+    readonly onProjectChange: (projectKey: string | null) => void;
+  };
   /** List padding the scroller bleeds through so pills start where row content does. */
   readonly gutter: number;
 }) {
+  const project = props.project;
+  const noun = project ? "threads" : "agents";
   const selectedEnvironment = props.environments.find(
     (environment) => environment.environmentId === props.selectedEnvironmentId,
   );
-  const selectedProject = props.projects.find(
-    (project) => project.key === props.selectedProjectKey,
+  const selectedProject = project?.projects.find(
+    (candidate) => candidate.key === project.selectedProjectKey,
   );
   return (
     <ScrollView
@@ -32,7 +37,7 @@ export function ThreadListFilters(props: {
     >
       <ListFilterMenu
         label={selectedEnvironment?.label ?? "All environments"}
-        accessibilityLabel="Filter threads by environment"
+        accessibilityLabel={`Filter ${noun} by environment`}
         active={selectedEnvironment !== undefined}
         actions={[
           {
@@ -59,40 +64,43 @@ export function ThreadListFilters(props: {
           }
         }}
       />
-      <ListFilterMenu
-        label={selectedProject?.label ?? "All projects"}
-        accessibilityLabel="Filter threads by project"
-        active={selectedProject !== undefined}
-        actions={[
-          {
-            id: "all",
-            title: "All projects",
-            state: props.selectedProjectKey === null ? "on" : "off",
-          },
-          ...props.projects.map((project) => ({
-            id: JSON.stringify(project.key),
-            title: project.label,
-            state: project.key === props.selectedProjectKey ? ("on" as const) : ("off" as const),
-          })),
-        ]}
-        onSelect={(id) => {
-          if (id === "all") props.onProjectChange(null);
-          else {
-            const project = props.projects.find(
-              (candidate) => JSON.stringify(candidate.key) === id,
-            );
-            if (project) props.onProjectChange(project.key);
-          }
-        }}
-      />
-      {props.selectedEnvironmentId !== null || props.selectedProjectKey !== null ? (
+      {project ? (
+        <ListFilterMenu
+          label={selectedProject?.label ?? "All projects"}
+          accessibilityLabel="Filter threads by project"
+          active={selectedProject !== undefined}
+          actions={[
+            {
+              id: "all",
+              title: "All projects",
+              state: project.selectedProjectKey === null ? "on" : "off",
+            },
+            ...project.projects.map((candidate) => ({
+              id: JSON.stringify(candidate.key),
+              title: candidate.label,
+              state:
+                candidate.key === project.selectedProjectKey ? ("on" as const) : ("off" as const),
+            })),
+          ]}
+          onSelect={(id) => {
+            if (id === "all") project.onProjectChange(null);
+            else {
+              const selected = project.projects.find(
+                (candidate) => JSON.stringify(candidate.key) === id,
+              );
+              if (selected) project.onProjectChange(selected.key);
+            }
+          }}
+        />
+      ) : null}
+      {props.selectedEnvironmentId !== null || (project?.selectedProjectKey ?? null) !== null ? (
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel="Reset thread filters"
+          accessibilityLabel={`Reset ${noun.slice(0, -1)} filters`}
           className="h-8 w-8 items-center justify-center"
           onPress={() => {
             props.onEnvironmentChange(null);
-            props.onProjectChange(null);
+            project?.onProjectChange(null);
           }}
         >
           <SymbolView name="xmark.circle.fill" size={18} tintColorClassName="accent-icon-muted" />

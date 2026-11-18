@@ -5,7 +5,7 @@ import { View } from "react-native";
 import type { AppBarProps } from "../../../components/ui/AppBar.types";
 import { AppBar } from "../../../components/ui/AppBar";
 import { ScreenContent as SettingsScreenContent } from "../../../components/ui/ScreenContent";
-import { useWorkspaceTabs } from "../../layout/workspace/WorkspaceTabsContext";
+import { useAdaptiveWorkspaceLayout } from "../../layout/adaptive-workspace-context";
 import { useDeviceType } from "../../../native/native-layout-metrics";
 import { useCompactWorkspaceTabs } from "../../layout/workspace/useSystemWorkspaceTabBar";
 import { useSettingsPageBack } from "../useSettingsPageBack";
@@ -26,13 +26,14 @@ export function SettingsScreen(
   },
 ) {
   const route = useRoute();
-  const workspace = useWorkspaceTabs();
+  const { layout } = useAdaptiveWorkspaceLayout();
   const deviceType = useDeviceType();
   const compactTabs = useCompactWorkspaceTabs();
   const back = useSettingsPageBack();
   const cover = deviceType === "duo-folded";
-  // Opened as a workspace tab, the Settings list has nothing to go back to.
-  const workspaceRoot = props.workspaceRoot || (workspace !== null && route.name === "Settings");
+  // Beside columns the Settings list is a workspace tab with nothing to go back to; without
+  // them it is a page pushed over the tabs.
+  const workspaceRoot = props.workspaceRoot || (layout.usesSplitView && route.name === "Settings");
 
   const surfaceClassName = workspaceRoot || cover ? "bg-screen" : "bg-sheet";
 

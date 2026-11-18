@@ -67,14 +67,23 @@ export function ThreadBackgroundWorkSheet({ route }: StaticScreenProps<Backgroun
   );
 }
 
-function BackgroundWorkRow(props: {
+export function BackgroundWorkRow(props: {
   readonly item: PendingBackgroundWorkItem;
   readonly onOpen: (threadId: ThreadId) => void;
+  readonly onStop?: (() => void) | undefined;
+  readonly stopping?: boolean;
+  readonly last?: boolean;
 }) {
   const { item } = props;
   const childThreadId = item.childThreadId;
   const row = (
-    <View className="flex-row items-center gap-3 border-b border-border py-3.5">
+    <View
+      className={
+        props.last
+          ? "min-h-12 flex-row items-center gap-3 py-3.5"
+          : "min-h-12 flex-row items-center gap-3 border-b border-border py-3.5"
+      }
+    >
       <SymbolView
         name={
           item.kind === "subagent" ? "person.2" : item.kind === "monitor" ? "clock" : "terminal"
@@ -87,6 +96,23 @@ function BackgroundWorkRow(props: {
         <Text className="font-t3-medium text-sm text-foreground">{item.label}</Text>
         <Text className="text-xs text-foreground-muted">{KIND_LABELS[item.kind]}</Text>
       </View>
+      {props.onStop ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={`Stop ${item.label}`}
+          disabled={props.stopping}
+          hitSlop={8}
+          onPress={props.onStop}
+          className="size-9 items-center justify-center rounded-full active:opacity-60"
+        >
+          <SymbolView
+            name="stop.fill"
+            size={13}
+            tintColorClassName={props.stopping ? "accent-icon-subtle" : "accent-danger-foreground"}
+            type="monochrome"
+          />
+        </Pressable>
+      ) : null}
       {childThreadId === undefined ? null : (
         <SymbolView name="chevron.right" size={12} tintColorClassName="accent-icon-subtle" />
       )}

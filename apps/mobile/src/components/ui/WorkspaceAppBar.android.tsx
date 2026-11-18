@@ -21,6 +21,7 @@ import { useToolbarLayout } from "./useToolbarLayout";
 const SEARCH_ICON = require("../../../assets/icons/search.xml");
 const FILTER_ICON = require("../../../assets/icons/filter.xml");
 const FILTER_FILLED_ICON = require("../../../assets/icons/filter-filled.xml");
+const SETTINGS_ICON = require("../../../assets/icons/settings.xml");
 // Material TopAppBar: 48dp icon buttons, the last one 4dp from the end.
 const ACTION_SIZE = 48;
 const ACTION_END_INSET = 4;
@@ -41,6 +42,11 @@ export interface WorkspaceAppBarProps {
     readonly customized: boolean;
     readonly actions: MenuAction[];
     readonly onSelect: (id: string) => void;
+  };
+  /** Home's way to Settings, which the tab bar no longer holds. */
+  readonly settings?: {
+    readonly accessibilityLabel: string;
+    readonly onPress: () => void;
   };
 }
 
@@ -127,7 +133,7 @@ export function WorkspaceAppBar(props: WorkspaceAppBarProps) {
  * by a frame whenever its size changes, which showed as the filter jumping between tabs.
  */
 function WorkspaceAppBarView(props: WorkspaceAppBarProps) {
-  const { search, filter } = props;
+  const { search, filter, settings } = props;
   const searching = search?.active === true;
   const { colors } = useControlTheme();
   const tint = colors["--color-header-foreground"];
@@ -181,10 +187,19 @@ function WorkspaceAppBarView(props: WorkspaceAppBarProps) {
               </View>
             </RNHostView>
           }
-          // Both slots always exist: Expo UI applies a child insert or removal a frame before the
+          // Every slot always exists: Expo UI applies a child insert or removal a frame before the
           // other children's new props, so changing the slot count drew the wrong glyph mid-switch.
+          // Settings leads, so tabs without it keep search and filter where they are.
           nativeActions={
             <>
+              <IconButton enabled={settings !== undefined} onClick={settings?.onPress}>
+                <Icon
+                  source={SETTINGS_ICON}
+                  size={24}
+                  tint={settings ? tint : "transparent"}
+                  contentDescription={settings?.accessibilityLabel}
+                />
+              </IconButton>
               <IconButton enabled={search !== undefined} onClick={search?.onOpen}>
                 <Icon
                   source={SEARCH_ICON}

@@ -5,7 +5,7 @@ import { useWorkspaceTabs } from "./WorkspaceTabsContext";
 export function useWorkspaceCompose() {
   const workspace = useWorkspaceTabs();
   const { startNewTask } = useAdaptiveWorkspaceLayout();
-  if (!workspace || workspace.settingsOpen || workspace.state.selectedTab !== "threads")
-    return null;
+  const tab = workspace?.state.selectedTab;
+  if (!workspace || workspace.settingsOpen || (tab !== "threads" && tab !== "agents")) return null;
   return { label: "New chat", onPress: startNewTask } as const;
 }

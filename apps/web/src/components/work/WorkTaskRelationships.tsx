@@ -9,7 +9,11 @@ import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../
 import { WorkReviewChanged } from "./WorkNotice";
 import { WorkField, WorkFormStatus, WorkMeta, WorkRow, WorkSection } from "./WorkLayout";
 import { WorkTaskLink, WorkTaskPicker } from "./WorkTaskRefs";
-import { RELATIONSHIP_KINDS, relationshipFromTask, relationshipKindLabel } from "./workLogic";
+import {
+  RELATIONSHIP_KINDS,
+  relationshipFromTask,
+  relationshipKindLabel,
+} from "@t3tools/client-runtime/project-work-logic";
 import { newCommandId, useWorkReview, type WorkTaskSurface } from "./workTaskSurface";
 
 type Kind = (typeof RELATIONSHIP_KINDS)[number];

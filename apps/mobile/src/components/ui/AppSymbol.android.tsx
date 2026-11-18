@@ -112,6 +112,7 @@ import IconPuzzle from "@tabler/icons-react-native/IconPuzzle";
 import IconQrcode from "@tabler/icons-react-native/IconQrcode";
 import IconRefresh from "@tabler/icons-react-native/IconRefresh";
 import IconRobot from "@tabler/icons-react-native/IconRobot";
+import { IconRobotHead } from "./IconRobotHead";
 import IconSearch from "@tabler/icons-react-native/IconSearch";
 import IconShare from "@tabler/icons-react-native/IconShare";
 import IconServer from "@tabler/icons-react-native/IconServer";
@@ -289,6 +290,7 @@ const ANDROID_ICON_BY_SF_SYMBOL = {
   "plus.bubble": IconMessagePlus,
   "ellipsis.bubble": IconMessageDots,
   robot: IconRobot,
+  "robot.head": IconRobotHead,
   "text.word.spacing": IconLetterSpacing,
   "textformat.size": IconTypography,
   "textformat.size.larger": IconTextIncrease,
@@ -309,7 +311,8 @@ const ANDROID_ICON_BY_SF_SYMBOL = {
     | "git.commit"
     | "git.issue"
     | "file.diff"
-    | "robot",
+    | "robot"
+    | "robot.head",
     Icon
   >
 >;
@@ -321,7 +324,8 @@ const SF_ICON_LOOKUP: Partial<
     | "git.commit"
     | "git.issue"
     | "file.diff"
-    | "robot",
+    | "robot"
+    | "robot.head",
     Icon
   >
 > = ANDROID_ICON_BY_SF_SYMBOL;

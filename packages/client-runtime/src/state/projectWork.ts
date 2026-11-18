@@ -459,6 +459,13 @@ export function createProjectWorkEnvironmentAtoms<R, E>(
       readonly input: ProjectWorkClientRead;
     }) => readFamily(projectWorkResourceKey(target)),
     stream: projectStream,
+    /** Refetches every read of one project, as a Work write does; pull-to-refresh uses it. */
+    refreshProject: (
+      registry: Parameters<typeof write.run>[0],
+      environmentId: EnvironmentId,
+      projectId: ProjectId,
+    ) =>
+      registry.update(mutation(projectKey(environmentId, projectId)), (revision) => revision + 1),
     write: {
       ...write,
       run: (

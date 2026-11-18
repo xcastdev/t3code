@@ -126,7 +126,7 @@ class T3WorkspaceNavigationView(
   private val onTabSelected by EventDispatcher()
   private val onNewThread by EventDispatcher()
   private val onOverlayChange by EventDispatcher()
-  var tabs by mutableStateOf(listOf("threads", "pullRequests", "issues", "work", "usage", "settings"))
+  var tabs by mutableStateOf(listOf("threads", "agents", "work", "pullRequests", "usage"))
   var selectedTab by mutableStateOf("threads")
   var rail by mutableStateOf(false)
   var floating by mutableStateOf(false)
@@ -321,7 +321,7 @@ class T3WorkspaceNavigationView(
           }
         }
         // Other tabs keep the button's slot so the destinations below never move between tabs.
-        if (selectedTab == "threads") {
+        if (selectedTab == "threads" || selectedTab == "agents") {
           newThreadButton(fraction) {
             expanded = false
             onNewThread(emptyMap<String, Any>())
@@ -414,6 +414,7 @@ class T3WorkspaceNavigationView(
 
   private fun tabTitle(tab: String) = when (tab) {
     "threads" -> "Chats"
+    "agents" -> "Agents"
     "pullRequests" -> "Pulls"
     "issues" -> "Issues"
     "usage" -> "Usage"
@@ -428,6 +429,7 @@ class T3WorkspaceNavigationView(
   private fun tabIconPainter(tab: String) = painterResource(
     when (tab) {
       "threads" -> R.drawable.t3_chats
+      "agents" -> R.drawable.t3_agents
       "pullRequests" -> R.drawable.t3_pull_requests
       "work" -> R.drawable.t3_work
       "issues" -> R.drawable.t3_issues

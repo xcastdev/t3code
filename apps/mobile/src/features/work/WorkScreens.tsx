@@ -1,45 +1,60 @@
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import {
   asProjectTeamRecord,
-  asProjectWorkBriefing,
   asProjectWorkDecision,
   asProjectWorkKnowledge,
-  asProjectWorkTask,
   asProjectWorkTaskContext,
   type ProjectWorkScope,
   type ProjectWorkSelection,
 } from "@t3tools/client-runtime/project-work";
+import {
+  existingTaskRefineChanged,
+  existingTaskRefineFields,
+  existingTaskRefineSnapshot,
+  knowledgeLineage,
+  type ExistingTaskRefineReview,
+} from "@t3tools/client-runtime/project-work-logic";
 import {
   EnvironmentId,
   ProjectId,
   ProjectIssueRepositoryBindingsRead,
   ProjectIssueRepositoryIdentityRead,
   ProjectIssueSyncReceipt,
-  ProjectWorkAttentionRead,
   ProjectWorkDecisionId,
   ProjectWorkKnowledgeId,
   ProjectWorkTaskId,
+  type ProjectWorkActorRead,
   type ProjectWorkDecisionRead,
   type ProjectWorkKnowledgeRead,
   type ProjectWorkTaskRead,
 } from "@t3tools/contracts";
-import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
+import { useNavigation, useRoute, type StaticScreenProps } from "@react-navigation/native";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import { useEffect, useState } from "react";
-import { View } from "react-native";
+import { use, useEffect, useState, type ReactNode } from "react";
+import { ScrollView as HorizontalScroll, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { RelativeTime } from "../../components/RelativeTime";
+import { AppBar } from "../../components/ui/AppBar";
+import type { AppBarAction } from "../../components/ui/AppBar.types";
+import { AppText as Text } from "../../components/ui/AppText";
 import { Chip } from "../../components/ui/Chip";
+import { EmptyState } from "../../components/ui/EmptyState";
 import { ListActionRow } from "../../components/ui/ListActionRow";
-import { ListRow } from "../../components/ui/ListRow";
 import { ListSection } from "../../components/ui/ListSection";
 import { Notice } from "../../components/ui/Notice";
-import { ScreenScrollView as ScrollView } from "../../components/ui/ScreenScrollView";
+import { RefreshControl } from "../../components/ui/RefreshControl";
+import { ScreenContent } from "../../components/ui/ScreenContent";
+import {
+  ScreenScrollView as ScrollView,
+  ScreenScrollViewSurface,
+} from "../../components/ui/ScreenScrollView";
 import { SegmentedControl } from "../../components/ui/SegmentedControl";
 import { uuidv4 } from "../../lib/uuid";
 import { appAtomRegistry } from "../../state/atom-registry";
 import { useProject } from "../../state/entities";
+import { useEnvironments } from "../../state/environments";
 import { projectWorkEnvironment } from "../../state/projectWork";
 import { SettingsScreen } from "../settings/components/SettingsScreen";
 import {
@@ -49,12 +64,13 @@ import {
   WorkPager,
   WorkReadNotice,
   WorkRecordsNotice,
-  WorkScopeLabel,
   WorkTaskLink,
   WorkTaskPicker,
   WorkText,
 } from "./WorkParts";
-import { WorkInboxSection, WorkProjectList, WorkSupervisionSection } from "./WorkOverviewSections";
+import { WorkHome, type WorkSectionName } from "./WorkHome";
+import { WorkOverview } from "./WorkOverview";
+import { WorkTaskList } from "./WorkTasks";
 import { WorkTeamSection } from "./WorkTeam";
 import {
   humanAttribution,
@@ -66,50 +82,90 @@ import {
   type WorkWriter,
 } from "./useWork";
 import { useWorkPage, useWorkRecords, workRecordsBlockedReason } from "./useWorkRecords";
+import { isIssueRecord, workStateLabel, type WorkIssueRecord } from "./workModel";
 import {
-  existingTaskRefineChanged,
-  existingTaskRefineFields,
-  existingTaskRefineSnapshot,
-  knowledgeLineage,
-  pageWindow,
-  type ExistingTaskRefineReview,
-} from "./workLogic";
-import {
-  isIssueRecord,
-  isMissionRecord,
-  workStateLabel,
-  type WorkIssueRecord,
-  type WorkMissionRecord,
-} from "./workModel";
+  WorkEmptyRow,
+  WorkHeading,
+  WorkSeparator,
+  WorkStatusChip,
+  WorkTagChip,
+} from "./WorkStatus";
 
-const isAttention = Schema.is(ProjectWorkAttentionRead);
 const decodeBindings = Schema.decodeUnknownOption(ProjectIssueRepositoryBindingsRead);
 const decodeIdentity = Schema.decodeUnknownOption(ProjectIssueRepositoryIdentityRead);
 const decodeReceipt = Schema.decodeUnknownOption(ProjectIssueSyncReceipt);
 const LIST_PAGE = 32;
 
-export { WorkProjectList };
-export type WorkSection = "overview" | "tasks" | "knowledge" | "intake";
+export type WorkSection = WorkSectionName;
+export const WORK_SECTIONS: ReadonlyArray<{ readonly value: WorkSection; readonly label: string }> =
+  [
+    { value: "overview", label: "Overview" },
+    { value: "tasks", label: "Tasks" },
+    { value: "team", label: "Team" },
+    { value: "knowledge", label: "Knowledge" },
+    { value: "intake", label: "Intake" },
+  ];
+const isSection = (value: unknown): value is WorkSection =>
+  WORK_SECTIONS.some((section) => section.value === value);
 
-function useScrollInsets() {
+function useBottomInset() {
   const insets = useSafeAreaInsets();
-  return { paddingBottom: Math.max(insets.bottom, 18) + 18 };
+  return Math.max(insets.bottom, 18) + 18;
 }
 
+/**
+ * The bar and surface of a Work page. Settings pages keep the Settings sheet look; the same
+ * page opened from the workspace is a plain page with native Back.
+ */
+export function WorkPageFrame(props: {
+  readonly title: string;
+  readonly subtitle?: string | null;
+  readonly actions?: ReadonlyArray<AppBarAction>;
+  readonly children: ReactNode;
+}) {
+  const route = useRoute();
+  const navigation = useNavigation();
+  if (route.name.startsWith("Settings"))
+    return (
+      <SettingsScreen title={props.title} {...(props.actions ? { actions: props.actions } : {})}>
+        {props.children}
+      </SettingsScreen>
+    );
+  return (
+    <View collapsable={false} className="flex-1 bg-screen">
+      <AppBar
+        title={props.title}
+        subtitle={props.subtitle ?? null}
+        {...(props.actions ? { actions: props.actions } : {})}
+        onBack={() => navigation.goBack()}
+        hideBottomBorder
+      />
+      <ScreenScrollViewSurface value="bg-screen">
+        <ScreenContent surface="screen">{props.children}</ScreenContent>
+      </ScreenScrollViewSurface>
+    </View>
+  );
+}
+
+/** Settings › Work: the same cross-project home the Work tab shows. */
 export function SettingsWorkRouteScreen() {
   const navigation = useNavigation();
-  const style = useScrollInsets();
+  const bottom = useBottomInset();
   return (
     <SettingsScreen title="Work">
       <ScrollView
         contentInsetAdjustmentBehavior="automatic"
         className="flex-1"
-        contentContainerClassName="gap-5 px-5 pt-4"
-        contentContainerStyle={style}
+        contentContainerClassName="gap-6 px-5 pt-4"
+        contentContainerStyle={{ paddingBottom: bottom }}
       >
-        <WorkProjectList
-          onOpenProject={(environmentId, projectId) =>
-            navigation.navigate("SettingsWorkProject", { environmentId, projectId })
+        <WorkHome
+          onOpenProject={(environmentId, projectId, section) =>
+            navigation.navigate("SettingsWorkProject", {
+              environmentId,
+              projectId,
+              ...(section ? { section } : {}),
+            })
           }
           onOpenTask={(environmentId, projectId, taskId) =>
             navigation.navigate("SettingsWorkTask", { environmentId, projectId, taskId })
@@ -123,44 +179,108 @@ export function SettingsWorkRouteScreen() {
 type ProjectProps = StaticScreenProps<{
   readonly environmentId: string;
   readonly projectId: string;
+  readonly section?: WorkSection;
 }>;
 
-export function SettingsWorkProjectRouteScreen({ route }: ProjectProps) {
+/**
+ * One project's Work, opened at a section. Serves both `ProjectWork` (workspace pages, such as
+ * from the Work tab or a thread's tools) and `SettingsWorkProject`.
+ */
+export function WorkProjectRouteScreen({ route }: ProjectProps) {
   const environmentId = EnvironmentId.make(route.params.environmentId);
   const projectId = ProjectId.make(route.params.projectId);
+  const section = isSection(route.params.section) ? route.params.section : "overview";
   const project = useProject(scopeProjectRef(environmentId, projectId));
+  const { environments, isReady } = useEnvironments();
+  const environment = environments.find((entry) => entry.environmentId === environmentId);
   const navigation = useNavigation();
-  const [section, setSection] = useState<WorkSection>("overview");
-  const style = useScrollInsets();
+  const settings = useRoute().name.startsWith("Settings");
+  const subtitle = environment
+    ? `${environment.label}${environment.connection.phase === "connected" ? "" : " · offline"}`
+    : null;
   return (
-    <SettingsScreen title={project?.title ?? "Work"}>
-      <ScrollView
-        contentInsetAdjustmentBehavior="automatic"
-        className="flex-1"
-        contentContainerClassName="gap-5 px-5 pt-4"
-        contentContainerStyle={style}
-      >
-        {project === null ? (
-          <WorkText muted>
-            This project isn't on the selected environment, or it was removed.
-          </WorkText>
-        ) : (
-          <WorkProjectContent
-            key={`${environmentId}:${projectId}`}
-            scope={{ environmentId, projectId, checkoutPath: project.workspaceRoot }}
-            section={section}
-            onSectionChange={setSection}
-            onOpenTask={(taskId) =>
-              navigation.navigate("SettingsWorkTask", { environmentId, projectId, taskId })
-            }
-          />
-        )}
-      </ScrollView>
-    </SettingsScreen>
+    <WorkPageFrame title={project?.title ?? "Work"} subtitle={subtitle}>
+      {project === null ? (
+        <EmptyState
+          variant="plain"
+          title={isReady ? "Project not found" : "Loading project…"}
+          detail={
+            isReady
+              ? "This project isn't on the selected environment, or it was removed."
+              : "Waiting for this environment's projects."
+          }
+        />
+      ) : (
+        <WorkProjectContent
+          key={`${environmentId}:${projectId}`}
+          scope={{ environmentId, projectId, checkoutPath: project.workspaceRoot }}
+          section={section}
+          onSectionChange={(next) => navigation.setParams({ section: next })}
+          onOpenTask={(taskId) =>
+            navigation.navigate(settings ? "SettingsWorkTask" : "WorkTask", {
+              environmentId,
+              projectId,
+              taskId,
+            })
+          }
+        />
+      )}
+    </WorkPageFrame>
   );
 }
 
-/** Work for one checkout. Hosts own navigation, so the Work tab and Settings share it. */
+/**
+ * Pull-to-refresh refetches every Work read of the project. It spins until the supervision
+ * read, which every section shows, has come back.
+ */
+function useProjectRefresh(scope: ProjectWorkScope) {
+  const view = useWorkRead(scope.environmentId, {
+    projectId: scope.projectId,
+    operation: "supervision",
+  });
+  const [pulled, setPulled] = useState<typeof view.result | null>(null);
+  const refreshing =
+    pulled !== null &&
+    view.status !== "disconnected" &&
+    (view.result === pulled || view.result.waiting);
+  if (pulled !== null && !refreshing) setPulled(null);
+  return {
+    refreshing,
+    onRefresh: () => {
+      setPulled(view.result);
+      projectWorkEnvironment.refreshProject(appAtomRegistry, scope.environmentId, scope.projectId);
+    },
+  };
+}
+
+/** The project's heading above its sections: checkout path, then the section tabs. */
+function ProjectSectionTabs(props: {
+  readonly section: WorkSection;
+  readonly onSectionChange: (section: WorkSection) => void;
+}) {
+  const surface = use(ScreenScrollViewSurface) ?? "bg-screen";
+  return (
+    <View className={surface}>
+      <HorizontalScroll
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerClassName="gap-2 py-2"
+        accessibilityRole="tablist"
+      >
+        {WORK_SECTIONS.map((entry) => (
+          <Chip
+            key={entry.value}
+            label={entry.label}
+            selected={props.section === entry.value}
+            onPress={() => props.onSectionChange(entry.value)}
+          />
+        ))}
+      </HorizontalScroll>
+    </View>
+  );
+}
+
+/** Work for one checkout, in web's sections. Hosts own navigation. */
 export function WorkProjectContent(props: {
   readonly scope: ProjectWorkScope;
   readonly section: WorkSection;
@@ -169,300 +289,74 @@ export function WorkProjectContent(props: {
 }) {
   const { scope, section, onOpenTask } = props;
   const writer = useWorkWriter(scope.environmentId);
-  return (
-    <>
-      <WorkScopeLabel scope={scope} />
-      <SegmentedControl
-        role="tab"
-        options={[
-          { value: "overview", label: "Overview" },
-          { value: "tasks", label: "Tasks" },
-          { value: "knowledge", label: "Knowledge" },
-          { value: "intake", label: "Intake" },
-        ]}
-        selected={section}
-        onSelect={props.onSectionChange}
+  const refresh = useProjectRefresh(scope);
+  const bottom = useBottomInset();
+  const refreshControl = (
+    <RefreshControl
+      refreshing={refresh.refreshing}
+      onRefresh={refresh.onRefresh}
+      tintColorClassName={String("accent-icon")}
+    />
+  );
+  const path = (
+    <Text
+      selectable
+      textRole="label"
+      numberOfLines={1}
+      ellipsizeMode="middle"
+      className="px-2 text-foreground-tertiary"
+    >
+      {scope.checkoutPath}
+    </Text>
+  );
+  const tabs = <ProjectSectionTabs section={section} onSectionChange={props.onSectionChange} />;
+  // The task list is long, so it is its own virtualized scroller with the page as its header.
+  if (section === "tasks")
+    return (
+      <WorkTaskList
+        scope={scope}
+        writer={writer}
+        header={
+          <View className="gap-2">
+            {path}
+            {tabs}
+          </View>
+        }
+        refreshControl={refreshControl}
+        bottomInset={bottom}
+        onOpenTask={onOpenTask}
       />
+    );
+  return (
+    <ScrollView
+      contentInsetAdjustmentBehavior="automatic"
+      className="flex-1"
+      contentContainerClassName="gap-6 px-5 pt-4"
+      contentContainerStyle={{ paddingBottom: bottom }}
+      keyboardShouldPersistTaps="handled"
+      stickyHeaderIndices={[1]}
+      refreshControl={refreshControl}
+    >
+      {path}
+      {tabs}
       {section === "overview" ? (
-        <Overview scope={scope} writer={writer} onOpenTask={onOpenTask} />
-      ) : section === "tasks" ? (
-        <Tasks scope={scope} writer={writer} onOpenTask={onOpenTask} />
+        <WorkOverview
+          scope={scope}
+          writer={writer}
+          onOpenTask={onOpenTask}
+          onOpenTeam={() => props.onSectionChange("team")}
+        />
+      ) : section === "team" ? (
+        <WorkTeamSection scope={scope} writer={writer} onOpenTask={onOpenTask} />
       ) : section === "knowledge" ? (
         <>
-          <Knowledge scope={scope} writer={writer} />
+          <Knowledge scope={scope} writer={writer} onOpenTask={onOpenTask} />
           <Decisions scope={scope} writer={writer} />
         </>
       ) : (
         <Intake scope={scope} writer={writer} />
       )}
-    </>
-  );
-}
-
-function Overview({
-  scope,
-  writer,
-  onOpenTask,
-}: {
-  scope: ProjectWorkScope;
-  writer: WorkWriter;
-  onOpenTask: (taskId: ProjectWorkTaskId) => void;
-}) {
-  const briefingView = useWorkRead(scope.environmentId, {
-    projectId: scope.projectId,
-    operation: "briefing",
-    kind: "standard",
-  });
-  const attention = useWorkPage(
-    scope.environmentId,
-    { projectId: scope.projectId, operation: "attention" },
-    LIST_PAGE,
-  );
-  const missions = useWorkPage(
-    scope.environmentId,
-    { projectId: scope.projectId, operation: "foundation-records", recordKind: "mission" },
-    LIST_PAGE,
-  );
-  const briefing = asProjectWorkBriefing(briefingView.value);
-  const attentionItems = (attention.view.page?.items ?? [])
-    .map((item) => item.value)
-    .filter(isAttention)
-    .filter((entry) => entry.resolvedAt === undefined);
-  const missionItems = (missions.view.page?.items ?? []).flatMap((item): WorkMissionRecord[] => {
-    const record = asProjectTeamRecord(item.value);
-    return record !== null && isMissionRecord(record) ? [record] : [];
-  });
-  return (
-    <>
-      <WorkReadNotice view={briefingView} subject="the brief" />
-      <ListSection title="Brief">
-        <WorkBlock>
-          <WorkText muted={briefing === null}>
-            {briefing ? (briefing.narrative ?? briefing.text) : "No brief is available yet."}
-          </WorkText>
-        </WorkBlock>
-      </ListSection>
-      <WorkSupervisionSection scope={scope} onOpenTask={onOpenTask} />
-      <WorkInboxSection scope={scope} writer={writer} onOpenTask={onOpenTask} />
-      <WorkReadNotice view={attention.view} subject="attention" />
-      <ListSection title="Needs attention">
-        {attentionItems.length === 0 ? (
-          <WorkBlock>
-            <WorkText muted>
-              {attention.offset === 0 ? "Nothing needs attention." : "Nothing open on this page."}
-            </WorkText>
-          </WorkBlock>
-        ) : (
-          attentionItems.map((entry) => (
-            <ListRow
-              key={`${entry.taskId}:${entry.reason}`}
-              icon="exclamationmark.triangle"
-              label={workStateLabel(entry.reason)}
-              {...(entry.detail ? { description: entry.detail } : {})}
-              onPress={() => onOpenTask(entry.taskId)}
-            />
-          ))
-        )}
-        <WorkPager pager={attention} noun="Items" />
-      </ListSection>
-      <WorkReadNotice view={missions.view} subject="missions" />
-      <ListSection title="Missions" footer="New missions come from refining an issue in Intake.">
-        {missionItems.length === 0 ? (
-          <WorkBlock>
-            <WorkText muted>
-              {missions.offset === 0 ? "No missions." : "No more missions."}
-            </WorkText>
-          </WorkBlock>
-        ) : (
-          missionItems.map((mission) => (
-            <MissionRow
-              key={mission.recordId}
-              scope={scope}
-              mission={mission}
-              onOpenTask={onOpenTask}
-            />
-          ))
-        )}
-        <WorkPager pager={missions} noun="Missions" />
-      </ListSection>
-      <WorkTeamSection scope={scope} writer={writer} />
-    </>
-  );
-}
-
-const REQUIRED_WINDOW = 10;
-
-function MissionRow(props: {
-  scope: ProjectWorkScope;
-  mission: WorkMissionRecord;
-  onOpenTask: (taskId: ProjectWorkTaskId) => void;
-}) {
-  const { mission } = props;
-  const [open, setOpen] = useState(false);
-  const [offset, setOffset] = useState(0);
-  const required = mission.requiredTaskIds;
-  const shown = required.slice(offset, offset + REQUIRED_WINDOW);
-  const window = pageWindow(
-    offset,
-    shown.length,
-    REQUIRED_WINDOW,
-    offset + REQUIRED_WINDOW < required.length,
-  );
-  return (
-    <View>
-      <WorkBlock>
-        <WorkText>{mission.title}</WorkText>
-        <WorkText muted>{workStateLabel(mission.status)}</WorkText>
-        {mission.objective ? <WorkText>{mission.objective}</WorkText> : null}
-      </WorkBlock>
-      <ListActionRow
-        icon={open ? "chevron.down" : "chevron.right"}
-        label={`${required.length} required ${required.length === 1 ? "task" : "tasks"}`}
-        disabled={required.length === 0}
-        onPress={() => setOpen(!open)}
-      />
-      {open
-        ? shown.map((taskId) => (
-            <WorkTaskLink
-              key={taskId}
-              scope={props.scope}
-              taskId={taskId}
-              onOpen={props.onOpenTask}
-            />
-          ))
-        : null}
-      {open && required.length > REQUIRED_WINDOW ? (
-        <WorkPager
-          noun="Tasks"
-          pager={{
-            window,
-            next: () => window.nextOffset !== null && setOffset(window.nextOffset),
-            previous: () => window.previousOffset !== null && setOffset(window.previousOffset),
-          }}
-        />
-      ) : null}
-    </View>
-  );
-}
-
-const DELIVERABLES = ["code", "research", "plan", "review", "non-code", "reminder"] as const;
-
-function Tasks({
-  scope,
-  writer,
-  onOpenTask,
-}: {
-  scope: ProjectWorkScope;
-  writer: WorkWriter;
-  onOpenTask: (taskId: ProjectWorkTaskId) => void;
-}) {
-  const pager = useWorkPage(
-    scope.environmentId,
-    { projectId: scope.projectId, operation: "tasks" },
-    LIST_PAGE,
-  );
-  const view = pager.view;
-  const tasks = (view.page?.items ?? []).flatMap((item): ProjectWorkTaskRead[] => {
-    const task = asProjectWorkTask(item.value);
-    return task === null || task.projectId !== scope.projectId ? [] : [task];
-  });
-  const blocked = workWriteBlockedReason(view, writer.canWrite);
-  const [creating, setCreating] = useState(false);
-  const [title, setTitle] = useState("");
-  const [kind, setKind] = useState<"guided" | "simple">("guided");
-  const [deliverable, setDeliverable] = useState<(typeof DELIVERABLES)[number]>("code");
-  const key = "task:create";
-  const create = async () => {
-    if (view.page === null) return;
-    const selected: ProjectWorkSelection = {
-      ...scope,
-      revision: view.page.revision,
-      taskRevision: 0,
-    };
-    const taskId = ProjectWorkTaskId.make(uuidv4());
-    const sent = await writer.submit(key, selected, selected, {
-      type: "project-work.task.create",
-      commandId: newCommandId(),
-      projectId: scope.projectId,
-      expectedRevision: selected.revision,
-      taskId,
-      title: title.trim(),
-      ...(kind === "guided" ? { deliverableKind: deliverable } : {}),
-      createdAt: new Date().toISOString(),
-    });
-    if (sent) {
-      setCreating(false);
-      setTitle("");
-      onOpenTask(taskId);
-    }
-  };
-  return (
-    <>
-      <WorkReadNotice view={view} subject="tasks" />
-      <ListSection title="Tasks">
-        {creating ? (
-          <WorkBlock>
-            <WorkInput label="Title" value={title} onChange={setTitle} />
-            <SegmentedControl
-              size="compact"
-              options={[
-                { value: "guided", label: "Guided" },
-                { value: "simple", label: "Simple" },
-              ]}
-              selected={kind}
-              onSelect={setKind}
-            />
-            {kind === "guided" ? (
-              <View className="flex-row flex-wrap gap-2">
-                {DELIVERABLES.map((value) => (
-                  <Chip
-                    key={value}
-                    label={workStateLabel(value)}
-                    selected={deliverable === value}
-                    onPress={() => setDeliverable(value)}
-                  />
-                ))}
-              </View>
-            ) : null}
-            <WorkText muted>
-              {kind === "guided"
-                ? "Guided tasks record scope and plan approvals. Approving never starts work."
-                : "Simple tasks keep a scope, criteria and one approval."}
-            </WorkText>
-            <WorkFormActions
-              submitLabel="Create task"
-              pending={writer.pendingKey === key}
-              disabled={title.trim() === "" || blocked !== null}
-              failure={writer.failureFor(key)}
-              onSubmit={() => void create()}
-              onCancel={() => setCreating(false)}
-            />
-          </WorkBlock>
-        ) : (
-          <ListActionRow
-            icon="plus"
-            label="New task"
-            {...(blocked ? { description: blocked } : {})}
-            disabled={blocked !== null}
-            onPress={() => setCreating(true)}
-          />
-        )}
-        {tasks.map((task) => (
-          <ListRow
-            key={task.taskId}
-            label={task.title}
-            description={`${workStateLabel(task.state)} · r${task.revision}`}
-            onPress={() => onOpenTask(task.taskId)}
-          />
-        ))}
-        {view.page !== null && tasks.length === 0 && !creating ? (
-          <WorkBlock>
-            <WorkText muted>{pager.offset === 0 ? "No tasks yet." : "No more tasks."}</WorkText>
-          </WorkBlock>
-        ) : null}
-        <WorkPager pager={pager} noun="Tasks" />
-      </ListSection>
-    </>
+    </ScrollView>
   );
 }
 
@@ -472,7 +366,15 @@ const projectSelection = (scope: ProjectWorkScope, revision: number): ProjectWor
   taskRevision: 0,
 });
 
-function Knowledge({ scope, writer }: { scope: ProjectWorkScope; writer: WorkWriter }) {
+function Knowledge({
+  scope,
+  writer,
+  onOpenTask,
+}: {
+  scope: ProjectWorkScope;
+  writer: WorkWriter;
+  onOpenTask: (taskId: ProjectWorkTaskId) => void;
+}) {
   const pager = useWorkPage(
     scope.environmentId,
     { projectId: scope.projectId, operation: "knowledge" },
@@ -551,16 +453,29 @@ function Knowledge({ scope, writer }: { scope: ProjectWorkScope; writer: WorkWri
   };
 
   return (
-    <>
+    <View className="gap-3">
       <WorkReadNotice view={view} subject="knowledge" />
       {history.complete && history.status === "ready" ? null : (
         <WorkRecordsNotice set={history} subject="knowledge history" />
       )}
-      <ListSection
+      <WorkHeading
         title="Knowledge"
-        footer="Revising keeps the earlier version as history and marks it replaced."
-      >
-        {editing !== null ? (
+        count={view.page === null ? null : entries.length}
+        detail="Facts and conventions people confirmed for this project. Revising keeps the earlier version."
+        trailing={
+          editing === null ? (
+            <Chip
+              label="Add"
+              icon="plus"
+              accessibilityLabel={blocked ?? "Add knowledge"}
+              disabled={blocked !== null}
+              onPress={() => open("new")}
+            />
+          ) : undefined
+        }
+      />
+      {editing !== null ? (
+        <ListSection>
           <WorkBlock>
             {editing !== "new" ? <WorkText muted>Revising “{editing.title}”</WorkText> : null}
             <WorkInput label="Title" value={title} onChange={setTitle} />
@@ -586,61 +501,162 @@ function Knowledge({ scope, writer }: { scope: ProjectWorkScope; writer: WorkWri
               }}
             />
           </WorkBlock>
-        ) : (
-          <ListActionRow
-            icon="plus"
-            label="Add knowledge"
-            {...(blocked ? { description: blocked } : {})}
-            disabled={blocked !== null}
-            onPress={() => open("new")}
+        </ListSection>
+      ) : null}
+      {view.page !== null && entries.length === 0 && editing === null ? (
+        <ListSection>
+          <WorkEmptyRow
+            title={pager.offset === 0 ? "No knowledge yet" : "No more knowledge"}
+            {...(pager.offset === 0
+              ? { detail: "Add what agents should always know about this project." }
+              : {})}
           />
-        )}
-        {entries.map((entry) => {
-          const replacement = lineage.supersededBy.get(entry.knowledgeId);
-          const predecessor =
-            entry.supersedesKnowledgeId === undefined
-              ? null
-              : (lineage.byId.get(entry.supersedesKnowledgeId) ?? null);
-          const reason = reviseReason(entry);
-          return (
-            <View key={entry.knowledgeId}>
-              <WorkBlock>
-                <WorkText muted={replacement !== undefined}>{entry.title}</WorkText>
-                {entry.body ? <WorkText muted>{entry.body}</WorkText> : null}
-                <WorkText muted>
-                  {history.complete
-                    ? replacement
-                      ? "Replaced"
-                      : "Current"
-                    : "Checking currentness"}
-                  {replacement ? ` by “${replacement.title}”` : ""}
-                  {entry.supersedesKnowledgeId !== undefined
-                    ? ` · replaces ${predecessor ? `“${predecessor.title}”` : "an earlier entry"}`
-                    : ""}
-                </WorkText>
-              </WorkBlock>
-              {replacement || editing !== null ? null : (
-                <ListActionRow
-                  icon="pencil"
-                  label="Revise…"
-                  {...(reason ? { description: reason } : {})}
-                  disabled={reason !== null}
-                  onPress={() => open(entry)}
-                />
-              )}
-            </View>
-          );
-        })}
-        {view.page !== null && entries.length === 0 && editing === null ? (
-          <WorkBlock>
-            <WorkText muted>
-              {pager.offset === 0 ? "No knowledge yet." : "No more knowledge."}
-            </WorkText>
-          </WorkBlock>
+        </ListSection>
+      ) : null}
+      {entries.map((entry) => {
+        const replacement = lineage.supersededBy.get(entry.knowledgeId);
+        const predecessor =
+          entry.supersedesKnowledgeId === undefined
+            ? null
+            : (lineage.byId.get(entry.supersedesKnowledgeId) ?? null);
+        const reason = reviseReason(entry);
+        return (
+          <KnowledgeCard
+            key={entry.knowledgeId}
+            scope={scope}
+            entry={entry}
+            status={history.complete ? (replacement ? "replaced" : "current") : null}
+            replacementTitle={replacement?.title ?? null}
+            predecessorTitle={
+              entry.supersedesKnowledgeId === undefined
+                ? null
+                : (predecessor?.title ?? "an earlier entry")
+            }
+            reviseBlocked={reason}
+            onRevise={replacement || editing !== null ? null : () => open(entry)}
+            onOpenTask={onOpenTask}
+          />
+        );
+      })}
+      <WorkPager pager={pager} noun="Entries" />
+    </View>
+  );
+}
+
+const SOURCE_LABEL: Record<string, string> = {
+  manual: "Added by hand",
+  task: "From a task",
+  thread: "From a thread",
+  session: "From a session",
+  worktree: "From a worktree",
+  attempt: "From an attempt",
+};
+
+function actorLabel(actor: ProjectWorkActorRead | undefined) {
+  if (actor === undefined) return null;
+  if (actor.displayName) return actor.displayName;
+  return actor.kind === "human"
+    ? "A person"
+    : actor.kind === "agent"
+      ? "An agent"
+      : workStateLabel(actor.kind);
+}
+
+function KnowledgeCard(props: {
+  readonly scope: ProjectWorkScope;
+  readonly entry: ProjectWorkKnowledgeRead;
+  readonly status: "current" | "replaced" | null;
+  readonly replacementTitle: string | null;
+  readonly predecessorTitle: string | null;
+  readonly reviseBlocked: string | null;
+  readonly onRevise: (() => void) | null;
+  readonly onOpenTask: (taskId: ProjectWorkTaskId) => void;
+}) {
+  const { entry } = props;
+  const [expanded, setExpanded] = useState(false);
+  const replaced = props.status === "replaced";
+  // Long entries clamp to an excerpt; the full text is one tap away.
+  const long = entry.body.length > 280 || entry.body.split("\n").length > 4;
+  const author = actorLabel(entry.attribution?.actor);
+  return (
+    <ListSection>
+      <View className="gap-2.5 px-4 pt-4 pb-3">
+        <View className="flex-row items-start gap-2">
+          <View className="min-w-0 flex-1 gap-0.5">
+            <Text
+              selectable
+              textRole="body"
+              className={
+                replaced ? "font-t3-bold text-foreground-muted" : "font-t3-bold text-foreground"
+              }
+            >
+              {entry.title}
+            </Text>
+            <Text textRole="label" className="text-foreground-tertiary">
+              {SOURCE_LABEL[entry.sourceKind] ??
+                `From ${workStateLabel(entry.sourceKind).toLowerCase()}`}
+            </Text>
+          </View>
+          {props.status === null ? null : (
+            <WorkStatusChip
+              state={replaced ? "superseded" : "accepted"}
+              label={replaced ? "Replaced" : "Current"}
+              icon={null}
+            />
+          )}
+        </View>
+        {entry.body ? (
+          <View className="items-start gap-1">
+            <Text
+              selectable
+              textRole="footnote"
+              numberOfLines={long && !expanded ? 4 : undefined}
+              className="text-foreground"
+            >
+              {entry.body}
+            </Text>
+            {long ? (
+              <Chip
+                size="small"
+                label={expanded ? "Show less" : "Show more"}
+                onPress={() => setExpanded(!expanded)}
+              />
+            ) : null}
+          </View>
         ) : null}
-        <WorkPager pager={pager} noun="Entries" />
-      </ListSection>
-    </>
+        {props.replacementTitle !== null ? (
+          <Text textRole="label" className="text-foreground-muted">
+            Replaced by “{props.replacementTitle}”
+          </Text>
+        ) : null}
+        {props.predecessorTitle !== null ? (
+          <Text textRole="label" className="text-foreground-muted">
+            Replaces “{props.predecessorTitle}”
+          </Text>
+        ) : null}
+        <Text textRole="label" className="text-foreground-tertiary">
+          {author ? `${author} · ` : ""}
+          <RelativeTime timestamp={entry.updatedAt} />
+        </Text>
+      </View>
+      {entry.sourceKind === "task" ? (
+        <WorkTaskLink
+          scope={props.scope}
+          taskId={ProjectWorkTaskId.make(entry.sourceId)}
+          prefix="From"
+          onOpen={props.onOpenTask}
+        />
+      ) : null}
+      {props.onRevise ? (
+        <ListActionRow
+          icon="pencil"
+          label="Revise…"
+          {...(props.reviseBlocked ? { description: props.reviseBlocked } : {})}
+          disabled={props.reviseBlocked !== null}
+          onPress={props.onRevise}
+        />
+      ) : null}
+    </ListSection>
   );
 }
 
@@ -819,33 +835,47 @@ function Decisions({ scope, writer }: { scope: ProjectWorkScope; writer: WorkWri
   };
 
   return (
-    <>
-      <WorkReadNotice view={view} subject="decisions" />
-      <ListSection
+    <View className="gap-2">
+      <WorkHeading
         title="Decisions"
-        footer="Proposed choices stay proposed until a person accepts or rejects them."
-      >
-        {formFor(null) ?? (
-          <ListActionRow
-            icon="plus"
-            label="Propose decision"
-            {...(blocked ? { description: blocked } : {})}
-            disabled={blocked !== null || form !== null}
-            onPress={() => open({ mode: "propose" })}
-          />
-        )}
-        {decisions.map((decision) => {
+        count={view.page === null ? null : decisions.length}
+        detail="Proposed choices stay proposed until a person accepts or rejects them."
+        trailing={
+          form === null ? (
+            <Chip
+              label="Propose"
+              icon="plus"
+              accessibilityLabel={blocked ?? "Propose decision"}
+              disabled={blocked !== null}
+              onPress={() => open({ mode: "propose" })}
+            />
+          ) : undefined
+        }
+      />
+      <WorkReadNotice view={view} subject="decisions" />
+      <ListSection>
+        {formFor(null)}
+        {decisions.map((decision, index) => {
           const decisionForm = formFor(decision);
           const failure = decisionForm === null ? writer.failureFor(keyFor(decision)) : null;
           return (
             <View key={decision.decisionId}>
+              {index > 0 || form?.mode === "propose" ? <WorkSeparator /> : null}
               <WorkBlock>
-                <WorkText>{decision.title}</WorkText>
-                {decision.body ? <WorkText>{decision.body}</WorkText> : null}
-                <WorkText muted>
-                  {workStateLabel(decision.state)}
-                  {decision.rejectionReason ? ` · ${decision.rejectionReason}` : ""}
-                </WorkText>
+                <View className="flex-row items-start gap-2">
+                  <Text
+                    selectable
+                    textRole="body"
+                    className="min-w-0 flex-1 font-t3-medium text-foreground"
+                  >
+                    {decision.title}
+                  </Text>
+                  <WorkStatusChip state={decision.state} />
+                </View>
+                {decision.body ? <WorkText muted>{decision.body}</WorkText> : null}
+                {decision.rejectionReason ? (
+                  <WorkText muted>Rejected: {decision.rejectionReason}</WorkText>
+                ) : null}
               </WorkBlock>
               {failure ? (
                 <WorkBlock>
@@ -878,15 +908,13 @@ function Decisions({ scope, writer }: { scope: ProjectWorkScope; writer: WorkWri
           );
         })}
         {view.page !== null && decisions.length === 0 && form === null ? (
-          <WorkBlock>
-            <WorkText muted>
-              {pager.offset === 0 ? "No decisions recorded." : "No more decisions."}
-            </WorkText>
-          </WorkBlock>
+          <WorkEmptyRow
+            title={pager.offset === 0 ? "No decisions recorded." : "No more decisions."}
+          />
         ) : null}
         <WorkPager pager={pager} noun="Decisions" />
       </ListSection>
-    </>
+    </View>
   );
 }
 
@@ -1017,9 +1045,21 @@ function Bindings({
             return (
               <View key={bindingKey(entry)}>
                 <WorkBlock>
-                  <WorkText>{entry.repositoryName || entry.repositoryNodeId}</WorkText>
+                  <View className="flex-row items-start gap-2">
+                    <Text
+                      selectable
+                      textRole="body"
+                      className="min-w-0 flex-1 font-t3-medium text-foreground"
+                    >
+                      {entry.repositoryName || entry.repositoryNodeId}
+                    </Text>
+                    <WorkStatusChip
+                      state={entry.status}
+                      tone={entry.status === "active" ? "success" : "outline"}
+                    />
+                  </View>
                   <WorkText muted>
-                    {workStateLabel(entry.status)} · {entry.host}
+                    {entry.host}
                     {entry.accountLogin ? ` · as ${entry.accountLogin}` : ""} · r
                     {entry.bindingRevision}
                   </WorkText>
@@ -1181,17 +1221,17 @@ function Issues({ scope, writer }: { scope: ProjectWorkScope; writer: WorkWriter
   const current = view.page ? projectSelection(scope, view.page.revision) : null;
   const blocked = workWriteBlockedReason(view, writer.canWrite);
   return (
-    <>
+    <View className="gap-2">
+      <WorkHeading title="Issues" count={view.page === null ? null : issues.length} />
       <WorkReadNotice view={view} subject="issues" />
-      <ListSection title="Issues">
+      <ListSection>
         {view.page !== null && issues.length === 0 ? (
-          <WorkBlock>
-            <WorkText muted>
-              {pager.offset === 0
-                ? "No issues copied in. Sync a bound repository."
-                : "No more issues."}
-            </WorkText>
-          </WorkBlock>
+          <WorkEmptyRow
+            title={pager.offset === 0 ? "No issues copied in" : "No more issues"}
+            {...(pager.offset === 0
+              ? { detail: "Sync a bound repository to bring its issues in." }
+              : {})}
+          />
         ) : null}
         {current
           ? issues.map((issue) => (
@@ -1207,7 +1247,7 @@ function Issues({ scope, writer }: { scope: ProjectWorkScope; writer: WorkWriter
           : null}
         <WorkPager pager={pager} noun="Issues" />
       </ListSection>
-    </>
+    </View>
   );
 }
 
@@ -1266,13 +1306,17 @@ function IssueRow(props: {
   return (
     <View>
       <WorkBlock>
-        <WorkText>
-          #{issue.identity.number} {issue.title}
-        </WorkText>
-        <WorkText muted>
-          {issue.repositoryName} · {workStateLabel(issue.status)}
-          {linked ? " · refined" : ""}
-        </WorkText>
+        <View className="flex-row items-start gap-2">
+          <Text selectable textRole="body" className="min-w-0 flex-1 text-foreground">
+            <Text className="font-mono text-foreground-muted">#{issue.identity.number}</Text>{" "}
+            {issue.title}
+          </Text>
+          <WorkStatusChip state={issue.status} />
+        </View>
+        <View className="flex-row flex-wrap items-center gap-1.5">
+          <WorkText muted>{issue.repositoryName}</WorkText>
+          {linked ? <WorkTagChip label="Refined" icon="checkmark" /> : null}
+        </View>
       </WorkBlock>
       {review.selected !== null ? (
         <WorkBlock>

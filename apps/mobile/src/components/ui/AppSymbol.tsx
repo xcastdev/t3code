@@ -8,6 +8,7 @@ import IconCircleDot from "@tabler/icons-react-native/IconCircleDot";
 import IconGitPullRequest from "@tabler/icons-react-native/IconGitPullRequest";
 import IconFileDiff from "@tabler/icons-react-native/IconFileDiff";
 import IconRobot from "@tabler/icons-react-native/IconRobot";
+import { IconRobotHead } from "./IconRobotHead";
 import { SymbolView as ExpoSymbolView } from "expo-symbols";
 import { withUniwind } from "uniwind";
 import type { AppSymbolViewProps } from "./AppSymbol.android";
@@ -26,6 +27,7 @@ const CUSTOM_ICONS = {
   "git.commit": IconGitCommit,
   "git.issue": IconCircleDot,
   robot: IconRobot,
+  "robot.head": IconRobotHead,
 };
 
 function AppSymbolView(props: AppSymbolViewProps) {

@@ -443,6 +443,18 @@
       "types": "./src/state/contextWindow.ts",
       "default": "./src/state/contextWindow.ts"
     },
+    "./state/thread-checklist": {
+      "types": "./src/state/threadChecklist.ts",
+      "default": "./src/state/threadChecklist.ts"
+    },
+    "./state/thread-details": {
+      "types": "./src/state/threadDetails.ts",
+      "default": "./src/state/threadDetails.ts"
+    },
+    "./state/changes-totals": {
+      "types": "./src/state/changesTotals.ts",
+      "default": "./src/state/changesTotals.ts"
+    },
     "./state/thread-subagents": {
       "types": "./src/state/threadSubagents.ts",
       "default": "./src/state/threadSubagents.ts"
@@ -639,6 +651,22 @@
       "types": "./src/projectWork.ts",
       "default": "./src/projectWork.ts"
     },
+    "./project-work-logic": {
+      "types": "./src/projectWorkLogic.ts",
+      "default": "./src/projectWorkLogic.ts"
+    },
+    "./project-work-presentation": {
+      "types": "./src/projectWorkPresentation.ts",
+      "default": "./src/projectWorkPresentation.ts"
+    },
+    "./project-work-team": {
+      "types": "./src/projectWorkTeam.ts",
+      "default": "./src/projectWorkTeam.ts"
+    },
+    "./state/work-attention": {
+      "types": "./src/state/workAttention.ts",
+      "default": "./src/state/workAttention.ts"
+    },
     "./state/mcp-catalog": {
       "types": "./src/state/mcpCatalog.ts",
       "default": "./src/state/mcpCatalog.ts"
@@ -671,6 +699,10 @@
       "types": "./src/composerManagedResources.ts",
       "default": "./src/composerManagedResources.ts"
     },
+    "./mcp-catalog-forms": {
+      "types": "./src/mcpCatalogForms.ts",
+      "default": "./src/mcpCatalogForms.ts"
+    },
     "./resource-actions": {
       "types": "./src/resourceActions.ts",
       "default": "./src/resourceActions.ts"
@@ -686,6 +718,10 @@
     "./state/assistants": {
       "types": "./src/state/assistants.ts",
       "default": "./src/state/assistants.ts"
+    },
+    "./state/agents-list": {
+      "types": "./src/state/agentsList.ts",
+      "default": "./src/state/agentsList.ts"
     },
     "./state/external-notifications": {
       "types": "./src/state/externalNotificationCommands.ts",

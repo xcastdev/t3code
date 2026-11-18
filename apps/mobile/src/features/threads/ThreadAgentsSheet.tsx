@@ -50,8 +50,62 @@ export function useThreadTurnSubagents(target: AgentsTarget | null): ThreadTurnS
 export function ThreadAgentsSheet({ route }: StaticScreenProps<AgentsTarget>) {
   const target = route.params;
   const navigation = useNavigation();
-  const openInspector = useOpenThreadInspector();
   const insets = useSafeAreaInsets();
+  const openThread = useOpenThreadFromSheet(target);
+  return (
+    <View collapsable={false} className="flex-1 bg-sheet">
+      <SheetHeader title="Agents" onClose={() => navigation.goBack()} />
+      <ScreenContent>
+        <ScrollView
+          nestedScrollEnabled
+          className="flex-1"
+          // UIKit must inset content beneath the floating translucent iOS header.
+          contentInsetAdjustmentBehavior="automatic"
+          contentContainerClassName="px-5 pb-6"
+          contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 16) + 8 }}
+        >
+          <ThreadAgentsList target={target} onOpenThread={openThread} />
+        </ScrollView>
+      </ScreenContent>
+    </View>
+  );
+}
+
+/**
+ * Opens another thread from a sheet over the thread: in the inspector where there is one, else
+ * replacing this leaf sheet so the thread enters the workspace stack Home's Back button expects.
+ */
+export function useOpenThreadFromSheet(target: AgentsTarget) {
+  const navigation = useNavigation();
+  const openInspector = useOpenThreadInspector();
+  return (child: { readonly environmentId: EnvironmentId; readonly threadId: ThreadId }) => {
+    void Haptics.selectionAsync();
+    if (
+      openInspector(target, {
+        type: "thread",
+        environmentId: child.environmentId,
+        threadId: child.threadId,
+      })
+    )
+      return;
+    navigation.dispatch(
+      StackActions.replace("Thread", {
+        environmentId: child.environmentId,
+        threadId: child.threadId,
+      }),
+    );
+  };
+}
+
+/** The turn's agents with their stop buttons; empty when the turn has none. */
+export function ThreadAgentsList(props: {
+  readonly target: AgentsTarget;
+  readonly onOpenThread: (child: {
+    readonly environmentId: EnvironmentId;
+    readonly threadId: ThreadId;
+  }) => void;
+}) {
+  const { target, onOpenThread } = props;
   const turn = useThreadTurnSubagents(target);
   const subagents = turn?.subagents ?? [];
   const hasLiveAgent = (turn?.liveCount ?? 0) > 0;
@@ -63,45 +117,10 @@ export function ThreadAgentsSheet({ route }: StaticScreenProps<AgentsTarget>) {
     projection: thread?.projection ?? null,
     history,
   });
-  const workflowGroups = useMemo(
-    () =>
-      new Map(
-        deriveWorkflowGroups(projectedSubagentsToRuntime(subagents)).map((group) => [
-          group.workflow.id,
-          group,
-        ]),
-      ),
-    [subagents],
-  );
+  const workflowGroups = useWorkflowGroups(subagents);
 
-  const openChildThread = (child: { environmentId: EnvironmentId; threadId: ThreadId }) => {
-    void Haptics.selectionAsync();
-    if (
-      openInspector(target, {
-        type: "thread",
-        environmentId: child.environmentId,
-        threadId: child.threadId,
-      })
-    )
-      return;
-    // Replace this leaf sheet so the child enters the workspace stack expected by Home's Back button.
-    navigation.dispatch(
-      StackActions.replace("Thread", {
-        environmentId: child.environmentId,
-        threadId: child.threadId,
-      }),
-    );
-  };
-
-  const content = (
-    <ScrollView
-      nestedScrollEnabled
-      className="flex-1"
-      // UIKit must inset content beneath the floating translucent iOS header.
-      contentInsetAdjustmentBehavior="automatic"
-      contentContainerClassName="px-5 pb-6"
-      contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 16) + 8 }}
-    >
+  return (
+    <>
       {work ? (
         <Text className="pt-3 text-xs text-foreground-muted">
           This turn: {work.messageCount} messages · {work.commandCount} commands ·{" "}
@@ -114,46 +133,93 @@ export function ThreadAgentsSheet({ route }: StaticScreenProps<AgentsTarget>) {
           No agents in this turn.
         </Text>
       ) : (
-        subagents.map((subagent) => {
-          const group = workflowGroups.get(subagent.id);
-          return group === undefined ? (
-            <View key={subagent.id} className="border-b border-border">
-              <AgentRow
-                subagent={subagent}
-                environmentId={target.environmentId}
-                tickSeconds={hasLiveAgent}
-                onOpen={openChildThread}
-              />
-            </View>
-          ) : (
-            <ThreadWorkflowGroup
-              key={subagent.id}
-              environmentId={target.environmentId}
-              subagent={subagent}
-              group={group}
-              onOpen={(threadId) =>
-                openChildThread({ environmentId: target.environmentId, threadId })
-              }
-            />
-          );
-        })
+        <ThreadAgentRows
+          environmentId={target.environmentId}
+          subagents={subagents}
+          workflowGroups={workflowGroups}
+          tickSeconds={hasLiveAgent}
+          onOpenThread={onOpenThread}
+        />
       )}
-    </ScrollView>
-  );
-
-  return (
-    <View collapsable={false} className="flex-1 bg-sheet">
-      <SheetHeader title="Agents" onClose={() => navigation.goBack()} />
-      <ScreenContent>{content}</ScreenContent>
-    </View>
+    </>
   );
 }
+
+export function useWorkflowGroups(subagents: ReadonlyArray<OrchestrationV2Subagent>) {
+  return useMemo(
+    () =>
+      new Map(
+        deriveWorkflowGroups(projectedSubagentsToRuntime(subagents)).map((group) => [
+          group.workflow.id,
+          group,
+        ]),
+      ),
+    [subagents],
+  );
+}
+
+/** Agent rows with their stop buttons; a workflow's agent shows its phases instead. */
+export function ThreadAgentRows(props: {
+  readonly environmentId: EnvironmentId;
+  readonly subagents: ReadonlyArray<OrchestrationV2Subagent>;
+  readonly workflowGroups: ReturnType<typeof useWorkflowGroups>;
+  readonly tickSeconds: boolean;
+  readonly onOpenThread: OpenAgentThread;
+  /** Failures not yet seen show their elapsed time in red. */
+  readonly isUnseenFailure?: (subagent: OrchestrationV2Subagent) => boolean;
+  readonly onOpened?: (subagent: OrchestrationV2Subagent) => void;
+  /** Rule between rows instead of under each, for rows inside a grouped card. */
+  readonly dividedBetween?: boolean;
+}) {
+  const { environmentId, onOpenThread } = props;
+  return props.subagents.map((subagent, index) => {
+    const group = props.workflowGroups.get(subagent.id);
+    const open: OpenAgentThread = (child) => {
+      props.onOpened?.(subagent);
+      onOpenThread(child);
+    };
+    return group === undefined ? (
+      <View
+        key={subagent.id}
+        className={
+          !props.dividedBetween
+            ? "border-b border-border"
+            : index === 0
+              ? undefined
+              : "border-t border-border-subtle"
+        }
+      >
+        <AgentRow
+          subagent={subagent}
+          environmentId={environmentId}
+          tickSeconds={props.tickSeconds}
+          failed={props.isUnseenFailure?.(subagent) ?? false}
+          onOpen={open}
+        />
+      </View>
+    ) : (
+      <ThreadWorkflowGroup
+        key={subagent.id}
+        environmentId={environmentId}
+        subagent={subagent}
+        group={group}
+        onOpen={(threadId) => open({ environmentId, threadId })}
+      />
+    );
+  });
+}
+
+type OpenAgentThread = (child: {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+}) => void;
 
 function AgentRow(props: {
   readonly environmentId: EnvironmentId;
   readonly subagent: OrchestrationV2Subagent;
   readonly tickSeconds: boolean;
-  readonly onOpen: (child: { environmentId: EnvironmentId; threadId: ThreadId }) => void;
+  readonly failed: boolean;
+  readonly onOpen: OpenAgentThread;
 }) {
   const { subagent } = props;
   const { presentationById } = useEnvironments();
@@ -167,7 +233,9 @@ function AgentRow(props: {
         environmentId={props.environmentId}
         subagent={subagent}
         canOpenRemote={target !== null}
-        elapsed={<AgentElapsed subagent={subagent} tickSeconds={props.tickSeconds} />}
+        elapsed={
+          <AgentElapsed subagent={subagent} tickSeconds={props.tickSeconds} failed={props.failed} />
+        }
       />
     </View>
   );
@@ -207,10 +275,20 @@ function AgentRow(props: {
 function AgentElapsed(props: {
   readonly subagent: OrchestrationV2Subagent;
   readonly tickSeconds: boolean;
+  readonly failed: boolean;
 }) {
   const elapsed = useSubagentElapsed(props.subagent, props.tickSeconds);
   return elapsed === null ? null : (
-    <Text className="shrink-0 text-xs tabular-nums text-foreground-muted">{elapsed}</Text>
+    <Text
+      accessibilityLabel={props.failed ? `Failed, ${elapsed}` : undefined}
+      className={
+        props.failed
+          ? "shrink-0 text-xs tabular-nums text-danger-foreground"
+          : "shrink-0 text-xs tabular-nums text-foreground-muted"
+      }
+    >
+      {elapsed}
+    </Text>
   );
 }
 

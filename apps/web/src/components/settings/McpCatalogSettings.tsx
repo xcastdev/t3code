@@ -48,8 +48,7 @@ import {
 import {
   EMPTY_MCP_SERVER_FORM,
   mcpApplicationSummary,
-  mcpCatalogRows,
-  matchesResourceQuery,
+  mcpCatalogDestinationView,
   mcpDefinitionInputFromForm,
   mcpFormFromDefinition,
   mcpOverrideFieldsFromRow,
@@ -65,8 +64,8 @@ import {
   type McpOverrideFields,
   type McpOverridePatch,
   type McpServerForm,
-  type ResourceSettingsTarget,
-} from "./resourceInventory";
+} from "@t3tools/client-runtime/mcp-catalog-forms";
+import { matchesResourceQuery, type ResourceSettingsTarget } from "./resourceInventory";
 import { SettingsSection } from "./settingsLayout";
 import { useResourceCommand, type ResourceCommandRunner } from "./useResourceCommand";
 
@@ -143,38 +142,29 @@ export function useMcpCatalogView(target: ResourceSettingsTarget) {
           input: { scope: "session", scopeId: snapshot.catalogSessionId },
         }),
   );
-  const view = (() => {
-    if (globalRead.data === null) return null;
-    if (target.projectId === null)
-      return {
-        own: globalRead,
-        scope: { scope: "global" as const, scopeId: environmentId },
-        rows: mcpCatalogRows({ inherited: [], own: globalRead.data.definitions, overrides: [] }),
-      };
-    if (projectRead.data === null) return null;
-    const projectRows = mcpCatalogRows({
-      inherited: globalRead.data.definitions,
-      own: projectRead.data.definitions,
-      overrides: projectRead.data.overrides,
-    });
-    if (target.threadId === null)
-      return {
-        own: projectRead,
-        scope: { scope: "project" as const, scopeId: target.projectId },
-        rows: projectRows,
-      };
-    if (snapshot === null || sessionRead.data === null)
-      return { own: null, scope: null, rows: projectRows };
-    return {
-      own: sessionRead,
-      scope: { scope: "session" as const, scopeId: snapshot.catalogSessionId },
-      rows: mcpCatalogRows({
-        inherited: snapshot.baseline,
-        own: sessionRead.data.definitions,
-        overrides: sessionRead.data.overrides,
-      }),
-    };
-  })();
+  const destination = mcpCatalogDestinationView({
+    environmentId,
+    projectId: target.projectId,
+    threadId: target.threadId,
+    global: globalRead.data,
+    project: projectRead.data,
+    snapshot,
+    session: sessionRead.data,
+  });
+  const view =
+    destination === null
+      ? null
+      : {
+          ...destination,
+          own:
+            destination.scope === null
+              ? null
+              : destination.scope.scope === "global"
+                ? globalRead
+                : destination.scope.scope === "project"
+                  ? projectRead
+                  : sessionRead,
+        };
   return { globalRead, projectRead, threadSession, snapshot, sessionRead, view };
 }
 

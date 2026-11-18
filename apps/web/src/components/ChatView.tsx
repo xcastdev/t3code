@@ -312,7 +312,7 @@ import type { AssistantCitationRequest } from "./chat/AssistantCitationSource";
 import { useCitedHistory } from "./chat/citationProcedure";
 import type { MessagesTimelineHistoryControls } from "./chat/MessagesTimeline";
 import { ThreadTimeline } from "./chat/ThreadTimeline";
-import { checklistProgressByRun } from "./chat/ThreadDetailsSections.logic";
+import { checklistProgressByRun } from "@t3tools/client-runtime/state/thread-checklist";
 import { NativeChildWorkDialog } from "./chat/NativeChildWorkDialog";
 import { ProviderSubagentBar } from "./chat/ProviderSubagentBar";
 import { latestRunWork as deriveLatestRunWork } from "./chat/runWorkSummary";

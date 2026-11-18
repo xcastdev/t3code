@@ -14,19 +14,26 @@ import {
 } from "./navigation-tab-order";
 
 describe("navigation tab order", () => {
-  it("enables customization only above four registered sections, excluding Settings", () => {
+  it("enables customization only when the sections outnumber the five tab slots", () => {
     expect(navigationCustomizationAvailable()).toBe(false);
-    expect(navigationCustomizationAvailable(3)).toBe(false);
-    expect(navigationCustomizationAvailable(4)).toBe(false);
-    expect(navigationCustomizationAvailable(5)).toBe(true);
+    expect(navigationCustomizationAvailable(5)).toBe(false);
     expect(navigationCustomizationAvailable(6)).toBe(true);
   });
 
-  it("fills missing sections and drops removed placeholders, duplicates, and Settings", () => {
+  it("fills missing sections after their default neighbour and drops unknown entries", () => {
     expect(
       resolveNavigationTabOrder(["usage", "home", "inbox", "settings", "usage", null]),
-    ).toEqual(["usage", "threads", "pullRequests", "issues", "work"]);
+    ).toEqual(["usage", "threads", "agents", "work", "pullRequests", "issues"]);
     expect(resolveNavigationTabOrder()).toEqual(NAVIGATION_TAB_ORDER);
+  });
+
+  it("inserts Agents after Chats in an order saved before it existed", () => {
+    expect(
+      resolveNavigationTabOrder(["threads", "pullRequests", "issues", "work", "usage"]),
+    ).toEqual(["threads", "agents", "pullRequests", "issues", "work", "usage"]);
+    expect(
+      resolveNavigationTabOrder(["usage", "work", "threads", "pullRequests", "issues"]),
+    ).toEqual(["usage", "work", "threads", "agents", "pullRequests", "issues"]);
   });
 
   it("gives the shared slot to the open list, or else the one opened last", () => {
@@ -48,14 +55,15 @@ describe("navigation tab order", () => {
     }
   });
 
-  it("shows every real section without overflow and keeps Settings selected during editing", () => {
+  it("fits Chats, Agents, Work, PRs and Usage in the bar and selects nothing in it for Settings", () => {
     expect(visibleNavigationTabs(undefined, ["issues"])).toEqual([
       "threads",
-      "pullRequests",
+      "agents",
       "work",
+      "pullRequests",
       "usage",
     ]);
-    expect(visibleNavigationTabs(undefined, [], 5)).toEqual(NAVIGATION_TAB_ORDER);
+    expect(visibleNavigationTabs(undefined, [], 6)).toEqual(NAVIGATION_TAB_ORDER);
     expect(overflowNavigationTabs(undefined, ["issues"])).toEqual([]);
     expect(selectedNavigationTab(undefined, "threads", true)).toBe("settings");
     expect(selectedNavigationTab(undefined, "usage", false, ["issues"])).toBe("usage");
@@ -67,19 +75,20 @@ describe("navigation tab order", () => {
     const hidden = toggleNavigationTabVisibility([], "usage");
     expect(enabledNavigationTabs(order, hidden)).toEqual([
       "threads",
+      "agents",
+      "work",
       "pullRequests",
       "issues",
-      "work",
     ]);
     expect(toggleNavigationTabVisibility(hidden, "usage")).toEqual([]);
-    expect(visibleNavigationTabs(order, [], 5)).toEqual(order);
+    expect(visibleNavigationTabs(order, [], 6)).toEqual(order);
     expect(enabledNavigationTabs(undefined, ["home", "inbox", "settings"])).toEqual(
       NAVIGATION_TAB_ORDER,
     );
   });
 
   it("falls back when the selected section is hidden, including when all are hidden", () => {
-    expect(resolveSelectedNavigationTab(undefined, ["threads"], "threads")).toBe("pullRequests");
+    expect(resolveSelectedNavigationTab(undefined, ["threads"], "threads")).toBe("agents");
     expect(resolveSelectedNavigationTab(undefined, ["threads"], "usage")).toBe("usage");
     expect(
       resolveSelectedNavigationTab(undefined, NAVIGATION_TAB_ORDER, "threads"),

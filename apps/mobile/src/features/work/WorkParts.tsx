@@ -8,7 +8,6 @@ import { Button } from "../../components/ui/Button";
 import { ListChoiceRow } from "../../components/ui/ListChoiceRow";
 import { ListRow } from "../../components/ui/ListRow";
 import { Notice } from "../../components/ui/Notice";
-import { useEnvironments } from "../../state/environments";
 import { useWorkRead, workReadMessage, type WorkReadView } from "./useWork";
 import { useWorkPage, type WorkPageView, type WorkRecordsView } from "./useWorkRecords";
 import { workStateLabel } from "./workModel";
@@ -177,22 +176,6 @@ export function WorkPager({
         />
       </View>
     </View>
-  );
-}
-
-/** Which environment and checkout a Work view acts on; two checkouts can share a title. */
-export function useWorkScopeLabel(scope: ProjectWorkScope): string {
-  const { environments } = useEnvironments();
-  const environment = environments.find((entry) => entry.environmentId === scope.environmentId);
-  return `${environment?.label ?? "Environment"} · ${scope.checkoutPath}`;
-}
-
-export function WorkScopeLabel({ scope }: { scope: ProjectWorkScope }) {
-  const label = useWorkScopeLabel(scope);
-  return (
-    <Text selectable textRole="footnote" className="text-foreground-muted">
-      {label}
-    </Text>
   );
 }
 

@@ -68,6 +68,7 @@ import { GitConfirmSheet } from "./features/threads/git/GitConfirmSheet";
 import { GitOverviewSheet } from "./features/threads/git/GitOverviewSheet";
 import { ThreadPullRequestsSheet } from "./features/threads/ThreadPullRequestsSheet";
 import { ThreadAgentsSheet } from "./features/threads/ThreadAgentsSheet";
+import { ThreadLiveDetailsSheet } from "./features/threads/ThreadLiveDetailsSheet";
 import { ThreadHistorySheet } from "./features/thread-history/ThreadHistorySheet";
 import { ThreadBackgroundWorkSheet } from "./features/threads/ThreadBackgroundWorkSheet";
 import { ThreadQueueSheet } from "./features/threads/ThreadQueueControl";
@@ -138,11 +139,8 @@ import { UsageLimitAccountScreen } from "./features/usage/UsageLimitsPooled";
 import { UsageRouteScreen } from "./features/usage/UsageRouteScreen";
 import { PluginPanelRouteScreen } from "./features/plugins/PluginPanelRouteScreen";
 import { PluginsSettingsRouteScreen } from "./features/plugins/PluginsSettingsRouteScreen";
-import {
-  SettingsWorkProjectRouteScreen,
-  SettingsWorkRouteScreen,
-} from "./features/work/WorkScreens";
-import { SettingsWorkTaskRouteScreen } from "./features/work/WorkTaskScreen";
+import { SettingsWorkRouteScreen, WorkProjectRouteScreen } from "./features/work/WorkScreens";
+import { WorkTaskRouteScreen } from "./features/work/WorkTaskScreen";
 import {
   SettingsAgentRouteScreen,
   SettingsAgentsRouteScreen,
@@ -193,7 +191,7 @@ const SETTINGS_SCREENS = {
     screen: SettingsRouteScreen,
     linking: "settings",
     options: {
-      ...pageRoute({ title: "Settings", itemStyle: "standard", root: true }),
+      ...pageRoute({ title: "Settings", itemStyle: "standard" }),
       ...(Platform.OS === "android" ? { animation: "none" as const } : {}),
     },
   }),
@@ -396,12 +394,12 @@ const SETTINGS_SCREENS = {
     options: settingsPage("Work"),
   }),
   SettingsWorkProject: createNativeStackScreen({
-    screen: SettingsWorkProjectRouteScreen,
+    screen: WorkProjectRouteScreen,
     linking: "settings/work/:environmentId/:projectId",
     options: settingsPage("Work"),
   }),
   SettingsWorkTask: createNativeStackScreen({
-    screen: SettingsWorkTaskRouteScreen,
+    screen: WorkTaskRouteScreen,
     linking: "settings/work/:environmentId/:projectId/:taskId",
     options: settingsPage("Task"),
   }),
@@ -650,6 +648,17 @@ const RootStackConfig = createWorkspaceStackNavigator({
       screen: PullRequestEditScreen,
       options: sheetRoute({ detent: 0.75, androidFit: true }),
     }),
+    // One project's Work at a section, as a page; the Work tab and thread tools open it.
+    ProjectWork: createNativeStackScreen({
+      screen: WorkProjectRouteScreen,
+      linking: "work/:environmentId/:projectId",
+      options: pageRoute({ title: "Work", duoMinimize: "never" }),
+    }),
+    WorkTask: createNativeStackScreen({
+      screen: WorkTaskRouteScreen,
+      linking: "work/:environmentId/:projectId/tasks/:taskId",
+      options: pageRoute({ title: "Task" }),
+    }),
     Issue: createNativeStackScreen({
       screen: IssueRouteScreen,
       linking: "issues/:environmentId/:projectId/:tracker/:scope/:issueKey",
@@ -808,9 +817,13 @@ const RootStackConfig = createWorkspaceStackNavigator({
       screen: ThreadAgentsSheet,
       options: sheetRoute({ detent: 0.5, androidMaxDetent: 0.9 }),
     }),
+    ThreadLiveDetails: createNativeStackScreen({
+      screen: ThreadLiveDetailsSheet,
+      options: sheetRoute({ detent: 0.6, androidMaxDetent: 0.95 }),
+    }),
     ThreadHistory: createNativeStackScreen({
       screen: ThreadHistorySheet,
-      options: sheetRoute({ detent: 0.6, androidMaxDetent: 0.95 }),
+      options: pageRoute(),
     }),
     GitOverview: createNativeStackScreen({
       screen: GitOverviewSheet,

@@ -19,7 +19,7 @@ import { WorkTeamRail } from "./WorkTeamRoster";
 import { useWorkRead } from "./useWorkRead";
 import { useWorkPage } from "./useWorkRecords";
 import type { WorkWriter } from "./useWorkWriter";
-import { pageWindow } from "./workLogic";
+import { pageWindow } from "@t3tools/client-runtime/project-work-logic";
 import { isMissionRecord, type WorkMissionRecord } from "./workModel";
 
 const isAttention = Schema.is(ProjectWorkAttentionRead);

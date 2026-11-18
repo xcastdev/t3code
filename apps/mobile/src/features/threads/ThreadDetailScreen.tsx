@@ -1,4 +1,4 @@
-import { ChildThreadApprovals } from "./ChildThreadApprovals";
+import { ChildThreadApprovalBody } from "./ChildThreadApprovals";
 import { useOpenThreadInspector } from "./thread-inspector-navigation";
 import { useSidebarWorkspaceTabs } from "../layout/workspace/useSystemWorkspaceTabBar";
 import { useWorkspaceTabs } from "../layout/workspace/WorkspaceTabsContext";
@@ -13,7 +13,12 @@ import { useAtomMount, useAtomValue } from "@effect/atom-react";
 import { mobilePreferencesAtom } from "../../state/preferences";
 import { parseThreadKey, threadKey } from "@t3tools/client-runtime/state/entities";
 import { createThreadVisitTracker } from "@t3tools/client-runtime/state/thread-visits";
-import { useChildThreadInputs, useThreadReportedModelSelection } from "../../state/entities";
+import {
+  useChildThreadInputs,
+  useSideChats,
+  useThreadReportedModelSelection,
+} from "../../state/entities";
+import { useThreadChecklist, useThreadContextWindow } from "../../state/use-thread-live-data";
 import { UsageLimitRecoveryCard } from "./UsageLimitRecoveryCard";
 import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import {
@@ -84,6 +89,7 @@ import {
   useCallback,
   useEffect,
   useEffectEvent,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -153,6 +159,7 @@ import {
   threadComposerErrorsAtom,
 } from "../../state/thread-composer-error";
 import {
+  childThreadApprovalsAtom,
   environmentThreadDetails,
   environmentThreadShells,
   threadEnvironment,
@@ -178,16 +185,29 @@ import { ComposerUsageLimits } from "./ComposerUsageLimits";
 import { PendingUserInputCard } from "./PendingUserInputCard";
 import { ProviderSubagentBar } from "./ProviderSubagentBar";
 import { ThreadCreationFailedCard } from "./ThreadCreationFailedCard";
+import { LIVE_BAR_PILL_COVERAGE, LiveBar, type LiveBarTime } from "./floating-working-control";
 import {
-  FLOATING_WORKING_CONTROL_COVERAGE,
-  FloatingWorkingControl,
-} from "./floating-working-control";
+  anySubagentFailed,
+  contextUsagePercent,
+  lastTurnDurationMs,
+  presentChecklist,
+  summarizeSideChats,
+} from "./live-bar-presentation";
+import {
+  buildLiveRequestQueue,
+  INITIAL_REQUEST_FOCUS,
+  type LiveRequest,
+  resolveComposerAnswerMode,
+  resolveFocusedRequestIndex,
+  stepRequestFocus,
+  summarizeLiveRequest,
+} from "./live-bar-requests";
+import { LiveRequestSlot } from "./live-bar-request-slot";
 import { connectionFloatingStatus, type FloatingWorkingStatus } from "./floating-working-status";
 import type { ThreadStatusLineModel } from "./thread-context-divider";
 import {
   derivePendingUserInputMaxHeight,
   ESTIMATED_KEYBOARD_HEIGHT,
-  USER_INPUT_TOGGLE_DURATION_MS,
 } from "./pendingUserInputLayout";
 import { useComposerBottomInset } from "../../components/ComposerSurface";
 import {
@@ -202,7 +222,6 @@ import { useThreadTurnSubagents } from "./ThreadAgentsSheet";
 import { ComposerQueuedEditBanner } from "./ComposerQueuedEdit";
 import { useThreadQueuedCount } from "./ThreadQueueControl";
 import { ThreadGuestShareBar } from "./ThreadGuestShareBar";
-import { ThreadSideChatsRow } from "./ThreadSideChatsRow";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
 import { resolveThreadFeedSubmissionAnchor } from "./thread-feed-scroll-position";
 import { useOpenLinkedThread } from "./useOpenLinkedThread";
@@ -312,12 +331,16 @@ export interface ThreadDetailScreenProps {
     questionId: string,
     customAnswer: string,
   ) => void;
-  readonly onSubmitUserInput: () => Promise<unknown>;
+  /** `customAnswer` is the composer's text when it answers the open question. */
+  readonly onSubmitUserInput: (customAnswer?: {
+    readonly questionId: string;
+    readonly text: string;
+  }) => Promise<unknown>;
   readonly onDismissUserInput: () => Promise<unknown>;
   readonly showContent?: boolean;
 }
 
-// iOS questions overlay the controls; Android questions stack with child approvals.
+// Android caps the stacked notices and scrolls them.
 const ComposerPanels = Platform.OS === "android" ? Animated.ScrollView : Animated.View;
 
 /**
@@ -336,10 +359,14 @@ const USAGE_LIMITS_PANEL_GAP = 12;
 const FEED_END_GAP = 12;
 const USAGE_LIMITS_PANEL_MIN_HEIGHT = 44;
 
-const USER_INPUT_TOGGLE_TIMING = {
-  duration: USER_INPUT_TOGGLE_DURATION_MS,
-  easing: Easing.out(Easing.cubic),
-};
+// Room the expanded request's own header takes above its scrolling body.
+const LIVE_REQUEST_HEADER_HEIGHT = 64;
+
+function isSuccessfulResponse(result: unknown): boolean {
+  return typeof result === "object" && result !== null && "_tag" in result
+    ? result._tag === "Success"
+    : false;
+}
 
 // A scheduled wake can happen without a newer server update, so the tracker
 // is told when one takes effect. The shell's updatedAt ticks while a run
@@ -498,6 +525,41 @@ function ThreadDetailBody(
   const queuedCount = useThreadQueuedCount(props.selectedThreadDetailRef);
   const turnSubagents = useThreadTurnSubagents(props.selectedThreadDetailRef);
   const agentsSegment = resolveSubagentPillSegment(turnSubagents);
+  const checklistPlan = useThreadChecklist(props.selectedThreadDetailRef);
+  const checklist = useMemo(() => presentChecklist(checklistPlan?.steps ?? null), [checklistPlan]);
+  const contextPercent = contextUsagePercent(useThreadContextWindow(props.selectedThreadDetailRef));
+  const sideChats = useSideChats({
+    environmentId: props.environmentId,
+    threadId: props.selectedThread.id,
+  });
+  const sideChatSummary = props.draftMode ? null : summarizeSideChats(sideChats);
+  const childApprovals = useAtomValue(childThreadApprovalsAtom(props.selectedThreadDetailRef));
+  const requestQueue = useMemo(
+    () =>
+      buildLiveRequestQueue({
+        approvals: props.activePendingApprovals,
+        // Answers and drafts exist only for the first open question; the next shows once it resolves.
+        userInputs: props.activePendingUserInput === null ? [] : [props.activePendingUserInput],
+        childApprovals,
+      }),
+    [props.activePendingApprovals, props.activePendingUserInput, childApprovals],
+  );
+  const [requestFocus, setRequestFocus] = useState(INITIAL_REQUEST_FOCUS);
+  const focusedRequestIndex = resolveFocusedRequestIndex(requestQueue, requestFocus);
+  const focusedRequest: LiveRequest | null = requestQueue[focusedRequestIndex] ?? null;
+  // Remembering the position lets a resolved request hand focus to the one after it.
+  if (
+    focusedRequest !== null &&
+    (focusedRequest.key !== requestFocus.key || focusedRequestIndex !== requestFocus.index)
+  ) {
+    setRequestFocus({ key: focusedRequest.key, index: focusedRequestIndex });
+  }
+  const [requestExpanded, setRequestExpanded] = useState(false);
+  if (requestExpanded && focusedRequest === null) setRequestExpanded(false);
+  const [checklistExpanded, setChecklistExpanded] = useState(false);
+  if (checklistExpanded && (checklist === null || focusedRequest !== null)) {
+    setChecklistExpanded(false);
+  }
   const defaultComposerEditorRef = useRef<ComposerEditorHandle>(null);
   const composerEditorRef = props.draftMode?.editorRef ?? defaultComposerEditorRef;
   const isProviderSubagent = isProviderNativeSubagentThread(props.selectedThread.source);
@@ -813,12 +875,14 @@ function ThreadDetailBody(
     if (props.creationState?.kind === "failed") {
       return null;
     }
-    const childInput = childThreadInputs[0];
+    // Child approvals are answered in the request slot; only child questions open the child.
+    const childQuestions = childThreadInputs.filter((input) => !input.hasPendingApprovals);
+    const childInput = childQuestions[0];
     if (childInput && contentPresentationKind === "ready") {
       return {
         kind: "child-input",
-        label: childThreadInputsTitle(childThreadInputs),
-        accessibilityLabel: `Open ${childInput.hasPendingApprovals ? "approval" : "question"} from ${childInput.title}`,
+        label: childThreadInputsTitle(childQuestions),
+        accessibilityLabel: `Open question from ${childInput.title}`,
         onPress: () => {
           Keyboard.dismiss();
           openLinkedThread({ environmentId: childInput.environmentId, threadId: childInput.id });
@@ -838,13 +902,40 @@ function ThreadDetailBody(
     }
     return null;
   })();
-  const showWorkingControl = floatingStatus !== null;
-  const showFloatingStatus =
-    showWorkingControl ||
+  const workStartedAtMs =
+    props.activeWorkStartedAt === null ? Number.NaN : Date.parse(props.activeWorkStartedAt);
+  const lastTurnMs = lastTurnDurationMs(props.selectedThread.latestRun ?? null);
+  const liveTime: LiveBarTime | null = props.draftMode
+    ? null
+    : Number.isFinite(workStartedAtMs)
+      ? {
+          kind: "working",
+          startedAtMs: workStartedAtMs,
+          environmentId: props.environmentId,
+          waiting: focusedRequest !== null,
+        }
+      : lastTurnMs !== null
+        ? { kind: "idle", durationMs: lastTurnMs }
+        : null;
+  const showLiveBar =
+    floatingStatus !== null ||
+    liveTime !== null ||
     queuedCount > 0 ||
     agentsSegment !== null ||
+    sideChatSummary !== null ||
+    contextPercent !== null ||
     devicePreviews.length > 0 ||
-    browserTabs.tabs.length > 0;
+    browserTabs.tabs.length > 0 ||
+    checklist !== null ||
+    focusedRequest !== null;
+  const openLiveDetails = (section: "turn" | "agents" | "sideChats" | "context") => {
+    Keyboard.dismiss();
+    navigation.navigate("ThreadLiveDetails", {
+      environmentId: props.environmentId,
+      threadId: props.selectedThread.id,
+      section,
+    });
+  };
   const selectedThreadFeed = props.selectedThreadFeed;
   // A palette message result opens the thread at that message: earlier
   // history loads until the message is in the feed, which then scrolls to it.
@@ -902,15 +993,9 @@ function ThreadDetailBody(
     COMPOSER_COLLAPSED_CHROME +
       (!isProviderSubagent && (deviceType === "pad" || hasSidebarTabBar) ? 14 : 0) +
       composerBottomInset;
-  // The last collapse toggle; it only applies to the request it was made on.
-  const [userInputToggle, setUserInputToggle] = useState<{
-    readonly requestId: RuntimeRequestId;
-    readonly collapsed: boolean;
-  } | null>(null);
   const activeUserInputRequestId = props.activePendingUserInput?.requestId ?? null;
-  const questionInFlow = Platform.OS === "android" && activeUserInputRequestId !== null;
-  const composerSlotHidden =
-    activeUserInputRequestId !== null || props.creationState?.kind === "failed";
+  // An open question keeps the composer: it is the question's free-text field.
+  const composerSlotHidden = props.creationState?.kind === "failed";
   const pendingMessageEditBlocked =
     queuedRunEditBlockedReason({ openQuestionCount: activeUserInputRequestId === null ? 0 : 1 }) !==
     null;
@@ -954,9 +1039,6 @@ function ThreadDetailBody(
     setUsageLimitsPanel((current) =>
       current !== null && current.threadKey === threadKey ? null : current,
     );
-  const userInputToggled =
-    userInputToggle !== null && userInputToggle.requestId === activeUserInputRequestId;
-  const userInputCollapsed = userInputToggled && userInputToggle.collapsed;
   // A height React sets from keyboard state lags the sticky translation by a Yoga pass and
   // flashes over the nav header on the way up, so the usage panel reserves the keyboard instead.
   const [lastKnownKeyboardHeight, setLastKnownKeyboardHeight] = useState(0);
@@ -992,44 +1074,38 @@ function ThreadDetailBody(
   };
   const screenAreaHeight = screenHeight ?? windowHeight;
   const draftViewportHeight = screenAreaHeight - navigationHeaderHeight - liveKeyboardHeight;
-  // The question card reads the keyboard frame on the UI thread, in the same frame the sticky
-  // view translates, so it gets the full height while the keyboard is closed and never crosses
-  // the header while the keyboard moves.
+  // Heights read the keyboard frame on the UI thread, in the same frame the sticky view
+  // translates, so they get the full height while the keyboard is closed and never cross the
+  // header while the keyboard moves.
   const { height: keyboardTranslation } = useReanimatedKeyboardAnimation();
   const pendingUserInputMaxHeight = useDerivedValue(() =>
     derivePendingUserInputMaxHeight({
       windowHeight: screenAreaHeight,
       keyboardHeight: keyboardStickyEnabled ? -keyboardTranslation.value : 0,
       navigationHeaderHeight,
-      // An in-flow question shares the room above it with the floating control.
-      composerOverlapHeight:
-        composerBottomInset +
-        (questionInFlow && showFloatingStatus ? FLOATING_WORKING_CONTROL_COVERAGE : 0),
+      composerOverlapHeight: composerBottomInset,
     }),
   );
-  // A question pads itself clear of the bottom inset, below the card's own height limit.
-  const questionBottomInset = activeUserInputRequestId !== null ? composerBottomInset : 0;
   const composerPanelsHeightStyle = useAnimatedStyle(() => ({
-    maxHeight: pendingUserInputMaxHeight.value + questionBottomInset,
+    maxHeight: pendingUserInputMaxHeight.value,
     flexGrow: 0,
   }));
-  // Questions overlay the composer on iOS; an approval sits above it, so it gives up its height.
-  const approvalHeightStyle = useAnimatedStyle(() => ({
-    maxHeight: derivePendingUserInputMaxHeight({
+  // An expanded request sits on the composer, which stays visible as its answer field.
+  const requestBodyMaxHeight = useDerivedValue(() =>
+    derivePendingUserInputMaxHeight({
       windowHeight: screenAreaHeight,
       keyboardHeight: keyboardStickyEnabled ? -keyboardTranslation.value : 0,
       navigationHeaderHeight,
-      composerOverlapHeight,
+      composerOverlapHeight: composerOverlapHeight + LIVE_REQUEST_HEADER_HEIGHT,
     }),
-    flexGrow: 0,
-  }));
+  );
   // The usage panel stacks with the composer and any approval card, so it gets
   // whatever room they leave below the header. Measured only while it is open
   // so typing in the composer does not re-render the screen.
-  const usageLimitsOpen = usageLimitsReport !== null && activeUserInputRequestId === null;
+  const usageLimitsOpen = usageLimitsReport !== null;
   const [usageLimitsLayout, setUsageLimitsLayout] = useState({ overlay: 0, panel: 0 });
   const handleComposerOverlayLayout = (event: LayoutChangeEvent) => {
-    if (!questionInFlow) onComposerLayout(event);
+    onComposerLayout(event);
     if (!usageLimitsOpen) return;
     const overlay = event.nativeEvent.layout.height;
     setUsageLimitsLayout((current) =>
@@ -1056,66 +1132,23 @@ function ThreadDetailBody(
         USAGE_LIMITS_PANEL_GAP * 2,
     ),
   );
-  // A toggle animates the card; a new request starts expanded at once.
-  const userInputMotion = !userInputToggled
-    ? "fresh"
-    : userInputCollapsed
-      ? "collapsed"
-      : "expanded";
-  const userInputCardProgress = useDerivedValue<number>(
-    () =>
-      userInputMotion === "fresh"
-        ? 1
-        : withTiming(userInputMotion === "collapsed" ? 0 : 1, USER_INPUT_TOGGLE_TIMING),
-    [userInputMotion],
-  );
-  // Collapsing the inset is instant: the sinking card still covers the strip
-  // being revealed, and animating the inset downward drifted the short-content
-  // end anchor.
-  const userInputInsetProgress = useDerivedValue<number>(() => {
-    if (userInputMotion === "collapsed") return 0;
-    return userInputMotion === "fresh" ? 1 : withTiming(1, USER_INPUT_TOGGLE_TIMING);
-  }, [userInputMotion]);
-  const userInputCardCoverage = useSharedValue(0);
   const composerPopoverHeight = useSharedValue(0);
   const { freeze, scrollMessageToEnd } = useKeyboardScrollToEnd({ listRef });
   const reduceMotion = useReducedMotion();
-  const floatingCoverageTarget = showFloatingStatus ? FLOATING_WORKING_CONTROL_COVERAGE : 0;
-  const floatingControlCoverage = useDerivedValue(
-    () => withTiming(floatingCoverageTarget, { duration: 180, reduceMotion: ReduceMotion.System }),
-    [floatingCoverageTarget],
-  );
-  const userInputCoverageApplies = Platform.OS === "ios" && activeUserInputRequestId !== null;
-  const questionStatusSpace = useAnimatedStyle(() => ({ height: floatingControlCoverage.value }));
   const combinedContentInsetEndAdjustment = useSharedValue(estimatedOverlayHeight);
   useAnimatedReaction(
-    () =>
-      questionInFlow
-        ? 0
-        : contentInsetEndAdjustment.value +
-          // The feed's last row keeps a gap above the composer; the status row grows from it.
-          Math.max(FEED_END_GAP, floatingControlCoverage.value) +
-          (userInputCoverageApplies
-            ? userInputInsetProgress.value * userInputCardCoverage.value
-            : 0),
+    // The live bar card is in the measured overlay and animates its height there, so the feed's
+    // last row only keeps a gap above it.
+    () => contentInsetEndAdjustment.value + FEED_END_GAP,
     (value) => {
       combinedContentInsetEndAdjustment.set(value);
     },
-    [questionInFlow, userInputCoverageApplies],
   );
   const composerPopoverLift = useDerivedValue(() =>
     withTiming(
       !composerSlotHidden && composerPopoverHeight.value > 0 ? composerPopoverHeight.value + 8 : 0,
       { duration: 180, easing: Easing.out(Easing.cubic), reduceMotion: ReduceMotion.System },
     ),
-  );
-  const floatingControlLift = useDerivedValue(
-    () =>
-      Math.max(
-        userInputCoverageApplies ? userInputCardProgress.value * userInputCardCoverage.value : 0,
-        composerPopoverLift.value,
-      ),
-    [userInputCoverageApplies],
   );
   // A jump this thread never reached lets go when it closes.
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- aborts the thread scope, clears its timers and ends a pending message jump when the thread changes
@@ -1128,17 +1161,6 @@ function ThreadDetailBody(
       finishThreadMessageJump(selectedThreadKey);
     };
   }, [selectedThreadKey]);
-  const handleToggleUserInputCollapsed = () => {
-    if (activeUserInputRequestId === null) {
-      return;
-    }
-    if (userInputCollapsed) {
-      setUserInputToggle({ requestId: activeUserInputRequestId, collapsed: false });
-    } else {
-      Keyboard.dismiss();
-      setUserInputToggle({ requestId: activeUserInputRequestId, collapsed: true });
-    }
-  };
   const showContent = props.showContent ?? true;
   // Showing the thread counts as viewing it, before its live shell arrives too.
   useAtomMount(
@@ -1200,6 +1222,11 @@ function ThreadDetailBody(
       : [];
   })();
 
+  // Only while its request is expanded does the composer answer it.
+  const composerAnswerMode =
+    requestExpanded && props.canOperateThread && !isProviderSubagent && !props.draftMode
+      ? resolveComposerAnswerMode(focusedRequest)
+      : null;
   const currentPendingApprovals = () =>
     props.selectedThreadDetailRef === null
       ? []
@@ -1218,12 +1245,35 @@ function ThreadDetailBody(
     // Runs only once the send path has validated the draft and is about to deliver it, so an
     // empty submit, a queued-message edit, or `/feedback` leaves approvals alone.
     const approvalsToDecline = props.activePendingApprovals;
+    const answerMode = composerAnswerMode;
+    const answerBeforeDispatch =
+      answerMode?.kind === "custom-answer"
+        ? async (text: string, hasAttachmentsOrContext: boolean) => {
+            if (scope.aborted || stillSendable?.() === false) return false;
+            if (hasAttachmentsOrContext) {
+              Dialog.alert(
+                "Custom answer",
+                "Send your answer without attachments or added context.",
+              );
+              return false;
+            }
+            const result = await props.onSubmitUserInput({
+              questionId: answerMode.questionId,
+              text,
+            });
+            return isSuccessfulResponse(result) ? ("responded" as const) : false;
+          }
+        : undefined;
     const declineBeforeDispatch =
-      approvalsToDecline.length > 0 && props.activePendingUserInput === null
+      approvalsToDecline.length > 0 &&
+      (props.activePendingUserInput === null || answerMode?.kind === "approval-feedback")
         ? async (text: string, hasAttachmentsOrContext: boolean) => {
             if (scope.aborted || stillSendable?.() === false || props.respondingApprovalId !== null)
               return false;
-            const feedbackTarget = approvalsToDecline[0];
+            const feedbackTarget =
+              answerMode?.kind === "approval-feedback"
+                ? answerMode.approval
+                : approvalsToDecline[0];
             if (feedbackTarget?.supportsFeedback) {
               if (hasAttachmentsOrContext) {
                 Dialog.alert(
@@ -1252,17 +1302,21 @@ function ThreadDetailBody(
           }
         : undefined;
     let dismissingKeyboard = false;
-    const messageId = await props.onSendMessage(followUp, declineBeforeDispatch, () => {
-      if (
-        scope.aborted ||
-        Platform.OS !== "ios" ||
-        !hasUserMessage ||
-        !KeyboardController.isVisible()
-      )
-        return;
-      setSendingWithKeyboard(true);
-      dismissingKeyboard = true;
-    });
+    const messageId = await props.onSendMessage(
+      followUp,
+      answerBeforeDispatch ?? declineBeforeDispatch,
+      () => {
+        if (
+          scope.aborted ||
+          Platform.OS !== "ios" ||
+          !hasUserMessage ||
+          !KeyboardController.isVisible()
+        )
+          return;
+        setSendingWithKeyboard(true);
+        dismissingKeyboard = true;
+      },
+    );
     if (messageId === null || scope.aborted) {
       return messageId;
     }
@@ -1344,6 +1398,75 @@ function ThreadDetailBody(
   };
 
   const showScrollToEndButton = !props.draftMode && contentPresentationKind === "ready" && !isAtEnd;
+
+  const collapseLiveBar = () => {
+    setChecklistExpanded(false);
+    if (requestExpanded) {
+      Keyboard.dismiss();
+      setRequestExpanded(false);
+    }
+  };
+  const renderRequestBody = (request: LiveRequest) => {
+    if (request.kind === "child-approval") return <ChildThreadApprovalBody entry={request.entry} />;
+    if (request.kind === "approval") {
+      return (
+        <PendingApprovalCard
+          canOperateThread={props.canOperateThread}
+          approval={request.approval}
+          respondingApprovalId={props.respondingApprovalId}
+          onRespond={props.onRespondToApproval}
+        />
+      );
+    }
+    return (
+      <PendingUserInputCard
+        environmentId={props.environmentId}
+        threadId={props.selectedThread.id}
+        workspaceRoot={props.threadCwd}
+        canOperateThread={props.canOperateThread}
+        pendingUserInput={request.userInput}
+        composerAnswersQuestionId={
+          composerAnswerMode?.kind === "custom-answer" ? composerAnswerMode.questionId : null
+        }
+        onInputFocusChange={handleOwnedInputFocusChange}
+        drafts={props.activePendingUserInputDrafts}
+        answers={props.activePendingUserInputAnswers}
+        respondingUserInputId={props.respondingUserInputId}
+        onSelectOption={props.onSelectUserInputOption}
+        onChangeCustomAnswer={props.onChangeUserInputCustomAnswer}
+        onSubmit={() => props.onSubmitUserInput()}
+        onDismiss={props.onDismissUserInput}
+      />
+    );
+  };
+  const requestSlot =
+    focusedRequest === null ? null : (
+      <LiveRequestSlot
+        kind={focusedRequest.kind}
+        summary={summarizeLiveRequest(focusedRequest)}
+        position={focusedRequestIndex + 1}
+        count={requestQueue.length}
+        expanded={requestExpanded}
+        onToggle={() => {
+          if (requestExpanded) Keyboard.dismiss();
+          setRequestExpanded(!requestExpanded);
+        }}
+        onPrevious={() => setRequestFocus(stepRequestFocus(requestQueue, requestFocus, -1))}
+        onNext={() => setRequestFocus(stepRequestFocus(requestQueue, requestFocus, 1))}
+        composerHint={
+          composerAnswerMode?.kind === "approval-feedback"
+            ? "Or decline with a note below"
+            : composerAnswerMode?.kind === "custom-answer"
+              ? "Or type your own answer below"
+              : null
+        }
+        bodyMaxHeight={requestBodyMaxHeight}
+      >
+        <View key={focusedRequest.key} className="gap-2.5">
+          {renderRequestBody(focusedRequest)}
+        </View>
+      </LiveRequestSlot>
+    );
   const { themeAppearance } = useAppearancePreferences();
   const isDarkMode = themeAppearance === "dark";
 
@@ -1369,6 +1492,7 @@ function ThreadDetailBody(
   const handleFeedTouchEnd = () => {
     if (feedTouchStartRef.current) {
       collapseComposer();
+      setChecklistExpanded(false);
     }
     feedTouchStartRef.current = null;
   };
@@ -1452,12 +1576,10 @@ function ThreadDetailBody(
                   contentInsetEndAdjustment={combinedContentInsetEndAdjustment}
                   keyboardOffset={composerKeyboardOffset}
                   sendingWithKeyboard={sendingWithKeyboard}
-                  fitShortFeedToViewport={questionInFlow && !isKeyboardVisible}
                   contentBottomInset={
-                    questionInFlow
-                      ? 0
-                      : estimatedOverlayHeight +
-                        (showFloatingStatus ? FLOATING_WORKING_CONTROL_COVERAGE : FEED_END_GAP)
+                    estimatedOverlayHeight +
+                    FEED_END_GAP +
+                    (showLiveBar ? LIVE_BAR_PILL_COVERAGE : 0)
                   }
                   contentMaxWidth={contentMaxWidth}
                   historyControls={props.historyControls}
@@ -1493,51 +1615,34 @@ function ThreadDetailBody(
         <KeyboardStickyView
           enabled={keyboardStickyEnabled}
           pointerEvents="box-none"
-          style={
-            questionInFlow
-              ? {
-                  marginLeft: controlInsets.left,
-                  marginRight: controlInsets.right,
-                  marginBottom: controlInsets.bottom,
-                }
-              : { position: "absolute", bottom: 0, left: 0, right: 0, top: 0 }
-          }
+          style={{ position: "absolute", bottom: 0, left: 0, right: 0, top: 0 }}
           offset={{ closed: 0, opened: composerKeyboardOffset }}
         >
-          {questionInFlow ? (
-            <Animated.View pointerEvents="none" style={questionStatusSpace} />
-          ) : null}
-          <ComposerPopoverHost
-            hidden={composerSlotHidden}
-            popoverHeight={composerPopoverHeight}
-            inFlow={questionInFlow}
-          >
+          <ComposerPopoverHost hidden={composerSlotHidden} popoverHeight={composerPopoverHeight}>
             {/* The fixed sticky host gives this bottom-anchored child a stable
               coordinate space. Its top and height can then animate together
               instead of the auto-sized host jumping to Yoga's destination. */}
             <Animated.View
               pointerEvents="box-none"
               style={
-                questionInFlow
-                  ? (columnComposerWidthStyle ?? (isSplitLayout ? composerWidthStyle : undefined))
-                  : columnComposerWidthStyle
-                    ? [
-                        {
-                          position: "absolute",
-                          bottom: controlInsets.bottom,
-                          left: controlInsets.left,
-                        },
-                        columnComposerWidthStyle,
-                      ]
-                    : [
-                        {
-                          position: "absolute",
-                          bottom: controlInsets.bottom,
-                          left: controlInsets.left,
-                          right: controlInsets.right,
-                        },
-                        composerWidthStyle,
-                      ]
+                columnComposerWidthStyle
+                  ? [
+                      {
+                        position: "absolute",
+                        bottom: controlInsets.bottom,
+                        left: controlInsets.left,
+                      },
+                      columnComposerWidthStyle,
+                    ]
+                  : [
+                      {
+                        position: "absolute",
+                        bottom: controlInsets.bottom,
+                        left: controlInsets.left,
+                        right: controlInsets.right,
+                      },
+                      composerWidthStyle,
+                    ]
               }
             >
               {/* No paddingTop here: the overlay's measured height becomes the
@@ -1545,7 +1650,7 @@ function ThreadDetailBody(
                 pushes the resting content floor up by the same amount. */}
               <View onLayout={handleComposerOverlayLayout} className="w-full">
                 <View className="w-full self-center" style={{ maxWidth: contentMaxWidth }}>
-                  <FloatingWorkingControl
+                  <LiveBar
                     colorScheme={isDarkMode ? "dark" : "light"}
                     status={floatingStatus}
                     extensionStatus={
@@ -1553,7 +1658,20 @@ function ThreadDetailBody(
                         ? extensionStatus
                         : null
                     }
-                    lift={floatingControlLift}
+                    lift={composerPopoverLift}
+                    time={liveTime}
+                    onOpenTurn={() => openLiveDetails("turn")}
+                    agents={
+                      agentsSegment === null
+                        ? null
+                        : {
+                            segment: agentsSegment,
+                            failed: anySubagentFailed(turnSubagents?.subagents ?? []),
+                          }
+                    }
+                    onOpenAgents={() => openLiveDetails("agents")}
+                    sideChats={sideChatSummary}
+                    onOpenSideChats={() => openLiveDetails("sideChats")}
                     devicePreview={
                       devicePreviews.length > 0
                         ? { count: devicePreviews.length, onPress: openDevicePreview }
@@ -1564,16 +1682,8 @@ function ThreadDetailBody(
                         ? { count: browserTabs.tabs.length, onPress: () => openBrowserPreview() }
                         : null
                     }
-                    showScrollToEnd={showScrollToEndButton}
-                    onScrollToEnd={handleScrollToEnd}
-                    agents={agentsSegment}
-                    onOpenAgents={() => {
-                      Keyboard.dismiss();
-                      navigation.navigate("ThreadAgents", {
-                        environmentId: props.environmentId,
-                        threadId: props.selectedThread.id,
-                      });
-                    }}
+                    contextPercent={contextPercent}
+                    onOpenContext={() => openLiveDetails("context")}
                     queuedCount={queuedCount}
                     onOpenQueue={() => {
                       Keyboard.dismiss();
@@ -1582,6 +1692,14 @@ function ThreadDetailBody(
                         threadId: props.selectedThread.id,
                       });
                     }}
+                    checklist={checklist}
+                    checklistExpanded={checklistExpanded}
+                    onToggleChecklist={() => setChecklistExpanded((expanded) => !expanded)}
+                    request={requestSlot}
+                    requestExpanded={requestExpanded}
+                    onCollapse={collapseLiveBar}
+                    showScrollToEnd={showScrollToEndButton}
+                    onScrollToEnd={handleScrollToEnd}
                   />
                   <ComposerPanels
                     className="w-full"
@@ -1609,20 +1727,10 @@ function ThreadDetailBody(
                       thread={props.selectedThread}
                       environmentId={props.environmentId}
                     />
-                    <ChildThreadApprovals
-                      threadRef={props.selectedThreadDetailRef}
-                      maxHeight={pendingUserInputMaxHeight}
-                    />
                     <ThreadGuestShareBar
                       threadRef={props.selectedThreadDetailRef}
                       canOperateThread={props.canOperateThread}
                     />
-                    {props.draftMode ? null : (
-                      <ThreadSideChatsRow
-                        environmentId={props.environmentId}
-                        threadId={props.selectedThread.id}
-                      />
-                    )}
                     {props.feedbackSubmissions.map((submission) => (
                       <ComposerFeedback
                         key={submission.id}
@@ -1659,7 +1767,7 @@ function ThreadDetailBody(
                         />
                       </Animated.View>
                     ) : null}
-                    {usageLimitsReport && activeUserInputRequestId === null ? (
+                    {usageLimitsReport ? (
                       <Animated.View
                         className="shrink-0 px-4"
                         style={{ paddingBottom: USAGE_LIMITS_PANEL_GAP }}
@@ -1686,57 +1794,6 @@ function ThreadDetailBody(
                           reason={props.creationState.reason}
                           onEditTask={props.creationState.onEditTask}
                         />
-                      </Animated.View>
-                    ) : null}
-                    {props.activePendingApproval || props.activePendingUserInput ? (
-                      <Animated.View
-                        className="shrink-0 gap-3 px-4 pb-3"
-                        style={
-                          activeUserInputRequestId !== null
-                            ? { paddingBottom: composerBottomInset }
-                            : undefined
-                        }
-                        entering={FadeInDown.duration(220)}
-                        exiting={FadeOut.duration(140)}
-                      >
-                        {props.activePendingApproval ? (
-                          <Animated.ScrollView
-                            key={props.activePendingApproval.requestId}
-                            style={approvalHeightStyle}
-                            keyboardShouldPersistTaps="handled"
-                            nestedScrollEnabled
-                          >
-                            <PendingApprovalCard
-                              canOperateThread={props.canOperateThread}
-                              approval={props.activePendingApproval}
-                              respondingApprovalId={props.respondingApprovalId}
-                              onRespond={props.onRespondToApproval}
-                            />
-                          </Animated.ScrollView>
-                        ) : null}
-                        {props.activePendingUserInput ? (
-                          <PendingUserInputCard
-                            environmentId={props.environmentId}
-                            threadId={props.selectedThread.id}
-                            workspaceRoot={props.threadCwd}
-                            canOperateThread={props.canOperateThread}
-                            pendingUserInput={props.activePendingUserInput}
-                            maxHeight={pendingUserInputMaxHeight}
-                            collapsed={userInputCollapsed}
-                            onToggleCollapsed={handleToggleUserInputCollapsed}
-                            onStopThread={props.onStopThread}
-                            cardProgress={userInputCardProgress}
-                            cardCoverage={userInputCardCoverage}
-                            onInputFocusChange={handleOwnedInputFocusChange}
-                            drafts={props.activePendingUserInputDrafts}
-                            answers={props.activePendingUserInputAnswers}
-                            respondingUserInputId={props.respondingUserInputId}
-                            onSelectOption={props.onSelectUserInputOption}
-                            onChangeCustomAnswer={props.onChangeUserInputCustomAnswer}
-                            onSubmit={props.onSubmitUserInput}
-                            onDismiss={props.onDismissUserInput}
-                          />
-                        ) : null}
                       </Animated.View>
                     ) : null}
                   </ComposerPanels>
@@ -1791,11 +1848,15 @@ function ThreadDetailBody(
                         reportedModelSelection={reportedModelSelection}
                         editorRef={composerEditorRef}
                         placeholder={
-                          props.activePendingApproval
-                            ? props.activePendingApproval.supportsFeedback
-                              ? "Send feedback to decline this request"
-                              : "Send a message to decline and redirect the agent"
-                            : "Ask anything"
+                          composerAnswerMode?.kind === "approval-feedback"
+                            ? "Tell the agent what to do instead"
+                            : composerAnswerMode?.kind === "custom-answer"
+                              ? "Type a custom answer…"
+                              : props.activePendingApproval && props.activePendingUserInput === null
+                                ? props.activePendingApproval.supportsFeedback
+                                  ? "Send feedback to decline this request"
+                                  : "Send a message to decline and redirect the agent"
+                                : "Ask anything"
                         }
                         contentMaxWidth={contentMaxWidth}
                         draftControls={props.draftMode?.controls(draftViewportHeight)}

@@ -2,6 +2,8 @@ import type { AppBarMenuItem } from "../../../components/ui/AppBar.types";
 
 /** The header of the workspace thread list, on Home and in the sidebar column. */
 export interface WorkspaceListHeaderProps {
+  /** The tab the list belongs to. Defaults to Chats. */
+  readonly tab?: "threads" | "agents";
   /** Spoken for the brand title, such as "T3 Code, Threads". */
   readonly accessibilityLabel: string;
   /** The connection status beside the brand opens environment settings. */
@@ -16,7 +18,6 @@ export interface WorkspaceListHeaderProps {
     readonly customized: boolean;
     readonly items: ReadonlyArray<AppBarMenuItem>;
   };
-  /** iOS: a settings button. Android reaches Settings from the workspace navigation. */
   readonly onOpenSettings?: () => void;
   /**
    * Set when the list is the workspace's sidebar column, which draws its own bar on iOS. Without

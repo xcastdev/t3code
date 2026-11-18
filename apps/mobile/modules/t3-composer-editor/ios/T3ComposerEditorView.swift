@@ -1319,7 +1319,8 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
     // its current height can clip TextKit's laid-out line fragments.
     let fittedHeight = textView.sizeThatFits(CGSize(width: bounds.width, height: .greatestFiniteMagnitude)).height
       - textView.textContainerInset.top - textView.textContainerInset.bottom
-    let measuredHeight = min(lineHeight * 4, fittedHeight)
+    // Callers cap the editor height themselves; this bound only keeps the report small.
+    let measuredHeight = min(lineHeight * 8, fittedHeight)
     let width = fittedHeight <= lineHeight + 0.5
       ? textView.layoutManager.usedRect(for: textView.textContainer).width
       : 0

@@ -160,6 +160,7 @@ export function HomeRouteScreen() {
         <WorkspaceListHeader
           accessibilityLabel="T3 Code, Threads"
           onOpenEnvironments={() => openSettings(navigation, "SettingsEnvironments")}
+          onOpenSettings={() => selectTab("settings")}
           search={{
             value: searchQuery,
             onChangeText: setSearchQuery,

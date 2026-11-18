@@ -42,6 +42,14 @@ import type { WorkWriter } from "./useWorkWriter";
 import { workStateLabel } from "./workModel";
 import { WorkStatusGlyph } from "./WorkStatus";
 import { newCommandId } from "./workTaskSurface";
+import {
+  groupWorkTasks,
+  WORK_TASK_FILTERS,
+  workTaskFilterOptions,
+  type WorkTaskCounts,
+  type WorkTaskFilter,
+  type WorkTaskGroupId,
+} from "@t3tools/client-runtime/project-work-team";
 
 const DELIVERABLES = {
   code: "Code change",
@@ -53,42 +61,15 @@ const DELIVERABLES = {
 } as const;
 type Deliverable = keyof typeof DELIVERABLES;
 
-const TASK_FILTERS = [
-  "all",
-  "in-progress",
-  "in-review",
-  "blocked",
-  "failed",
-  "ready",
-  "specified",
-  "draft",
-  "completed",
-  "canceled",
-] as const;
-type TaskFilter = (typeof TASK_FILTERS)[number];
-type TaskCounts = Partial<Record<TaskFilter | "total", number>>;
+type TaskFilter = WorkTaskFilter;
+type TaskCounts = WorkTaskCounts;
 
-// Grouped by what the task needs from you; a state from a newer server waits in Up next.
-const TASK_GROUPS = [
-  {
-    id: "needs-you",
-    label: "Needs you",
-    states: ["in-review", "blocked", "failed"],
-    dot: "bg-warning",
-  },
-  { id: "running", label: "Running", states: ["in-progress"], dot: "bg-info" },
-  {
-    id: "up-next",
-    label: "Up next",
-    states: ["ready", "specified", "draft"],
-    dot: "bg-muted-foreground/60",
-  },
-  { id: "done", label: "Done", states: ["completed", "canceled"], dot: "bg-success" },
-] as const;
-type TaskGroup = (typeof TASK_GROUPS)[number];
-const taskGroupOf = (state: string): TaskGroup =>
-  TASK_GROUPS.find((group) => (group.states as ReadonlyArray<string>).includes(state)) ??
-  TASK_GROUPS[2];
+const GROUP_DOT: Record<WorkTaskGroupId, string> = {
+  "needs-you": "bg-warning",
+  running: "bg-info",
+  "up-next": "bg-muted-foreground/60",
+  done: "bg-success",
+};
 
 const COLLAPSED_GROUPS_KEY = "t3code:work:collapsed-task-groups";
 const GroupIds = Schema.Array(Schema.String);
@@ -169,14 +150,11 @@ function TaskFilterMenu(props: {
         <MenuRadioGroup
           value={props.filter}
           onValueChange={(value) => {
-            const next = TASK_FILTERS.find((candidate) => candidate === value);
+            const next = WORK_TASK_FILTERS.find((candidate) => candidate === value);
             if (next) props.onFilterChange(next);
           }}
         >
-          {TASK_FILTERS.map((state) => {
-            const count = props.counts?.[state === "all" ? "total" : state];
-            if (count === 0 && state !== "all" && state !== props.filter) return null;
-            const label = state === "all" ? "All tasks" : workStateLabel(state);
+          {workTaskFilterOptions(props.counts, props.filter).map(({ state, label, count }) => {
             return (
               <MenuRadioItem
                 key={state}
@@ -242,15 +220,8 @@ function TaskList({
     return task === null || task.projectId !== scope.projectId ? [] : [task];
   });
   const unknown = (view.page?.items.length ?? 0) - tasks.length;
-  const groups = TASK_GROUPS.map((group) => ({
-    ...group,
-    tasks: tasks.filter((task) => taskGroupOf(task.state).id === group.id),
-    count:
-      counts === null || filter !== "all"
-        ? undefined
-        : group.states.reduce((sum, state) => sum + (counts[state] ?? 0), 0),
-  }));
-  const hasGroups = groups.some((group) => group.tasks.length > 0 || (group.count ?? 0) > 0);
+  const groups = groupWorkTasks(tasks, counts, filter);
+  const hasGroups = groups.some((group) => !group.empty);
   const toggleGroup = (id: string) =>
     setCollapsedGroups((current) =>
       current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id],
@@ -334,7 +305,7 @@ function TaskList({
         <div className="flex min-w-0 flex-col overflow-hidden rounded-xl border border-border/70 bg-card/20 @3xl/work:grid @3xl/work:grid-cols-2 @3xl/work:items-start @3xl/work:gap-3 @3xl/work:overflow-visible @3xl/work:rounded-none @3xl/work:border-0 @3xl/work:bg-transparent @4xl/work:grid-cols-4">
           {groups.map((group) => {
             const collapsed = collapsedGroups.includes(group.id);
-            const empty = group.tasks.length === 0 && (group.count ?? 0) === 0;
+            const empty = group.empty;
             return (
               <section
                 key={group.id}
@@ -360,11 +331,14 @@ function TaskList({
                   />
                   <span
                     aria-hidden="true"
-                    className={cn("hidden size-2 shrink-0 rounded-full @3xl/work:block", group.dot)}
+                    className={cn(
+                      "hidden size-2 shrink-0 rounded-full @3xl/work:block",
+                      GROUP_DOT[group.id],
+                    )}
                   />
                   <span className="flex-1 @3xl/work:text-foreground">{group.label}</span>
                   <span className="tabular-nums @3xl/work:rounded-full @3xl/work:bg-muted @3xl/work:px-1.5 @3xl/work:py-px @3xl/work:text-2xs @3xl/work:text-muted-foreground">
-                    {group.count ?? group.tasks.length}
+                    {group.count}
                   </span>
                 </button>
                 <div

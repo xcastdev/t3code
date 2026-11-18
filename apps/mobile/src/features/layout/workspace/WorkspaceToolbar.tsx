@@ -21,9 +21,11 @@ import { shouldRestoreNativeSearch } from "./workspace-tabs-state";
 import { useFloatingWorkspaceTabs, useSidebarWorkspaceTabs } from "./useSystemWorkspaceTabBar";
 import { WorkspaceTabToolbarButtons } from "./WorkspaceSectionToolbar";
 import { useWorkspaceCompose } from "./useWorkspaceCompose";
+import { useSelectWorkspaceTab } from "./useSelectWorkspaceTab";
 
 const SEARCH_LABELS = {
   threads: "Search threads",
+  agents: "Search agents",
   pullRequests: "Search pull requests",
   issues: "Search issues",
   settings: "Search settings",
@@ -47,6 +49,7 @@ export function WorkspaceToolbar(props: {
   const tabActive = use(NativeWorkspaceTabActivityContext)?.active ?? true;
   const focused = useIsFocused();
   const { layout, togglePrimarySidebar } = useAdaptiveWorkspaceLayout();
+  const selectTab = useSelectWorkspaceTab();
   const { panes } = useWorkspacePaneState();
   const searchRef = useRef<SearchBarCommands>(null);
   const settingsMenu = useSettingsEnvironmentMenu();
@@ -135,6 +138,17 @@ export function WorkspaceToolbar(props: {
       separateBackground
     />
   ) : null;
+  // Home's lists lead to Settings, which the tab bar no longer holds.
+  const settingsButton =
+    selectedTab === "threads" || selectedTab === "agents" ? (
+      <Toolbar.Button
+        identifier="workspace-settings"
+        accessibilityLabel="Settings"
+        icon="gearshape"
+        onPress={() => selectTab("settings")}
+        separateBackground
+      />
+    ) : null;
   const searchButton = foldedSearch ? (
     <Toolbar.Button
       identifier="workspace-search"
@@ -198,6 +212,7 @@ export function WorkspaceToolbar(props: {
       ) : (
         <Toolbar placement="right">
           {searchButton}
+          {settingsButton}
           {nativeToolbarCompose && foldedSearch ? <Toolbar.Spacer width={8} /> : null}
           {composeButton}
           {compose === null ||

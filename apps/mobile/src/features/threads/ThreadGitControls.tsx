@@ -1,6 +1,6 @@
 import * as Dialog from "../../components/ui/Dialog";
 import { useOpenPullRequest } from "../../native/useOpenPullRequest";
-import type { AppBarMenu } from "../../components/ui/AppBar.types";
+import type { AppBarMenu, AppBarMenuItem } from "../../components/ui/AppBar.types";
 import {
   AuthSourceControlWriteScope,
   EnvironmentId,
@@ -10,14 +10,18 @@ import {
   type VcsStatusResult,
 } from "@t3tools/contracts";
 import {
+  buildMenuItems,
+  getGitActionDisabledReason,
   type GitActionRequestInput,
   requiresDefaultBranchConfirmation,
   resolveQuickAction,
 } from "@t3tools/client-runtime/state/vcs";
-import { useNavigation } from "@react-navigation/native";
+import { StackActions, useNavigation } from "@react-navigation/native";
 import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
 
 import { useEnvironmentScope } from "../../state/session";
+import { useThreadSelection } from "../../state/use-thread-selection";
+import { useLinkedPullRequestActions } from "./useLinkedPullRequestActions";
 import { PullRequestGlyph } from "../pull-requests/pullRequestGlyphs";
 import {
   basename,
@@ -89,7 +93,22 @@ export type ThreadGitMenuProps = {
   readonly onMergeBack?: () => void;
   readonly onPull: () => Promise<void>;
   readonly onRunAction: (input: GitActionRequestInput) => Promise<GitRunStackedActionResult | null>;
+  /** Opened from a sheet: destinations replace it instead of stacking on top. */
+  readonly replaceOnNavigate?: boolean;
 };
+
+type RootParams = ReactNavigation.RootParamList;
+
+function useGitNavigate(replace: boolean | undefined) {
+  const navigation = useNavigation();
+  return <Name extends "GitConfirm" | "GitCommit" | "GitBranches" | "GitOverview" | "ThreadReview">(
+    name: Name,
+    params: RootParams[Name],
+  ) => {
+    if (replace) navigation.dispatch(StackActions.replace(name, params));
+    else (navigation.navigate as (name: Name, params: RootParams[Name]) => void)(name, params);
+  };
+}
 
 export type ThreadGitControlsProps = ThreadGitMenuProps & {
   readonly canOpenTerminal: boolean;
@@ -103,7 +122,7 @@ export type ThreadGitControlsProps = ThreadGitMenuProps & {
 };
 
 function useThreadGitControlModel(props: ThreadGitMenuProps) {
-  const navigation = useNavigation();
+  const navigate = useGitNavigate(props.replaceOnNavigate);
   const openPullRequest = useOpenPullRequest();
   const environmentId = props.environmentId;
   const canWriteSourceControl = useEnvironmentScope(
@@ -190,7 +209,7 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
         );
         return;
       }
-      navigation.navigate("GitConfirm", {
+      navigate("GitConfirm", {
         environmentId: String(environmentId),
         threadId: String(threadId),
         confirmAction: confirmableAction,
@@ -219,7 +238,7 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
   };
 
   const openReview = () => {
-    navigation.navigate("ThreadReview", {
+    navigate("ThreadReview", {
       environmentId: EnvironmentId.make(String(environmentId)),
       threadId: ThreadId.make(String(threadId)),
     });
@@ -230,13 +249,18 @@ function useThreadGitControlModel(props: ThreadGitMenuProps) {
       props.onOpenGitInspector();
       return;
     }
-    navigation.navigate("GitOverview", {
+    navigate("GitOverview", {
       environmentId: String(environmentId),
       threadId: String(threadId),
     });
   };
 
   return {
+    busy,
+    canWriteSourceControl,
+    hasPrimaryRemote,
+    openExistingPr,
+    runActionWithPrompt,
     currentBranchLabel,
     isRepo,
     openGitInspector,
@@ -362,4 +386,135 @@ export function useThreadGitMenuDefinition(props: ThreadGitMenuProps): AppBarMen
       },
     ],
   };
+}
+
+const REQUIRES_THREAD = "Available after the first message";
+// Same symbols as the git overview sheet's rows.
+const GIT_ACTION_ICONS = {
+  commit: "checkmark.circle",
+  push: "arrow.up.circle",
+  pr: "arrow.up.right.circle",
+} as const;
+const NO_WRITE_ACCESS = "This connection cannot change source control.";
+
+/** The git overview's actions as flat rows, for the phone tools panel. */
+export function useThreadGitPanelItems(props: ThreadGitMenuProps): ReadonlyArray<AppBarMenuItem> {
+  const navigate = useGitNavigate(props.replaceOnNavigate);
+  const model = useThreadGitControlModel(props);
+  const { selectedThread, selectedThreadProject, selectedEnvironmentRuntime } =
+    useThreadSelection();
+  const linkedPrActions = useLinkedPullRequestActions({
+    thread: selectedThread,
+    project: selectedThreadProject,
+    runtime: selectedEnvironmentRuntime,
+  });
+  const status = props.gitStatus;
+  const hasThread = props.hasThread !== false;
+  const routeParams = {
+    environmentId: String(props.environmentId),
+    threadId: String(props.threadId),
+  };
+  const { shortLabel } = sourceControlClients.get(
+    status?.sourceControlProvider?.kind,
+  ).changeRequest;
+
+  const actionItems = (
+    model.isRepo ? buildMenuItems(status, model.busy, model.hasPrimaryRemote) : []
+  ).map((item): AppBarMenuItem => {
+    const blocked = !model.canWriteSourceControl && item.kind !== "open_pr";
+    const reason = blocked
+      ? NO_WRITE_ACCESS
+      : getGitActionDisabledReason({
+          item,
+          gitStatus: status,
+          isBusy: model.busy,
+          hasOriginRemote: model.hasPrimaryRemote,
+        });
+    const detail =
+      item.dialogAction === "commit" && status?.hasWorkingTreeChanges
+        ? `${status.workingTree.files.length} file${status.workingTree.files.length === 1 ? "" : "s"} changed`
+        : item.dialogAction === "push" && (status?.aheadCount ?? 0) > 0
+          ? `${status?.aheadCount} commit${status?.aheadCount === 1 ? "" : "s"} ahead`
+          : item.kind === "open_pr" && status?.pr?.number != null
+            ? `${shortLabel} #${status.pr.number} ${status.pr.state ?? "open"}`
+            : undefined;
+    return {
+      id: `git-action-${item.id}`,
+      title: item.label,
+      icon: GIT_ACTION_ICONS[item.icon],
+      subtitle: reason ?? detail,
+      disabled: item.disabled || blocked || !hasThread,
+      onPress: () => {
+        if (item.kind === "open_pr") void model.openExistingPr();
+        else if (item.dialogAction === "commit") navigate("GitCommit", routeParams);
+        else if (item.dialogAction === "push") void model.runActionWithPrompt({ action: "push" });
+        else if (item.dialogAction === "create_pr")
+          void model.runActionWithPrompt({ action: "create_pr" });
+      },
+    };
+  });
+  const behind = status?.behindCount ?? 0;
+  return [
+    {
+      id: "git-status",
+      title: compactMenuBranchLabel(model.currentBranchLabel),
+      icon: "point.topleft.down.curvedto.point.bottomright.up",
+      disabled: true,
+      subtitle: compactMenuStatus(status),
+      onPress: () => {},
+    },
+    ...actionItems,
+    ...(behind > 0
+      ? [
+          {
+            id: "git-pull",
+            title: "Pull latest",
+            icon: "arrow.down.circle",
+            subtitle: model.canWriteSourceControl
+              ? `${behind} commit${behind === 1 ? "" : "s"} behind upstream`
+              : NO_WRITE_ACCESS,
+            disabled: !model.canWriteSourceControl || model.busy || !model.isRepo,
+            onPress: () => void props.onPull(),
+          },
+        ]
+      : []),
+    {
+      id: "git-review",
+      title: "Review changes",
+      icon: "text.bubble",
+      disabled: !model.isRepo || !hasThread,
+      subtitle: hasThread ? "Turn diffs and worktree changes" : REQUIRES_THREAD,
+      onPress: model.openReview,
+    },
+    {
+      id: "git-branches",
+      title: "Branches & worktrees",
+      icon: "point.topleft.down.curvedto.point.bottomright.up",
+      disabled: model.busy || !model.isRepo || !hasThread,
+      subtitle: hasThread ? "Switch branch, create branch, or move to a worktree" : REQUIRES_THREAD,
+      onPress: () => navigate("GitBranches", routeParams),
+    },
+    ...(props.onMergeBack
+      ? [
+          {
+            id: "git-merge-back",
+            title: "Merge back to source",
+            icon: PullRequestGlyph.merged,
+            subtitle: "Bring this thread's latest turn into its source",
+            onPress: props.onMergeBack,
+          },
+        ]
+      : []),
+    ...(linkedPrActions.canLink
+      ? [
+          {
+            id: "git-link-pr",
+            title: `Link ${linkedPrActions.terminology.singular}`,
+            icon: "link",
+            subtitle: `Attach a ${linkedPrActions.terminology.singular} by URL or number`,
+            onPress: linkedPrActions.promptLink,
+          },
+        ]
+      : []),
+  ];
 }

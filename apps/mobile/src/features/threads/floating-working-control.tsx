@@ -1,7 +1,9 @@
+import { toServerClock } from "@t3tools/client-runtime/clock";
 import type { SubagentPillSegment } from "@t3tools/client-runtime/state/thread-subagents";
-import { GlassContainer, GlassView } from "expo-glass-effect";
-import { type ReactNode, useEffect, useRef, useState } from "react";
-import { type LayoutChangeEvent, Pressable, useWindowDimensions, View } from "react-native";
+import type { EnvironmentId } from "@t3tools/contracts";
+import { GlassView } from "expo-glass-effect";
+import { type ReactNode, useEffect, useEffectEvent, useRef, useState } from "react";
+import { BackHandler, type LayoutChangeEvent, Pressable, StyleSheet, View } from "react-native";
 import Animated, {
   Easing,
   FadeIn,
@@ -19,25 +21,40 @@ import { AppActivityIndicator } from "../../components/ui/AppActivityIndicator";
 import { AppText as Text } from "../../components/ui/AppText";
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { ControlPill } from "../../components/ui/ControlPill";
+import { cn } from "../../lib/cn";
 import { NATIVE_LIQUID_GLASS_SUPPORTED } from "../../native/native-glass";
 import { BrowserPreviewButton } from "../browser/browser-preview-button";
-import { DevicePreviewButton } from "../devices/device-preview-button";
 import type { FloatingWorkingStatus } from "./floating-working-status";
+import { ContextRing } from "./ContextRing";
+import { ChecklistExpanded, ChecklistStrip } from "./live-bar-checklist";
+import {
+  type ChecklistPresentation,
+  formatLastTurnDuration,
+  formatLiveClock,
+  liveBarCardTargetWidth,
+  resolveScrollButtonPlacement,
+  type ScrollButtonPlacement,
+  type SideChatSummary,
+} from "./live-bar-presentation";
 import { ShimmeringWorkContent } from "./thread-work-log";
+import { useVisibleSecondClock } from "./use-visible-second-clock";
 
-const CONTROL_HEIGHT = 38.5;
-const CONTROL_GAP = 8;
-const COMPOSER_CAPSULE_INSET = 6;
-const GLASS_MERGE_SPACING = 12;
-const CONTROL_ENTERING = FadeIn.duration(180).reduceMotion(ReduceMotion.System);
-const CONTROL_EXITING = FadeOut.duration(120).reduceMotion(ReduceMotion.System);
-const CONTROL_TIMING = {
-  duration: 240,
+const PILL_HEIGHT = 44;
+const SCROLL_BUTTON_SIZE = 44;
+const SCROLL_BUTTON_GAP = 8;
+const BESIDE_SHIFT = (SCROLL_BUTTON_SIZE + SCROLL_BUTTON_GAP) / 2;
+// Matches the composer capsule's side gutter, so an expanded card lines up with it.
+const CARD_GUTTER = 12;
+// The composer pads 6pt above its capsule; together they leave 8pt below the card.
+const CARD_BOTTOM_GAP = 2;
+/** Room the pill takes above the composer, for estimates made before it is measured. */
+export const LIVE_BAR_PILL_COVERAGE = PILL_HEIGHT + CARD_BOTTOM_GAP + 6;
+
+const CARD_TIMING = {
+  duration: 260,
   easing: Easing.out(Easing.cubic),
   reduceMotion: ReduceMotion.System,
 } as const;
-const CONTROL_ROW_GAP = 14;
-const CONTROL_SEPARATION = (CONTROL_ROW_GAP + CONTROL_HEIGHT) / 2;
 const LABEL_ENTERING = FadeIn.duration(160).delay(80).reduceMotion(ReduceMotion.System);
 const LABEL_EXITING = FadeOut.duration(100).reduceMotion(ReduceMotion.System);
 
@@ -45,141 +62,201 @@ const LABEL_EXITING = FadeOut.duration(100).reduceMotion(ReduceMotion.System);
 const UniwindGlassView = withUniwind(GlassView, {
   style: { fromClassName: "className" },
 });
-const UniwindGlassContainer = withUniwind(GlassContainer, {
-  style: { fromClassName: "className" },
-});
-const AnimatedGlassView = Animated.createAnimatedComponent(UniwindGlassView);
 
-// Segment widths feed back into labelWidth; ignore sub-point changes to avoid rounding-driven ellipsis loops.
+// Segment widths feed back into the card width; ignore sub-point changes to avoid rounding-driven loops.
 function settleWidth(next: number) {
   return (current: number) => (Math.abs(current - next) < 1 ? current : next);
 }
 
-const CONTROL_OVERLAY_OFFSET = CONTROL_HEIGHT + CONTROL_GAP - COMPOSER_CAPSULE_INSET;
-export const FLOATING_WORKING_CONTROL_COVERAGE = CONTROL_OVERLAY_OFFSET + CONTROL_GAP;
+export type LiveBarTime =
+  | {
+      readonly kind: "working";
+      readonly startedAtMs: number;
+      readonly environmentId: EnvironmentId;
+      /** A request waits on the user, so the dot turns amber. */
+      readonly waiting: boolean;
+    }
+  | { readonly kind: "idle"; readonly durationMs: number };
 
-export function FloatingWorkingControl(props: {
+interface LiveBarProps {
   readonly colorScheme: "light" | "dark";
   readonly status: FloatingWorkingStatus | null;
   readonly extensionStatus?: { readonly label: string; readonly onPress: () => void } | null;
+  readonly time: LiveBarTime | null;
+  readonly onOpenTurn: () => void;
+  readonly agents: { readonly segment: SubagentPillSegment; readonly failed: boolean } | null;
+  readonly onOpenAgents: () => void;
+  readonly sideChats: SideChatSummary | null;
+  readonly onOpenSideChats: () => void;
   readonly devicePreview: { readonly count: number; readonly onPress: () => void } | null;
   readonly browserPreview: { readonly count: number; readonly onPress: () => void } | null;
-  readonly showScrollToEnd: boolean;
-  readonly onScrollToEnd: () => void;
-  readonly agents: SubagentPillSegment | null;
-  readonly onOpenAgents: () => void;
+  readonly contextPercent: number | null;
+  readonly onOpenContext: () => void;
   readonly queuedCount: number;
   readonly onOpenQueue: () => void;
+  readonly checklist: ChecklistPresentation | null;
+  readonly checklistExpanded: boolean;
+  readonly onToggleChecklist: () => void;
+  /** The pending request slot; it replaces the checklist strip. */
+  readonly request: ReactNode | null;
+  readonly requestExpanded: boolean;
+  /** Collapses whichever of the checklist or request is expanded. */
+  readonly onCollapse: () => void;
+  readonly showScrollToEnd: boolean;
+  readonly onScrollToEnd: () => void;
   readonly lift?: SharedValue<number>;
-}) {
-  const { width: windowWidth } = useWindowDimensions();
+}
+
+/**
+ * The live bar: a pill of live segments with the checklist or a pending request attached on top,
+ * as one card that sits in flow above the composer so the feed inset follows its height.
+ */
+export function LiveBar(props: LiveBarProps) {
   const reducedMotion = useReducedMotion();
-  const [overlayWidth, setOverlayWidth] = useState(windowWidth);
-  const [queueWidth, setQueueWidth] = useState(0);
-  const [actionWidth, setActionWidth] = useState(0);
-  const [extensionWidth, setExtensionWidth] = useState(0);
-  const extensionStatus = props.extensionStatus ?? null;
-  const extensionOnly = props.status?.kind === "extension";
-  const useGlass = NATIVE_LIQUID_GLASS_SUPPORTED && !extensionOnly;
+  const [hostWidth, setHostWidth] = useState(0);
+  const [rowWidth, setRowWidth] = useState(0);
+  const availableWidth = Math.max(0, hostWidth - CARD_GUTTER * 2);
   const action = props.status?.kind === "stop" ? props.status.action : null;
-  const [agentsWidth, setAgentsWidth] = useState(0);
-  const hasQueue = props.queuedCount > 0;
-  const hasPreview = props.devicePreview !== null || props.browserPreview !== null;
-  const [previewWidth, setPreviewWidth] = useState(0);
-  const agents = props.agents;
-  const hasAgents = agents !== null;
-  // Only reserve the scroll button's slot while it is visible.
-  const reservedWidth = props.showScrollToEnd ? CONTROL_HEIGHT + 32 : 16;
-  const availableLabelWidth = Math.max(
-    0,
-    Math.min(overlayWidth, windowWidth) -
-      reservedWidth -
-      (action !== null ? actionWidth : 0) -
-      (hasQueue ? queueWidth : 0) -
-      (hasAgents ? agentsWidth : 0) -
-      (hasPreview ? previewWidth : 0),
-  );
-  const labelWidth = Math.max(
-    0,
-    availableLabelWidth - (extensionStatus === null ? 0 : extensionWidth),
-  );
-  const separationProgress = useSharedValue(props.showScrollToEnd ? 1 : 0);
+  const extensionStatus = props.extensionStatus ?? null;
+  const hasSegments =
+    props.status !== null ||
+    extensionStatus !== null ||
+    props.time !== null ||
+    props.agents !== null ||
+    props.sideChats !== null ||
+    props.devicePreview !== null ||
+    props.browserPreview !== null ||
+    props.contextPercent !== null ||
+    props.queuedCount > 0;
+  const requestShown = props.request !== null;
+  const checklistExpanded = props.checklistExpanded && props.checklist !== null && !requestShown;
+  const requestExpanded = props.requestExpanded && requestShown;
+  const pillVisible = hasSegments && !requestExpanded;
+  const topSlot: ReactNode =
+    props.request ??
+    (props.checklist === null ? null : checklistExpanded ? (
+      <ChecklistExpanded checklist={props.checklist} onCollapse={props.onToggleChecklist} />
+    ) : (
+      <ChecklistStrip checklist={props.checklist} onExpand={props.onToggleChecklist} />
+    ));
+  const hasLiveBar = pillVisible || topSlot !== null;
+  const expanded = checklistExpanded || requestExpanded;
+  const targetWidth = liveBarCardTargetWidth({
+    rowWidth: pillVisible ? rowWidth : 0,
+    hasStrip: topSlot !== null,
+    fullWidth: requestShown || checklistExpanded,
+    availableWidth,
+  });
+  const sized = availableWidth > 0 && (!pillVisible || rowWidth > 0);
+  const placement = resolveScrollButtonPlacement({
+    visible: props.showScrollToEnd,
+    hasLiveBar,
+    expanded,
+    cardTargetWidth: targetWidth,
+  });
+  // A hidden button keeps its last spot so it fades out where it was.
+  const [buttonSpot, setButtonSpot] = useState<Exclude<ScrollButtonPlacement, "hidden">>("alone");
+  if (placement !== "hidden" && placement !== buttonSpot) setButtonSpot(placement);
 
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- animates the Reanimated separation value when scroll-to-end visibility changes
+  const cardWidth = useSharedValue(0);
+  const cardHeight = useSharedValue(0);
+  const cardOpacity = useSharedValue(0);
+  const besideProgress = useSharedValue(0);
+  const buttonOpacity = useSharedValue(props.showScrollToEnd ? 1 : 0);
+  const shownRef = useRef(false);
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- drives the Reanimated card width and opacity toward what this render settled on
   useEffect(() => {
-    separationProgress.set(withTiming(props.showScrollToEnd ? 1 : 0, CONTROL_TIMING));
-  }, [props.showScrollToEnd, separationProgress]);
-
-  const lift = props.lift;
-  const liftStyle = useAnimatedStyle(() => ({
-    transform: [{ translateY: -(lift?.value ?? 0) }],
-  }));
-  const arrowTransformStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: -CONTROL_SEPARATION * (1 - separationProgress.value) }],
-  }));
-  const arrowContentStyle = useAnimatedStyle(() => ({
-    opacity: separationProgress.value,
-  }));
-
-  // Animate an in-flow sizer for native glass layout. Measure labels at fixed width to avoid repeated animation retargeting.
-  const capsuleWidth = useSharedValue<number | null>(null);
-  const measuredWidthRef = useRef<number | null>(null);
-  const handleLabelLayout = (event: LayoutChangeEvent) => {
-    const width = event.nativeEvent.layout.width;
-    if (width === measuredWidthRef.current) {
+    if (!hasLiveBar) {
+      shownRef.current = false;
+      cardOpacity.set(withTiming(0, CARD_TIMING));
       return;
     }
-    const first = measuredWidthRef.current === null;
-    measuredWidthRef.current = width;
-    capsuleWidth.set(first ? width : withTiming(width, CONTROL_TIMING));
-  };
-  const hasStatus = props.status !== null;
-  const hasCapsule = hasStatus || hasQueue || hasAgents || hasPreview;
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- clears the Reanimated capsule width value and measured width when the status goes away
-  useEffect(() => {
-    if (!hasStatus) {
-      measuredWidthRef.current = null;
-      capsuleWidth.set(null);
-    }
-  }, [capsuleWidth, hasStatus]);
-  const capsuleStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: CONTROL_SEPARATION * (1 - separationProgress.value) }],
-  }));
-  const capsuleSizerStyle = useAnimatedStyle(() => ({
-    width: capsuleWidth.value ?? 0,
-  }));
+    if (!sized) return;
+    const animate = shownRef.current && !reducedMotion;
+    cardWidth.set(animate ? withTiming(targetWidth, CARD_TIMING) : targetWidth);
+    cardOpacity.set(animate ? withTiming(1, CARD_TIMING) : 1);
+    shownRef.current = true;
+  }, [cardOpacity, cardWidth, hasLiveBar, reducedMotion, sized, targetWidth]);
 
-  if (!hasCapsule && !props.showScrollToEnd) {
-    return null;
-  }
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- animates the Reanimated scroll button position and visibility when its placement changes
+  useEffect(() => {
+    besideProgress.set(withTiming(placement === "beside" ? 1 : 0, CARD_TIMING));
+    buttonOpacity.set(withTiming(placement === "hidden" ? 0 : 1, CARD_TIMING));
+  }, [besideProgress, buttonOpacity, placement]);
+
+  const collapse = useEffectEvent(() => props.onCollapse());
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- subscribes to Android back while the card is expanded, so back collapses it first
+  useEffect(() => {
+    if (!expanded) return;
+    const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
+      collapse();
+      return true;
+    });
+    return () => subscription.remove();
+  }, [expanded]);
+
+  const lastHeightRef = useRef<number | null>(null);
+  const handleContentLayout = (event: LayoutChangeEvent) => {
+    const height = event.nativeEvent.layout.height;
+    if (height === lastHeightRef.current) return;
+    // The first measurement lands at once so an open thread does not grow its card on entry.
+    cardHeight.set(lastHeightRef.current === null ? height : withTiming(height, CARD_TIMING));
+    lastHeightRef.current = height;
+  };
+
+  const lift = props.lift;
+  const hostStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: -(lift?.value ?? 0) }],
+  }));
+  const cardStyle = useAnimatedStyle(() => ({
+    width: cardWidth.value,
+    height: cardHeight.value,
+    opacity: NATIVE_LIQUID_GLASS_SUPPORTED ? 1 : cardOpacity.value,
+    transform: [{ translateX: -BESIDE_SHIFT * besideProgress.value }],
+  }));
+  // Content lays out once at its resting width and stays centred while the card resizes, so text
+  // does not reflow on every frame.
+  const contentStyle = useAnimatedStyle(() => ({
+    left: (cardWidth.value - targetWidth) / 2,
+  }));
+  const rowStyle = useAnimatedStyle(() => ({
+    left: (cardWidth.value - availableWidth) / 2,
+  }));
+  const buttonStyle = useAnimatedStyle(() => {
+    const center = hostWidth / 2;
+    const left =
+      buttonSpot === "beside"
+        ? center + cardWidth.value / 2 - BESIDE_SHIFT * besideProgress.value + SCROLL_BUTTON_GAP
+        : center - SCROLL_BUTTON_SIZE / 2;
+    return {
+      left,
+      bottom: buttonSpot === "above" ? cardHeight.value + SCROLL_BUTTON_GAP : 0,
+      opacity: buttonOpacity.value,
+    };
+  });
 
   const previewCompact =
-    hasStatus ||
-    hasAgents ||
-    hasQueue ||
+    props.status !== null ||
+    props.time !== null ||
+    props.agents !== null ||
+    props.queuedCount > 0 ||
     (props.devicePreview !== null && props.browserPreview !== null);
   const statusInteractive =
     props.status?.kind === "connection" ||
     props.status?.kind === "extension" ||
     props.status?.kind === "child-input";
-  const capsuleInteractive =
-    statusInteractive ||
-    extensionStatus !== null ||
-    action !== null ||
-    hasQueue ||
-    hasAgents ||
-    hasPreview;
-  const statusContent =
-    props.status !== null ? (
-      <View
-        pointerEvents={statusInteractive ? "box-none" : "none"}
-        className="h-11 items-center justify-center overflow-hidden"
-      >
-        <Animated.View className="h-11" style={capsuleSizerStyle} />
+
+  const segments = (
+    <View
+      onLayout={(event) => setRowWidth(settleWidth(event.nativeEvent.layout.width))}
+      className="h-11 flex-row items-center px-1.5"
+    >
+      {props.status !== null ? (
         <View
           pointerEvents={statusInteractive ? "box-none" : "none"}
-          className="absolute h-11 items-center justify-center"
-          style={{ width: labelWidth }}
+          className="shrink"
+          style={{ maxWidth: availableWidth * 0.6 }}
         >
           <FloatingStatusLabel
             key={
@@ -188,99 +265,122 @@ export function FloatingWorkingControl(props: {
                 : `${props.status.kind}:${props.status.label}`
             }
             status={props.status}
-            onLayout={handleLabelLayout}
           />
         </View>
-      </View>
-    ) : null;
-
-  const capsuleContent = (
-    <View className="flex-row items-center">
-      {statusContent}
+      ) : null}
       {extensionStatus !== null ? (
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={extensionStatus.label}
           accessibilityHint="Shows the full Pi status"
           onPress={extensionStatus.onPress}
-          onLayout={(event) => setExtensionWidth(settleWidth(event.nativeEvent.layout.width))}
-          style={{ maxWidth: availableLabelWidth * 0.5 }}
-          className="h-11 flex-row items-center px-3 active:opacity-70"
+          style={{ maxWidth: availableWidth * 0.4 }}
+          className="h-11 shrink flex-row items-center px-2.5 active:opacity-70"
         >
-          {hasStatus ? <View className="absolute left-0 h-4 w-px bg-border" /> : null}
           <Text className="shrink font-t3-medium text-xs text-foreground" numberOfLines={1}>
             {extensionStatus.label}
           </Text>
         </Pressable>
       ) : null}
       {action !== null ? (
-        <View
-          onLayout={(event) => setActionWidth(settleWidth(event.nativeEvent.layout.width))}
-          className="h-11 flex-row items-center"
-        >
-          <View className="h-4 w-px bg-border" />
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={action.accessibilityLabel}
-            accessibilityState={{ disabled: action.disabled }}
-            disabled={action.disabled}
-            onPress={action.onPress}
-            className={`h-11 items-center justify-center px-3 active:opacity-70 ${action.disabled ? "opacity-50" : ""}`}
-          >
-            <Text className="font-t3-medium text-xs text-foreground" numberOfLines={1}>
-              {action.label}
-            </Text>
-          </Pressable>
-        </View>
-      ) : null}
-      {hasPreview ? (
-        <View
-          className="h-11 flex-row items-center"
-          onLayout={(event) => setPreviewWidth(settleWidth(event.nativeEvent.layout.width))}
-        >
-          {hasStatus ? <View className="h-4 w-px bg-border" /> : null}
-          {props.devicePreview !== null ? (
-            <DevicePreviewButton {...props.devicePreview} compact={previewCompact} />
-          ) : null}
-          {props.browserPreview !== null ? (
-            <BrowserPreviewButton {...props.browserPreview} compact={previewCompact} />
-          ) : null}
-        </View>
-      ) : null}
-      {agents !== null ? (
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={`Open agents, ${agents.accessibilityLabel}`}
-          accessibilityHint="Opens this turn's subagents"
-          onPress={props.onOpenAgents}
-          onLayout={(event) => setAgentsWidth(settleWidth(event.nativeEvent.layout.width))}
-          className="h-11 flex-row items-center gap-1.5 px-3 active:opacity-70"
+          accessibilityLabel={action.accessibilityLabel}
+          accessibilityState={{ disabled: action.disabled }}
+          disabled={action.disabled}
+          onPress={action.onPress}
+          className={cn(
+            "h-11 items-center justify-center px-2.5 active:opacity-70",
+            action.disabled && "opacity-50",
+          )}
         >
-          {hasStatus || hasPreview ? <View className="absolute left-0 h-4 w-px bg-border" /> : null}
-          <SymbolView name="person.2" size={13} tintColorClassName="accent-foreground" />
-          <Text className="font-t3-medium text-xs tabular-nums" numberOfLines={1}>
-            {agents.label}
+          <Text className="font-t3-medium text-xs text-foreground" numberOfLines={1}>
+            {action.label}
           </Text>
         </Pressable>
       ) : null}
-      {hasQueue ? (
-        <Pressable
-          accessibilityRole="button"
+      {props.time !== null ? <TimeSegment time={props.time} onPress={props.onOpenTurn} /> : null}
+      {props.agents !== null ? (
+        <Segment
+          accessibilityLabel={`Agents, ${props.agents.segment.accessibilityLabel}${props.agents.failed ? ", one failed" : ""}`}
+          accessibilityHint="Opens this turn's agents"
+          onPress={props.onOpenAgents}
+        >
+          <SymbolView name="person.2" size={13} tintColorClassName="accent-foreground" />
+          <Text className="font-t3-medium text-xs tabular-nums text-foreground" numberOfLines={1}>
+            {props.agents.segment.label}
+          </Text>
+          {props.agents.failed ? (
+            <View className="size-1.5 rounded-full bg-danger-foreground" />
+          ) : null}
+        </Segment>
+      ) : null}
+      {props.sideChats !== null ? (
+        <Segment
+          accessibilityLabel={`${props.sideChats.count} side ${props.sideChats.count === 1 ? "chat" : "chats"}${props.sideChats.needsAttention ? ", one needs you" : ""}`}
+          accessibilityHint="Opens this thread's side chats"
+          onPress={props.onOpenSideChats}
+        >
+          <SymbolView
+            name="bubble.left.and.bubble.right"
+            size={13}
+            tintColorClassName="accent-foreground"
+          />
+          <Text className="font-t3-medium text-xs tabular-nums text-foreground">
+            {props.sideChats.count}
+          </Text>
+          {props.sideChats.needsAttention ? (
+            <View className="size-1.5 rounded-full bg-warning-foreground" />
+          ) : null}
+        </Segment>
+      ) : null}
+      {props.devicePreview !== null ? (
+        <Segment
+          accessibilityLabel={
+            props.devicePreview.count === 1
+              ? "View device"
+              : `View ${props.devicePreview.count} devices`
+          }
+          accessibilityHint="Watch and control devices open in this thread"
+          onPress={props.devicePreview.onPress}
+        >
+          <SymbolView
+            name={{ ios: "iphone", android: "smartphone" }}
+            size={14}
+            tintColorClassName="accent-foreground"
+            type="monochrome"
+          />
+          <Text className="font-t3-medium text-xs tabular-nums text-foreground">
+            {props.devicePreview.count}
+          </Text>
+        </Segment>
+      ) : null}
+      {props.browserPreview !== null ? (
+        <BrowserPreviewButton {...props.browserPreview} compact={previewCompact} />
+      ) : null}
+      {props.contextPercent !== null ? (
+        <Segment
+          accessibilityLabel={`Context window ${props.contextPercent}% used`}
+          accessibilityHint="Opens context window details"
+          onPress={props.onOpenContext}
+        >
+          <ContextRing percent={props.contextPercent} size={14} stroke={2} />
+          <Text className="font-t3-medium text-xs tabular-nums text-foreground">
+            {props.contextPercent}%
+          </Text>
+        </Segment>
+      ) : null}
+      {props.queuedCount > 0 ? (
+        <Segment
           accessibilityLabel={`Open queue, ${props.queuedCount} messages`}
           accessibilityHint="Opens queued messages to send now, edit, or remove"
           onPress={props.onOpenQueue}
-          onLayout={(event) => setQueueWidth(settleWidth(event.nativeEvent.layout.width))}
-          style={{ maxWidth: Math.min(overlayWidth, windowWidth) * 0.45 }}
-          className="h-11 flex-row items-center gap-2 px-3 active:opacity-70"
         >
-          {hasStatus || hasPreview || hasAgents ? (
-            <View className="absolute left-0 h-4 w-px bg-border" />
-          ) : null}
           <SymbolView name="list.number" size={13} tintColorClassName="accent-foreground" />
-          <Text className="shrink font-t3-medium text-xs tabular-nums" numberOfLines={1}>
+          <Text className="font-t3-medium text-xs tabular-nums text-foreground" numberOfLines={1}>
             {props.queuedCount} queued
           </Text>
-        </Pressable>
+        </Segment>
       ) : null}
     </View>
   );
@@ -288,103 +388,158 @@ export function FloatingWorkingControl(props: {
   return (
     <Animated.View
       pointerEvents="box-none"
-      className="absolute left-0 right-0 z-20 items-center"
-      style={[{ top: -CONTROL_OVERLAY_OFFSET }, liftStyle]}
-      onLayout={(event) => setOverlayWidth(event.nativeEvent.layout.width)}
-      entering={useGlass || extensionOnly || reducedMotion ? undefined : CONTROL_ENTERING}
-      exiting={useGlass || extensionOnly || reducedMotion ? undefined : CONTROL_EXITING}
+      className="z-20 w-full items-center"
+      style={[{ marginBottom: CARD_BOTTOM_GAP }, hostStyle]}
+      onLayout={(event) => setHostWidth(event.nativeEvent.layout.width)}
     >
-      {hasCapsule && useGlass ? (
-        <UniwindGlassContainer
-          spacing={GLASS_MERGE_SPACING}
+      <Animated.View
+        pointerEvents={hasLiveBar ? "box-none" : "none"}
+        accessibilityElementsHidden={!hasLiveBar}
+        importantForAccessibility={hasLiveBar ? "auto" : "no-hide-descendants"}
+        className={NATIVE_LIQUID_GLASS_SUPPORTED ? undefined : "shadow-md shadow-black/10"}
+        style={cardStyle}
+      >
+        <View
           pointerEvents="box-none"
-          className="flex-row items-center gap-4"
+          className={cn(
+            "flex-1 overflow-hidden rounded-[22px]",
+            !NATIVE_LIQUID_GLASS_SUPPORTED && "border border-border bg-glass-fallback",
+            requestShown && "border border-warning-border",
+          )}
         >
-          <AnimatedGlassView
-            colorScheme={props.colorScheme}
-            glassEffectStyle="regular"
-            isInteractive={capsuleInteractive}
-            pointerEvents={capsuleInteractive ? "box-none" : "none"}
-            className="h-11 items-center justify-center overflow-hidden rounded-full"
-            style={capsuleStyle}
-          >
-            {capsuleContent}
-          </AnimatedGlassView>
-
-          <AnimatedGlassView
-            colorScheme={props.colorScheme}
-            glassEffectStyle={{ style: props.showScrollToEnd ? "regular" : "none", animate: true }}
-            isInteractive
-            pointerEvents={props.showScrollToEnd ? "auto" : "none"}
-            accessibilityElementsHidden={!props.showScrollToEnd}
-            importantForAccessibility={props.showScrollToEnd ? "auto" : "no-hide-descendants"}
-            className="h-11 w-11 items-center justify-center overflow-hidden rounded-full"
-            style={arrowTransformStyle}
-          >
-            <Animated.View style={arrowContentStyle}>
-              <ScrollToEndButton disabled={!props.showScrollToEnd} onPress={props.onScrollToEnd} />
+          {NATIVE_LIQUID_GLASS_SUPPORTED ? (
+            <UniwindGlassView
+              pointerEvents="none"
+              colorScheme={props.colorScheme}
+              glassEffectStyle={{ style: hasLiveBar ? "regular" : "none", animate: true }}
+              className="absolute inset-0 rounded-[22px]"
+            />
+          ) : null}
+          {availableWidth > 0 ? (
+            <Animated.View
+              pointerEvents="box-none"
+              className="absolute bottom-0"
+              style={[{ width: targetWidth }, contentStyle]}
+              onLayout={handleContentLayout}
+            >
+              {topSlot}
+              {topSlot !== null && pillVisible ? (
+                <View className="bg-border" style={{ height: StyleSheet.hairlineWidth }} />
+              ) : null}
+              {pillVisible ? <View pointerEvents="none" style={{ height: PILL_HEIGHT }} /> : null}
             </Animated.View>
-          </AnimatedGlassView>
-        </UniwindGlassContainer>
-      ) : hasCapsule ? (
-        <View pointerEvents="box-none" className="flex-row items-center gap-4">
-          <Animated.View
-            pointerEvents={capsuleInteractive ? "box-none" : "none"}
-            className="h-11 items-center justify-center overflow-hidden rounded-full border border-border bg-glass-fallback shadow-md shadow-black/10"
-            style={capsuleStyle}
-          >
-            {capsuleContent}
-          </Animated.View>
+          ) : null}
+          {pillVisible && availableWidth > 0 ? (
+            <Animated.View
+              pointerEvents="box-none"
+              className="absolute bottom-0 items-center justify-center"
+              style={[{ height: PILL_HEIGHT, width: availableWidth }, rowStyle]}
+            >
+              {segments}
+            </Animated.View>
+          ) : null}
+        </View>
+      </Animated.View>
 
-          <Animated.View
-            pointerEvents={props.showScrollToEnd ? "auto" : "none"}
-            accessibilityElementsHidden={!props.showScrollToEnd}
-            importantForAccessibility={props.showScrollToEnd ? "auto" : "no-hide-descendants"}
-            style={[arrowTransformStyle, arrowContentStyle]}
+      <Animated.View
+        pointerEvents={placement === "hidden" ? "none" : "box-none"}
+        accessibilityElementsHidden={placement === "hidden"}
+        importantForAccessibility={placement === "hidden" ? "no-hide-descendants" : "auto"}
+        className="absolute"
+        style={buttonStyle}
+      >
+        {NATIVE_LIQUID_GLASS_SUPPORTED ? (
+          <UniwindGlassView
+            colorScheme={props.colorScheme}
+            glassEffectStyle={{ style: placement === "hidden" ? "none" : "regular", animate: true }}
+            isInteractive
+            className="h-11 w-11 items-center justify-center overflow-hidden rounded-full"
           >
             <ControlPill
               accessibilityLabel="Scroll to end"
               activateOnPressIn
-              className="h-11 w-11 border border-border bg-glass-fallback shadow-md shadow-black/10"
-              disabled={!props.showScrollToEnd}
+              className="h-11 w-11 bg-transparent"
+              disabled={placement === "hidden"}
               icon={{ ios: "chevron.down", android: "keyboard_arrow_down" }}
               onPress={props.onScrollToEnd}
             />
-          </Animated.View>
-        </View>
-      ) : NATIVE_LIQUID_GLASS_SUPPORTED ? (
-        <UniwindGlassView
-          colorScheme={props.colorScheme}
-          glassEffectStyle="regular"
-          isInteractive
-          className="h-11 w-11 items-center justify-center overflow-hidden rounded-full"
-        >
-          <ScrollToEndButton onPress={props.onScrollToEnd} />
-        </UniwindGlassView>
-      ) : (
-        <ControlPill
-          accessibilityLabel="Scroll to end"
-          activateOnPressIn
-          className="h-11 w-11 border border-border bg-glass-fallback shadow-md shadow-black/10"
-          icon={{ ios: "chevron.down", android: "keyboard_arrow_down" }}
-          onPress={props.onScrollToEnd}
-        />
-      )}
+          </UniwindGlassView>
+        ) : (
+          <ControlPill
+            accessibilityLabel="Scroll to end"
+            activateOnPressIn
+            className="h-11 w-11 border border-border bg-glass-fallback shadow-md shadow-black/10"
+            disabled={placement === "hidden"}
+            icon={{ ios: "chevron.down", android: "keyboard_arrow_down" }}
+            onPress={props.onScrollToEnd}
+          />
+        )}
+      </Animated.View>
     </Animated.View>
   );
 }
 
-function FloatingStatusLabel(props: {
-  readonly status: FloatingWorkingStatus;
-  readonly onLayout: (event: LayoutChangeEvent) => void;
+function Segment(props: {
+  readonly accessibilityLabel: string;
+  readonly accessibilityHint: string;
+  readonly onPress: () => void;
+  readonly children: ReactNode;
 }) {
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={props.accessibilityLabel}
+      accessibilityHint={props.accessibilityHint}
+      onPress={props.onPress}
+      className="h-11 flex-row items-center gap-1.5 px-2.5 active:opacity-70"
+    >
+      {props.children}
+    </Pressable>
+  );
+}
+
+/** Ticks once a second while working; only this segment re-renders. */
+function TimeSegment(props: { readonly time: LiveBarTime; readonly onPress: () => void }) {
+  const { time } = props;
+  const nowMs = useVisibleSecondClock(time.kind === "working");
+  const label =
+    time.kind === "working"
+      ? formatLiveClock(toServerClock(time.environmentId, nowMs) - time.startedAtMs)
+      : formatLastTurnDuration(time.durationMs);
+  return (
+    <Segment
+      accessibilityLabel={
+        time.kind === "working" ? `Working for ${label}` : `Last turn took ${label}`
+      }
+      accessibilityHint="Opens this turn's details"
+      onPress={props.onPress}
+    >
+      {time.kind === "working" ? (
+        <View
+          className={cn(
+            "size-2 rounded-full",
+            time.waiting ? "bg-warning-foreground" : "bg-adaptive-blue-500-400",
+          )}
+        />
+      ) : (
+        <SymbolView
+          name="checkmark"
+          size={11}
+          tintColorClassName="accent-adaptive-emerald-600-400"
+        />
+      )}
+      <Text className="font-t3-medium text-xs tabular-nums text-foreground">{label}</Text>
+    </Segment>
+  );
+}
+
+function FloatingStatusLabel(props: { readonly status: FloatingWorkingStatus }) {
   if (props.status.kind === "extension") {
     return (
       <StatusLabelRow
         accessibilityLabel={props.status.label}
         accessibilityRole="button"
         onPress={props.status.onPress}
-        onLayout={props.onLayout}
         className="gap-1.5"
         animated={false}
       >
@@ -398,11 +553,9 @@ function FloatingStatusLabel(props: {
   if (props.status.kind === "child-input") {
     return (
       <StatusLabelRow
-        key="child-input"
         accessibilityLabel={props.status.accessibilityLabel}
         accessibilityRole="button"
         className="gap-2"
-        onLayout={props.onLayout}
         onPress={props.status.onPress}
       >
         <SymbolView name="text.bubble" size={13} tintColorClassName="accent-foreground" />
@@ -415,18 +568,13 @@ function FloatingStatusLabel(props: {
   if (props.status.kind === "connection") {
     return (
       <StatusLabelRow
-        key="connection"
         accessibilityLabel={props.status.label}
         accessibilityRole="button"
         className="gap-2"
-        onLayout={props.onLayout}
         onPress={props.status.onPress}
       >
         <View className="h-2 w-2 rounded-full bg-red-500" />
-        <Text
-          className="max-w-[260px] shrink font-t3-medium text-xs text-foreground"
-          numberOfLines={1}
-        >
+        <Text className="shrink font-t3-medium text-xs text-foreground" numberOfLines={1}>
           {props.status.label}
         </Text>
       </StatusLabelRow>
@@ -434,12 +582,7 @@ function FloatingStatusLabel(props: {
   }
   if (props.status.kind === "stop") {
     return (
-      <StatusLabelRow
-        key="stop"
-        accessibilityLabel={props.status.label}
-        className="gap-2"
-        onLayout={props.onLayout}
-      >
+      <StatusLabelRow accessibilityLabel={props.status.label} className="gap-2">
         {props.status.unresponsive ? (
           <SymbolView
             name="exclamationmark.triangle"
@@ -458,12 +601,7 @@ function FloatingStatusLabel(props: {
   }
   if (props.status.kind === "goal") {
     return (
-      <StatusLabelRow
-        key="goal"
-        accessibilityLabel={props.status.accessibilityLabel}
-        className="gap-2"
-        onLayout={props.onLayout}
-      >
+      <StatusLabelRow accessibilityLabel={props.status.accessibilityLabel} className="gap-2">
         <SymbolView
           name="target"
           size={13}
@@ -477,12 +615,7 @@ function FloatingStatusLabel(props: {
     );
   }
   return (
-    <StatusLabelRow
-      key="preparing"
-      accessibilityLabel={props.status.label}
-      className="gap-1.5"
-      onLayout={props.onLayout}
-    >
+    <StatusLabelRow accessibilityLabel={props.status.label} className="gap-1.5">
       <SymbolView
         name="arrow.triangle.branch"
         size={13}
@@ -508,17 +641,15 @@ function StatusLabelRow(props: {
   readonly accessibilityRole?: "button";
   readonly className?: string;
   readonly children: ReactNode;
-  readonly onLayout: (event: LayoutChangeEvent) => void;
   readonly onPress?: () => void;
 }) {
   const reducedMotion = useReducedMotion();
-  const rowClassName = `h-11 flex-row items-center px-4 ${props.className ?? ""}`;
+  const rowClassName = `h-11 flex-row items-center px-2.5 ${props.className ?? ""}`;
   return (
     <Animated.View
-      className="absolute max-w-full"
+      className="max-w-full"
       entering={props.animated === false || reducedMotion ? undefined : LABEL_ENTERING}
       exiting={props.animated === false || reducedMotion ? undefined : LABEL_EXITING}
-      onLayout={props.onLayout}
     >
       {props.onPress ? (
         <Pressable
@@ -535,18 +666,5 @@ function StatusLabelRow(props: {
         </View>
       )}
     </Animated.View>
-  );
-}
-
-function ScrollToEndButton(props: { readonly disabled?: boolean; readonly onPress: () => void }) {
-  return (
-    <ControlPill
-      accessibilityLabel="Scroll to end"
-      activateOnPressIn
-      className="h-11 w-11 bg-transparent"
-      disabled={props.disabled}
-      icon={{ ios: "chevron.down", android: "keyboard_arrow_down" }}
-      onPress={props.onPress}
-    />
   );
 }

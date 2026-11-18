@@ -39,9 +39,13 @@ import { WorkspaceSidebarTabs } from "./WorkspaceSidebarTabs";
 import { useAdaptiveWorkspaceLayout, useWorkspacePaneState } from "../AdaptiveWorkspaceLayout";
 import { useSelectWorkspaceTab } from "./useSelectWorkspaceTab";
 import { useWorkspaceCompose } from "./useWorkspaceCompose";
+import { useComposeMenu } from "./useComposeMenu";
+import { useWorkTabAttention } from "../../work/workAttention";
 
 const PULL_REQUEST_ICON = require("../../../../assets/icons/pull-request.png");
 const ISSUE_ICON = require("../../../../assets/icons/issue.png");
+const AGENT_ICON = require("../../../../assets/icons/agent.png");
+const LAST_SLOT = NATIVE_WORKSPACE_TAB_SLOTS.length - 1;
 
 /** Retain each native controller tree; removing its root can leave RNS's stack empty. */
 function RetainedWorkspaceTab(props: {
@@ -50,6 +54,8 @@ function RetainedWorkspaceTab(props: {
   readonly active: boolean;
   /** Render a slot that hasn't been shown yet: its header, and the page it opens with. */
   readonly prewarm: boolean;
+  /** The slot opens with Settings rather than a tab. */
+  readonly prewarmsSettings: boolean;
   readonly setMountedSlots: Dispatch<SetStateAction<ReadonlySet<string>>>;
   readonly setPrewarmRequests: Dispatch<SetStateAction<ReadonlyMap<string, number>>>;
   readonly children: (workspace: SlotWorkspace, headerOnly: boolean) => ReactNode;
@@ -76,7 +82,7 @@ function RetainedWorkspaceTab(props: {
       source: workspace,
       workspace: {
         ...workspace,
-        settingsOpen: props.slot === "settings",
+        settingsOpen: props.prewarmsSettings,
         state: { ...workspace.state, selectedTab: props.tab },
       },
       children: props.children,
@@ -148,9 +154,8 @@ export function WorkspaceNativeTabs(props: {
   readonly tabsInSidebarColumn?: boolean;
 }) {
   const workspace = useWorkspaceTabs()!;
-  const order = useEnabledNavigationTabs();
-  const primaryTabs = order.slice(0, 4);
-  const overflow = order[4];
+  const slotTabs = useEnabledNavigationTabs().slice(0, NATIVE_WORKSPACE_TAB_SLOTS.length);
+  const workAttention = useWorkTabAttention(slotTabs.includes("work"));
   const selectTab = useSelectWorkspaceTab();
   const [provenance, setProvenance] = useState(0);
   const systemTabBar = useSystemWorkspaceTabBar();
@@ -168,9 +173,10 @@ export function WorkspaceNativeTabs(props: {
   const { width } = useWindowDimensions();
   const { colors } = useControlTheme();
   const selectedTab = workspace.state.selectedTab;
-  const selectedSlot = workspace.settingsOpen ? -1 : primaryTabs.indexOf(selectedTab);
-  const selectedScreenKey =
-    selectedSlot === -1 ? "settings" : NATIVE_WORKSPACE_TAB_SLOTS[selectedSlot]!;
+  // Settings, and a section the bar has no room for, open in the last slot.
+  const tabSlot = slotTabs.indexOf(selectedTab);
+  const selectedSlot = workspace.settingsOpen || tabSlot === -1 ? LAST_SLOT : tabSlot;
+  const selectedScreenKey = NATIVE_WORKSPACE_TAB_SLOTS[selectedSlot]!;
   // A slot renders its body the first time it's selected. Until it has, UIKit keeps the last
   // tab's snapshot over it, so the switch never shows a half-built tab.
   const [mountedSlots, setMountedSlots] = useState<ReadonlySet<string>>(() => new Set());
@@ -219,21 +225,23 @@ export function WorkspaceNativeTabs(props: {
           onTabSelected={({ nativeEvent }: NativeSyntheticEvent<TabSelectedEvent>) => {
             setProvenance(nativeEvent.provenance);
             if (nativeEvent.actionOrigin === "programmatic-js") return;
-            const tab = workspaceTabForNativeSlot(primaryTabs, nativeEvent.selectedScreenKey);
+            const tab = workspaceTabForNativeSlot(slotTabs, nativeEvent.selectedScreenKey);
             if (tab) selectTab(tab);
           }}
         >
           {NATIVE_WORKSPACE_TAB_SLOTS.map((slot, index) => {
-            const settings = slot === "settings";
-            const tab = settings ? (overflow ?? selectedTab) : primaryTabs[index];
+            const settings = index === LAST_SLOT && slotTabs[index] === undefined;
+            const tab = slotTabs[index] ?? (index === LAST_SLOT ? selectedTab : undefined);
             if (!tab) return null;
             return (
               <Tabs.Screen
-                // Stable slot controllers keep UIKit's stacks attached when a section moves into Settings.
+                // Stable slot controllers keep UIKit's stacks attached when Settings opens in the last slot.
                 key={slot}
                 screenKey={slot}
                 title=""
                 tabBarItemAccessibilityLabel={settings ? "Settings" : WORKSPACE_TAB_LABELS[tab]}
+                // An empty badge is dropped before UIKit sees it, so a space draws the dot without a count.
+                badgeValue={!settings && tab === "work" && workAttention ? " " : undefined}
                 ios={{
                   prewarmRequest: prewarmRequests.get(slot) ?? 0,
                   contentReady: mountedSlots.has(slot),
@@ -243,7 +251,9 @@ export function WorkspaceNativeTabs(props: {
                       ? { type: "templateSource", templateSource: PULL_REQUEST_ICON }
                       : tab === "issues"
                         ? { type: "templateSource", templateSource: ISSUE_ICON }
-                        : { type: "sfSymbol", name: NAVIGATION_TAB_ICONS[tab] },
+                        : tab === "agents"
+                          ? { type: "templateSource", templateSource: AGENT_ICON }
+                          : { type: "sfSymbol", name: NAVIGATION_TAB_ICONS[tab] },
                   selectedIcon:
                     !settings && tab === "threads"
                       ? { type: "sfSymbol", name: "text.bubble.fill" }
@@ -255,9 +265,10 @@ export function WorkspaceNativeTabs(props: {
                   slot={slot}
                   tab={tab}
                   prewarm={prewarm}
+                  prewarmsSettings={settings}
                   setMountedSlots={setMountedSlots}
                   setPrewarmRequests={setPrewarmRequests}
-                  active={settings ? selectedSlot === -1 : selectedSlot === index}
+                  active={selectedSlot === index}
                 >
                   {props.children}
                 </RetainedWorkspaceTab>
@@ -298,11 +309,14 @@ export function WorkspaceNativeTabs(props: {
 export function WorkspaceSidebarTabsFooter() {
   const compose = useWorkspaceCompose();
   const compact = useFloatingWorkspaceTabs();
+  const onNewTask = compact ? compose?.onPress : undefined;
+  const composeMenu = useComposeMenu(onNewTask !== undefined);
   return (
     <WorkspaceSidebarTabs
       compact={compact}
       reserveComposeSpace={compact}
-      onNewTask={compact ? compose?.onPress : undefined}
+      onNewTask={onNewTask}
+      composeMenu={onNewTask ? composeMenu : undefined}
     />
   );
 }

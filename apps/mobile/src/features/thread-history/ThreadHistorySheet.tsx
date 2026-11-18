@@ -45,6 +45,7 @@ import { useContext, useEffect, useState } from "react";
 import { ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { AppBar } from "../../components/ui/AppBar";
 import { AppText as Text } from "../../components/ui/AppText";
 import { Button } from "../../components/ui/Button";
 import * as Dialog from "../../components/ui/Dialog";
@@ -52,7 +53,6 @@ import { ListRow } from "../../components/ui/ListRow";
 import { ListSection } from "../../components/ui/ListSection";
 import { Notice } from "../../components/ui/Notice";
 import { ScreenContent } from "../../components/ui/ScreenContent";
-import { SheetHeader } from "../../components/ui/SheetHeader";
 import { uuidv4 } from "../../lib/uuid";
 import { createHistorySelectionOwner, type HistorySelectionOwner } from "./historySelectionOwner";
 import { threadHistoryEnvironment } from "./threadHistoryState";
@@ -145,7 +145,7 @@ export function ThreadHistorySheet({ route }: StaticScreenProps<HistoryTarget>) 
       }),
     );
   };
-  // The sheet is a leaf: threads it opens belong in the workspace stack.
+  // The page is a leaf: threads it opens belong in the workspace stack.
   const openThread = (threadId: ThreadId) =>
     navigation.dispatch(
       StackActions.replace("Thread", { environmentId: target.environmentId, threadId }),
@@ -216,8 +216,8 @@ export function ThreadHistorySheet({ route }: StaticScreenProps<HistoryTarget>) 
   );
 
   return (
-    <View collapsable={false} className="flex-1 bg-sheet">
-      <SheetHeader title="History" onClose={() => navigation.goBack()} />
+    <View collapsable={false} className="flex-1 bg-screen">
+      <AppBar title="Thread history" onBack={() => navigation.goBack()} hideBottomBorder />
       <ScreenContent>{content}</ScreenContent>
     </View>
   );

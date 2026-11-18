@@ -254,7 +254,7 @@ import {
   type SidebarView,
 } from "./sidebar/SidebarThreadHeader";
 import { SidebarAgentsHeaderActions, SidebarAgentsList } from "./sidebar/SidebarAgentsList";
-import { AgentSidebarFilter, NO_AGENT_FILTER } from "./sidebar/SidebarAgentsList.logic";
+import { AgentSidebarFilter, NO_AGENT_FILTER } from "@t3tools/client-runtime/state/agents-list";
 import { SidebarScopeRowIcon } from "./sidebar/SidebarScopeRowIcon";
 import { CreateAgentDialog } from "./assistants/CreateAgentDialog";
 import { TooltipProvider } from "./ui/tooltip";

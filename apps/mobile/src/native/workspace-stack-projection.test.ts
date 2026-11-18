@@ -127,11 +127,30 @@ describe("workspace router projection", () => {
     });
   });
 
+  it("pushes the Settings list over Home when Settings is a page", () => {
+    const environments = { key: "environments", name: "SettingsEnvironments" };
+    const state = history([home, settings, environments]);
+    expect(projectWorkspaceStack(state, () => false, { settingsPage: true })).toEqual({
+      primary: home,
+      detail: [settings, environments],
+      overlays: [],
+    });
+  });
+
   it("returns from a Settings page to the Settings list that Home is showing", () => {
     const environments = { key: "environments", name: "SettingsEnvironments" };
     expect(
       nativeStackPopAction(history([home, settings, environments]), environments.key, home.key),
     ).toMatchObject({ payload: { count: 1 } });
+  });
+
+  it("returns from the pushed Settings list to Home", () => {
+    expect(nativeStackPopAction(history([home, settings]), settings.key)).toMatchObject({
+      payload: { count: 1 },
+    });
+    expect(nativeStackPopAction(history([home, settings]), settings.key, home.key)).toMatchObject({
+      payload: { count: 1 },
+    });
   });
 
   it("retains a cold-linked detail route without changing the router history", () => {

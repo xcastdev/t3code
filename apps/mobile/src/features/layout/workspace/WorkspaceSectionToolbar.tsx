@@ -14,6 +14,7 @@ import { useCompactWorkspaceTabs, useSidebarWorkspaceTabs } from "./useSystemWor
 
 const PULL_REQUEST_ICON = require("../../../../assets/icons/pull-request.png");
 const ISSUE_ICON = require("../../../../assets/icons/issue.png");
+const AGENT_ICON = require("../../../../assets/icons/agent.png");
 
 export function WorkspaceTabToolbarButtons() {
   const order = useNavigationTabOrder();
@@ -39,19 +40,14 @@ export function WorkspaceTabToolbarButtons() {
               ? { type: "image", source: PULL_REQUEST_ICON, tinted: true }
               : tab === "issues"
                 ? { type: "image", source: ISSUE_ICON, tinted: true }
-                : NAVIGATION_TAB_ICONS[tab]
+                : tab === "agents"
+                  ? { type: "image", source: AGENT_ICON, tinted: true }
+                  : NAVIGATION_TAB_ICONS[tab]
           }
           tintColor={selected === tab ? selectedTint : undefined}
           onPress={() => selectTab(tab)}
         />
       ))}
-      <Toolbar.Button
-        identifier="workspace-tab-settings"
-        accessibilityLabel="Settings"
-        icon="gearshape"
-        tintColor={selected === "settings" ? selectedTint : undefined}
-        onPress={() => selectTab("settings")}
-      />
     </>
   );
 }

@@ -30,7 +30,7 @@ import {
   sameMemorySelector,
   scannedPageState,
   sharedSourceSelection,
-} from "./workPresentation";
+} from "@t3tools/client-runtime/project-work-presentation";
 import { newCommandId, teamFields, useWorkReview, type WorkTaskSurface } from "./workTaskSurface";
 
 const MEMORY_PAGE = 16;

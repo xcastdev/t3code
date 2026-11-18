@@ -1,0 +1,704 @@
+import {
+  McpCatalogName,
+  ProjectMcpCredentialName,
+  ProjectMcpEnvironmentVariableName,
+  ProjectMcpHeaderName,
+  ProjectMcpUrl,
+  SecretRef,
+  TrimmedNonEmptyString,
+  type EnvironmentId,
+  type McpCatalogDefinition,
+  type McpCatalogOverride,
+  type McpCatalogReadResult,
+  type McpCatalogSnapshot,
+  type McpCatalogTestCredentialInput,
+  type McpCatalogTestTransportInput,
+  type McpCatalogTransportInput,
+  type ProjectMcpCredentialId,
+  type ProjectMcpCredentialRef,
+  type McpCatalogWriteInput,
+  type ProjectId,
+  type ProjectMcpTransport,
+  type ProviderInstanceId,
+  type ThreadId,
+} from "@t3tools/contracts";
+import * as Redacted from "effect/Redacted";
+import * as Schema from "effect/Schema";
+
+/**
+ * A credential is kept as stored, typed as a new value, or (only after the
+ * server prepared that value) a one-use reference. A typed value lives in this
+ * form until save and is never sent with the catalog write itself.
+ */
+export type McpCredentialField =
+  | { readonly kind: "stored"; readonly name: string; readonly id: ProjectMcpCredentialId }
+  | { readonly kind: "new-secret"; readonly name: string; readonly value: string }
+  | { readonly kind: "secret-ref"; readonly name: string; readonly secretRef: string };
+
+export interface McpNamedCredential {
+  /** Stable row identity while editing; never sent to the server. */
+  readonly rowId: string;
+  readonly name: string;
+  readonly credential: McpCredentialField;
+}
+
+export type McpAuthorizationForm =
+  | { readonly type: "none" }
+  | { readonly type: "oauth-automatic" }
+  | {
+      readonly type: "oauth-pre-registered";
+      readonly clientId: string;
+      readonly clientSecret: McpCredentialField | null;
+    };
+
+export interface McpServerForm {
+  readonly name: string;
+  readonly enabled: boolean;
+  readonly providerInstanceIds: ReadonlyArray<ProviderInstanceId>;
+  /** Every provider, including ones added later. */
+  readonly allProviders: boolean;
+  readonly transport: "streamable-http" | "legacy-sse" | "stdio";
+  readonly url: string;
+  readonly headers: ReadonlyArray<McpNamedCredential>;
+  readonly authorization: McpAuthorizationForm;
+  readonly command: string;
+  /** One argument per line, so arguments may contain spaces. */
+  readonly args: string;
+  readonly cwd: string;
+  readonly env: ReadonlyArray<McpNamedCredential>;
+}
+
+export const EMPTY_MCP_SERVER_FORM: McpServerForm = {
+  name: "",
+  enabled: true,
+  providerInstanceIds: [],
+  allProviders: false,
+  transport: "streamable-http",
+  url: "",
+  headers: [],
+  authorization: { type: "none" },
+  command: "",
+  args: "",
+  cwd: "",
+  env: [],
+};
+
+const stored = (ref: ProjectMcpCredentialRef): McpCredentialField => ({
+  kind: "stored",
+  name: ref.name,
+  id: ref.id,
+});
+
+export function mcpFormFromDefinition(
+  definition: Pick<
+    McpCatalogDefinition,
+    "name" | "enabled" | "providerInstanceIds" | "allProviders"
+  > & {
+    readonly transport: ProjectMcpTransport;
+  },
+): McpServerForm {
+  const { transport } = definition;
+  const base = {
+    ...EMPTY_MCP_SERVER_FORM,
+    name: definition.name,
+    enabled: definition.enabled,
+    providerInstanceIds: definition.providerInstanceIds,
+    allProviders: definition.allProviders === true,
+  };
+  if (transport.type === "stdio") {
+    return {
+      ...base,
+      transport: "stdio",
+      command: transport.command,
+      args: transport.args.join("\n"),
+      cwd: transport.cwd ?? "",
+      env: transport.env.map((entry, index) => ({
+        rowId: `env:${index}`,
+        name: entry.name,
+        credential: stored(entry.credential),
+      })),
+    };
+  }
+  const authorization: McpAuthorizationForm =
+    transport.authorization.type === "none"
+      ? { type: "none" }
+      : transport.authorization.registration.type === "automatic"
+        ? { type: "oauth-automatic" }
+        : {
+            type: "oauth-pre-registered",
+            clientId: transport.authorization.registration.clientId,
+            clientSecret: transport.authorization.registration.clientSecret
+              ? stored(transport.authorization.registration.clientSecret)
+              : null,
+          };
+  return {
+    ...base,
+    transport: transport.type,
+    url: transport.url,
+    headers: transport.headers.map((entry, index) => ({
+      rowId: `header:${index}`,
+      name: entry.name,
+      credential: stored(entry.credential),
+    })),
+    authorization,
+  };
+}
+
+type FormResult<A> =
+  | { readonly ok: true; readonly value: A }
+  | { readonly ok: false; readonly error: string };
+
+const decodeName = Schema.decodeUnknownOption(McpCatalogName);
+const decodeCredentialName = Schema.decodeUnknownOption(ProjectMcpCredentialName);
+const decodeHeaderName = Schema.decodeUnknownOption(ProjectMcpHeaderName);
+const decodeEnvName = Schema.decodeUnknownOption(ProjectMcpEnvironmentVariableName);
+const decodeSecretRef = Schema.decodeUnknownOption(SecretRef);
+const decodeNonEmpty = Schema.decodeUnknownOption(TrimmedNonEmptyString);
+const decodeUrl = Schema.decodeUnknownOption(ProjectMcpUrl);
+
+function credentialInput(
+  field: McpCredentialField,
+  label: string,
+): FormResult<Extract<McpCatalogTransportInput, { type: "stdio" }>["env"][number]["credential"]> {
+  const name = decodeCredentialName(field.name.trim());
+  if (name._tag === "None") return { ok: false, error: `${label} needs a credential name.` };
+  if (field.kind === "stored") return { ok: true, value: { id: field.id, name: name.value } };
+  if (field.kind === "new-secret") return { ok: false, error: `${label} has an unsaved secret.` };
+  const secretRef = decodeSecretRef(field.secretRef.trim());
+  if (secretRef._tag === "None")
+    return { ok: false, error: `${label} needs a secret reference from a saved secret request.` };
+  return { ok: true, value: { name: name.value, secretRef: secretRef.value } };
+}
+
+/**
+ * Builds the catalog write shape. Secret bytes never pass through here:
+ * a credential is a stored ID or a one-use reference the server consumes.
+ */
+export function mcpTransportInputFromForm(
+  form: McpServerForm,
+): FormResult<McpCatalogTransportInput> {
+  return transportFromForm(form, credentialInput);
+}
+
+/** A connection test sends typed values directly; it never consumes one-use references. */
+export function mcpTestTransportInputFromForm(
+  form: McpServerForm,
+): FormResult<McpCatalogTestTransportInput> {
+  return transportFromForm(form, (field, label): FormResult<McpCatalogTestCredentialInput> => {
+    const name = decodeCredentialName(field.name.trim());
+    if (name._tag === "None") return { ok: false, error: `${label} needs a credential name.` };
+    if (field.kind === "stored") return { ok: true, value: { id: field.id, name: name.value } };
+    if (field.kind === "new-secret" && field.value.length > 0)
+      return { ok: true, value: { name: name.value, secret: Redacted.make(field.value) } };
+    return { ok: false, error: `Enter the secret for ${label}.` };
+  });
+}
+
+type FormTransport<C> =
+  | {
+      readonly type: "stdio";
+      readonly command: string;
+      readonly args: ReadonlyArray<string>;
+      readonly cwd?: string;
+      readonly env: ReadonlyArray<{
+        readonly name: ProjectMcpEnvironmentVariableName;
+        readonly credential: C;
+      }>;
+    }
+  | {
+      readonly type: "streamable-http" | "legacy-sse";
+      readonly url: string;
+      readonly headers: ReadonlyArray<{
+        readonly name: ProjectMcpHeaderName;
+        readonly credential: C;
+      }>;
+      readonly authorization:
+        | { readonly type: "none" }
+        | {
+            readonly type: "oauth";
+            readonly registration:
+              | { readonly type: "automatic" }
+              | {
+                  readonly type: "pre-registered";
+                  readonly clientId: string;
+                  readonly clientSecret?: C;
+                };
+          };
+    };
+
+function transportFromForm<C>(
+  form: McpServerForm,
+  credentialInput: (field: McpCredentialField, label: string) => FormResult<C>,
+): FormResult<FormTransport<C>> {
+  if (form.transport === "stdio") {
+    const command = decodeNonEmpty(form.command.trim());
+    if (command._tag === "None")
+      return { ok: false, error: "Enter the command that starts the server." };
+    const env = [];
+    for (const entry of form.env) {
+      const name = decodeEnvName(entry.name.trim());
+      if (name._tag === "None")
+        return { ok: false, error: `"${entry.name}" isn't a valid environment variable name.` };
+      const credential = credentialInput(entry.credential, name.value);
+      if (!credential.ok) return credential;
+      env.push({ name: name.value, credential: credential.value });
+    }
+    const cwd = decodeNonEmpty(form.cwd.trim());
+    return {
+      ok: true,
+      value: {
+        type: "stdio",
+        command: command.value,
+        args: form.args.split("\n").filter((arg) => arg.length > 0),
+        ...(cwd._tag === "Some" ? { cwd: cwd.value } : {}),
+        env,
+      },
+    };
+  }
+  const url = decodeUrl(form.url.trim());
+  if (url._tag === "None")
+    return {
+      ok: false,
+      error: "Enter an https:// URL without credentials or a query (http:// only for localhost).",
+    };
+  const headers = [];
+  for (const entry of form.headers) {
+    const name = decodeHeaderName(entry.name.trim());
+    if (name._tag === "None")
+      return { ok: false, error: `"${entry.name}" isn't a valid header name.` };
+    if (form.authorization.type !== "none" && name.value.toLowerCase() === "authorization")
+      return {
+        ok: false,
+        error: "OAuth sets the Authorization header. Remove the header or OAuth.",
+      };
+    const credential = credentialInput(entry.credential, name.value);
+    if (!credential.ok) return credential;
+    headers.push({ name: name.value, credential: credential.value });
+  }
+  const authorization = (() => {
+    switch (form.authorization.type) {
+      case "none":
+        return { ok: true as const, value: { type: "none" as const } };
+      case "oauth-automatic":
+        return {
+          ok: true as const,
+          value: { type: "oauth" as const, registration: { type: "automatic" as const } },
+        };
+      case "oauth-pre-registered": {
+        const clientId = decodeNonEmpty(form.authorization.clientId.trim());
+        if (clientId._tag === "None")
+          return { ok: false as const, error: "Enter the OAuth client ID." };
+        const secret = form.authorization.clientSecret;
+        if (secret === null)
+          return {
+            ok: true as const,
+            value: {
+              type: "oauth" as const,
+              registration: { type: "pre-registered" as const, clientId: clientId.value },
+            },
+          };
+        const clientSecret = credentialInput(secret, "Client secret");
+        if (!clientSecret.ok) return clientSecret;
+        return {
+          ok: true as const,
+          value: {
+            type: "oauth" as const,
+            registration: {
+              type: "pre-registered" as const,
+              clientId: clientId.value,
+              clientSecret: clientSecret.value,
+            },
+          },
+        };
+      }
+    }
+  })();
+  if (!authorization.ok) return authorization;
+  return {
+    ok: true,
+    value: {
+      type: form.transport,
+      url: url.value,
+      headers,
+      authorization: authorization.value,
+    },
+  };
+}
+
+export function mcpDefinitionInputFromForm(form: McpServerForm) {
+  const name = decodeName(form.name.trim());
+  if (name._tag === "None")
+    return { ok: false as const, error: "Name the server (up to 120 characters)." };
+  const transport = mcpTransportInputFromForm(form);
+  if (!transport.ok) return transport;
+  return {
+    ok: true as const,
+    value: {
+      name: name.value,
+      enabled: form.enabled,
+      providerInstanceIds: [...form.providerInstanceIds],
+      allProviders: form.allProviders,
+      transport: transport.value,
+    },
+  };
+}
+
+export interface McpCatalogRow {
+  readonly definition: McpCatalogDefinition;
+  /** The destination's override of an inherited definition, if any. */
+  readonly override: McpCatalogOverride | null;
+  readonly inherited: boolean;
+  readonly enabled: boolean;
+  readonly name: string;
+  readonly providerInstanceIds: ReadonlyArray<ProviderInstanceId>;
+  readonly allProviders: boolean;
+  /** The connection this destination uses: its override's, else the definition's. */
+  readonly transport: ProjectMcpTransport;
+  /** Identifies `transport`; OAuth grants belong to it. */
+  readonly transportDefinitionId: McpCatalogDefinition["definitionId"];
+}
+
+/**
+ * Rows for one destination: inherited definitions with this scope's override
+ * applied, then the scope's own definitions. Nothing here resolves delivery.
+ */
+export function mcpCatalogRows(input: {
+  readonly inherited: ReadonlyArray<McpCatalogDefinition>;
+  readonly own: ReadonlyArray<McpCatalogDefinition>;
+  readonly overrides: ReadonlyArray<McpCatalogOverride>;
+}): ReadonlyArray<McpCatalogRow> {
+  const row = (definition: McpCatalogDefinition, inherited: boolean): McpCatalogRow => {
+    const override =
+      input.overrides.find((candidate) => candidate.targetId === definition.logicalServerId) ??
+      null;
+    return {
+      definition,
+      override,
+      inherited,
+      enabled: override?.enabled ?? definition.enabled,
+      name: override?.name ?? definition.name,
+      providerInstanceIds: override?.providerInstanceIds ?? definition.providerInstanceIds,
+      allProviders:
+        override?.providerInstanceIds !== undefined || override?.allProviders !== undefined
+          ? override.allProviders === true
+          : definition.allProviders === true,
+      transport: override?.transport ?? definition.transport,
+      transportDefinitionId: override?.transportDefinitionId ?? definition.definitionId,
+    };
+  };
+  // A session holds its own copy of each inherited server under the same id, and its overrides
+  // target that copy, so the copy stands in for the inherited row.
+  const own = new Map(input.own.map((definition) => [definition.logicalServerId, definition]));
+  const inheritedIds = new Set(input.inherited.map((definition) => definition.logicalServerId));
+  return [
+    ...input.inherited.map((definition) =>
+      row(own.get(definition.logicalServerId) ?? definition, true),
+    ),
+    ...input.own
+      .filter((definition) => !inheritedIds.has(definition.logicalServerId))
+      .map((definition) => row(definition, false)),
+  ];
+}
+
+/** The definitions this destination effectively has, with overrides applied, for read-only views. */
+export function effectiveMcpDefinitions(
+  rows: ReadonlyArray<McpCatalogRow>,
+): ReadonlyArray<McpCatalogDefinition> {
+  return rows.map((row) => ({
+    ...row.definition,
+    name: row.name as McpCatalogDefinition["name"],
+    enabled: row.enabled,
+    providerInstanceIds: row.providerInstanceIds,
+    allProviders: row.allProviders,
+    transport: row.transport,
+  }));
+}
+
+/** The persisted connection as write input, keeping stored credentials by ID. */
+function mcpTransportInputFromPersisted(
+  transport: ProjectMcpTransport,
+): FormResult<McpCatalogTransportInput> {
+  return mcpTransportInputFromForm(
+    mcpFormFromDefinition({
+      name: "",
+      enabled: true,
+      providerInstanceIds: [],
+      allProviders: false,
+      transport,
+    }),
+  );
+}
+
+/**
+ * Stored credentials belong to the definition that stored them. A connection
+ * copied into an override starts with empty values that must be entered again.
+ */
+export function withNewCredentialValues(form: McpServerForm): McpServerForm {
+  const fresh = (field: McpCredentialField): McpCredentialField =>
+    field.kind === "stored" ? { kind: "new-secret", name: field.name, value: "" } : field;
+  return {
+    ...form,
+    headers: form.headers.map((entry) => ({ ...entry, credential: fresh(entry.credential) })),
+    env: form.env.map((entry) => ({ ...entry, credential: fresh(entry.credential) })),
+    authorization:
+      form.authorization.type === "oauth-pre-registered" && form.authorization.clientSecret !== null
+        ? { ...form.authorization, clientSecret: fresh(form.authorization.clientSecret) }
+        : form.authorization,
+  };
+}
+
+/**
+ * Exchanges each newly typed value for a one-use reference through the
+ * protected Settings secret request, in order, before anything is written.
+ * The form returned holds references only.
+ */
+export async function prepareMcpFormSecrets(
+  form: McpServerForm,
+  prepare: (value: string) => Promise<string | null>,
+): Promise<FormResult<McpServerForm>> {
+  const swap = async (
+    field: McpCredentialField,
+    label: string,
+  ): Promise<FormResult<McpCredentialField>> => {
+    if (field.kind !== "new-secret") return { ok: true, value: field };
+    if (field.value.length === 0) return { ok: false, error: `Enter the secret for ${label}.` };
+    const secretRef = await prepare(field.value);
+    if (secretRef === null) return { ok: false, error: "" };
+    return { ok: true, value: { kind: "secret-ref", name: field.name, secretRef } };
+  };
+  const headers: McpNamedCredential[] = [];
+  for (const entry of form.transport === "stdio" ? [] : form.headers) {
+    const credential = await swap(entry.credential, entry.name || "a header");
+    if (!credential.ok) return credential;
+    headers.push({ ...entry, credential: credential.value });
+  }
+  const env: McpNamedCredential[] = [];
+  for (const entry of form.transport === "stdio" ? form.env : []) {
+    const credential = await swap(entry.credential, entry.name || "a variable");
+    if (!credential.ok) return credential;
+    env.push({ ...entry, credential: credential.value });
+  }
+  let authorization = form.authorization;
+  if (
+    form.transport !== "stdio" &&
+    authorization.type === "oauth-pre-registered" &&
+    authorization.clientSecret !== null
+  ) {
+    const clientSecret = await swap(authorization.clientSecret, "the client secret");
+    if (!clientSecret.ok) return clientSecret;
+    authorization = { ...authorization, clientSecret: clientSecret.value };
+  }
+  return { ok: true, value: { ...form, headers, env, authorization } };
+}
+
+export interface McpOverridePatch {
+  /** A pinned value, or null to follow the definition's again. */
+  readonly enabled?: boolean | null;
+  /** A pinned provider selection, or null to follow the definition's again. */
+  readonly providerInstanceIds?: ReadonlyArray<ProviderInstanceId> | null;
+  /** Pinned with `providerInstanceIds`; null follows the definition's again. */
+  readonly allProviders?: boolean | null;
+  /** A new name, or null to follow the definition's name again. */
+  readonly name?: string | null;
+  /** A replacement connection, or null to use the definition's again. */
+  readonly transport?: McpCatalogTransportInput | null;
+}
+
+/**
+ * The complete override to put. A put replaces the stored override, so every
+ * field the patch leaves alone is carried over, including a replaced
+ * connection with its stored credential IDs and definition ID.
+ */
+export function mcpOverrideInput(input: {
+  readonly scope: "project" | "session";
+  readonly scopeId: string;
+  readonly row: McpCatalogRow;
+  readonly patch: McpOverridePatch;
+  readonly newId: McpCatalogOverride["id"];
+}) {
+  const previous = input.row.override;
+  const { patch } = input;
+  const nameText = patch.name === undefined ? previous?.name : (patch.name ?? undefined);
+  const name = nameText === undefined ? undefined : decodeName(nameText.trim());
+  if (name?._tag === "None")
+    return { ok: false as const, error: "Name the server (up to 120 characters)." };
+  const enabled = patch.enabled === undefined ? previous?.enabled : (patch.enabled ?? undefined);
+  const providerInstanceIds =
+    patch.providerInstanceIds === undefined
+      ? previous?.providerInstanceIds
+      : (patch.providerInstanceIds ?? undefined);
+  const allProviders =
+    patch.allProviders === undefined ? previous?.allProviders : (patch.allProviders ?? undefined);
+  let transport: McpCatalogTransportInput | undefined;
+  if (patch.transport !== undefined) transport = patch.transport ?? undefined;
+  else if (previous?.transport !== undefined) {
+    const kept = mcpTransportInputFromPersisted(previous.transport);
+    if (!kept.ok) return { ok: false as const, error: kept.error };
+    transport = kept.value;
+  }
+  return {
+    ok: true as const,
+    value: {
+      id: previous?.id ?? input.newId,
+      scope: input.scope,
+      scopeId: input.scopeId,
+      targetId: input.row.definition.logicalServerId,
+      ...(enabled === undefined ? {} : { enabled }),
+      ...(name === undefined ? {} : { name: name.value }),
+      ...(providerInstanceIds === undefined
+        ? {}
+        : { providerInstanceIds: [...providerInstanceIds] }),
+      ...(allProviders === undefined ? {} : { allProviders }),
+      ...(transport === undefined
+        ? {}
+        : {
+            transport,
+            ...(previous?.transportDefinitionId === undefined
+              ? {}
+              : { transportDefinitionId: previous.transportDefinitionId }),
+          }),
+    },
+  };
+}
+
+/**
+ * What an override editor shows and edits. Null means the field follows the
+ * definition; showing an inherited value never pins it.
+ */
+export interface McpOverrideFields {
+  readonly name: string;
+  readonly enabled: boolean | null;
+  readonly providerInstanceIds: ReadonlyArray<ProviderInstanceId> | null;
+  readonly allProviders: boolean | null;
+}
+
+export function mcpOverrideFieldsFromRow(row: McpCatalogRow): McpOverrideFields {
+  return {
+    name: row.override?.name ?? "",
+    enabled: row.override?.enabled ?? null,
+    providerInstanceIds: row.override?.providerInstanceIds ?? null,
+    allProviders:
+      row.override?.allProviders ??
+      (row.override?.providerInstanceIds === undefined ? null : false),
+  };
+}
+
+/**
+ * The editor's fields as a patch: only explicitly overridden values are pinned.
+ * A blank name follows the definition. A typed name stays pinned even when it
+ * equals the inherited one, so a later rename of the definition doesn't flow in.
+ */
+export function mcpOverridePatchFromFields(
+  fields: McpOverrideFields,
+): Omit<McpOverridePatch, "transport"> {
+  const name = fields.name.trim();
+  return {
+    name: name.length === 0 ? null : name,
+    enabled: fields.enabled,
+    providerInstanceIds: fields.providerInstanceIds,
+    allProviders: fields.allProviders,
+  };
+}
+
+/** Desired versus delivered, never inferred: only the gateway's receipt says applied. */
+export function mcpApplicationSummary(snapshot: McpCatalogSnapshot): {
+  readonly label: string;
+  readonly tone: "success" | "warning" | "error" | "info";
+} {
+  if (snapshot.disposedAt !== undefined) return { label: "Session ended", tone: "info" };
+  const application = snapshot.application;
+  if (
+    application?.status === "restart-required" &&
+    application.revision === snapshot.desiredRevision
+  )
+    return { label: `Restart required: ${application.reason}`, tone: "warning" };
+  if (application?.status === "failed" && application.revision === snapshot.desiredRevision)
+    return { label: `Delivery failed: ${application.reason}`, tone: "error" };
+  if (application?.status === "applied" && snapshot.appliedRevision === snapshot.desiredRevision)
+    return { label: "Applied", tone: "success" };
+  return { label: "Waiting for delivery", tone: "info" };
+}
+
+type McpCatalogReadData = Pick<McpCatalogReadResult, "definitions" | "overrides">;
+
+export type McpCatalogViewScope =
+  | { readonly scope: "global"; readonly scopeId: EnvironmentId }
+  | { readonly scope: "project"; readonly scopeId: ProjectId }
+  | { readonly scope: "session"; readonly scopeId: McpCatalogSnapshot["catalogSessionId"] };
+
+/**
+ * The rows a destination shows and the scope its writes go to. A thread with no MCP session yet
+ * shows its project's rows with no writable scope. Null until the reads it needs have loaded.
+ */
+export function mcpCatalogDestinationView(input: {
+  readonly environmentId: EnvironmentId;
+  readonly projectId: ProjectId | null;
+  readonly threadId: ThreadId | null;
+  readonly global: McpCatalogReadData | null;
+  readonly project: McpCatalogReadData | null;
+  readonly snapshot: McpCatalogSnapshot | null;
+  readonly session: McpCatalogReadData | null;
+}): {
+  readonly scope: McpCatalogViewScope | null;
+  readonly rows: ReadonlyArray<McpCatalogRow>;
+} | null {
+  if (input.global === null) return null;
+  if (input.projectId === null)
+    return {
+      scope: { scope: "global", scopeId: input.environmentId },
+      rows: mcpCatalogRows({ inherited: [], own: input.global.definitions, overrides: [] }),
+    };
+  if (input.project === null) return null;
+  const projectRows = mcpCatalogRows({
+    inherited: input.global.definitions,
+    own: input.project.definitions,
+    overrides: input.project.overrides,
+  });
+  if (input.threadId === null)
+    return { scope: { scope: "project", scopeId: input.projectId }, rows: projectRows };
+  if (input.snapshot === null || input.session === null) return { scope: null, rows: projectRows };
+  return {
+    scope: { scope: "session", scopeId: input.snapshot.catalogSessionId },
+    rows: mcpCatalogRows({
+      inherited: input.snapshot.baseline,
+      own: input.session.definitions,
+      overrides: input.session.overrides,
+    }),
+  };
+}
+
+/**
+ * Switches one server on or off for a thread's MCP session: an inherited server gets a session
+ * override, a server the session owns is rewritten. The same write Settings makes for a thread.
+ */
+export function mcpSessionToggleOperation(input: {
+  readonly sessionId: string;
+  readonly row: McpCatalogRow;
+  readonly newOverrideId: McpCatalogOverride["id"];
+}): FormResult<McpCatalogWriteInput["operation"]> {
+  const { row } = input;
+  if (row.inherited) {
+    const override = mcpOverrideInput({
+      scope: "session",
+      scopeId: input.sessionId,
+      row,
+      patch: { enabled: !row.enabled },
+      newId: input.newOverrideId,
+    });
+    if (!override.ok) return override;
+    return { ok: true, value: { type: "put-override", override: override.value } };
+  }
+  const definition = mcpDefinitionInputFromForm({
+    ...mcpFormFromDefinition(row.definition),
+    enabled: !row.definition.enabled,
+  });
+  if (!definition.ok) return definition;
+  return {
+    ok: true,
+    value: {
+      type: "update",
+      logicalServerId: row.definition.logicalServerId,
+      definition: definition.value,
+    },
+  };
+}

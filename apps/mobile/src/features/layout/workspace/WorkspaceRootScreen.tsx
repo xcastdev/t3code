@@ -26,6 +26,7 @@ import {
   useNativeLayoutMetrics,
 } from "../../../native/native-layout-metrics";
 import { HomeRouteScreen } from "../../home/HomeRouteScreen";
+import { HomeAgentsRouteScreen } from "../../home/HomeAgentsRouteScreen";
 import { WorkspaceConnectionTitle } from "../../home/WorkspaceConnectionTitle";
 import { useAdaptiveWorkspaceLayout } from "../AdaptiveWorkspaceLayout";
 import { PullRequestsScreen } from "../../pull-requests/PullRequestsScreen";
@@ -168,6 +169,8 @@ function WorkspaceRootContent() {
             <WorkspaceNoTabs />
           ) : state.selectedTab === "threads" ? (
             <HomeRouteScreen />
+          ) : state.selectedTab === "agents" ? (
+            <HomeAgentsRouteScreen />
           ) : state.selectedTab === "pullRequests" ? (
             <PullRequestsScreen />
           ) : state.selectedTab === "issues" ? (

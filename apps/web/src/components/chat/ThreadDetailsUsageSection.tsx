@@ -14,6 +14,7 @@ import {
   resolveUsageLimitDriver,
 } from "@t3tools/shared/usageLimits";
 
+import { shortPlanLabel, usageSummaryWindows } from "@t3tools/client-runtime/state/thread-details";
 import { useState } from "react";
 
 import { useNowMinute } from "~/hooks/useNowMinute";
@@ -25,7 +26,6 @@ import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
 import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import { ThreadDetailsRing } from "./ThreadDetailsRing";
 import { ThreadDetailsSection, ThreadDetailsSummary } from "./ThreadDetailsSection";
-import { shortPlanLabel } from "./ThreadDetailsUsageSection.logic";
 
 function LimitWindowRow(props: {
   readonly window: ServerProviderUsageWindow;
@@ -128,12 +128,7 @@ export default function ThreadDetailsUsageSection(props: {
       mapping,
     }),
   });
-  // Room for two gauges: the two windows closest to running out, in the provider's own order.
-  const windows = threadAccount?.limits.windows ?? [];
-  const tightestTwo = windows
-    .toSorted((a, b) => remainingPercent(a) - remainingPercent(b))
-    .slice(0, 2);
-  const summaryWindows = windows.filter((window) => tightestTwo.includes(window));
+  const summaryWindows = usageSummaryWindows(threadAccount?.limits.windows ?? []);
   const others = threadAccount
     ? accounts.filter((account) => account.key !== threadAccount.key)
     : [];

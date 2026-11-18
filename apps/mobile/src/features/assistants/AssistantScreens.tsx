@@ -67,8 +67,11 @@ function useScrollInsets() {
   return { paddingBottom: Math.max(insets.bottom, 18) + 18 };
 }
 
-export function SettingsAgentsRouteScreen() {
+export function SettingsAgentsRouteScreen({
+  route,
+}: StaticScreenProps<{ readonly createIn?: string } | undefined>) {
   const style = useScrollInsets();
+  const createIn = route.params?.createIn;
   const { environments, isReady } = useEnvironments();
   const [includeArchived, setIncludeArchived] = useState(false);
   return (
@@ -97,6 +100,7 @@ export function SettingsAgentsRouteScreen() {
               key={`${environment.environmentId}:${includeArchived}`}
               environment={environment}
               includeArchived={includeArchived}
+              startCreating={environment.environmentId === createIn}
             />
           ))
         )}
@@ -108,13 +112,15 @@ export function SettingsAgentsRouteScreen() {
 function EnvironmentAgents(props: {
   readonly environment: EnvironmentPresentation;
   readonly includeArchived: boolean;
+  /** Opened from Home's New agent, which names this environment. */
+  readonly startCreating: boolean;
 }) {
   const navigation = useNavigation();
   const environmentId = props.environment.environmentId;
   const pages = useCursorPages();
   const roster = useAssistantRoster(environmentId, props.includeArchived, pages.cursor);
   const connection = useAssistantConnection(environmentId);
-  const [creating, setCreating] = useState(false);
+  const [creating, setCreating] = useState(props.startCreating);
   const assistants = roster.data?.assistants ?? [];
   const next = roster.data?.nextCursor ?? null;
   return (

@@ -142,6 +142,7 @@ function AppBarView(props: AppBarProps & { readonly searchState?: SearchState })
               }
             : undefined
         }
+        settings={props.actions?.find((action) => action.icon === "gearshape")}
       />
     );
   }

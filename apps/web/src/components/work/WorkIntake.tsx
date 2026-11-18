@@ -44,7 +44,7 @@ import {
   existingTaskRefineFields,
   existingTaskRefineSnapshot,
   type ExistingTaskRefineReview,
-} from "./workLogic";
+} from "@t3tools/client-runtime/project-work-logic";
 import { isIssueRecord, workStateLabel, type WorkIssueRecord } from "./workModel";
 import { WorkStatus } from "./WorkStatus";
 import { newCommandId, useWorkReview } from "./workTaskSurface";

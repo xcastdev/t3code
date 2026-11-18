@@ -21,7 +21,7 @@ import {
   useResourceCatalogSubscriptions,
 } from "../../state/resources";
 import { useMcpCatalogView } from "../settings/McpCatalogSettings";
-import { effectiveMcpDefinitions } from "../settings/resourceInventory";
+import { effectiveMcpDefinitions } from "@t3tools/client-runtime/mcp-catalog-forms";
 import { Button } from "../ui/button";
 import { Checkbox } from "../ui/checkbox";
 import { Input } from "../ui/input";

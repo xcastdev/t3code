@@ -15,6 +15,8 @@ type SheetConfirmation = {
 
 export type SheetHeaderProps = SheetDismissAction & {
   readonly title: string;
+  /** Drawn in place of the title text; `title` still names the sheet. */
+  readonly titleContent?: ReactNode;
   readonly subtitle?: string;
   readonly accessibilityLabel?: string;
   readonly dismissDisabled?: boolean;

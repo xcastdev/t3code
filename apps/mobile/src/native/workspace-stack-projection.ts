@@ -22,12 +22,15 @@ export function projectStackPresentation(
 export function projectWorkspaceStack(
   state: StackNavigationState<ParamListBase>,
   isOverlay: (route: Route) => boolean,
+  options?: { readonly settingsPage?: boolean },
 ) {
   const { workspace: workspaceRoutes, overlays } = projectStackPresentation(state, isOverlay);
   const primary = workspaceRoutes.find((route) => route.name === "Home");
-  // The Settings tab's route only selects what Home shows; its pages are the detail.
+  // Beside columns the Settings tab's route only selects what Home shows, and its pages are the
+  // detail. As a page, the Settings list is pushed like any other.
   const detail = workspaceRoutes.filter(
-    (route) => route.name !== "Home" && route.name !== "Settings",
+    (route) =>
+      route.name !== "Home" && (options?.settingsPage === true || route.name !== "Settings"),
   );
   return { primary, detail, overlays };
 }
@@ -69,7 +72,12 @@ export function nativeStackPopAction(
       ? sourceIndex - 1
       : state.routes.findIndex((route) => route.key === destinationKey);
   // Home's screen draws the Settings list, so going back to it from a Settings page stops there.
-  if (destinationIndex >= 0 && state.routes[destinationIndex + 1]?.name === "Settings")
+  // The Settings list's own page, popped as a card, still returns to Home.
+  if (
+    destinationIndex >= 0 &&
+    destinationIndex + 1 < sourceIndex &&
+    state.routes[destinationIndex + 1]?.name === "Settings"
+  )
     destinationIndex += 1;
   if (
     sourceIndex <= 0 ||

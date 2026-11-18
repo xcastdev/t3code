@@ -20,7 +20,7 @@ import {
   supervisionCounts,
   type WorkMessageAction,
   type WorkMessageRecord,
-} from "./workPresentation";
+} from "@t3tools/client-runtime/project-work-presentation";
 import { WorkTaskLink } from "./WorkTaskRefs";
 import { WorkStatus, WorkStatusGlyph } from "./WorkStatus";
 import { WorkMemberAvatar } from "./WorkMemberAvatar";

@@ -71,6 +71,7 @@ import {
 } from "../keyboard/hardwareKeyboardCommands";
 import { useAndroidControlSizing } from "../../components/ui/useAndroidControlSizing";
 import { useEnabledNavigationTabs } from "./workspace/navigation-tabs";
+import { NAVIGATION_TAB_CAPACITY } from "./workspace/navigation-tab-order";
 import { FLOATING_TABS, floatingTabsMetrics } from "./workspace/floating-workspace-tabs";
 import {
   AndroidWorkspaceNavigation,
@@ -331,7 +332,11 @@ function AdaptiveWorkspaceLayoutContent(
     Platform.OS === "android" && baseLayout.usesSplitView && !floatingTabsEnabled;
   const enabledTabs = useEnabledNavigationTabs();
   const { scale, fabSize } = useAndroidControlSizing();
-  const floatingTabs = floatingTabsMetrics(enabledTabs.length + 1, scale, fabSize);
+  const floatingTabs = floatingTabsMetrics(
+    Math.min(enabledTabs.length, NAVIGATION_TAB_CAPACITY),
+    scale,
+    fabSize,
+  );
   // The rail stays whether or not the sidebar shows; only the list pane comes and goes.
   const navigationRailWidth = shouldRenderNavigationRail ? ANDROID_WORKSPACE_RAIL_WIDTH : 0;
   const [hinge, setHinge] = useState<VerticalHinge | null>(null);
@@ -573,7 +578,10 @@ function AdaptiveWorkspaceLayoutContent(
       setFileInspectorPreferredVisible(false);
       setInspectorSheetRoute(null);
       if (layout.variant === "medium") setPrimarySidebarVisible(false);
-      workspace?.dispatch({ type: "select", tab: workspaceTabOf(detail.name) });
+      workspace?.dispatch({
+        type: "select",
+        tab: workspaceTabOf(detail.name, workspace.isTabActive("agents") ? "agents" : undefined),
+      });
       startOpeningDetail(detail);
       navigation.dispatch(selectWorkspaceDetail(detail, sheet));
     });
@@ -582,8 +590,6 @@ function AdaptiveWorkspaceLayoutContent(
     handleSelectDetail({ name: "Thread", params });
 
   const projects = useProjects();
-  const compactAndroidSettings =
-    Platform.OS === "android" && androidSettingsOpen && !layout.usesSplitView;
   // Reads the open page when pressed, so the layout context doesn't change on every navigation.
   const handleStartNewTask = () => {
     const state = rootStackState(navigation);
@@ -1084,11 +1090,9 @@ function AdaptiveWorkspaceLayoutContent(
             <WorkspaceSettledContentWidthContext
               value={Platform.OS === "android" && layout.usesSplitView ? contentTargetWidth : null}
             >
-              {/* Compact Settings keeps the bottom navigation under all of its pages. */}
               <SafeAreaInsetsContext
                 value={
-                  floatingTabsEnabled &&
-                  (compactAndroidSettings || (layout.usesSplitView && workspacePage))
+                  floatingTabsEnabled && layout.usesSplitView && workspacePage
                     ? {
                         ...safeAreaInsets,
                         bottom:
@@ -1097,9 +1101,7 @@ function AdaptiveWorkspaceLayoutContent(
                           FLOATING_TABS.edge +
                           floatingTabs.height,
                       }
-                    : compactAndroidSettings
-                      ? { ...safeAreaInsets, bottom: 0 }
-                      : safeAreaInsets
+                    : safeAreaInsets
                 }
               >
                 <View className="flex-1">
@@ -1108,15 +1110,11 @@ function AdaptiveWorkspaceLayoutContent(
                   </PaneContext>
                 </View>
               </SafeAreaInsetsContext>
-              {floatingTabsEnabled &&
-              (compactAndroidSettings || (layout.usesSplitView && workspacePage)) ? (
+              {floatingTabsEnabled && layout.usesSplitView && workspacePage ? (
                 <FloatingWorkspaceTabs
-                  paneWidth={layout.usesSplitView ? (layout.listPaneWidth ?? undefined) : undefined}
-                  fillWidth={compactAndroidSettings}
+                  paneWidth={layout.listPaneWidth ?? undefined}
                   onNewThread={handleStartNewTask}
                 />
-              ) : compactAndroidSettings ? (
-                <AndroidWorkspaceNavigation onNewThread={handleStartNewTask} />
               ) : null}
             </WorkspaceSettledContentWidthContext>
           </WorkspaceContentWidthContext>

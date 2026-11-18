@@ -22,7 +22,7 @@ import { ListSection } from "../../components/ui/ListSection";
 import { Notice } from "../../components/ui/Notice";
 import { uuidv4 } from "../../lib/uuid";
 import { useWorkProviderCatalog } from "./useWorkProviderCatalog";
-import { workRouteLabel } from "./workLogic";
+import { workRouteLabel } from "@t3tools/client-runtime/project-work-logic";
 import { WorkBlock, WorkFormActions, WorkInput, WorkReadNotice, WorkText } from "./WorkParts";
 import type { Surface } from "./workSurface";
 import { newCommandId, useWorkRead, useWorkReview } from "./useWork";
@@ -81,7 +81,7 @@ import {
   type WorkGate,
   type WorkMessageAction,
   type WorkQuestionRecord,
-} from "./workPresentation";
+} from "@t3tools/client-runtime/project-work-presentation";
 
 const MEMORY_PAGE = 16;
 const newestFirst = <T extends { readonly updatedAt: string }>(a: T, b: T) =>

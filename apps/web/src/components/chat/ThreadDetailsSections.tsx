@@ -4,7 +4,10 @@ import {
   isProjectTerminalRunning,
   projectTerminalStatusLabel,
 } from "@t3tools/client-runtime/project-terminal-view";
-import type { ContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
+import {
+  formatContextWindowTokens,
+  type ContextWindowSnapshot,
+} from "@t3tools/client-runtime/state/context-window";
 import type { ThreadStructure } from "@t3tools/client-runtime/state/models";
 import {
   type AtomCommandResult,
@@ -31,7 +34,6 @@ import {
   TerminalSquareIcon,
 } from "lucide-react";
 
-import { formatContextWindowTokens } from "~/lib/contextWindow";
 import { revealThreadTerminal } from "~/lib/revealThreadTerminal";
 import { confirmTerminalClose } from "~/lib/terminalCloseConfirm";
 import { cn } from "~/lib/utils";
@@ -51,7 +53,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import { ThreadDetailsRing } from "./ThreadDetailsRing";
 import { ThreadDetailsSection, ThreadDetailsSummary } from "./ThreadDetailsSection";
-import { latestTodoList } from "./ThreadDetailsSections.logic";
+import { latestTodoList } from "@t3tools/client-runtime/state/thread-checklist";
 import { ThreadProcessRow } from "./ThreadProcessRow";
 import { ThreadServerRows } from "./ThreadServersPanel";
 import {

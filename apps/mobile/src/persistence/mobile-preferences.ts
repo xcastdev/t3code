@@ -159,6 +159,10 @@ export interface Preferences {
   readonly connectOnboardingOptOutAccounts?: ReadonlyArray<string>;
   readonly collapsedProjectGroups?: readonly string[];
   readonly dismissedDatabaseStorageNotices?: readonly string[];
+  /** Thread details sections the user collapsed, by section id, kept across threads. */
+  readonly threadDetailsCollapsedSections?: readonly string[];
+  /** Failed agents opened or dismissed in thread details, so they stop showing as failures. */
+  readonly seenFailedAgents?: readonly string[];
   /** Hardware-keyboard Return behavior in the composer. */
   readonly composerEnterBehavior?: ComposerEnterBehavior;
   readonly followUpBehavior?: FollowUpBehavior;
@@ -251,6 +255,8 @@ function sanitizePreferences(parsed: Preferences): Preferences {
     connectOnboardingOptOutAccounts?: ReadonlyArray<string>;
     collapsedProjectGroups?: readonly string[];
     dismissedDatabaseStorageNotices?: readonly string[];
+    threadDetailsCollapsedSections?: readonly string[];
+    seenFailedAgents?: readonly string[];
     composerEnterBehavior?: ComposerEnterBehavior;
     followUpBehavior?: FollowUpBehavior;
     language?: string;
@@ -359,6 +365,16 @@ function sanitizePreferences(parsed: Preferences): Preferences {
   }
   if (Array.isArray(parsed.dismissedDatabaseStorageNotices)) {
     preferences.dismissedDatabaseStorageNotices = parsed.dismissedDatabaseStorageNotices.filter(
+      (value): value is string => typeof value === "string",
+    );
+  }
+  if (Array.isArray(parsed.threadDetailsCollapsedSections)) {
+    preferences.threadDetailsCollapsedSections = parsed.threadDetailsCollapsedSections.filter(
+      (value): value is string => typeof value === "string",
+    );
+  }
+  if (Array.isArray(parsed.seenFailedAgents)) {
+    preferences.seenFailedAgents = parsed.seenFailedAgents.filter(
       (value): value is string => typeof value === "string",
     );
   }

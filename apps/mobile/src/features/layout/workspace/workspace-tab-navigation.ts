@@ -282,9 +282,12 @@ export function workspaceTabNavigationState<
     return { ...settings, index: routes.length - 1, routes };
   }
   const home = state.routes.find((route) => route.name === "Home") ?? { name: "Home" };
+  // Agents lists chats too, so beside it the detail column shows the last chat.
+  const detailTab = tab === "agents" ? "threads" : tab;
   const detail =
-    options.columns && (tab === "threads" || tab === "pullRequests" || tab === "issues")
-      ? detailRoute(state, tab, selections, options.check, options.seedPullRequest)
+    options.columns &&
+    (detailTab === "threads" || detailTab === "pullRequests" || detailTab === "issues")
+      ? detailRoute(state, detailTab, selections, options.check, options.seedPullRequest)
       : undefined;
   const routes = [keyed(home), ...(detail ? [keyedPage(detail)] : []), ...overlays];
   return { ...state, index: routes.length - 1, routes };

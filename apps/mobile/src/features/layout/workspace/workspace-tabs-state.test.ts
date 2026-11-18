@@ -11,6 +11,7 @@ import {
   workspaceSearchBottomClearance,
   workspaceDockBottomClearance,
   workspaceUsesColumns,
+  workspaceTabOf,
   type WorkspaceTab,
   type WorkspaceTabsState,
 } from "./workspace-tabs-state";
@@ -63,12 +64,20 @@ describe("workspace root navigation", () => {
     expect(workspaceUsesColumns("work")).toBe(true);
   });
 
+  it("keeps Agents selected when it opens a chat, and gives other pages their own list", () => {
+    expect(workspaceTabOf("Thread", "agents")).toBe("agents");
+    expect(workspaceTabOf("Thread", "work")).toBe("threads");
+    expect(workspaceTabOf("PullRequest", "agents")).toBe("pullRequests");
+    expect(workspaceTabOf("Issue")).toBe("issues");
+  });
+
   it("keeps the registered defaults while customization is unavailable", () => {
     expect(resolveWorkspaceTabOrder(undefined)).toEqual([
       "threads",
+      "agents",
+      "work",
       "pullRequests",
       "issues",
-      "work",
       "usage",
     ]);
     expect(resolveWorkspaceTabOrder(["home", "usage", "issues", "threads"])).toEqual(
@@ -194,12 +203,13 @@ describe("workspace root navigation", () => {
     state = workspaceTabsReducer(state, { type: "select", tab: "threads" });
     expect(state.tabs.threads.query).toBe("retained");
   });
-  it("opens Settings on native reselection instead of selecting its overflow section", () => {
-    const order = ["threads", "pullRequests", "work", "usage"] as const;
-    expect(workspaceTabForNativeSlot(order, "settings")).toBe("settings");
+  it("gives the last native slot to the fifth tab, or to Settings when there is none", () => {
+    const order = ["threads", "agents", "work", "pullRequests", "usage"] as const;
+    expect(workspaceTabForNativeSlot(order, "settings")).toBe("usage");
+    expect(workspaceTabForNativeSlot(order.slice(0, 4), "settings")).toBe("settings");
     expect(workspaceTabForNativeSlot(order, "first")).toBe("threads");
     expect(workspaceTabForNativeSlot(order, "third")).toBe("work");
-    expect(workspaceTabForNativeSlot(order, "fourth")).toBe("usage");
+    expect(workspaceTabForNativeSlot(order.slice(0, 2), "fourth")).toBeNull();
     expect(workspaceTabForNativeSlot(order, "removed")).toBeNull();
   });
 });
@@ -263,6 +273,7 @@ vi.mock("../../../components/ui/useAndroidControlSizing", () => ({
   useAndroidControlSizing: () => ({ fabClearance: 64, scale: 1, fabSize: 56 }),
 }));
 vi.mock("../../home/HomeRouteScreen", () => ({ HomeRouteScreen: () => null }));
+vi.mock("../../home/HomeAgentsRouteScreen", () => ({ HomeAgentsRouteScreen: () => null }));
 vi.mock("../../work/WorkTab", () => ({ WorkTab: () => null }));
 vi.mock("../../pull-requests/PullRequestFilterMenuContext", () => ({
   PullRequestFilterMenuProvider: ({ children }: { children: ReactNode }) =>

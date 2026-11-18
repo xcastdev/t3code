@@ -1,10 +1,10 @@
 import { useAtomSet, useAtomValue } from "@effect/atom-react";
 import { AsyncResult } from "effect/reactivity";
-import { useAdaptiveWorkspaceLayout } from "../layout/adaptive-workspace-context";
-import { Platform, View } from "react-native";
+import { View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import {
   moveNavigationTab,
+  NAVIGATION_TAB_CAPACITY,
   navigationCustomizationAvailable,
   toggleNavigationTabVisibility,
 } from "../layout/workspace/navigation-tab-order";
@@ -28,8 +28,6 @@ import { resolveWorkspaceTabOrder } from "../layout/workspace/workspace-tabs-sta
 export function SettingsNavigationRouteScreen() {
   const insets = useSafeAreaInsets();
   const order = useNavigationTabOrder();
-  const { layout } = useAdaptiveWorkspaceLayout();
-  const capacity = Platform.OS === "android" && layout.usesSplitView ? 5 : 4;
   const hidden = useHiddenNavigationTabs();
   const enabled = useEnabledNavigationTabs();
   const preferences = useAtomValue(mobilePreferencesAtom);
@@ -45,8 +43,8 @@ export function SettingsNavigationRouteScreen() {
       >
         <Text className="px-2 text-sm text-foreground-muted">
           {customizable
-            ? "Phones show the first four enabled sections; Android tablet rails show all enabled sections. Remaining sections appear at the top of Settings. Hidden sections appear only here. Settings always stays last. Saved on this device."
-            : "Tab customization becomes available when there are six sections, including Settings."}
+            ? "The tab bar shows the first five enabled sections. Remaining sections appear at the top of Settings. Hidden sections appear only here. Saved on this device."
+            : "Tab customization becomes available when there are more than five sections."}
         </Text>
         <SettingsSection title="Tab order">
           {order.map((tab, index) => (
@@ -61,7 +59,7 @@ export function SettingsNavigationRouteScreen() {
                 <Text className="text-xs text-foreground-muted">
                   {hidden.includes(tab)
                     ? "Hidden"
-                    : enabled.indexOf(tab) < capacity
+                    : enabled.indexOf(tab) < NAVIGATION_TAB_CAPACITY
                       ? `Tab ${enabled.indexOf(tab) + 1}`
                       : "In Settings"}
                 </Text>

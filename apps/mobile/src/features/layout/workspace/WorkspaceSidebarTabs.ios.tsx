@@ -1,5 +1,6 @@
 import { selectedNavigationTab, visibleNavigationTabs } from "./navigation-tab-order";
 import { requireNativeView } from "expo";
+import type { MenuAction } from "@react-native-menu/menu";
 import type { NativeSyntheticEvent, ViewProps } from "react-native";
 import { useControlTheme } from "../../../components/ui/useControlTheme";
 import { useNavigationTabOrder, useHiddenNavigationTabs } from "./navigation-tabs";
@@ -15,13 +16,22 @@ const NativeSidebarTabBar = requireNativeView<
     appearance: string;
     showsCompose: boolean;
     compact?: boolean;
+    composeMenu: readonly MenuAction[];
     onSelectionChange: (event: NativeSyntheticEvent<{ tab: string }>) => void;
     onCompose: () => void;
+    onComposeMenuAction: (event: NativeSyntheticEvent<{ id: string }>) => void;
   }
 >("T3NativeControls", "SidebarTabBar");
 
+const NO_MENU: readonly MenuAction[] = [];
+
 export function WorkspaceSidebarTabs(props: {
   readonly onNewTask?: () => void;
+  /** Compose's long-press menu. */
+  readonly composeMenu?: {
+    readonly actions: readonly MenuAction[];
+    readonly onSelect: (id: string) => void;
+  };
   readonly compact?: boolean;
   readonly reserveComposeSpace?: boolean;
 }) {
@@ -29,7 +39,7 @@ export function WorkspaceSidebarTabs(props: {
   const { layout } = useAdaptiveWorkspaceLayout();
   const order = useNavigationTabOrder();
   const hidden = useHiddenNavigationTabs();
-  const tabs = [...visibleNavigationTabs(order, hidden), "settings" as const];
+  const tabs = visibleNavigationTabs(order, hidden);
   const selectTab = useSelectWorkspaceTab();
   const { colors, colorScheme } = useControlTheme();
   // UIKit loses accessible names when updating nil-titled items in place.
@@ -49,10 +59,11 @@ export function WorkspaceSidebarTabs(props: {
       showsCompose={Boolean(props.onNewTask)}
       compact={props.compact}
       onCompose={() => props.onNewTask?.()}
+      composeMenu={props.composeMenu?.actions ?? NO_MENU}
+      onComposeMenuAction={({ nativeEvent }) => props.composeMenu?.onSelect(nativeEvent.id)}
       onSelectionChange={({ nativeEvent }) => {
         const tab = tabs.find((candidate) => candidate === nativeEvent.tab);
-        if (tab === "settings") selectTab("settings");
-        else if (tab) selectTab(tab);
+        if (tab) selectTab(tab);
       }}
       // Keep the host stable while UIKit updates the bars' intrinsic size and safe area together.
       style={{

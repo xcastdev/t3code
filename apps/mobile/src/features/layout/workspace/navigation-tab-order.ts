@@ -1,4 +1,11 @@
-export const NAVIGATION_TAB_ORDER = ["threads", "pullRequests", "issues", "work", "usage"] as const;
+export const NAVIGATION_TAB_ORDER = [
+  "threads",
+  "agents",
+  "work",
+  "pullRequests",
+  "issues",
+  "usage",
+] as const;
 export type NavigationTab = (typeof NAVIGATION_TAB_ORDER)[number];
 
 const SHARED_SLOT_TABS = ["pullRequests", "issues"] as const;
@@ -17,14 +24,18 @@ export function sharedSlotAbsentee(selected: NavigationTab, last: unknown): Shar
   return holder === "issues" ? "pullRequests" : "issues";
 }
 
+/** The tab bar's slots. Settings sits in the Home header, not the bar. */
+export const NAVIGATION_TAB_CAPACITY = 5;
+
 export function navigationCustomizationAvailable(
   registeredSections: number = NAVIGATION_TAB_ORDER.length - 1,
 ) {
-  return registeredSections > 4;
+  return registeredSections > NAVIGATION_TAB_CAPACITY;
 }
 
 export const NAVIGATION_TAB_LABELS: Readonly<Record<NavigationTab, string>> = {
   threads: "Threads",
+  agents: "Agents",
   pullRequests: "Pulls",
   issues: "Issues",
   work: "Work",
@@ -35,10 +46,19 @@ function isNavigationTab(value: unknown): value is NavigationTab {
   return NAVIGATION_TAB_ORDER.some((tab) => tab === value);
 }
 
-/** Complete older preferences without losing their order or retaining removed sections. */
+/**
+ * Complete older preferences without losing their order or retaining removed sections. A section
+ * the saved order lacks goes after the one it follows by default, so Agents lands after Chats.
+ */
 export function resolveNavigationTabOrder(saved?: readonly unknown[]): readonly NavigationTab[] {
   if (!saved?.length) return NAVIGATION_TAB_ORDER;
-  return [...new Set([...saved.filter(isNavigationTab), ...NAVIGATION_TAB_ORDER])];
+  const order = [...new Set(saved.filter(isNavigationTab))];
+  NAVIGATION_TAB_ORDER.forEach((tab, index) => {
+    if (order.includes(tab)) return;
+    const after = index === 0 ? -1 : order.indexOf(NAVIGATION_TAB_ORDER[index - 1]!);
+    order.splice(after === -1 ? order.length : after + 1, 0, tab);
+  });
+  return order;
 }
 
 export function moveNavigationTab(
@@ -74,13 +94,13 @@ export function enabledNavigationTabs(saved?: readonly unknown[], hidden?: reado
 export function visibleNavigationTabs(
   saved?: readonly unknown[],
   hidden?: readonly unknown[],
-  capacity = 4,
+  capacity = NAVIGATION_TAB_CAPACITY,
 ) {
   return enabledNavigationTabs(saved, hidden).slice(0, capacity);
 }
 
 export function overflowNavigationTabs(saved?: readonly unknown[], hidden?: readonly unknown[]) {
-  return enabledNavigationTabs(saved, hidden).slice(4);
+  return enabledNavigationTabs(saved, hidden).slice(NAVIGATION_TAB_CAPACITY);
 }
 
 export function selectedNavigationTab(
@@ -88,7 +108,7 @@ export function selectedNavigationTab(
   selected: NavigationTab,
   settingsOpen: boolean,
   hidden?: readonly unknown[],
-  capacity = 4,
+  capacity = NAVIGATION_TAB_CAPACITY,
 ): NavigationTab | "settings" {
   return settingsOpen || !visibleNavigationTabs(saved, hidden, capacity).includes(selected)
     ? "settings"

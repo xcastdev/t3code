@@ -39,7 +39,7 @@ import {
   type WorkDeliverySource,
   type WorkDeliveryTrack,
   type WorkRecoveryItem,
-} from "./workPresentation";
+} from "@t3tools/client-runtime/project-work-presentation";
 import { guidedFields, newCommandId, type WorkTaskSurface } from "./workTaskSurface";
 
 /**

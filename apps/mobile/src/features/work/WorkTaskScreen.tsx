@@ -1,9 +1,11 @@
 import {
   asProjectTeamRecord,
+  asProjectWorkTask,
   asProjectWorkTaskContext,
   type ProjectWorkScope,
   type ProjectWorkSelection,
 } from "@t3tools/client-runtime/project-work";
+import { taskMember } from "@t3tools/client-runtime/project-work-team";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import {
   EnvironmentId,
@@ -18,28 +20,35 @@ import {
   type ProjectTeamRecordRead,
   type ProjectWorkCriterionRead,
   type ProjectWorkRelationshipRead,
+  type ProjectWorkTaskRead,
 } from "@t3tools/contracts";
-import { useNavigation, type StaticScreenProps } from "@react-navigation/native";
-import { useState } from "react";
+import { useNavigation, useRoute, type StaticScreenProps } from "@react-navigation/native";
+import { useState, type ReactNode } from "react";
 import { Platform, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
+import { RelativeTime } from "../../components/RelativeTime";
+import { AppText as Text } from "../../components/ui/AppText";
 import { Button } from "../../components/ui/Button";
 import { ListActionRow } from "../../components/ui/ListActionRow";
 import { ListChoiceRow } from "../../components/ui/ListChoiceRow";
 import { ListSection } from "../../components/ui/ListSection";
 import { Notice } from "../../components/ui/Notice";
+import { RefreshControl } from "../../components/ui/RefreshControl";
 import { ScreenScrollView as ScrollView } from "../../components/ui/ScreenScrollView";
 import { uuidv4 } from "../../lib/uuid";
+import { appAtomRegistry } from "../../state/atom-registry";
 import { useProject } from "../../state/entities";
-import { SettingsScreen } from "../settings/components/SettingsScreen";
+import { projectWorkEnvironment } from "../../state/projectWork";
+import { WorkPageFrame } from "./WorkScreens";
+import { useWorkTeamRoster, type WorkRosterMember } from "./useWorkTeamRoster";
+import { WorkMemberAvatar, WorkStatusChip, WorkTagChip } from "./WorkStatus";
 import {
   WorkBlock,
   WorkFormActions,
   WorkInput,
   WorkReadNotice,
   WorkRecordsNotice,
-  WorkScopeLabel,
   WorkTaskLink,
   WorkTaskPicker,
   WorkText,
@@ -53,7 +62,7 @@ import {
   workWriteBlockedReason,
 } from "./useWork";
 import { useWorkRecords, workRecordsBlockedReason } from "./useWorkRecords";
-import { planIntegrationRefs } from "./workPresentation";
+import { planIntegrationRefs } from "@t3tools/client-runtime/project-work-presentation";
 import {
   buildProtectedRevision,
   decisionChanged,
@@ -64,7 +73,7 @@ import {
   relationshipKindLabel,
   type WorkDecisionResponse,
   type WorkDecisionSnapshot,
-} from "./workLogic";
+} from "@t3tools/client-runtime/project-work-logic";
 import {
   TaskDelivery,
   TaskMemory,
@@ -97,39 +106,82 @@ export const guidedFields = (surface: Surface, selected: ProjectWorkSelection) =
   expectedTaskRevision: selected.taskRevision,
 });
 
-export function SettingsWorkTaskRouteScreen({ route }: Props) {
+/** One task as a page. Serves both `WorkTask` and `SettingsWorkTask`. */
+export function WorkTaskRouteScreen({ route }: Props) {
   const environmentId = EnvironmentId.make(route.params.environmentId);
   const projectId = ProjectId.make(route.params.projectId);
   const taskId = ProjectWorkTaskId.make(route.params.taskId);
   const project = useProject(scopeProjectRef(environmentId, projectId));
   const navigation = useNavigation();
+  const settings = useRoute().name.startsWith("Settings");
   const insets = useSafeAreaInsets();
+  const titleView = useWorkRead(environmentId, { projectId, operation: "task", taskId });
+  const task = asProjectWorkTask(titleView.value);
+  const scope =
+    project === null ? null : { environmentId, projectId, checkoutPath: project.workspaceRoot };
+  const refresh = useTaskRefresh(environmentId, projectId, titleView);
   return (
-    <SettingsScreen title="Task">
+    <WorkPageFrame
+      title={task !== null && task.taskId === taskId ? task.title : "Task"}
+      subtitle={project?.title ?? null}
+    >
       <ScrollView
         contentInsetAdjustmentBehavior="automatic"
         className="flex-1"
-        contentContainerClassName="gap-5 px-5 pt-4"
+        contentContainerClassName="gap-6 px-5 pt-4"
         contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 18) + 18 }}
+        keyboardShouldPersistTaps="handled"
+        refreshControl={
+          <RefreshControl
+            refreshing={refresh.refreshing}
+            onRefresh={refresh.onRefresh}
+            tintColorClassName={String("accent-icon")}
+          />
+        }
       >
-        {project === null ? (
+        {scope === null ? (
           <WorkText muted>This project isn't on the selected environment.</WorkText>
         ) : (
           <WorkTaskContent
             key={`${environmentId}:${projectId}:${taskId}`}
-            scope={{ environmentId, projectId, checkoutPath: project.workspaceRoot }}
+            scope={scope}
             taskId={taskId}
             onOpenTask={(next) =>
-              navigation.navigate("SettingsWorkTask", { environmentId, projectId, taskId: next })
+              navigation.navigate(settings ? "SettingsWorkTask" : "WorkTask", {
+                environmentId,
+                projectId,
+                taskId: next,
+              })
             }
           />
         )}
       </ScrollView>
-    </SettingsScreen>
+    </WorkPageFrame>
   );
 }
 
-/** One task's detail. Hosts own navigation, so the Work tab and Settings share it. */
+/** Pull-to-refresh refetches the project's Work reads and spins until this task's read is back. */
+function useTaskRefresh(
+  environmentId: EnvironmentId,
+  projectId: ProjectId,
+  view: ReturnType<typeof useWorkRead>,
+) {
+  const [pulled, setPulled] = useState<typeof view.result | null>(null);
+  const refreshing =
+    pulled !== null &&
+    view.status !== "disconnected" &&
+    (view.result === pulled || view.result.waiting);
+  if (pulled !== null && !refreshing) setPulled(null);
+  return {
+    refreshing,
+    onRefresh: () => {
+      setPulled(view.result);
+      projectWorkEnvironment.refreshProject(appAtomRegistry, environmentId, projectId);
+    },
+  };
+}
+
+/** One task's detail in web's order: facts, approvals, scope and plan, then team and controls. */
 export function WorkTaskContent({
   scope,
   taskId,
@@ -152,11 +204,11 @@ export function WorkTaskContent({
     operation: "foundation-records",
     taskId,
   });
+  const { roster } = useWorkTeamRoster(scope);
   const context = asProjectWorkTaskContext(contextView.value);
   if (context === null || context.task.taskId !== taskId || context.projectId !== scope.projectId)
     return (
       <>
-        <WorkScopeLabel scope={scope} />
         <WorkReadNotice view={contextView} subject="this task" />
         {contextView.status === "ready" ? (
           <WorkText muted>This task isn't in this project, or it was removed.</WorkText>
@@ -165,20 +217,28 @@ export function WorkTaskContent({
     );
 
   const task = context.task;
-  const header = (
-    <View className="gap-1.5 px-1">
-      <WorkScopeLabel scope={scope} />
-      <WorkText>{task.title}</WorkText>
-      {task.summary ? <WorkText muted>{task.summary}</WorkText> : null}
+  const header = (kind: string | null, controlState: string | null) => (
+    <View className="gap-2 px-1">
+      <View className="flex-row flex-wrap items-center gap-1.5">
+        <WorkStatusChip state={task.state} />
+        {kind ? <WorkTagChip label={kind} /> : null}
+        {controlState && controlState !== "active" ? <WorkStatusChip state={controlState} /> : null}
+      </View>
+      <Text selectable textRole="title" className="font-t3-bold text-foreground">
+        {task.title}
+      </Text>
+      {task.summary ? (
+        <Text selectable textRole="footnote" className="text-foreground-muted">
+          {task.summary}
+        </Text>
+      ) : null}
     </View>
   );
   if (!records.complete)
+    // Without every team record the task could be guided or simple; show nothing that guesses.
     return (
       <>
-        {header}
-        <WorkText muted>
-          {workStateLabel(task.state)} · task r{task.revision} · project r{context.revision}
-        </WorkText>
+        {header(null, null)}
         <WorkReadNotice view={contextView} subject="this task" />
         <WorkRecordsNotice set={records} subject="this task's team records" />
         <WorkText muted>
@@ -211,32 +271,158 @@ export function WorkTaskContent({
         : "Team records are catching up with this task."),
     onOpenTask,
   };
+  const kind = model.guided
+    ? model.membership
+      ? `Guided · ${workStateLabel(model.membership.deliverableKind)}`
+      : "Guided"
+    : "Simple";
 
   return (
     <>
-      {header}
-      <WorkText muted>
-        {workStateLabel(task.state)} ·{" "}
-        {model.guided
-          ? `Guided${model.membership ? ` ${workStateLabel(model.membership.deliverableKind)}` : ""}`
-          : "Simple"}
-        {model.controlState !== "active" ? ` · ${workStateLabel(model.controlState)}` : ""} · task r
-        {task.revision} · project r{context.revision}
-      </WorkText>
+      {header(kind, model.controlState)}
+      <TaskProperties
+        task={task}
+        kind={kind}
+        projectRevision={context.revision}
+        worker={taskMember(roster, task)}
+      />
       <WorkReadNotice view={contextView} subject="this task" />
       <WorkRecordsNotice set={records} subject="this task's team records" />
       <Approvals surface={surface} />
       <Scope surface={surface} />
       {model.guided ? <Plan surface={surface} /> : null}
       <Relationships surface={surface} />
-      <TaskWorkers surface={surface} />
       <TaskReview surface={surface} />
       <TaskDelivery key={`${surface.scope.checkoutPath}:${taskId}`} surface={surface} />
       <TaskMemory surface={surface} />
-      <Controls surface={surface} />
       <Evidence surface={surface} />
       <Comments surface={surface} />
+      <TaskWorkers surface={surface} />
+      <Controls surface={surface} />
     </>
+  );
+}
+
+/** The task's facts at a glance: who, where it stands, and when it changed. */
+function TaskProperties(props: {
+  readonly task: ProjectWorkTaskRead;
+  readonly kind: string;
+  readonly projectRevision: number;
+  readonly worker: WorkRosterMember | undefined;
+}) {
+  const { task, worker } = props;
+  const criteria = task.specification?.criterionIds.length ?? 0;
+  const approved = task.approval !== undefined && task.approval.specRevision === task.specRevision;
+  const watchers = task.watchers.flatMap((watcher) =>
+    watcher.displayName ? [watcher.displayName] : [],
+  );
+  const assignee = worker?.name ?? task.assignee?.displayName ?? null;
+  const rows: ReadonlyArray<readonly [string, ReactNode]> = [
+    [
+      "Assignee",
+      <View key="assignee" className="flex-row items-center gap-1.5">
+        {worker ? (
+          <WorkMemberAvatar
+            role={worker.role}
+            name={worker.name}
+            avatar={worker.avatar}
+            size={20}
+          />
+        ) : null}
+        <Text
+          textRole="footnote"
+          className={assignee ? "text-foreground" : "text-foreground-tertiary"}
+        >
+          {assignee ?? "Unassigned"}
+        </Text>
+      </View>,
+    ],
+    ["Type", props.kind],
+    [
+      "Approval",
+      approved ? (
+        <WorkStatusChip key="approval" state="approved" icon="checkmark.circle" label="Approved" />
+      ) : task.specification ? (
+        <WorkStatusChip
+          key="approval"
+          state="pending"
+          tone="warning"
+          icon="exclamationmark.shield"
+          label="Waiting"
+        />
+      ) : (
+        "No scope yet"
+      ),
+    ],
+    ["Criteria", criteria > 0 ? String(criteria) : "None"],
+    [
+      "Watchers",
+      task.watchers.length === 0
+        ? "None"
+        : watchers.length > 0
+          ? watchers.join(", ")
+          : String(task.watchers.length),
+    ],
+    ...(task.failureKind
+      ? ([
+          [
+            "Failure",
+            <WorkStatusChip
+              key="failure"
+              state="failed"
+              icon="exclamationmark.circle"
+              label={workStateLabel(task.failureKind)}
+            />,
+          ],
+        ] as const)
+      : []),
+    ...(task.blockerId
+      ? ([
+          ["Blocker", <WorkStatusChip key="blocker" state="blocked" label="Open blocker" />],
+        ] as const)
+      : []),
+  ];
+  const times: ReadonlyArray<readonly [string, string]> = [
+    ["Created", task.createdAt],
+    ["Updated", task.updatedAt],
+    ...(task.completedAt ? ([["Completed", task.completedAt]] as const) : []),
+    ...(task.canceledAt ? ([["Canceled", task.canceledAt]] as const) : []),
+  ];
+  return (
+    <ListSection>
+      <View className="gap-2 px-4 py-3">
+        {rows.map(([label, value]) => (
+          <PropertyRow key={label} label={label} value={value} />
+        ))}
+        <View className="h-px bg-separator" />
+        {times.map(([label, at]) => (
+          <PropertyRow key={label} label={label} value={<RelativeTime timestamp={at} />} />
+        ))}
+        <PropertyRow
+          label="Revision"
+          value={`task r${task.revision} · project r${props.projectRevision}`}
+        />
+      </View>
+    </ListSection>
+  );
+}
+
+function PropertyRow(props: { readonly label: string; readonly value: ReactNode }) {
+  return (
+    <View className="min-h-6 flex-row items-center gap-3">
+      <Text textRole="footnote" className="w-24 text-foreground-muted">
+        {props.label}
+      </Text>
+      <View className="min-w-0 flex-1 flex-row">
+        {typeof props.value === "string" ? (
+          <Text textRole="footnote" numberOfLines={1} className="text-foreground">
+            {props.value}
+          </Text>
+        ) : (
+          props.value
+        )}
+      </View>
+    </View>
   );
 }
 

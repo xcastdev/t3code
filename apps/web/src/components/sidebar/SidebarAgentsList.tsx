@@ -73,16 +73,16 @@ import { Spinner } from "../ui/spinner";
 import {
   type AgentSidebarFilter,
   agentChatTitle,
-  agentChats,
   agentsPinnedFirst,
   agentFilterIsActive,
   agentHomeThread,
   agentKey,
-  agentPassesFilter,
+  agentLastActivityAt,
+  agentsMatchingQuery,
   environmentsWithAgents,
   NO_AGENT_FILTER,
   toggleAgentFilterValue,
-} from "./SidebarAgentsList.logic";
+} from "@t3tools/client-runtime/state/agents-list";
 import { SidebarScopeRowIcon } from "./SidebarScopeRowIcon";
 import { SidebarHeaderIconButton } from "./SidebarThreadHeader";
 import { RelativeTimeLabel } from "./SidebarThreadRow";
@@ -152,14 +152,9 @@ function EnvironmentAgents(props: {
   const roster = useAssistantRoster(environmentId, false);
   const connection = useAssistantConnection(environmentId);
   const query = props.query.trim().toLowerCase();
-  const agents = (roster.data?.assistants ?? []).flatMap((agent) => {
-    if (!agentPassesFilter(agent, props.filter)) return [];
-    const chats = agentChats(props.threads, agent);
-    if (query.length === 0 || agent.name.toLowerCase().includes(query)) return [{ agent, chats }];
-    const matching = chats.filter((chat) =>
-      agentChatTitle(chat.title).toLowerCase().includes(query),
-    );
-    return matching.length > 0 ? [{ agent, chats: matching }] : [];
+  const agents = agentsMatchingQuery(roster.data?.assistants ?? [], props.threads, {
+    query,
+    filter: props.filter,
   });
   const order = agentsPinnedFirst(
     agents.map(({ agent }) => agent),
@@ -180,24 +175,6 @@ function EnvironmentAgents(props: {
       onNavigate={props.onNavigate}
     />
   ));
-}
-
-/** The newest update across the agent's Home and its chats. */
-function agentLastActivityAt(
-  threads: ReadonlyArray<EnvironmentThreadShell>,
-  agent: AssistantSummary,
-): string {
-  let latest = agent.updatedAt;
-  for (const thread of threads) {
-    if (
-      thread.environmentId === agent.environmentId &&
-      thread.projectId === agent.binding.backingProjectId &&
-      thread.updatedAt > latest
-    ) {
-      latest = thread.updatedAt;
-    }
-  }
-  return latest;
 }
 
 function SidebarAgent(props: {

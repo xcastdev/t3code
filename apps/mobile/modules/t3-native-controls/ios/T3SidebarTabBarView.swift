@@ -36,11 +36,12 @@ private final class WorkspaceTabBar: UITabBar {
 final class T3SidebarTabBarView: ExpoView, UITabBarDelegate {
   let onSelectionChange = EventDispatcher()
   let onCompose = EventDispatcher()
+  let onComposeMenuAction = EventDispatcher()
   private let tabBar = WorkspaceTabBar()
   private let composeButton = UIButton(type: .system)
   private lazy var tabBarTrailing = tabBar.trailingAnchor.constraint(equalTo: trailingAnchor)
   private var itemsByTab: [String: UITabBarItem] = [:]
-  var tabs = ["threads", "pullRequests", "issues", "work", "usage", "settings"] {
+  var tabs = ["threads", "agents", "work", "pullRequests", "usage"] {
     didSet { if tabs != oldValue { updateItems() } }
   }
   var selectedTab = "threads" { didSet { updateSelection() } }
@@ -61,6 +62,8 @@ final class T3SidebarTabBarView: ExpoView, UITabBarDelegate {
       tabBar.setNeedsLayout()
     }
   }
+  /** Long-press menu items shaped like `MenuAction`: `id`, `title`, `subtitle`, `image`, `subactions`. */
+  var composeMenu: [[String: Any]] = [] { didSet { updateComposeMenu() } }
   var appearance = "light" {
     didSet { overrideUserInterfaceStyle = appearance == "dark" ? .dark : .light }
   }
@@ -107,18 +110,64 @@ final class T3SidebarTabBarView: ExpoView, UITabBarDelegate {
   }
 
   private func prepareItems() {
-    let iconBundle = Bundle(for: Self.self).url(forResource: "T3NativeControlIcons", withExtension: "bundle").flatMap(Bundle.init(url:))
-    let pullRequestIcon = UIImage(named: "pull-request", in: iconBundle, compatibleWith: nil)?.withRenderingMode(.alwaysTemplate)
-    let labels = ["threads": "Chats", "pullRequests": "PRs", "issues": "Issues", "work": "Work", "usage": "Usage", "settings": "Settings"]
-    let issueIcon = UIImage(named: "issue", in: iconBundle, compatibleWith: nil)?.withRenderingMode(.alwaysTemplate)
-    let symbols = ["threads": "text.bubble", "work": "checklist", "usage": "chart.bar.xaxis", "settings": "gearshape"]
+    let labels = ["threads": "Chats", "agents": "Agents", "pullRequests": "PRs", "issues": "Issues", "work": "Work", "usage": "Usage"]
+    let bundled = ["pullRequests": "pull-request", "issues": "issue", "agents": "agent"]
+    let symbols = ["threads": "text.bubble", "work": "checklist", "usage": "chart.bar.xaxis"]
     for (tab, label) in labels {
-      let icon = tab == "pullRequests" ? pullRequestIcon : tab == "issues" ? issueIcon : UIImage(systemName: symbols[tab] ?? "circle")
+      let icon = bundled[tab].flatMap { bundledIcon($0) } ?? UIImage(systemName: symbols[tab] ?? "circle")
       let item = UITabBarItem(title: nil, image: tabIcon(icon), tag: 0)
       item.accessibilityLabel = label
       item.accessibilityIdentifier = "workspace-tab-\(tab)"
       if tab == "threads" { item.selectedImage = tabIcon(UIImage(systemName: "text.bubble.fill")) }
       itemsByTab[tab] = item
+    }
+  }
+
+  private func bundledIcon(_ name: String) -> UIImage? {
+    let bundle = Bundle(for: Self.self).url(forResource: "T3NativeControlIcons", withExtension: "bundle").flatMap(Bundle.init(url:))
+    return UIImage(named: name, in: bundle, compatibleWith: nil)?.withRenderingMode(.alwaysTemplate)
+  }
+
+  // Without showsMenuAsPrimaryAction a tap still composes and a long press opens the menu.
+  private func updateComposeMenu() {
+    let elements = menuElements(composeMenu)
+    composeButton.menu = elements.isEmpty ? nil : UIMenu(children: elements)
+    composeButton.accessibilityCustomActions = menuLeaves(composeMenu, path: []).map { leaf in
+      UIAccessibilityCustomAction(name: leaf.title) { [weak self] _ in
+        self?.onComposeMenuAction(["id": leaf.id])
+        return true
+      }
+    }
+  }
+
+  private func menuImage(_ item: [String: Any]) -> UIImage? {
+    guard let name = item["image"] as? String else { return nil }
+    return name == "robot" ? bundledIcon("agent") : UIImage(systemName: name)
+  }
+
+  private func menuElements(_ items: [[String: Any]]) -> [UIMenuElement] {
+    items.compactMap { item -> UIMenuElement? in
+      guard let title = item["title"] as? String else { return nil }
+      if let children = item["subactions"] as? [[String: Any]] {
+        return UIMenu(title: title, image: menuImage(item), children: menuElements(children))
+      }
+      guard let id = item["id"] as? String else { return nil }
+      let action = UIAction(title: title, image: menuImage(item)) { [weak self] _ in
+        self?.onComposeMenuAction(["id": id])
+      }
+      if let subtitle = item["subtitle"] as? String { action.subtitle = subtitle }
+      return action
+    }
+  }
+
+  private func menuLeaves(_ items: [[String: Any]], path: [String]) -> [(id: String, title: String)] {
+    items.flatMap { item -> [(id: String, title: String)] in
+      guard let title = item["title"] as? String else { return [] }
+      if let children = item["subactions"] as? [[String: Any]] {
+        return menuLeaves(children, path: path + [title])
+      }
+      guard let id = item["id"] as? String else { return [] }
+      return [(id: id, title: (path + [title]).joined(separator: ", "))]
     }
   }
 
@@ -162,7 +211,11 @@ final class T3SidebarTabBarView: ExpoView, UITabBarDelegate {
   }
 
   private func updateSelection() {
-    guard let item = itemsByTab[selectedTab], tabBar.items?.contains(item) == true else { return }
+    // Settings and sections beyond the bar select nothing in it.
+    guard let item = itemsByTab[selectedTab], tabBar.items?.contains(item) == true else {
+      if tabBar.selectedItem != nil { tabBar.selectedItem = nil }
+      return
+    }
     guard tabBar.selectedItem !== item else { return }
     tabBar.selectedItem = item
   }

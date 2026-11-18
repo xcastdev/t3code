@@ -16,6 +16,7 @@ import { useAdaptiveWorkspaceLayout } from "../features/layout/AdaptiveWorkspace
 import { useSidebarWorkspaceTabs } from "../features/layout/workspace/useSystemWorkspaceTabBar";
 import { useAndroidFloatingTabs } from "../features/settings/appearance/AppearancePreferencesProvider";
 import { compactEditorInsets } from "../features/threads/compactEditorInsets";
+import { compactEditorSizing } from "../features/threads/compactEditorSizing";
 import {
   useDeviceType,
   useDuoBottomBarInset,
@@ -41,33 +42,48 @@ function collapsedEditorInset(text: ScaledTextRole): number {
 }
 
 const EXPANDED_EDITOR_INSET = 14;
-// Room under the expanded editor for the toolbar row.
-const EXPANDED_EDITOR_BOTTOM = 52;
+/** The corner control a focus-growth editor leaves room for, top right of the expanded row. */
+export const EXPANDED_EDITOR_CORNER_CONTROL_SIZE = 30;
+const EXPANDED_EDITOR_CORNER_INSET = 6;
 
-export function useCompactComposerEditor(text: ScaledTextRole, value: string, animate: boolean) {
+/**
+ * `growth` opts in to growing on focus: expanded while focused, from 2x to 4x the one-row
+ * height, with the top-right corner kept clear for a control shown at max height.
+ */
+export function useCompactComposerEditor(
+  text: ScaledTextRole,
+  value: string,
+  animate: boolean,
+  growth?: { readonly focused: boolean },
+) {
   const [contentSize, setContentSize] = useState({ width: 0, height: 0 });
   const [compactWidth, setCompactWidth] = useState(0);
-  const contentHeight = contentSize.height;
   const rowWidth = useSharedValue(0);
   const editorX = useSharedValue(0);
   const editorWidth = useSharedValue(0);
   const inset =
     Platform.OS === "android" ? COLLAPSED_EDITOR_DEFAULT_INSET : collapsedEditorInset(text);
-  const minimum = Math.max(INLINE_EDITOR_HEIGHT, Math.ceil(text.lineHeight) + 2 * inset);
-  const height = Math.max(
+  const {
+    height,
+    compactRowHeight,
+    expandedRowHeight,
     minimum,
-    Math.min(text.lineHeight * 4 + 2 * inset, contentHeight + 2 * inset),
-  );
-  // A line that fits the expanded editor may still overflow its compact slot.
-  // Compare its measured width too so widening cannot trigger a collapse loop.
-  const isExpanded =
-    value.length > 0 &&
-    (contentHeight > text.lineHeight * 1.5 ||
-      (compactWidth > 0 && contentSize.width > compactWidth));
-  const compactRowHeight = Math.max(44, minimum);
+    isExpanded,
+    isFull,
+    isAtMaxHeight,
+  } = compactEditorSizing({
+    lineHeight: text.lineHeight,
+    inset,
+    content: contentSize,
+    compactWidth,
+    hasText: value.length > 0,
+    ...(growth ? { growth } : {}),
+  });
   const compactBottom = (compactRowHeight - minimum) / 2;
+  const expandedRight = growth
+    ? EXPANDED_EDITOR_CORNER_CONTROL_SIZE + 2 * EXPANDED_EDITOR_CORNER_INSET
+    : EXPANDED_EDITOR_INSET;
   const isRTL = I18nManager.isRTL;
-  const expandedRowHeight = height + EXPANDED_EDITOR_BOTTOM;
   const expansion = useDerivedValue(() => {
     const target = isExpanded ? 1 : 0;
     return animate
@@ -97,7 +113,7 @@ export function useCompactComposerEditor(text: ScaledTextRole, value: string, an
       top: compactBottom * (1 - progress),
       left: compactInsets.left + (EXPANDED_EDITOR_INSET - compactInsets.left) * progress,
       // Snapping the far edge keeps the line from rewrapping while the near edge moves.
-      right: isExpanded ? EXPANDED_EDITOR_INSET : compactInsets.right,
+      right: isExpanded ? expandedRight : compactInsets.right,
     };
   });
   const containerStyle = useAnimatedStyle(() => ({
@@ -105,6 +121,18 @@ export function useCompactComposerEditor(text: ScaledTextRole, value: string, an
   }));
   return {
     isExpanded,
+    isAtMaxHeight,
+    /** Centers the corner control on the first line of the expanded editor. */
+    cornerControlStyle: {
+      position: "absolute",
+      top: Math.max(
+        0,
+        Math.round(inset + text.lineHeight / 2 - EXPANDED_EDITOR_CORNER_CONTROL_SIZE / 2),
+      ),
+      right: EXPANDED_EDITOR_CORNER_INSET,
+      width: EXPANDED_EDITOR_CORNER_CONTROL_SIZE,
+      height: EXPANDED_EDITOR_CORNER_CONTROL_SIZE,
+    } satisfies ViewStyle,
     containerStyle,
     // The expanded toolbar takes the row the text is leaving; reveal it once the text has lifted.
     // An entering animation hides it from its first frame, which a shared-value opacity cannot.
@@ -129,7 +157,7 @@ export function useCompactComposerEditor(text: ScaledTextRole, value: string, an
     },
     editorProps: {
       singleLineCentered: !isExpanded,
-      scrollEnabled: Platform.OS === "android" || contentHeight >= text.lineHeight * 4,
+      scrollEnabled: Platform.OS === "android" || isFull,
       contentInsetVertical: inset,
       onContentSizeChange: (size: { width: number; height: number }) => {
         setContentSize(size);
@@ -165,7 +193,6 @@ const composerHeightTransition: LayoutAnimationFunction = (values) => {
 const COMPOSER_LAYOUT_TRANSITION = Platform.OS === "android" ? undefined : composerHeightTransition;
 // Share of the one-row composer the draft keeps; a long model name truncates first.
 export const INLINE_EDITOR_MIN_WIDTH = "40%";
-const INLINE_EDITOR_HEIGHT = 36;
 
 const AnimatedGlassSurface = Animated.createAnimatedComponent(GlassSurface);
 

@@ -15,7 +15,7 @@ import { ListToggleRow } from "../../components/ui/ListToggleRow";
 import { SegmentedControl } from "../../components/ui/SegmentedControl";
 import { WorkBlock, WorkText } from "./WorkParts";
 import { WorkAgentAvatar } from "./WorkAgentAvatar";
-import type { TeamRole } from "./workLogic";
+import type { TeamRole } from "@t3tools/client-runtime/project-work-logic";
 
 export function WorkAvatarEditor({
   role,

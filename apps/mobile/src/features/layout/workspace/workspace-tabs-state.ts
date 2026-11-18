@@ -38,10 +38,14 @@ function emptyTab(): WorkspaceTabState {
   return { query: "", searchMode: "resting", scrollOffset: 0, searchEntryOffset: 0 };
 }
 
-/** The list a workspace page belongs to. */
-export function workspaceTabOf(routeName: string | undefined): WorkspaceTab {
+/** The list a workspace page belongs to. A chat opened from Agents keeps Agents selected. */
+export function workspaceTabOf(
+  routeName: string | undefined,
+  current?: WorkspaceTab,
+): WorkspaceTab {
   if (routeName === "Issue") return "issues";
-  return routeName === "PullRequest" ? "pullRequests" : "threads";
+  if (routeName === "PullRequest") return "pullRequests";
+  return current === "agents" ? "agents" : "threads";
 }
 
 export function initialWorkspaceTabsState(
@@ -52,6 +56,7 @@ export function initialWorkspaceTabsState(
     selectionRevision: 0,
     tabs: {
       threads: emptyTab(),
+      agents: emptyTab(),
       pullRequests: emptyTab(),
       issues: emptyTab(),
       work: emptyTab(),
@@ -157,6 +162,7 @@ export function workspaceToolbarHeight(mode: WorkspaceSearchMode): number {
     : WORKSPACE_TOOLBAR.height;
 }
 
+/** The last slot holds the fifth tab, and Settings while it's open. */
 export const NATIVE_WORKSPACE_TAB_SLOTS = [
   "first",
   "second",
@@ -166,7 +172,7 @@ export const NATIVE_WORKSPACE_TAB_SLOTS = [
 ] as const;
 
 export function workspaceTabForNativeSlot(order: readonly WorkspaceTab[], slot: string) {
-  if (slot === "settings") return "settings";
   const index = NATIVE_WORKSPACE_TAB_SLOTS.findIndex((candidate) => candidate === slot);
-  return order[index] ?? null;
+  if (index === -1) return null;
+  return order[index] ?? (slot === "settings" ? "settings" : null);
 }

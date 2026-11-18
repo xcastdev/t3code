@@ -22,7 +22,7 @@ import {
   WorkSection,
 } from "./WorkLayout";
 import { useWorkRecords, workRecordsBlockedReason } from "./useWorkRecords";
-import { isMemberRecord } from "./workLogic";
+import { isMemberRecord } from "@t3tools/client-runtime/project-work-logic";
 import { GUIDED_CONTROL_LABELS, guidedControls, type WorkGuidedControl } from "./workModel";
 import { guidedFields, newCommandId, useWorkReview, type WorkTaskSurface } from "./workTaskSurface";
 

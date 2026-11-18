@@ -87,7 +87,7 @@ export function AndroidWorkspaceNavigation(props: {
   const window = useWindowDimensions();
   const rail = Boolean(props.rail);
   const floating = !rail && Boolean(props.floating);
-  const tabs = [...visibleNavigationTabs(order, hidden, rail ? 5 : 4), "settings"];
+  const tabs = visibleNavigationTabs(order, hidden);
   const { containerColor, indicatorColor, selectedColor, unselectedColor } =
     androidWorkspaceNavigationColors(colors, rail, floating);
   const selectedTab = selectedNavigationTab(
@@ -95,7 +95,6 @@ export function AndroidWorkspaceNavigation(props: {
     workspace.state.selectedTab,
     root?.settingsOpen ?? false,
     hidden,
-    rail ? 5 : 4,
   );
   // FloatingWorkspaceTabs starts the bar at the left inset, so a cutout narrows the room.
   const barWidth =

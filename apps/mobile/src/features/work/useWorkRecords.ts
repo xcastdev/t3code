@@ -12,7 +12,7 @@ import {
   pageWindow,
   retainCompleteWorkSet,
   type WorkRecordSet,
-} from "./workLogic";
+} from "@t3tools/client-runtime/project-work-logic";
 
 const CHAIN_PAGE = 128;
 /** 2048 records: past this a set is reported as truncated, never as complete. */
@@ -104,6 +104,7 @@ export function useWorkPage(
     window,
     next: () => window.nextOffset !== null && setOffset(window.nextOffset),
     previous: () => window.previousOffset !== null && setOffset(window.previousOffset),
+    reset: () => setOffset(0),
   };
 }
 export type WorkPageView = ReturnType<typeof useWorkPage>;

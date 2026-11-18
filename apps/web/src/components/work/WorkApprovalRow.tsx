@@ -19,9 +19,13 @@ import {
   decisionSnapshot,
   type WorkDecisionResponse as Response,
   type WorkDecisionSnapshot,
-} from "./workLogic";
+} from "@t3tools/client-runtime/project-work-logic";
 import { gateResponses, shortHash, type WorkApprovalStep } from "./workModel";
-import { bindingPhase, recordsOfKind, startAvailability } from "./workPresentation";
+import {
+  bindingPhase,
+  recordsOfKind,
+  startAvailability,
+} from "@t3tools/client-runtime/project-work-presentation";
 import { guidedFields, newCommandId, type WorkTaskSurface } from "./workTaskSurface";
 
 const RESPONSE_LABEL: Record<Response, string> = {

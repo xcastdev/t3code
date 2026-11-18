@@ -21,22 +21,9 @@ vi.mock("react-native", () => ({
     <div onClick={onPress}>{children}</div>
   ),
 }));
-vi.mock("react-native-reanimated", () => {
-  const animation = { duration: () => ({ easing: () => ({}) }) };
-  return {
-    default: { View: ({ children }: Children) => <div>{children}</div> },
-    Easing: { out: () => () => 0, cubic: () => 0 },
-    FadeInUp: animation,
-    FadeOutDown: animation,
-    useAnimatedStyle: () => ({}),
-    useSharedValue: (value: number) => ({ value, set: () => {} }),
-  };
-});
-vi.mock("../../components/ui/AppSymbol", () => ({ SymbolView: () => null }));
 vi.mock("../../components/ui/AppText", () => ({
   AppText: ({ children }: Children) => <span>{children}</span>,
 }));
-vi.mock("../../components/ui/ControlPill", () => ({ ControlPill: () => null }));
 vi.mock("../../components/ui/Button", () => ({ Button: () => null }));
 vi.mock("./QuestionAttachments", () => ({ QuestionAttachments: () => null }));
 vi.mock("../files/FileMarkdownPreview", () => ({
@@ -98,11 +85,6 @@ function setup(questionMarkdown: string) {
         workspaceRoot="/repo"
         canOperateThread
         pendingUserInput={pendingUserInput}
-        maxHeight={{ value: 600 } as never}
-        cardProgress={{ value: 1, set: () => {} } as never}
-        cardCoverage={{ value: 0, set: () => {} } as never}
-        collapsed={false}
-        onToggleCollapsed={() => {}}
         drafts={{}}
         answers={null}
         respondingUserInputId={null}

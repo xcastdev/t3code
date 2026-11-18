@@ -12,7 +12,7 @@ import {
   pageWindow,
   retainCompleteWorkSet,
   type WorkRecordSet,
-} from "./workLogic";
+} from "@t3tools/client-runtime/project-work-logic";
 
 const CHAIN_PAGE = 128;
 /** 2048 records: past this a set is reported as truncated, never as complete. */

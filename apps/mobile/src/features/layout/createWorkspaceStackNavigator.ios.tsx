@@ -534,9 +534,11 @@ function WorkspaceStackView(props: ViewProps & { readonly nativeColumns: boolean
   // when the primary screen starts appearing, including interactive back gestures.
   const [primaryVisible, setPrimaryVisible] = useState(false);
   const metrics = useNativeLayoutMetrics();
-  const projection = projectWorkspaceStack(props.state, (route) => {
-    return isPresentedRoute(props.descriptors[route.key]?.options);
-  });
+  const projection = projectWorkspaceStack(
+    props.state,
+    (route) => isPresentedRoute(props.descriptors[route.key]?.options),
+    { settingsPage: !layout.usesSplitView },
+  );
   // The root's willDisappear reaches JS frames into the push, so hide the dock in the commit that
   // pushes; the native events still own every later change, including back gestures.
   const topDetailKey = projection.detail.at(-1)?.key;
@@ -697,7 +699,7 @@ function WorkspaceStackNavigator({
   return (
     <NativeWorkspaceModeContext value={usesNativeWorkspaceColumns}>
       <NavigationContent>
-        <WorkspaceTabsProvider settingsOpen={settingsOpen}>
+        <WorkspaceTabsRoot settingsOpen={settingsOpen}>
           <WorkspaceStackView
             nativeColumns={usesNativeWorkspaceColumns}
             {...rest}
@@ -706,9 +708,25 @@ function WorkspaceStackNavigator({
             descriptors={descriptors}
             navigation={navigation}
           />
-        </WorkspaceTabsProvider>
+        </WorkspaceTabsRoot>
       </NavigationContent>
     </NativeWorkspaceModeContext>
+  );
+}
+
+/**
+ * Beside columns Settings is a workspace tab: its list replaces the tab's and its pages fill the
+ * detail column. Without them it is a page pushed over the tabs, which stay on the tab it left.
+ */
+function WorkspaceTabsRoot(props: {
+  readonly settingsOpen: boolean;
+  readonly children: ReactNode;
+}) {
+  const { layout } = useAdaptiveWorkspaceLayout();
+  return (
+    <WorkspaceTabsProvider settingsOpen={props.settingsOpen && layout.usesSplitView}>
+      {props.children}
+    </WorkspaceTabsProvider>
   );
 }
 

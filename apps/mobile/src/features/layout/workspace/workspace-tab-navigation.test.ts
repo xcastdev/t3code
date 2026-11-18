@@ -128,6 +128,10 @@ describe("opening a workspace tab", () => {
       "Home",
       "Issue",
     ]);
+    expect(names(workspaceTabNavigationState(state, "agents", selections, columns))).toEqual([
+      "Home",
+      "Thread",
+    ]);
     expect(names(workspaceTabNavigationState(state, "work", selections, columns))).toEqual([
       "Home",
     ]);

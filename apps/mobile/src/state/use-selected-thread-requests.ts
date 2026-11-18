@@ -351,12 +351,37 @@ export function useSelectedThreadRequests() {
     return result;
   };
 
-  const onSubmitUserInput = async () => {
+  /** `customAnswer` is typed outside the card, in the composer, and is stored as that question's draft. */
+  const onSubmitUserInput = async (customAnswer?: {
+    readonly questionId: string;
+    readonly text: string;
+  }) => {
+    const customQuestion =
+      customAnswer === undefined
+        ? undefined
+        : activePendingUserInput?.questions.find(
+            (question) => question.id === customAnswer.questionId,
+          );
+    if (customAnswer !== undefined && customQuestion === undefined) return;
+    const answers =
+      activePendingUserInput && customAnswer !== undefined && customQuestion !== undefined
+        ? buildPendingUserInputAnswers(activePendingUserInput.questions, {
+            ...activePendingUserInputDrafts,
+            [customQuestion.id]: {
+              ...activePendingUserInputDrafts[customQuestion.id],
+              ...setPendingUserInputCustomAnswer(
+                customQuestion,
+                activePendingUserInputDrafts[customQuestion.id],
+                customAnswer.text,
+              ),
+            },
+          })
+        : activePendingUserInputAnswers;
     if (
       !selectedThreadShell ||
       !activePendingUserInput ||
       activePendingUserInput.responseCapability === "not_resumable" ||
-      !activePendingUserInputAnswers ||
+      !answers ||
       !readEnvironmentScope(selectedThreadShell.environmentId, AuthOrchestrationOperateScope)
     ) {
       return;
@@ -408,13 +433,24 @@ export function useSelectedThreadRequests() {
       );
     }
     userInputResponsesInFlight.current.add(responseKey);
+    if (customAnswer !== undefined && customQuestion !== undefined) {
+      setUserInputDraftCustomAnswer(
+        userInputDraftKey(
+          selectedThreadShell.environmentId,
+          selectedThreadShell.id,
+          activePendingUserInput.requestId,
+        ),
+        customQuestion,
+        customAnswer.text,
+      );
+    }
     setRespondingUserInputId(activePendingUserInput.requestId);
     const result = await respondToUserInput({
       environmentId: selectedThreadShell.environmentId,
       input: {
         threadId: selectedThreadShell.id,
         requestId: activePendingUserInput.requestId,
-        answers: activePendingUserInputAnswers,
+        answers,
         ...(attachmentsByQuestionId.size > 0
           ? { attachmentsByQuestionId: Object.fromEntries(attachmentsByQuestionId) }
           : {}),

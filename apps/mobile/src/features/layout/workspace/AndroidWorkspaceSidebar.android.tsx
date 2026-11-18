@@ -16,6 +16,7 @@ import { IssuesScreen } from "../../issues/IssuesScreen";
 import { selectedIssueKey } from "../../issues/issueParams";
 import { selectedPullRequestKey } from "../../pull-requests/pullRequestSelection";
 import { AndroidHomeFabLayout } from "../../home/AndroidHomeFab";
+import { HomeAgentsRouteScreen } from "../../home/HomeAgentsRouteScreen";
 import { useAdaptiveWorkspaceLayout } from "../adaptive-workspace-context";
 import { useAndroidWorkspaceRoot } from "./AndroidWorkspaceTabsProvider";
 import { WorkspaceTabsContext, useWorkspaceTabs } from "./WorkspaceTabsContext";
@@ -50,6 +51,12 @@ export function AndroidWorkspaceSidebar() {
           tab === "threads" ? (
             <AndroidHomeFabLayout sidebar disabled={coveredByPage} onStartNewTask={startNewTask}>
               <WorkspaceThreadSidebar />
+            </AndroidHomeFabLayout>
+          ) : tab === "agents" ? (
+            <AndroidHomeFabLayout sidebar disabled={coveredByPage} onStartNewTask={startNewTask}>
+              <View className="flex-1 bg-header">
+                <HomeAgentsRouteScreen sidebar />
+              </View>
             </AndroidHomeFabLayout>
           ) : tab === "work" ? (
             <WorkspaceTabsContext value={context}>

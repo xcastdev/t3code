@@ -32,7 +32,7 @@ import {
   reviewSummary,
   splitArguments,
   type WorkGate,
-} from "./workPresentation";
+} from "@t3tools/client-runtime/project-work-presentation";
 import { guidedFields, teamFields, useWorkReview, type WorkTaskSurface } from "./workTaskSurface";
 
 const GATE_LABEL: Record<string, string> = {

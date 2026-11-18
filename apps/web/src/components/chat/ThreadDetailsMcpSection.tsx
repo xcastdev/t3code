@@ -1,5 +1,10 @@
 import { useAtomValue } from "@effect/atom-react";
 import {
+  mcpApplicationSummary,
+  mcpSessionToggleOperation,
+  type McpCatalogRow,
+} from "@t3tools/client-runtime/mcp-catalog-forms";
+import {
   McpCatalogOverrideId,
   type EnvironmentId,
   type ProjectId,
@@ -12,13 +17,6 @@ import { randomUUID } from "~/lib/utils";
 import { mcpCatalogEnvironment } from "~/state/resources";
 
 import { useMcpCatalogView } from "../settings/McpCatalogSettings";
-import {
-  mcpApplicationSummary,
-  mcpDefinitionInputFromForm,
-  mcpFormFromDefinition,
-  mcpOverrideInput,
-  type McpCatalogRow,
-} from "../settings/resourceInventory";
 import { useResourceCommand } from "../settings/useResourceCommand";
 import { Switch } from "../ui/switch";
 import { ThreadDetailsSection } from "./ThreadDetailsSection";
@@ -61,36 +59,18 @@ export default function ThreadDetailsMcpSection(props: {
   const toggle = (row: McpCatalogRow) => {
     if (!writable || baseline === null) return;
     const key = row.definition.definitionId;
-    const write = (
-      operation: Parameters<typeof mcpCatalogEnvironment.write.run>[1]["input"]["operation"],
-    ) =>
-      void runner
-        .run(key, mcpCatalogEnvironment.write, {
-          environmentId,
-          input: { ...baseline, expectedRevision: baseline.revision, operation },
-        })
-        .then(() => view?.own?.refresh());
-    if (row.inherited) {
-      const override = mcpOverrideInput({
-        scope: "session",
-        scopeId: baseline.scopeId,
-        row,
-        patch: { enabled: !row.enabled },
-        newId: McpCatalogOverrideId.make(randomUUID()),
-      });
-      if (!override.ok) return runner.reportFailure(key, override.error);
-      return write({ type: "put-override", override: override.value });
-    }
-    const definition = mcpDefinitionInputFromForm({
-      ...mcpFormFromDefinition(row.definition),
-      enabled: !row.definition.enabled,
+    const operation = mcpSessionToggleOperation({
+      sessionId: baseline.scopeId,
+      row,
+      newOverrideId: McpCatalogOverrideId.make(randomUUID()),
     });
-    if (!definition.ok) return runner.reportFailure(key, definition.error);
-    write({
-      type: "update",
-      logicalServerId: row.definition.logicalServerId,
-      definition: definition.value,
-    });
+    if (!operation.ok) return runner.reportFailure(key, operation.error);
+    void runner
+      .run(key, mcpCatalogEnvironment.write, {
+        environmentId,
+        input: { ...baseline, expectedRevision: baseline.revision, operation: operation.value },
+      })
+      .then(() => view?.own?.refresh());
   };
 
   return (

@@ -18,6 +18,8 @@ import { useAndroidControlSizing } from "../../components/ui/useAndroidControlSi
 import { WorkspaceTabsContext, useWorkspaceTabs } from "../layout/workspace/WorkspaceTabsContext";
 import { FLOATING_TABS, floatingTabsMetrics } from "../layout/workspace/floating-workspace-tabs";
 import { useEnabledNavigationTabs } from "../layout/workspace/navigation-tabs";
+import { NAVIGATION_TAB_CAPACITY } from "../layout/workspace/navigation-tab-order";
+import { useComposeMenu } from "../layout/workspace/useComposeMenu";
 import {
   useAppearancePreferences,
   useAndroidFloatingTabs,
@@ -38,7 +40,12 @@ export function AndroidHomeFabLayout(props: ComponentProps<typeof SharedAndroidH
       ? undefined
       : layoutWidth - (Math.max(insets.left, FLOATING_TABS.edge) - FLOATING_TABS.edge);
   const size = floatingTabsEnabled
-    ? floatingTabsMetrics(enabledTabs.length + 1, scale, fabSize, barWidth).height
+    ? floatingTabsMetrics(
+        Math.min(enabledTabs.length, NAVIGATION_TAB_CAPACITY),
+        scale,
+        fabSize,
+        barWidth,
+      ).height
     : fabSize;
   const workspace = useWorkspaceTabs();
   const bottomClearance = insets.bottom + FLOATING_TABS.bottom + FLOATING_TABS.edge + size;
@@ -55,6 +62,13 @@ export function AndroidHomeFabLayout(props: ComponentProps<typeof SharedAndroidH
     scrollState.current = next;
   };
 
+  const shown =
+    !props.disabled &&
+    (!props.sidebar || floatingTabsEnabled) &&
+    state.hasConnections &&
+    layoutWidth !== null;
+  const composeMenu = useComposeMenu(shown);
+
   // Remount only the FAB when its font or pane changes to clear the cached expanded width.
   // Floating navigation shares this row; Material split views put New thread in the rail.
   return (
@@ -62,15 +76,13 @@ export function AndroidHomeFabLayout(props: ComponentProps<typeof SharedAndroidH
       <WorkspaceTabsContext value={context}>
         <FabScrollContext value={onScroll}>{props.children}</FabScrollContext>
       </WorkspaceTabsContext>
-      {!props.disabled &&
-      (!props.sidebar || floatingTabsEnabled) &&
-      state.hasConnections &&
-      layoutWidth !== null ? (
+      {shown ? (
         <ScrollComposeButton
           key={`${appearance.baseFontSize}:${fontScale}:${layoutWidth}`}
           size={size}
           expanded={floatingTabsEnabled ? false : expanded}
           onPress={props.onStartNewTask}
+          menu={composeMenu}
           className="absolute"
           style={
             floatingTabsEnabled

@@ -1,44 +1,21 @@
 import { useAtomValue } from "@effect/atom-react";
-import {
-  type AttentionEntry,
-  collectAttention,
-  workAttentionFor,
-} from "@t3tools/client-runtime/state/attention";
-import { deriveWorkHome, type WorkHome } from "@t3tools/client-runtime/state/work-home";
-import type {
-  EnvironmentId,
-  ProjectId,
-  ProjectWorkActivitySummary,
-  ProjectWorkAttentionItem,
-} from "@t3tools/contracts";
-import * as Option from "effect/Option";
-import { AsyncResult, Atom } from "effect/reactivity";
+import { type AttentionEntry, workAttentionFor } from "@t3tools/client-runtime/state/attention";
+import type { WorkHome } from "@t3tools/client-runtime/state/work-home";
+import { createWorkAttentionAtoms } from "@t3tools/client-runtime/state/work-attention";
+import type { EnvironmentId, ProjectId } from "@t3tools/contracts";
 
 import { environmentSummaries } from "./presentation";
 import { environmentProjects } from "./projects";
 import { projectWorkEnvironment } from "./projectWork";
 import { environmentThreadShells } from "./threads";
 
-const NO_ITEMS: ReadonlyArray<ProjectWorkAttentionItem> = [];
-
-// One attention stream per connected environment; an older server without it just reports nothing.
-const workAttentionAtom = Atom.make((get) =>
-  get(environmentSummaries.connectedEnvironmentIdsAtom).map((environmentId) => ({
-    environmentId,
-    items: Option.match(AsyncResult.value(get(projectWorkEnvironment.attention(environmentId))), {
-      onNone: () => NO_ITEMS,
-      onSome: (summary) => summary.items,
-    }),
-  })),
-).pipe(Atom.withLabel("web-work-attention"));
-
-const attentionEntriesAtom = Atom.make((get) =>
-  collectAttention({
-    threads: get(environmentThreadShells.quietThreadShellsAtom),
-    work: get(workAttentionAtom),
-    projects: get(environmentProjects.projectsAtom),
-  }),
-).pipe(Atom.withLabel("web-attention-entries"));
+const { workAttentionAtom, attentionEntriesAtom, workHomeAtom } = createWorkAttentionAtoms({
+  label: "web",
+  connectedEnvironmentIdsAtom: environmentSummaries.connectedEnvironmentIdsAtom,
+  attention: projectWorkEnvironment.attention,
+  threadsAtom: environmentThreadShells.quietThreadShellsAtom,
+  projectsAtom: environmentProjects.projectsAtom,
+});
 
 /** Everything waiting on the user across environments, newest first. */
 export function useAttentionEntries(): ReadonlyArray<AttentionEntry> {
@@ -64,26 +41,6 @@ export function useAllWorkAttentionKeys(): ReadonlyArray<string> {
     .filter((entry) => entry.type === "work")
     .map((entry) => entry.key);
 }
-
-// The same per-environment stream carries what is moving; older servers send no activity.
-const workHomeAtom = Atom.make((get) =>
-  deriveWorkHome({
-    items: get(attentionEntriesAtom).flatMap((entry) =>
-      entry.type === "work" ? [{ environmentId: entry.environmentId, item: entry.item }] : [],
-    ),
-    activity: get(environmentSummaries.connectedEnvironmentIdsAtom).map((environmentId) => ({
-      environmentId,
-      activity: Option.match(
-        AsyncResult.value(get(projectWorkEnvironment.attention(environmentId))),
-        {
-          onNone: (): ProjectWorkActivitySummary | null => null,
-          onSome: (summary) => summary.activity ?? null,
-        },
-      ),
-    })),
-    projects: get(environmentProjects.projectsAtom),
-  }),
-).pipe(Atom.withLabel("web-work-home"));
 
 /** What waits on the user and what is moving, across every connected project. */
 export function useWorkHome(): WorkHome {

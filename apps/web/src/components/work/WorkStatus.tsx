@@ -14,7 +14,7 @@ import {
 
 import { cn } from "../../lib/utils";
 import { workStateLabel, workStateVariant } from "./workModel";
-import type { WorkTone } from "./workPresentation";
+import type { WorkTone } from "@t3tools/client-runtime/project-work-presentation";
 
 const GLYPHS = {
   draft: CircleDashedIcon,

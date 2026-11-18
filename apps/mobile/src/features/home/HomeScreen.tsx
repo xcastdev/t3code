@@ -163,7 +163,7 @@ function HomeTopContentSpacer() {
   return <View className="h-4" />;
 }
 
-function HomeScrollView(props: ComponentProps<typeof ScrollView>) {
+export function HomeScrollView(props: ComponentProps<typeof ScrollView>) {
   const primaryColumn = use(NativePrimaryColumnContext);
   const sidebarSurface = usePaneRole() === "sidebar" && primaryColumn !== null;
   if (Platform.OS !== "ios") return <ScrollView {...props} />;
@@ -680,21 +680,23 @@ export function HomeScreen(props: HomeScreenProps) {
         <ThreadListFilters
           gutter={sidebarSurface ? 8 : 0}
           environments={props.environments}
-          projects={pickableProjectGroups(
-            sortHomeProjectScopes({
-              scopes: projectScopes,
-              threads: props.threads,
-              pendingTasks: [],
-              projectSortOrder: "updated_at",
-            }),
-          ).map((scope) => ({
-            key: scope.key,
-            label: scope.title,
-          }))}
           selectedEnvironmentId={props.selectedEnvironmentId}
-          selectedProjectKey={props.selectedProjectKey}
           onEnvironmentChange={props.onEnvironmentChange}
-          onProjectChange={props.onProjectChange}
+          project={{
+            projects: pickableProjectGroups(
+              sortHomeProjectScopes({
+                scopes: projectScopes,
+                threads: props.threads,
+                pendingTasks: [],
+                projectSortOrder: "updated_at",
+              }),
+            ).map((scope) => ({
+              key: scope.key,
+              label: scope.title,
+            })),
+            selectedProjectKey: props.selectedProjectKey,
+            onProjectChange: props.onProjectChange,
+          }}
         />
       ) : null}
     </>

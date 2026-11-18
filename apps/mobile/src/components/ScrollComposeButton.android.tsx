@@ -7,8 +7,10 @@ import {
   onSizeChanged,
   size,
 } from "@expo/ui/jetpack-compose/modifiers";
+import type { MenuAction } from "@react-native-menu/menu";
 import { useState } from "react";
 import { I18nManager, Pressable, View, type StyleProp, type ViewStyle } from "react-native";
+import { Menu } from "./ui/Menu";
 import { useAndroidControlSizing } from "./ui/useAndroidControlSizing";
 import { useAppearancePreferences } from "../features/settings/appearance/AppearancePreferencesProvider";
 import { resolveScaledTextRole } from "../lib/appearancePreferences";
@@ -17,6 +19,11 @@ import { resolveScaledTextRole } from "../lib/appearancePreferences";
 export function ScrollComposeButton(props: {
   readonly expanded: boolean;
   readonly onPress: () => void;
+  /** Opens on long press. */
+  readonly menu?: {
+    readonly actions: MenuAction[];
+    readonly onSelect: (id: string) => void;
+  };
   readonly size?: number;
   readonly className?: string;
   readonly style?: StyleProp<ViewStyle>;
@@ -87,21 +94,36 @@ export function ScrollComposeButton(props: {
         </NativeThemeHost>
       </View>
       {/* The visual host is wider than the button; only this target intercepts list touches. */}
-      <Pressable
-        onPress={props.onPress}
-        accessibilityRole="button"
-        accessibilityLabel="New thread"
-        android_ripple={{ foreground: true }}
+      <Menu
+        actions={props.menu?.actions ?? []}
+        shouldOpenOnLongPress
+        onPressAction={({ nativeEvent }) => props.menu?.onSelect(nativeEvent.event)}
         style={{
           position: "absolute",
           right: 0,
           top: 0,
           bottom: 0,
           width: props.expanded ? buttonWidth * scale : fabSize,
-          borderRadius: 16 * scale,
-          overflow: "hidden",
         }}
-      />
+      >
+        <Pressable
+          onPress={props.onPress}
+          accessibilityRole="button"
+          accessibilityLabel="New thread"
+          accessibilityHint={props.menu ? "Long press for more ways to start" : undefined}
+          accessibilityActions={props.menu?.actions.flatMap((action) =>
+            action.subactions
+              ? action.subactions.map((sub) => ({
+                  name: sub.id ?? sub.title,
+                  label: `${action.title}, ${sub.title}`,
+                }))
+              : [{ name: action.id ?? action.title, label: action.title }],
+          )}
+          onAccessibilityAction={({ nativeEvent }) => props.menu?.onSelect(nativeEvent.actionName)}
+          android_ripple={{ foreground: true }}
+          style={{ flex: 1, borderRadius: 16 * scale, overflow: "hidden" }}
+        />
+      </Menu>
     </View>
   );
 }

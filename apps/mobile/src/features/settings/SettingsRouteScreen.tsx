@@ -23,7 +23,6 @@ import { deriveProjectGroupLabel } from "@t3tools/client-runtime/state/project-g
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { hasCloudPublicConfig } from "../cloud/publicConfig";
-import { useAdaptiveWorkspaceLayout } from "../layout/adaptive-workspace-context";
 import { useSavedRemoteConnections } from "../../state/use-remote-environment-registry";
 import { SettingsRow } from "./components/SettingsRow";
 import { SettingsSection, SettingsSidebarContext } from "./components/SettingsSection";
@@ -105,6 +104,9 @@ function TranslatedSettingsListScreen(props: {
                   onChangeText: (query) =>
                     workspace.dispatch({ type: "query", tab: "settings", query }),
                   placeholder: gt("Search settings"),
+                  // A search button beside the menu in the top bar, not the bottom toolbar.
+                  mode: "inline",
+                  compactToolbar: false,
                 }
               : undefined
           }
@@ -322,9 +324,7 @@ function useSettingsIndexSections(): SettingsListSection[] {
 function useOverflowRows(): SettingsListRow[] {
   const order = useNavigationTabOrder();
   const hidden = useHiddenNavigationTabs();
-  const { layout } = useAdaptiveWorkspaceLayout();
-  const tabs =
-    Platform.OS === "android" && layout.usesSplitView ? [] : overflowNavigationTabs(order, hidden);
+  const tabs = overflowNavigationTabs(order, hidden);
   const selectTab = useSelectWorkspaceTab();
   return tabs.map((tab) => ({
     id: tab,
