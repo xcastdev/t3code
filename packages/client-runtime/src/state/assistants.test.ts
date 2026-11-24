@@ -46,7 +46,7 @@ import {
   type SupervisorConnectionState,
 } from "../connection/model.ts";
 import type { RpcSession } from "../rpc/session.ts";
-import { createEnvironmentCommand } from "./runtime.ts";
+import { createEnvironmentCommand, runAtomCommand } from "./runtime.ts";
 import { interruptThreadTurn } from "../operations/commands.ts";
 import {
   assistantActivityState,
@@ -567,7 +567,7 @@ it.effect(
         registry.set(sessions(environmentId), AsyncResult.success(auth));
         expect(registry.get(atoms.lifecycle.permissionAtom(environmentId))).toBe(true);
         const accepted = yield* Effect.promise(() =>
-          atoms.lifecycle.run(registry, {
+          runAtomCommand(registry, atoms.lifecycle, {
             environmentId,
             input: {
               environmentId,
@@ -584,7 +584,9 @@ it.effect(
           current: selection,
           commandId,
         })!;
-        const stopped = yield* Effect.promise(() => atoms.stop.run(registry, stopTarget));
+        const stopped = yield* Effect.promise(() =>
+          runAtomCommand(registry, atoms.stop, stopTarget),
+        );
         expect(stopped._tag).toBe("Success");
         registry.set(
           sessions(environmentId),
@@ -600,7 +602,7 @@ it.effect(
         ])
           expect(registry.get(command.permissionAtom(environmentId))).toBe(false);
         const result = yield* Effect.promise(() =>
-          atoms.lifecycle.run(registry, {
+          runAtomCommand(registry, atoms.lifecycle, {
             environmentId,
             input: {
               environmentId,
@@ -612,7 +614,9 @@ it.effect(
           }),
         );
         expect(result._tag).toBe("Failure");
-        const deniedStop = yield* Effect.promise(() => atoms.stop.run(registry, stopTarget));
+        const deniedStop = yield* Effect.promise(() =>
+          runAtomCommand(registry, atoms.stop, stopTarget),
+        );
         expect(deniedStop._tag).toBe("Failure");
         expect(stops).toBe(1);
         expect(writes).toBe(1);
@@ -891,13 +895,13 @@ it.effect("normal thread Stop checks current grants at the shared custom command
         environmentId,
         input: { commandId, threadId: summary.binding.canonicalThreadId },
       };
-      const allowed = yield* Effect.promise(() => command.run(registry, target));
+      const allowed = yield* Effect.promise(() => runAtomCommand(registry, command, target));
       expect(allowed._tag).toBe("Success");
       registry.set(
         sessions(environmentId),
         AsyncResult.success({ ...auth, scopes: [], permissions: [] }),
       );
-      const revoked = yield* Effect.promise(() => command.run(registry, target));
+      const revoked = yield* Effect.promise(() => runAtomCommand(registry, command, target));
       expect(revoked._tag).toBe("Failure");
       expect(stops).toBe(1);
     }),
@@ -1097,7 +1101,7 @@ it.effect("private webhook handoff requires current read and operate grants", ()
       expect(normalizeAssistantRoutineRead(input)).toEqual(input);
       expect(registry.get(atoms.routineWebhook.permissionAtom(environmentId))).toBe(false);
       const denied = yield* Effect.promise(() =>
-        atoms.routineWebhook.run(registry, { environmentId, input }),
+        runAtomCommand(registry, atoms.routineWebhook, { environmentId, input }),
       );
       expect(denied._tag).toBe("Failure");
       registry.set(
@@ -1110,7 +1114,7 @@ it.effect("private webhook handoff requires current read and operate grants", ()
       );
       expect(registry.get(atoms.routineWebhook.permissionAtom(environmentId))).toBe(true);
       const allowed = yield* Effect.promise(() =>
-        atoms.routineWebhook.run(registry, { environmentId, input }),
+        runAtomCommand(registry, atoms.routineWebhook, { environmentId, input }),
       );
       expect(allowed).toMatchObject({
         _tag: "Success",

@@ -12,6 +12,7 @@ import {
   ProjectWorkTaskId,
   type ProjectWorkTaskRead,
 } from "@t3tools/contracts";
+import { runAtomCommand } from "@t3tools/client-runtime/state/runtime";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { PlusIcon } from "lucide-react";
@@ -113,27 +114,25 @@ function IssueBindingsGeneration({
   useEffect(() => {
     if (!writer.canIssue) return;
     let live = true;
-    void projectWorkEnvironment.issue
-      .run(registry, {
-        environmentId: scope.environmentId,
-        input: { operation: "list", input: { projectId: scope.projectId } },
-      })
-      .then((result) => {
-        if (!live) return;
-        const decoded =
-          result._tag === "Success" ? Option.getOrNull(decodeBindings(result.value)) : null;
-        setBindings(
-          decoded === null
-            ? {
-                status: "unavailable",
-                message:
-                  result._tag === "Success"
-                    ? "This environment answered with bindings this client doesn't recognize."
-                    : "Couldn't list repository bindings.",
-              }
-            : { status: "ready", items: decoded.items },
-        );
-      });
+    void runAtomCommand(registry, projectWorkEnvironment.issue, {
+      environmentId: scope.environmentId,
+      input: { operation: "list", input: { projectId: scope.projectId } },
+    }).then((result) => {
+      if (!live) return;
+      const decoded =
+        result._tag === "Success" ? Option.getOrNull(decodeBindings(result.value)) : null;
+      setBindings(
+        decoded === null
+          ? {
+              status: "unavailable",
+              message:
+                result._tag === "Success"
+                  ? "This environment answered with bindings this client doesn't recognize."
+                  : "Couldn't list repository bindings.",
+            }
+          : { status: "ready", items: decoded.items },
+      );
+    });
     return () => {
       live = false;
     };

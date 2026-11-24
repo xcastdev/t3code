@@ -2,6 +2,7 @@ import { toServerClock } from "@t3tools/client-runtime/clock";
 import type { SubagentPillSegment } from "@t3tools/client-runtime/state/thread-subagents";
 import type { EnvironmentId } from "@t3tools/contracts";
 import { GlassView } from "expo-glass-effect";
+import { useGT } from "gt-react-native";
 import { type ReactNode, useEffect, useEffectEvent, useRef, useState } from "react";
 import { BackHandler, type LayoutChangeEvent, Pressable, StyleSheet, View } from "react-native";
 import Animated, {
@@ -24,7 +25,7 @@ import { ControlPill } from "../../components/ui/ControlPill";
 import { cn } from "../../lib/cn";
 import { NATIVE_LIQUID_GLASS_SUPPORTED } from "../../native/native-glass";
 import { BrowserPreviewButton } from "../browser/browser-preview-button";
-import type { FloatingWorkingStatus } from "./floating-working-status";
+import type { FloatingStatusAction, FloatingWorkingStatus } from "./floating-working-status";
 import { ContextRing } from "./ContextRing";
 import { ChecklistExpanded, ChecklistStrip } from "./live-bar-checklist";
 import {
@@ -112,11 +113,17 @@ interface LiveBarProps {
  * as one card that sits in flow above the composer so the feed inset follows its height.
  */
 export function LiveBar(props: LiveBarProps) {
+  const gt = useGT();
   const reducedMotion = useReducedMotion();
   const [hostWidth, setHostWidth] = useState(0);
   const [rowWidth, setRowWidth] = useState(0);
   const availableWidth = Math.max(0, hostWidth - CARD_GUTTER * 2);
-  const action = props.status?.kind === "stop" ? props.status.action : null;
+  const actions: ReadonlyArray<FloatingStatusAction> =
+    props.status?.kind === "goal"
+      ? props.status.actions
+      : props.status?.kind === "stop" && props.status.action !== null
+        ? [props.status.action]
+        : [];
   const extensionStatus = props.extensionStatus ?? null;
   const hasSegments =
     props.status !== null ||
@@ -272,7 +279,7 @@ export function LiveBar(props: LiveBarProps) {
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={extensionStatus.label}
-          accessibilityHint="Shows the full Pi status"
+          accessibilityHint={gt("Shows the full Pi status")}
           onPress={extensionStatus.onPress}
           style={{ maxWidth: availableWidth * 0.4 }}
           className="h-11 shrink flex-row items-center px-2.5 active:opacity-70"
@@ -282,8 +289,9 @@ export function LiveBar(props: LiveBarProps) {
           </Text>
         </Pressable>
       ) : null}
-      {action !== null ? (
+      {actions.map((action) => (
         <Pressable
+          key={action.label}
           accessibilityRole="button"
           accessibilityLabel={action.accessibilityLabel}
           accessibilityState={{ disabled: action.disabled }}
@@ -298,12 +306,18 @@ export function LiveBar(props: LiveBarProps) {
             {action.label}
           </Text>
         </Pressable>
-      ) : null}
+      ))}
       {props.time !== null ? <TimeSegment time={props.time} onPress={props.onOpenTurn} /> : null}
       {props.agents !== null ? (
         <Segment
-          accessibilityLabel={`Agents, ${props.agents.segment.accessibilityLabel}${props.agents.failed ? ", one failed" : ""}`}
-          accessibilityHint="Opens this turn's agents"
+          accessibilityLabel={
+            props.agents.failed
+              ? gt("Agents, {agents}, one failed", {
+                  agents: props.agents.segment.accessibilityLabel,
+                })
+              : gt("Agents, {agents}", { agents: props.agents.segment.accessibilityLabel })
+          }
+          accessibilityHint={gt("Opens this turn's agents")}
           onPress={props.onOpenAgents}
         >
           <SymbolView name="person.2" size={13} tintColorClassName="accent-foreground" />
@@ -317,8 +331,17 @@ export function LiveBar(props: LiveBarProps) {
       ) : null}
       {props.sideChats !== null ? (
         <Segment
-          accessibilityLabel={`${props.sideChats.count} side ${props.sideChats.count === 1 ? "chat" : "chats"}${props.sideChats.needsAttention ? ", one needs you" : ""}`}
-          accessibilityHint="Opens this thread's side chats"
+          accessibilityLabel={
+            props.sideChats.needsAttention
+              ? gt(
+                  "{count, plural, one {{count} side chat, one needs you} other {{count} side chats, one needs you}}",
+                  { count: props.sideChats.count },
+                )
+              : gt("{count, plural, one {{count} side chat} other {{count} side chats}}", {
+                  count: props.sideChats.count,
+                })
+          }
+          accessibilityHint={gt("Opens this thread's side chats")}
           onPress={props.onOpenSideChats}
         >
           <SymbolView
@@ -336,12 +359,10 @@ export function LiveBar(props: LiveBarProps) {
       ) : null}
       {props.devicePreview !== null ? (
         <Segment
-          accessibilityLabel={
-            props.devicePreview.count === 1
-              ? "View device"
-              : `View ${props.devicePreview.count} devices`
-          }
-          accessibilityHint="Watch and control devices open in this thread"
+          accessibilityLabel={gt("{count, plural, =1 {View device} other {View {count} devices}}", {
+            count: props.devicePreview.count,
+          })}
+          accessibilityHint={gt("Watch and control devices open in this thread")}
           onPress={props.devicePreview.onPress}
         >
           <SymbolView
@@ -360,8 +381,10 @@ export function LiveBar(props: LiveBarProps) {
       ) : null}
       {props.contextPercent !== null ? (
         <Segment
-          accessibilityLabel={`Context window ${props.contextPercent}% used`}
-          accessibilityHint="Opens context window details"
+          accessibilityLabel={gt("Context window {percent}% used", {
+            percent: props.contextPercent,
+          })}
+          accessibilityHint={gt("Opens context window details")}
           onPress={props.onOpenContext}
         >
           <ContextRing percent={props.contextPercent} size={14} stroke={2} />
@@ -372,13 +395,15 @@ export function LiveBar(props: LiveBarProps) {
       ) : null}
       {props.queuedCount > 0 ? (
         <Segment
-          accessibilityLabel={`Open queue, ${props.queuedCount} messages`}
-          accessibilityHint="Opens queued messages to send now, edit, or remove"
+          accessibilityLabel={gt("{count, plural, other {Open queue, {count} messages}}", {
+            count: props.queuedCount,
+          })}
+          accessibilityHint={gt("Opens queued messages to send now, edit, or remove")}
           onPress={props.onOpenQueue}
         >
           <SymbolView name="list.number" size={13} tintColorClassName="accent-foreground" />
           <Text className="font-t3-medium text-xs tabular-nums text-foreground" numberOfLines={1}>
-            {props.queuedCount} queued
+            {gt("{count, plural, other {{count} queued}}", { count: props.queuedCount })}
           </Text>
         </Segment>
       ) : null}
@@ -456,7 +481,7 @@ export function LiveBar(props: LiveBarProps) {
             className="h-11 w-11 items-center justify-center overflow-hidden rounded-full"
           >
             <ControlPill
-              accessibilityLabel="Scroll to end"
+              accessibilityLabel={gt("Scroll to end")}
               activateOnPressIn
               className="h-11 w-11 bg-transparent"
               disabled={placement === "hidden"}
@@ -466,7 +491,7 @@ export function LiveBar(props: LiveBarProps) {
           </UniwindGlassView>
         ) : (
           <ControlPill
-            accessibilityLabel="Scroll to end"
+            accessibilityLabel={gt("Scroll to end")}
             activateOnPressIn
             className="h-11 w-11 border border-border bg-glass-fallback shadow-md shadow-black/10"
             disabled={placement === "hidden"}
@@ -501,6 +526,7 @@ function Segment(props: {
 /** Ticks once a second while working; only this segment re-renders. */
 function TimeSegment(props: { readonly time: LiveBarTime; readonly onPress: () => void }) {
   const { time } = props;
+  const gt = useGT();
   const nowMs = useVisibleSecondClock(time.kind === "working");
   const label =
     time.kind === "working"
@@ -509,9 +535,11 @@ function TimeSegment(props: { readonly time: LiveBarTime; readonly onPress: () =
   return (
     <Segment
       accessibilityLabel={
-        time.kind === "working" ? `Working for ${label}` : `Last turn took ${label}`
+        time.kind === "working"
+          ? gt("Working for {duration}", { duration: label })
+          : gt("Last turn took {duration}", { duration: label })
       }
-      accessibilityHint="Opens this turn's details"
+      accessibilityHint={gt("Opens this turn's details")}
       onPress={props.onPress}
     >
       {time.kind === "working" ? (

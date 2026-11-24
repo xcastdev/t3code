@@ -1,3 +1,4 @@
+import { runAtomCommand, type AtomCommandResult } from "@t3tools/client-runtime/state/runtime";
 import { RegistryContext, useAtomValue } from "@effect/atom-react";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import {
@@ -155,31 +156,37 @@ function ProjectTerminalPane({
   const live = isProjectTerminalViewLive(state, terminal);
   // Mutations target the generation this pane shows, never one only metadata has seen.
   const shownGeneration = state.terminal?.generation ?? terminal.generation;
-  const report = (result: Awaited<ReturnType<typeof projectTerminalEnvironment.write.run>>) => {
+  const report = (result: AtomCommandResult<unknown, unknown>) => {
     if (result._tag === "Failure" && !isAtomCommandInterrupted(result))
       setNotice(describeProjectTerminalFailure(squashAtomCommandFailure(result)));
   };
   const write = (data: string) => {
     if (!canWrite || !typing || !live) return;
-    void projectTerminalEnvironment.write
-      .run(registry, {
+    void runAtomCommand(
+      registry,
+      projectTerminalEnvironment.write,
+      {
         environmentId,
         input: { ...handle, data, expectedGeneration: shownGeneration },
-      })
-      .then(report);
+      },
+      { reportFailure: false },
+    ).then(report);
   };
   const fit = () => {
     const size = sizeRef.current;
     if (size === null || !live) return;
-    void projectTerminalEnvironment.resize
-      .run(registry, {
+    void runAtomCommand(
+      registry,
+      projectTerminalEnvironment.resize,
+      {
         environmentId,
         input: { ...handle, ...size, expectedGeneration: shownGeneration },
-      })
-      .then((result) => {
-        if (result._tag === "Failure" && !isAtomCommandInterrupted(result))
-          setNotice(describeProjectTerminalFailure(squashAtomCommandFailure(result)));
-      });
+      },
+      { reportFailure: false },
+    ).then((result) => {
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result))
+        setNotice(describeProjectTerminalFailure(squashAtomCommandFailure(result)));
+    });
   };
   const stop = () =>
     Dialog.confirm({
@@ -188,25 +195,28 @@ function ProjectTerminalPane({
       confirmText: "Stop",
       destructive: true,
       onConfirm: () => {
-        void projectTerminalEnvironment.kill
-          .run(registry, {
+        void runAtomCommand(
+          registry,
+          projectTerminalEnvironment.kill,
+          {
             environmentId,
             input: { ...handle, expectedGeneration: shownGeneration },
-          })
-          .then((result) => {
-            if (result._tag === "Failure") {
-              if (!isAtomCommandInterrupted(result))
-                setNotice(describeProjectTerminalFailure(squashAtomCommandFailure(result)));
-              return;
-            }
-            setNotice(
-              result.value.status === "exited"
-                ? "Stopped."
-                : result.value.status === "requested"
-                  ? "Stop requested. The status updates when the process exits."
-                  : "The stop couldn't be confirmed. The process may still be running.",
-            );
-          });
+          },
+          { reportFailure: false },
+        ).then((result) => {
+          if (result._tag === "Failure") {
+            if (!isAtomCommandInterrupted(result))
+              setNotice(describeProjectTerminalFailure(squashAtomCommandFailure(result)));
+            return;
+          }
+          setNotice(
+            result.value.status === "exited"
+              ? "Stopped."
+              : result.value.status === "requested"
+                ? "Stop requested. The status updates when the process exits."
+                : "The stop couldn't be confirmed. The process may still be running.",
+          );
+        });
       },
     });
   return (

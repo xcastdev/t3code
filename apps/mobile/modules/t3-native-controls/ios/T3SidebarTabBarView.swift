@@ -110,9 +110,15 @@ final class T3SidebarTabBarView: ExpoView, UITabBarDelegate {
   }
 
   private func prepareItems() {
-    let labels = ["threads": "Chats", "agents": "Agents", "pullRequests": "PRs", "issues": "Issues", "work": "Work", "usage": "Usage"]
+    let labels = [
+      "threads": "Chats", "agents": "Agents", "pullRequests": "PRs", "issues": "Issues", "work": "Work",
+      "workflows": "Workflows", "usage": "Usage",
+    ]
     let bundled = ["pullRequests": "pull-request", "issues": "issue", "agents": "agent"]
-    let symbols = ["threads": "text.bubble", "work": "checklist", "usage": "chart.bar.xaxis"]
+    let symbols = [
+      "threads": "text.bubble", "work": "checklist", "workflows": "point.3.connected.trianglepath.dotted",
+      "usage": "chart.bar.xaxis",
+    ]
     for (tab, label) in labels {
       let icon = bundled[tab].flatMap { bundledIcon($0) } ?? UIImage(systemName: symbols[tab] ?? "circle")
       let item = UITabBarItem(title: nil, image: tabIcon(icon), tag: 0)

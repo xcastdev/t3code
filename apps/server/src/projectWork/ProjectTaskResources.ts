@@ -5,6 +5,8 @@ import { canonicalProjectWorkPayload } from "@t3tools/contracts";
 export const projectTaskAssignment = (
   state: ProjectWorkReducerState,
   binding: Extract<ProjectTeamRecord, { kind: "run-binding" }>,
+  /** The one repository the run works in, relative to its working folder. */
+  repository?: string,
 ) => {
   const task = state.tasks.find((task) => task.taskId === binding.taskId);
   const records = state.foundationRecords ?? [];
@@ -26,6 +28,7 @@ export const projectTaskAssignment = (
     questions: records
       .filter((record) => record.kind === "question" && record.taskId === binding.taskId)
       .slice(-32),
+    ...(repository === undefined ? {} : { repository }),
     control: {
       bindingId: binding.recordId,
       generation: binding.generation,

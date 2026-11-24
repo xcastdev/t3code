@@ -8,7 +8,13 @@ import * as SqlClient from "effect/sql/SqlClient";
 export class ProjectTeamDispatchJournalError extends Schema.TaggedError<ProjectTeamDispatchJournalError>()(
   "ProjectTeamDispatchJournalError",
   {
-    reason: Schema.Literals(["storage", "identity-conflict", "stale-fence"]),
+    reason: Schema.Literals([
+      "storage",
+      "identity-conflict",
+      "stale-fence",
+      "repository-required",
+      "repository-unavailable",
+    ]),
     cause: Schema.optionalKey(Schema.Defect()),
   },
 ) {}

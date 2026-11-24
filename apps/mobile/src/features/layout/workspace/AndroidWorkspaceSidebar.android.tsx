@@ -1,7 +1,9 @@
+import { useGT } from "gt-react-native";
 import { useAndroidFloatingTabs } from "../../settings/appearance/AppearancePreferencesProvider";
 import { WorkspaceNoTabs } from "./WorkspaceNoTabs";
 import { useEnabledNavigationTabs } from "./navigation-tabs";
 import { NAVIGATION_TAB_ORDER } from "./navigation-tab-order";
+import { workspaceUsesColumns } from "./workspace-tabs-state";
 import { useNavigationState } from "@react-navigation/native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useAndroidControlSizing } from "../../../components/ui/useAndroidControlSizing";
@@ -26,6 +28,7 @@ import { WorkspaceAppBarScope } from "../../../components/ui/WorkspaceAppBar.and
 
 /** The Home route in the sidebar column: the selected tab's list. */
 export function AndroidWorkspaceSidebar() {
+  const gt = useGT();
   const floatingTabsEnabled = useAndroidFloatingTabs();
   const workspace = useWorkspaceTabs()!;
   const enabled = useEnabledNavigationTabs();
@@ -34,9 +37,10 @@ export function AndroidWorkspaceSidebar() {
   const { revealPrimarySidebar, startNewTask } = useAdaptiveWorkspaceLayout();
   const selectedPullRequest = useNavigationState(selectedPullRequestKey);
   const selectedIssue = useNavigationState(selectedIssueKey);
-  // Settings and Usage cover the sidebar.
+  // Settings and the one-page tabs cover the sidebar.
   const coveredByPage =
-    (useAndroidWorkspaceRoot()?.settingsOpen ?? false) || workspace.state.selectedTab === "usage";
+    (useAndroidWorkspaceRoot()?.settingsOpen ?? false) ||
+    !workspaceUsesColumns(workspace.state.selectedTab);
   const bottomClearance = floatingTabsEnabled
     ? insets.bottom + FLOATING_TABS.bottom + FLOATING_TABS.edge + fabSize
     : 16;
@@ -61,11 +65,11 @@ export function AndroidWorkspaceSidebar() {
           ) : tab === "work" ? (
             <WorkspaceTabsContext value={context}>
               <View className="flex-1 bg-header">
-                <AppBar embedded title="Work" />
+                <AppBar embedded title={gt("Work")} />
                 <WorkTab mode="list" />
               </View>
             </WorkspaceTabsContext>
-          ) : tab === "usage" ? (
+          ) : tab === "usage" || tab === "workflows" ? (
             <View className="flex-1 bg-screen" />
           ) : tab === "issues" ? (
             <WorkspaceTabsContext value={context}>

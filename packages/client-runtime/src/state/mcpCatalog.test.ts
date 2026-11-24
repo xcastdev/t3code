@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import { runAtomCommand } from "./runtime.ts";
 import {
   AuthSettingsWriteScope,
   EnvironmentId,
@@ -327,7 +328,7 @@ it.effect(
             snapshot: { ...materialized, desiredRevision: current.snapshot!.desiredRevision + 1 },
           };
           const result = yield* Effect.promise(() =>
-            command.run(registry, { environmentId, input }),
+            runAtomCommand(registry, command, { environmentId, input }),
           );
           expect(result._tag).toBe("Success");
           expect(yield* Queue.take(observed)).toEqual(current);

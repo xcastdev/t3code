@@ -1,7 +1,7 @@
 import { layerRemoteHttpClient } from "@t3tools/client-runtime/rpc";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
+import { FetchHttpClient, HttpClient, HttpClientError, HttpClientRequest } from "effect/http";
 
 import { attachedTargetForRequestUrl, readDesktopPrimaryBearerToken } from "./desktopAuth";
 import { resolvePrimaryEnvironmentHttpUrl } from "./target";
@@ -25,9 +25,17 @@ function withPrimaryBearerToken(client: HttpClient.HttpClient): HttpClient.HttpC
       client.postprocess(
         requestEffect.pipe(
           Effect.flatMap((request) =>
-            Effect.promise(() =>
-              readDesktopPrimaryBearerToken(attachedTargetForRequestUrl(request.url) ?? "managed"),
-            ).pipe(
+            // A destination mismatch refuses the request itself rather than reading as a transport failure.
+            Effect.sync(() => attachedTargetForRequestUrl(request.url) ?? "managed").pipe(
+              Effect.flatMap((target) =>
+                Effect.tryPromise({
+                  try: () => readDesktopPrimaryBearerToken(target),
+                  catch: (cause) =>
+                    new HttpClientError.HttpClientError({
+                      reason: new HttpClientError.TransportError({ request, cause }),
+                    }),
+                }),
+              ),
               Effect.map((bearerToken) =>
                 bearerToken ? HttpClientRequest.bearerToken(request, bearerToken) : request,
               ),

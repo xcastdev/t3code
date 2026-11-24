@@ -19,7 +19,7 @@ class FakeProcess implements PtyAdapter.PtyProcess {
   readonly awaitOwnedExit = Deferred.succeed(this.observingOwnedExit, undefined).pipe(
     Effect.andThen(Deferred.await(this.ownedExited)),
   );
-  readonly signalOwned = (signal: "SIGTERM" | "SIGKILL") =>
+  readonly signalOwned = (signal: "SIGHUP" | "SIGTERM" | "SIGKILL") =>
     Effect.try({
       try: () => this.kill(signal),
       catch: (cause) => new PtyAdapter.PtyDrainError({ reason: "signal-failed", cause }),

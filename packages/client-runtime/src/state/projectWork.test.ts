@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import { runAtomCommand } from "./runtime.ts";
 import {
   CommandId,
   AuthOrchestrationOperateScope,
@@ -587,7 +588,7 @@ describe("Work environment atoms", () => {
         expect(registry.get(atoms.permissionAtom(first))).toBe(false);
         expect(atoms.write.requiredScopes()).toEqual(["orchestration:operate"]);
         const result = yield* Effect.promise(() =>
-          atoms.write.run(registry, {
+          runAtomCommand(registry, atoms.write, {
             environmentId: first,
             input: {
               type: "project-work.task.create",
@@ -663,7 +664,7 @@ it.effect("sends one human approval and rejects worker intents before transport"
         response: "approved" as const,
       };
       const result = yield* Effect.promise(() =>
-        atoms.write.run(registry, { environmentId: first, input: approval }),
+        runAtomCommand(registry, atoms.write, { environmentId: first, input: approval }),
       );
       expect(result._tag).toBe("Success");
       expect(sent).toEqual([approval]);
@@ -686,7 +687,7 @@ it.effect("sends one human approval and rejects worker intents before transport"
       } as unknown as Parameters<typeof atoms.write.run>[1]["input"];
       expect(isWriteIntent(worker)).toBe(true);
       const denied = yield* Effect.promise(() =>
-        atoms.write.run(registry, { environmentId: first, input: worker }),
+        runAtomCommand(registry, atoms.write, { environmentId: first, input: worker }),
       );
       expect(denied._tag).toBe("Failure");
       expect(sent).toEqual([approval]);
@@ -1407,7 +1408,10 @@ it.effect("delivery requires both grants and retains an uncertain host result wi
         expect(registry.get(atoms.delivery.permissionAtom(first))).toBe(false);
         expect(
           (yield* Effect.promise(() =>
-            atoms.delivery.run(registry, { environmentId: first, input: { projectId, request } }),
+            runAtomCommand(registry, atoms.delivery, {
+              environmentId: first,
+              input: { projectId, request },
+            }),
           ))._tag,
         ).toBe("Failure");
       }
@@ -1415,7 +1419,10 @@ it.effect("delivery requires both grants and retains an uncertain host result wi
       authorize([AuthSourceControlWriteScope, AuthOrchestrationOperateScope]);
       expect(registry.get(atoms.delivery.permissionAtom(first))).toBe(true);
       const result = yield* Effect.promise(() =>
-        atoms.delivery.run(registry, { environmentId: first, input: { projectId, request } }),
+        runAtomCommand(registry, atoms.delivery, {
+          environmentId: first,
+          input: { projectId, request },
+        }),
       );
       expect(result).toMatchObject({ _tag: "Success", value: { stage: "uncertain" } });
       expect(calls).toBe(1);

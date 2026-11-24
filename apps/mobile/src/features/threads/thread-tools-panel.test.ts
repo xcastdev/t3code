@@ -35,6 +35,7 @@ const base: ThreadToolsInput = {
   deviceNames: [],
   gitItems: [],
   hasProject: false,
+  canShareWithGuest: false,
 };
 
 const rowsOf = (input: Partial<ThreadToolsInput>) =>
@@ -99,6 +100,7 @@ describe("threadToolSections", () => {
         canOpenTerminal: false,
         browserTabUrls: ["http://localhost:3000"],
         deviceNames: ["iPhone 17"],
+        canShareWithGuest: true,
       }),
     ).toMatchObject([
       { title: "Workspace", rows: [{ id: "files" }] },
@@ -129,6 +131,15 @@ describe("threadToolSections", () => {
       },
       { id: "git-git-review", nested: true, action: { type: "git", itemId: "git-review" } },
     ]);
+  });
+
+  it("offers guest sharing only where the environment allows it", () => {
+    expect(rowsOf({ canShareWithGuest: false }).some((row) => row.id === "guest-share")).toBe(
+      false,
+    );
+    expect(
+      rowsOf({ canShareWithGuest: true }).find((row) => row.id === "guest-share"),
+    ).toMatchObject({ action: { type: "guest-share" } });
   });
 
   it("links the thread's project Work sections when it has a project", () => {

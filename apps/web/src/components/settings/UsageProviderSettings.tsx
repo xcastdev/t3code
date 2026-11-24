@@ -1,6 +1,7 @@
 import { getProviderClient } from "@t3tools/client-runtime/provider-clients";
 import type { EnvironmentId, ServerProvider, UnifiedSettings } from "@t3tools/contracts";
 import { reportsOwnUsageLimits } from "@t3tools/shared/usageLimits";
+import { T, useGT, Var } from "gt-react";
 import { PlusIcon } from "lucide-react";
 import { useState } from "react";
 
@@ -17,8 +18,10 @@ import {
 import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { AddUsageLimitSourceDialog } from "./AddUsageLimitSourceDialog";
-import { searchableSetting } from "./settingsSearch";
+import { useSearchableSetting } from "./settingsSearch";
 import { SettingsRow, SettingsSection } from "./settingsLayout";
+
+const CLI_PROXY_NAME = "CLI Proxy";
 
 export function UsageProviderSettings({
   environmentId,
@@ -36,6 +39,8 @@ export function UsageProviderSettings({
   readonly providers: readonly ServerProvider[];
   readonly readOnly: boolean;
 }) {
+  const gt = useGT();
+  const searchableSetting = useSearchableSetting();
   const updateSettings = useUpdateEnvironmentSettings(environmentId);
   const [adding, setAdding] = useState(false);
   const entries = Object.entries(sources);
@@ -48,7 +53,7 @@ export function UsageProviderSettings({
           !readOnly ? (
             <Button size="xs" variant="outline" onClick={() => setAdding(true)}>
               <PlusIcon className="size-3" aria-hidden />
-              Add hub
+              <T>Add hub</T>
             </Button>
           ) : null
         }
@@ -64,7 +69,7 @@ export function UsageProviderSettings({
           />
         ) : null}
         {entries.length === 0 ? (
-          <SettingsRow title="No hubs configured." />
+          <SettingsRow title={gt("No hubs configured.")} />
         ) : (
           entries.map(([id, source]) => {
             const label = source.label?.trim() || source.url;
@@ -74,7 +79,9 @@ export function UsageProviderSettings({
                 title={label}
                 description={
                   <span className="break-all">
-                    CLI Proxy{source.enabled ? "" : " · Disabled"}
+                    {source.enabled
+                      ? CLI_PROXY_NAME
+                      : gt("{name} · Disabled", { name: CLI_PROXY_NAME })}
                     {label !== source.url ? ` · ${source.url}` : ""}
                   </span>
                 }
@@ -115,20 +122,28 @@ function RemoveUsageProviderButton({
   return (
     <>
       <Button size="xs" variant="ghost" onClick={() => setOpen(true)}>
-        Remove
+        <T>Remove</T>
       </Button>
       <AlertDialog open={open} onOpenChange={setOpen}>
         <AlertDialogPopup>
           <AlertDialogHeader>
-            <AlertDialogTitle>Remove {label}?</AlertDialogTitle>
+            <AlertDialogTitle>
+              <T>
+                Remove <Var>{label}</Var>?
+              </T>
+            </AlertDialogTitle>
             <AlertDialogDescription>
-              The hub's management key is deleted from this server. Its accounts leave the Limits
-              view; the hub itself is untouched. Add it again with the URL and key to bring them
-              back.
+              <T>
+                The hub's management key is deleted from this server. Its accounts leave the Limits
+                view; the hub itself is untouched. Add it again with the URL and key to bring them
+                back.
+              </T>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogClose render={<Button variant="outline" />}>Cancel</AlertDialogClose>
+            <AlertDialogClose render={<Button variant="outline" />}>
+              <T>Cancel</T>
+            </AlertDialogClose>
             <Button
               variant="destructive"
               onClick={() => {
@@ -136,7 +151,7 @@ function RemoveUsageProviderButton({
                 onConfirm();
               }}
             >
-              Remove hub
+              <T>Remove hub</T>
             </Button>
           </AlertDialogFooter>
         </AlertDialogPopup>
@@ -163,13 +178,15 @@ function UsageLimitMappingRows({
   readonly readOnly: boolean;
   readonly onChange: (instanceId: string, value: string | null) => void;
 }) {
+  const gt = useGT();
   const harnesses = providers.filter(
     (provider) => provider.enabled && !reportsOwnUsageLimits(provider),
   );
   const targets = [
     ...new Set(providers.filter(reportsOwnUsageLimits).map((provider) => provider.driver)),
   ];
-  const label = (value: string) => (value === UNMAPPED ? "Don't show limits" : driverLabel(value));
+  const label = (value: string) =>
+    value === UNMAPPED ? gt("Don't show limits") : driverLabel(value);
   return harnesses.map((harness) => {
     const value = mappings[harness.instanceId] ?? UNMAPPED;
     const options = [
@@ -182,8 +199,8 @@ function UsageLimitMappingRows({
     return (
       <SettingsRow
         key={harness.instanceId}
-        title={`${name} usage limits`}
-        description="Whose plan limits this harness shows in thread details."
+        title={gt("{name} usage limits", { name })}
+        description={gt("Whose plan limits this harness shows in thread details.")}
         control={
           <Select
             value={value}
@@ -193,7 +210,7 @@ function UsageLimitMappingRows({
               onChange(harness.instanceId, next === UNMAPPED ? null : next);
             }}
           >
-            <SelectTrigger size="sm" aria-label={`${name} usage limits`}>
+            <SelectTrigger size="sm" aria-label={gt("{name} usage limits", { name })}>
               <SelectValue>{(selected: string) => label(selected)}</SelectValue>
             </SelectTrigger>
             <SelectPopup align="end" alignItemWithTrigger={false}>

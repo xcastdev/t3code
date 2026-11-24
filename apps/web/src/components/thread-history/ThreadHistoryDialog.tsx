@@ -2,6 +2,7 @@ import { RegistryContext, useAtomValue } from "@effect/atom-react";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
   isAtomCommandInterrupted,
+  runAtomCommand,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import {
@@ -430,7 +431,7 @@ function ArchiveDetail(props: {
     const prepared = prepareHistoryMutation({ selected, current: now, input });
     if (prepared === null) return;
     setMessage(null);
-    const result = await threadHistoryEnvironment.recover.run(registry, prepared);
+    const result = await runAtomCommand(registry, threadHistoryEnvironment.recover, prepared);
     if (result._tag === "Failure") {
       if (isAtomCommandInterrupted(result) || currentNow() === null) return;
       setMessage({ tone: "error", text: describeHistoryFailure(squashAtomCommandFailure(result)) });
@@ -471,7 +472,7 @@ function ArchiveDetail(props: {
     });
     if (prepared === null) return;
     setMessage(null);
-    const result = await threadHistoryEnvironment.restoreFiles.run(registry, prepared);
+    const result = await runAtomCommand(registry, threadHistoryEnvironment.restoreFiles, prepared);
     if (result._tag === "Success") {
       toastManager.add({ type: "success", title: "Files restored" });
       return;
@@ -484,7 +485,7 @@ function ArchiveDetail(props: {
   const inspectFiles = async () => {
     const operation = mutation.fileOperation;
     if (operation === null || readLiveEpoch(registry, environmentId) === null) return;
-    const result = await threadHistoryEnvironment.inspectFileRestore.run(registry, {
+    const result = await runAtomCommand(registry, threadHistoryEnvironment.inspectFileRestore, {
       environmentId,
       input: operation,
     });
@@ -526,7 +527,7 @@ function ArchiveDetail(props: {
     });
     if (prepared === null) return;
     setMessage(null);
-    const result = await threadHistoryEnvironment.restoreFiles.run(registry, prepared);
+    const result = await runAtomCommand(registry, threadHistoryEnvironment.restoreFiles, prepared);
     if (result._tag === "Success") {
       toastManager.add({ type: "success", title: "Files restored" });
       return;
@@ -547,7 +548,7 @@ function ArchiveDetail(props: {
     const operation = mutation.fileOperation;
     if (compareBlocked || fileStatus === null || operation === null || currentNow() === null)
       return;
-    const result = await threadHistoryEnvironment.reconcile.run(registry, {
+    const result = await runAtomCommand(registry, threadHistoryEnvironment.reconcile, {
       environmentId,
       input: { threadId: fileStatus.threadId, archiveId: fileStatus.archiveId },
     });
@@ -577,7 +578,7 @@ function ArchiveDetail(props: {
       input: { threadId, archiveId },
     });
     if (prepared === null) return;
-    const result = await threadHistoryEnvironment.release.run(registry, prepared);
+    const result = await runAtomCommand(registry, threadHistoryEnvironment.release, prepared);
     if (result._tag === "Success") toastManager.add({ type: "success", title: "Archive released" });
     else if (!isAtomCommandInterrupted(result) && currentNow() !== null)
       setMessage({ tone: "error", text: describeHistoryFailure(squashAtomCommandFailure(result)) });

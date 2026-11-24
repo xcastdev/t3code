@@ -2,6 +2,8 @@ import { assert, it } from "@effect/vitest";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import * as TaskFolderStore from "../workspace/TaskFolderStore.ts";
+import * as WorkspaceFolders from "../workspace/WorkspaceFolders.ts";
 import * as Checkpoints from "../orchestration-v2/CheckpointService.ts";
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as VcsDrivers from "../vcs/VcsDriverRegistry.ts";
@@ -1345,14 +1347,27 @@ const continuationPorts = Layer.mergeAll(
   Receipts.layer,
   ContextHandoff.layer.pipe(Layer.provide(IdAllocator.layer)),
   ProviderSwitch.layer.pipe(Layer.provide(adapters)),
-  RuntimePolicy.layer,
+  Layer.succeed(RuntimePolicy.RuntimePolicyV2, {
+    resolve: Effect.fn("RuntimePolicy.RuntimePolicyV2.resolve")(function* (input) {
+      return {
+        runtimeMode: input.thread.runtimeMode,
+        interactionMode: input.thread.interactionMode,
+        cwd: input.thread.worktreePath,
+      };
+    }),
+  }),
   ThreadFork.layer,
   IdAllocator.layer,
   ContinuationRequests.layer,
+  TaskFolderStore.layer,
   Checkpoints.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
         IdAllocator.layer,
+        Layer.mock(WorkspaceFolders.WorkspaceFolders)({
+          forThread: () => Effect.succeed({ folders: [], extraRoots: [] }),
+          submodules: () => Effect.succeed([]),
+        }),
         CheckpointStore.layer.pipe(
           Layer.provide(VcsDrivers.layer.pipe(Layer.provide(VcsProcess.layer))),
         ),

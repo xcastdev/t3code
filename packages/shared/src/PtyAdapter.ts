@@ -49,7 +49,9 @@ export interface PtyProcess {
   resize(cols: number, rows: number): void;
   kill(signal?: string): void;
   /** Captured spawn ownership, including ordinary foreground/background jobs. */
-  readonly signalOwned?: (signal: "SIGTERM" | "SIGKILL") => Effect.Effect<void, PtyDrainError>;
+  readonly signalOwned?: (
+    signal: "SIGHUP" | "SIGTERM" | "SIGKILL",
+  ) => Effect.Effect<void, PtyDrainError>;
   readonly awaitOwnedExit?: Effect.Effect<void, PtyDrainError>;
   onData(callback: (data: string) => void): () => void;
   onExit(callback: (event: PtyExitEvent) => void): () => void;

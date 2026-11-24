@@ -8,6 +8,7 @@ import {
 } from "@t3tools/client-runtime/project-work";
 import {
   isAtomCommandInterrupted,
+  runAtomCommand,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import type {
@@ -70,7 +71,7 @@ export function useWorkWriter(environmentId: EnvironmentId) {
     busy.current = true;
     setPendingKey(key);
     setFailure(null);
-    const result = await projectWorkEnvironment.write.run(registry, {
+    const result = await runAtomCommand(registry, projectWorkEnvironment.write, {
       environmentId,
       input: prepared,
     });
@@ -87,7 +88,7 @@ export function useWorkWriter(environmentId: EnvironmentId) {
     busy.current = true;
     setPendingKey(key);
     setFailure(null);
-    const result = await projectWorkEnvironment.issue.run(registry, {
+    const result = await runAtomCommand(registry, projectWorkEnvironment.issue, {
       environmentId,
       input: request,
     });
@@ -121,7 +122,7 @@ export function useWorkWriter(environmentId: EnvironmentId) {
     busy.current = true;
     setPendingKey(key);
     setFailure(null);
-    const result = await projectWorkEnvironment.delivery.run(registry, {
+    const result = await runAtomCommand(registry, projectWorkEnvironment.delivery, {
       environmentId,
       input: prepared,
     });

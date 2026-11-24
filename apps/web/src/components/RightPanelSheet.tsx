@@ -1,3 +1,4 @@
+import { T, useGT } from "gt-react";
 import { type ReactNode } from "react";
 
 import { cn } from "~/lib/utils";
@@ -13,6 +14,7 @@ export function RightPanelSheet(props: {
   launcher?: boolean;
   initialFocus?: () => HTMLElement | null;
 }) {
+  const gt = useGT();
   return (
     <Sheet
       open={props.open}
@@ -28,7 +30,7 @@ export function RightPanelSheet(props: {
         side="right"
         showCloseButton={false}
         variant={props.launcher ? "sidebar" : "default"}
-        {...(props.launcher ? { "aria-label": "Right panel" } : {})}
+        {...(props.launcher ? { "aria-label": gt("Right panel") } : {})}
         {...(props.initialFocus ? { initialFocus: props.initialFocus } : {})}
         {...(props.launcher ? { finalFocus: false } : {})}
         className={cn(
@@ -39,7 +41,9 @@ export function RightPanelSheet(props: {
         )}
       >
         <SheetHeader className="sr-only">
-          <SheetTitle>Workspace panel</SheetTitle>
+          <SheetTitle>
+            <T>Workspace panel</T>
+          </SheetTitle>
         </SheetHeader>
         {props.children}
       </SheetPopup>

@@ -72,6 +72,9 @@ import * as EnvironmentTheme from "../environmentTheme.ts";
 import * as PreviewAutomationBroker from "../mcp/PreviewAutomationBroker.ts";
 import * as ServerBrowser from "../preview/ServerBrowser.ts";
 import * as OrchestrationEvents from "../persistence/OrchestrationEventStore.ts";
+import * as ThreadViewers from "../orchestration-v2/ThreadViewers.ts";
+import * as WorkspacePreviewRevisions from "../assets/WorkspacePreviewRevisions.ts";
+import * as FeatureFlags from "@t3tools/shared/FeatureFlags";
 import {
   makeClientApplicationRoutes,
   layerClientWebSocketRoutes,
@@ -186,7 +189,7 @@ export function controlledUpgradeApplicationLayer(
   );
   const localReadServices = Layer.mergeAll(
     Layer.mock(Analytics.AnalyticsService)({
-      record: () => Effect.void,
+      record: () => Effect.succeed(true),
       recordOwners: () => Effect.void,
     }),
     Layer.succeed(ServerStartup.ServerRuntimeStartup, {
@@ -243,6 +246,10 @@ export function controlledUpgradeApplicationLayer(
     WorkspacePaths.layer,
     WorktreeSetup.layer,
     OrchestrationEvents.layer,
+    ThreadViewers.layer,
+    WorkspacePreviewRevisions.layer,
+    // Developer feature-flag environment must not change the fixture.
+    FeatureFlags.layerTest(),
   ).pipe(Layer.provide(base));
   const safeServices = Layer.mergeAll(
     layerControlledFixtureBoundaries,

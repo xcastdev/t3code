@@ -1,3 +1,4 @@
+import { runAtomCommand } from "@t3tools/client-runtime/state/runtime";
 import { useAtomValue } from "@effect/atom-react";
 import {
   isAtomCommandInterrupted,
@@ -136,10 +137,15 @@ function DestinationsEditor({
     if (!online || operation.active() !== null) return;
     setMessage(null);
     const run = await operation.run(destinationId, () =>
-      externalNotificationsEnvironment.test.run(appAtomRegistry, {
-        environmentId,
-        input: { destinationId },
-      }),
+      runAtomCommand(
+        appAtomRegistry,
+        externalNotificationsEnvironment.test,
+        {
+          environmentId,
+          input: { destinationId },
+        },
+        { reportFailure: false },
+      ),
     );
     if (!run.started) return;
     const result = run.value;
@@ -261,10 +267,15 @@ function DestinationsEditor({
             if (!online || operation.active() !== null) return;
             setMessage(null);
             const run = await operation.run("save", () =>
-              externalNotificationsEnvironment.updateSettings.run(appAtomRegistry, {
-                environmentId,
-                input: patch,
-              }),
+              runAtomCommand(
+                appAtomRegistry,
+                externalNotificationsEnvironment.updateSettings,
+                {
+                  environmentId,
+                  input: patch,
+                },
+                { reportFailure: false },
+              ),
             );
             if (!run.started) return;
             const result = run.value;

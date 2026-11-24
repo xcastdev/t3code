@@ -313,7 +313,17 @@ const make = Effect.gen(function* () {
           source: principal.source,
           recordedAt: DateTime.formatIso(yield* DateTime.now),
         })
-        .pipe(Effect.mapError(() => failure("write", "rejected")));
+        .pipe(
+          Effect.mapError((error) =>
+            error.reason === "repository-required" || error.reason === "repository-unavailable"
+              ? new ProjectWorkRpcError({
+                  operation: "write",
+                  reason: "rejected",
+                  workspaceReason: error.reason,
+                })
+              : failure("write", "rejected"),
+          ),
+        );
     }
     if (input.type === "project-team.memory.configure") {
       if (Option.isNone(memoryRuntime)) return yield* failure("write", "unavailable");

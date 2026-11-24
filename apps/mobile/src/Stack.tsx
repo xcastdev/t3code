@@ -12,6 +12,7 @@ import {
   useNavigation,
 } from "@react-navigation/native";
 import { createNativeStackScreen } from "@react-navigation/native-stack";
+import { msg, T, useGT, useMessages } from "gt-react-native";
 import type { ReactNode } from "react";
 import { Platform, Pressable, ScrollView, StyleSheet, useWindowDimensions } from "react-native";
 import { useResolveClassNames } from "uniwind";
@@ -62,6 +63,7 @@ import { ThreadTerminalRouteScreen } from "./features/terminal/ThreadTerminalRou
 import { ProjectTerminalRouteScreen } from "./features/terminal/ProjectTerminalRouteScreen";
 import { DevicePreviewRouteScreen } from "./features/devices/DevicePreviewRouteScreen";
 import { BrowserPreviewRouteScreen } from "./features/browser/BrowserPreviewRouteScreen";
+import { LocalPreviewRouteScreen } from "./features/browser/LocalPreviewRouteScreen";
 import { GitBranchesSheet } from "./features/threads/git/GitBranchesSheet";
 import { GitCommitSheet } from "./features/threads/git/GitCommitSheet";
 import { GitConfirmSheet } from "./features/threads/git/GitConfirmSheet";
@@ -70,6 +72,8 @@ import { ThreadPullRequestsSheet } from "./features/threads/ThreadPullRequestsSh
 import { ThreadAgentsSheet } from "./features/threads/ThreadAgentsSheet";
 import { ThreadLiveDetailsSheet } from "./features/threads/ThreadLiveDetailsSheet";
 import { ThreadHistorySheet } from "./features/thread-history/ThreadHistorySheet";
+import { LinkedThreadSheet } from "./features/threads/LinkedThreadSheet";
+import { ThreadGuestShareSheet } from "./features/threads/ThreadGuestShareSheet";
 import { ThreadBackgroundWorkSheet } from "./features/threads/ThreadBackgroundWorkSheet";
 import { ThreadQueueSheet } from "./features/threads/ThreadQueueControl";
 import {
@@ -87,6 +91,7 @@ import { AddProjectSourceRoute } from "./features/projects/AddProjectSourceRoute
 import {
   NewTaskBranchPickerRouteScreen,
   NewTaskEnvironmentPickerRouteScreen,
+  NewTaskRepositoriesPickerRouteScreen,
 } from "./features/threads/NewTaskContextPickerScreens";
 import {
   ExistingThreadSettingsRouteScreen,
@@ -145,6 +150,8 @@ import {
   SettingsAgentRouteScreen,
   SettingsAgentsRouteScreen,
 } from "./features/assistants/AssistantScreens";
+import { WorkflowRunRouteScreen } from "./features/workflows/WorkflowRunRouteScreen";
+import { WorkflowStepSheet } from "./features/workflows/WorkflowStepSheet";
 import { SettingsAboutRouteScreen } from "./features/settings/SettingsAboutRouteScreen";
 import { SettingsNotificationsRouteScreen } from "./features/settings/SettingsNotificationsRouteScreen";
 import { SettingsRouteScreen } from "./features/settings/SettingsRouteScreen";
@@ -171,7 +178,81 @@ import { useNativeLayoutMetrics } from "./native/native-layout-metrics";
 import { isPresentedRoute } from "./native/workspace-stack-projection";
 import { workspaceDetailRouter } from "./features/layout/workspace/workspace-detail-selection";
 
-const settingsPage = (title: string) => pageRoute({ title, itemStyle: "standard" });
+const settingsPage = () => pageRoute({ itemStyle: "standard" });
+
+const { title: _compactBrandTitle, ...compactBrandHeaderOptions } = getCompactBrandHeaderOptions();
+
+// Resolved in the rendered Navigator's screenOptions so each header title follows the UI language;
+// route options stay plain objects because registerPresentedRoutes reads them at load.
+const ROUTE_TITLES: Readonly<Record<string, string>> = {
+  Settings: msg("Settings"),
+  SettingsEnvironments: msg("Environments"),
+  SettingsEnvironmentDetail: msg("Environment"),
+  SettingsEnvironmentNewThreads: msg("Threads"),
+  SettingsEnvironmentSourceControl: msg("Source control & issues"),
+  SettingsSourceControlProvider: msg("Provider", {
+    $context: "settings page of one source control provider",
+  }),
+  SettingsIssueTracker: msg("Issue tracker"),
+  SettingsEnvironmentAgentBehavior: msg("Threads"),
+  SettingsWorktrees: msg("Worktrees"),
+  SettingsLabs: msg("Labs"),
+  SettingsProviderAccounts: msg("Providers"),
+  SettingsEnvironmentMaintenance: msg("Maintenance"),
+  SettingsNotifications: msg("Notifications"),
+  SettingsThreads: msg("Threads"),
+  SettingsAbout: msg("About"),
+  SettingsEnvironmentNew: msg("Add Environment"),
+  SettingsArchive: msg("Archive", { $context: "noun, settings page of archived threads" }),
+  SettingsNavigation: msg("Navigation tabs"),
+  SettingsAppearance: msg("Appearance"),
+  SettingsProjectGrouping: msg("General"),
+  SettingsOrganization: msg("General"),
+  SettingsLanguage: msg("Language"),
+  SettingsProjectOverview: msg("Projects"),
+  SettingsKeyboard: msg("Keyboard"),
+  SettingsVoice: msg("Voice"),
+  SettingsFollowUp: msg("Chat", { $context: "noun, settings page title" }),
+  SettingsScheduledTasks: msg("Scheduled tasks"),
+  SettingsScheduledTaskNew: msg("New scheduled task"),
+  SettingsScheduledTaskEdit: msg("Edit scheduled task"),
+  SettingsScheduledTaskBranch: msg("Base branch"),
+  SettingsScheduledTaskThread: msg("Destination"),
+  SettingsClientStorage: msg("Client Storage"),
+  SettingsDiagnostics: msg("Diagnostics"),
+  SettingsUsageAccount: msg("Account"),
+  SettingsOpenSourceLicenses: msg("Open source licenses"),
+  SettingsOpenSourceLicense: msg("License notice"),
+  SettingsUsage: msg("Usage"),
+  ComponentCatalog: msg("UI components"),
+  NewTaskProject: msg("Choose project"),
+  NewTaskEnvironment: msg("Environment"),
+  NewTaskBranch: msg("Branch"),
+  NewTaskRepositories: msg("Repositories"),
+  AddProject: msg("Add project"),
+  ThreadFiles: msg("Files"),
+  WorkflowRun: msg("Run", { $context: "noun, page title for one workflow run" }),
+  SettingsPlugins: msg("Plugins"),
+  SettingsWork: msg("Work", { $context: "noun, page title for project work items" }),
+  SettingsWorkProject: msg("Work", { $context: "noun, page title for project work items" }),
+  SettingsWorkTask: msg("Task", { $context: "noun, page title for one Work task" }),
+  SettingsAgents: msg("Agents"),
+  SettingsAgent: msg("Agent", { $context: "noun, page title for one agent" }),
+  SettingsResources: msg("Skills and commands"),
+  SettingsResourceScope: msg("Skills and commands"),
+  SettingsSkillEditor: msg("Skill"),
+  SettingsTextResourceEditor: msg("Command", {
+    $context: "noun, page title for one slash command",
+  }),
+  SettingsSkillInstall: msg("Install skill"),
+  SettingsThreadResources: msg("Thread skills and commands"),
+  ProjectWork: msg("Work", { $context: "noun, page title for project work items" }),
+  WorkTask: msg("Task", { $context: "noun, page title for one Work task" }),
+  SettingsLegal: msg("Legal"),
+  ConnectOnboarding: msg("Set up {product}", { product: "T3 Connect" }),
+  Connections: msg("Environments"),
+  ConnectionsNew: msg("Add Environment"),
+};
 
 // Thread settings keep the Duo's vertical bar so cancel, search, filter and confirm sit in the
 // rail. The picker stack spans the sheet so its header reaches the rail, and insets its content.
@@ -191,128 +272,128 @@ const SETTINGS_SCREENS = {
     screen: SettingsRouteScreen,
     linking: "settings",
     options: {
-      ...pageRoute({ title: "Settings", itemStyle: "standard" }),
+      ...pageRoute({ itemStyle: "standard" }),
       ...(Platform.OS === "android" ? { animation: "none" as const } : {}),
     },
   }),
   SettingsEnvironments: createNativeStackScreen({
     screen: SettingsEnvironmentsRouteScreen,
     linking: "settings/environments",
-    options: settingsPage("Environments"),
+    options: settingsPage(),
   }),
   SettingsEnvironmentDetail: createNativeStackScreen({
     screen: SettingsEnvironmentDetailRouteScreen,
     linking: "settings/environments/:environmentId",
-    options: settingsPage("Environment"),
+    options: settingsPage(),
   }),
   // Old links to New threads and Agent behavior open Threads, which absorbed them.
   SettingsEnvironmentNewThreads: createNativeStackScreen({
     screen: SettingsThreadsRouteScreen,
     linking: "settings/new-threads",
-    options: settingsPage("Threads"),
+    options: settingsPage(),
   }),
   SettingsEnvironmentSourceControl: createNativeStackScreen({
     screen: SettingsEnvironmentSourceControlRouteScreen,
     linking: "settings/source-control",
-    options: settingsPage("Source control & issues"),
+    options: settingsPage(),
   }),
   SettingsSourceControlProvider: createNativeStackScreen({
     screen: SettingsSourceControlProviderRouteScreen,
-    options: settingsPage("Provider"),
+    options: settingsPage(),
   }),
   SettingsIssueTracker: createNativeStackScreen({
     screen: SettingsIssueTrackerRouteScreen,
-    options: settingsPage("Issue tracker"),
+    options: settingsPage(),
   }),
   SettingsEnvironmentAgentBehavior: createNativeStackScreen({
     screen: SettingsThreadsRouteScreen,
     linking: "settings/agent-behavior",
-    options: settingsPage("Threads"),
+    options: settingsPage(),
   }),
   SettingsWorktrees: createNativeStackScreen({
     screen: SettingsWorktreesRouteScreen,
     linking: "settings/worktrees",
-    options: settingsPage("Worktrees"),
+    options: settingsPage(),
   }),
   SettingsLabs: createNativeStackScreen({
     screen: SettingsLabsRouteScreen,
     linking: "settings/labs",
-    options: settingsPage("Labs"),
+    options: settingsPage(),
   }),
   SettingsProviderAccounts: createNativeStackScreen({
     screen: SettingsProviderAccountsRouteScreen,
     linking: "settings/provider-accounts",
-    options: settingsPage("Providers"),
+    options: settingsPage(),
   }),
   SettingsEnvironmentMaintenance: createNativeStackScreen({
     screen: SettingsEnvironmentMaintenanceRouteScreen,
     linking: "settings/maintenance",
-    options: settingsPage("Maintenance"),
+    options: settingsPage(),
   }),
   SettingsNotifications: createNativeStackScreen({
     screen: SettingsNotificationsRouteScreen,
     linking: "settings/notifications",
-    options: settingsPage("Notifications"),
+    options: settingsPage(),
   }),
   SettingsThreads: createNativeStackScreen({
     screen: SettingsThreadsRouteScreen,
     linking: "settings/thread-preferences",
-    options: settingsPage("Threads"),
+    options: settingsPage(),
   }),
   SettingsAbout: createNativeStackScreen({
     screen: SettingsAboutRouteScreen,
     linking: "settings/about",
-    options: settingsPage("About"),
+    options: settingsPage(),
   }),
   SettingsEnvironmentNew: createNativeStackScreen({
     screen: ConnectionsNewRouteScreen,
     linking: "settings/environment-new",
-    options: settingsPage("Add Environment"),
+    options: settingsPage(),
   }),
   SettingsArchive: createNativeStackScreen({
     screen: ArchivedThreadsRouteScreen,
     linking: "settings/archive",
-    options: settingsPage("Archive"),
+    options: settingsPage(),
   }),
   SettingsNavigation: createNativeStackScreen({
     screen: SettingsNavigationRouteScreen,
     linking: "settings/navigation-tabs",
-    options: settingsPage("Navigation tabs"),
+    options: settingsPage(),
   }),
   SettingsAppearance: createNativeStackScreen({
     screen: SettingsAppearanceRouteScreen,
     linking: "settings/appearance",
-    options: settingsPage("Appearance"),
+    options: settingsPage(),
   }),
   SettingsProjectGrouping: createNativeStackScreen({
     screen: SettingsProjectGroupingRouteScreen,
     linking: "settings/project-grouping",
-    options: settingsPage("General"),
+    options: settingsPage(),
   }),
   SettingsOrganization: createNativeStackScreen({
     screen: SettingsProjectGroupingRouteScreen,
     linking: "settings/organization",
-    options: settingsPage("General"),
+    options: settingsPage(),
   }),
   SettingsLanguage: createNativeStackScreen({
     screen: SettingsLanguageRouteScreen,
     linking: "settings/language",
-    options: settingsPage("Language"),
+    options: settingsPage(),
   }),
   SettingsProjectOverview: createNativeStackScreen({
     screen: SettingsProjectOverviewRouteScreen,
     linking: "settings/project",
-    options: settingsPage("Projects"),
+    options: settingsPage(),
   }),
   SettingsKeyboard: createNativeStackScreen({
     screen: SettingsKeyboardRouteScreen,
     linking: "settings/keyboard",
-    options: settingsPage("Keyboard"),
+    options: settingsPage(),
   }),
   SettingsVoice: createNativeStackScreen({
     screen: SettingsVoiceRouteScreen,
     linking: { path: "settings/voice", alias: ["settings/microphone"] },
-    options: settingsPage("Voice"),
+    options: settingsPage(),
   }),
   SettingsVoiceModels: createNativeStackScreen({
     screen: SettingsVoiceModelsRouteScreen,
@@ -321,32 +402,32 @@ const SETTINGS_SCREENS = {
   SettingsFollowUp: createNativeStackScreen({
     screen: SettingsFollowUpRouteScreen,
     linking: "settings/follow-ups",
-    options: settingsPage("Chat"),
+    options: settingsPage(),
   }),
   SettingsScheduledTasks: createNativeStackScreen({
     screen: SettingsScheduledTasksRouteScreen,
     linking: "settings/scheduled-tasks",
     options: {
-      ...settingsPage("Scheduled tasks"),
+      ...settingsPage(),
       headerTitleStyle: { fontSize: 16, fontWeight: "800" },
     },
   }),
   SettingsScheduledTaskNew: createNativeStackScreen({
     screen: SettingsScheduledTaskNewRouteScreen,
     linking: "settings/scheduled-tasks/new",
-    options: settingsPage("New scheduled task"),
+    options: settingsPage(),
   }),
   SettingsScheduledTaskEdit: createNativeStackScreen({
     screen: SettingsScheduledTaskEditRouteScreen,
-    options: settingsPage("Edit scheduled task"),
+    options: settingsPage(),
   }),
   SettingsScheduledTaskBranch: createNativeStackScreen({
     screen: ScheduledTaskBranchPickerRouteScreen,
-    options: settingsPage("Base branch"),
+    options: settingsPage(),
   }),
   SettingsScheduledTaskThread: createNativeStackScreen({
     screen: ScheduledTaskThreadPickerRouteScreen,
-    options: settingsPage("Destination"),
+    options: settingsPage(),
   }),
   SettingsScheduledTaskModel: createNativeStackScreen({
     screen: ScheduledTaskModelPickerRouteScreen,
@@ -355,93 +436,93 @@ const SETTINGS_SCREENS = {
   SettingsClientStorage: createNativeStackScreen({
     screen: SettingsClientStorageRouteScreen,
     linking: "settings/client-storage",
-    options: settingsPage("Client Storage"),
+    options: settingsPage(),
   }),
   SettingsDiagnostics: createNativeStackScreen({
     screen: SettingsDiagnosticsRouteScreen,
     linking: "settings/diagnostics",
-    options: settingsPage("Diagnostics"),
+    options: settingsPage(),
   }),
   // These params snapshot the tap time, local filters, and freshly aggregated pools.
   // A linking path would round-trip them as URL query strings and preserve stale values.
   SettingsUsageAccount: createNativeStackScreen({
     screen: UsageLimitAccountScreen,
-    options: settingsPage("Account"),
+    options: settingsPage(),
   }),
   SettingsOpenSourceLicenses: createNativeStackScreen({
     screen: SettingsOpenSourceLicensesRouteScreen,
     linking: "settings/open-source-licenses",
-    options: settingsPage("Open source licenses"),
+    options: settingsPage(),
   }),
   SettingsOpenSourceLicense: createNativeStackScreen({
     screen: SettingsOpenSourceLicenseRouteScreen,
     linking: "settings/open-source-licenses/:entryKey",
-    options: settingsPage("License notice"),
+    options: settingsPage(),
   }),
   SettingsUsage: createNativeStackScreen({
     screen: UsageRouteScreen,
     linking: "settings/usage",
-    options: settingsPage("Usage"),
+    options: settingsPage(),
   }),
   SettingsPlugins: createNativeStackScreen({
     screen: PluginsSettingsRouteScreen,
     linking: "settings/plugins",
-    options: settingsPage("Plugins"),
+    options: settingsPage(),
   }),
   SettingsWork: createNativeStackScreen({
     screen: SettingsWorkRouteScreen,
     linking: "settings/work",
-    options: settingsPage("Work"),
+    options: settingsPage(),
   }),
   SettingsWorkProject: createNativeStackScreen({
     screen: WorkProjectRouteScreen,
     linking: "settings/work/:environmentId/:projectId",
-    options: settingsPage("Work"),
+    options: settingsPage(),
   }),
   SettingsWorkTask: createNativeStackScreen({
     screen: WorkTaskRouteScreen,
     linking: "settings/work/:environmentId/:projectId/:taskId",
-    options: settingsPage("Task"),
+    options: settingsPage(),
   }),
   SettingsAgents: createNativeStackScreen({
     screen: SettingsAgentsRouteScreen,
     linking: "settings/agents",
-    options: settingsPage("Agents"),
+    options: settingsPage(),
   }),
   SettingsAgent: createNativeStackScreen({
     screen: SettingsAgentRouteScreen,
     linking: "settings/agents/:environmentId/:assistantId",
-    options: settingsPage("Agent"),
+    options: settingsPage(),
   }),
   SettingsResources: createNativeStackScreen({
     screen: SettingsResourcesRouteScreen,
     linking: "settings/resources",
-    options: settingsPage("Skills and commands"),
+    options: settingsPage(),
   }),
   SettingsResourceScope: createNativeStackScreen({
     screen: SettingsResourceScopeRouteScreen,
     linking: "settings/resources/:environmentId",
-    options: settingsPage("Skills and commands"),
+    options: settingsPage(),
   }),
   SettingsSkillEditor: createNativeStackScreen({
     screen: SettingsSkillEditorRouteScreen,
     linking: "settings/resources/:environmentId/skill",
-    options: settingsPage("Skill"),
+    options: settingsPage(),
   }),
   SettingsTextResourceEditor: createNativeStackScreen({
     screen: SettingsTextResourceEditorRouteScreen,
     linking: "settings/resources/:environmentId/text",
-    options: settingsPage("Command"),
+    options: settingsPage(),
   }),
   SettingsSkillInstall: createNativeStackScreen({
     screen: SettingsSkillInstallRouteScreen,
     linking: "settings/resources/:environmentId/install",
-    options: settingsPage("Install skill"),
+    options: settingsPage(),
   }),
   SettingsThreadResources: createNativeStackScreen({
     screen: SettingsThreadResourcesRouteScreen,
     linking: "settings/resources/:environmentId/thread/:threadId",
-    options: settingsPage("Thread skills and commands"),
+    options: settingsPage(),
   }),
   SettingsAuth: createNativeStackScreen({
     screen: SettingsAuthRouteScreen,
@@ -556,13 +637,15 @@ function NotFoundScreen() {
       style={[{ flex: 1 }, screenBgStyle]}
     >
       <Text className="text-3xl font-t3-bold text-foreground" selectable>
-        Route not found
+        <T>Route not found</T>
       </Text>
       <Pressable
         style={returnHomeButtonStyle}
         onPress={() => navigation.dispatch(StackActions.replace("Home"))}
       >
-        <Text className="text-base font-t3-bold text-primary-foreground">Return home</Text>
+        <Text className="text-base font-t3-bold text-primary-foreground">
+          <T>Return home</T>
+        </Text>
       </Pressable>
     </ScrollView>
   );
@@ -573,16 +656,13 @@ const RootStackConfig = createWorkspaceStackNavigator({
   UNSTABLE_router: workspaceDetailRouter,
   // React Navigation calls layouts inline; compiled components would share the navigator's memo cache.
   layout: (props) => <RootStackLayout {...props} />,
-  screenOptions: {
-    headerShown: false,
-  },
+  screenOptions: { headerShown: false },
   screens: {
     ...(__DEV__
       ? {
           ComponentCatalog: createNativeStackScreen({
             screen: ComponentCatalogScreen,
             linking: "dev/components",
-            options: { title: "UI components" },
           }),
         }
       : {}),
@@ -597,7 +677,7 @@ const RootStackConfig = createWorkspaceStackNavigator({
       options: {
         ...pageRoute({ duoMinimize: "never", root: true }),
         contentStyle: { backgroundColor: "transparent" },
-        ...getCompactBrandHeaderOptions(),
+        ...compactBrandHeaderOptions,
       },
     }),
     PullRequest: createNativeStackScreen({
@@ -652,12 +732,12 @@ const RootStackConfig = createWorkspaceStackNavigator({
     ProjectWork: createNativeStackScreen({
       screen: WorkProjectRouteScreen,
       linking: "work/:environmentId/:projectId",
-      options: pageRoute({ title: "Work", duoMinimize: "never" }),
+      options: pageRoute({ duoMinimize: "never" }),
     }),
     WorkTask: createNativeStackScreen({
       screen: WorkTaskRouteScreen,
       linking: "work/:environmentId/:projectId/tasks/:taskId",
-      options: pageRoute({ title: "Task" }),
+      options: pageRoute(),
     }),
     Issue: createNativeStackScreen({
       screen: IssueRouteScreen,
@@ -688,23 +768,28 @@ const RootStackConfig = createWorkspaceStackNavigator({
     NewTaskProject: createNativeStackScreen({
       screen: NewTaskRouteScreen,
       linking: { path: "new", alias: ["new/project"] },
-      options: pageRoute({ title: "Choose project" }),
+      options: pageRoute(),
     }),
     NewTaskEnvironment: createNativeStackScreen({
       linking: "new/draft/environment",
       screen: NewTaskEnvironmentPickerRouteScreen,
-      options: pageRoute({ title: "Environment" }),
+      options: pageRoute(),
     }),
     NewTaskBranch: createNativeStackScreen({
       linking: "new/draft/branch",
       screen: NewTaskBranchPickerRouteScreen,
-      options: pageRoute({ title: "Branch" }),
+      options: pageRoute(),
+    }),
+    NewTaskRepositories: createNativeStackScreen({
+      linking: "new/draft/repositories",
+      screen: NewTaskRepositoriesPickerRouteScreen,
+      options: pageRoute(),
     }),
     AddProject: createNativeStackScreen({
       linking: "new/add-project",
       screen: AddProjectSourceRoute,
 
-      options: pageRoute({ title: "Add project" }),
+      options: pageRoute(),
     }),
     AddProjectRepository: createNativeStackScreen({
       linking: "new/add-project/repository",
@@ -769,7 +854,12 @@ const RootStackConfig = createWorkspaceStackNavigator({
     ThreadBrowserPreview: createNativeStackScreen({
       screen: BrowserPreviewRouteScreen,
       linking: `${THREAD_LINKING_PREFIX}/browser`,
-      options: { ...modalRoute({ header: "solid" }), gestureEnabled: false },
+      options: immersiveRoute({ fullWidth: true }),
+    }),
+    ThreadLocalPreview: createNativeStackScreen({
+      screen: LocalPreviewRouteScreen,
+      linking: "environments/:environmentId/local-preview",
+      options: immersiveRoute({ fullWidth: true }),
     }),
     ThreadReview: createNativeStackScreen({
       screen: ReviewSheet,
@@ -784,7 +874,7 @@ const RootStackConfig = createWorkspaceStackNavigator({
     ThreadFiles: createNativeStackScreen({
       screen: ThreadFilesTreeScreen,
       linking: `${THREAD_LINKING_PREFIX}/files`,
-      options: pageRoute({ title: "Files" }),
+      options: pageRoute(),
     }),
     ThreadFile: createNativeStackScreen({
       screen: ThreadFileScreen,
@@ -809,6 +899,15 @@ const RootStackConfig = createWorkspaceStackNavigator({
       screen: ThreadQueueSheet,
       options: sheetRoute({ detent: 0.65, androidMaxDetent: 0.95 }),
     }),
+    WorkflowRun: createNativeStackScreen({
+      screen: WorkflowRunRouteScreen,
+      linking: { path: "workflows/:environmentId/:runId" },
+      options: pageRoute(),
+    }),
+    WorkflowStep: createNativeStackScreen({
+      screen: WorkflowStepSheet,
+      options: sheetRoute({ detent: 0.6, androidMaxDetent: 0.95 }),
+    }),
     ThreadBackgroundWork: createNativeStackScreen({
       screen: ThreadBackgroundWorkSheet,
       options: sheetRoute({ detent: 0.5, androidMaxDetent: 0.9 }),
@@ -824,6 +923,19 @@ const RootStackConfig = createWorkspaceStackNavigator({
     ThreadHistory: createNativeStackScreen({
       screen: ThreadHistorySheet,
       options: pageRoute(),
+    }),
+    LinkedThread: createNativeStackScreen({
+      screen: LinkedThreadSheet,
+      options: sheetRoute({ detent: 0.9, android: "fullScreen" }),
+    }),
+    // Maximized from the inspector, like ThreadInspectorFullscreen.
+    LinkedThreadFullscreen: createNativeStackScreen({
+      screen: LinkedThreadSheet,
+      options: modalRoute({ header: "glass", itemStyle: "editor", duoMinimize: "onScrollUp" }),
+    }),
+    ThreadGuestShare: createNativeStackScreen({
+      screen: ThreadGuestShareSheet,
+      options: sheetRoute({ detent: 0.5 }),
     }),
     GitOverview: createNativeStackScreen({
       screen: GitOverviewSheet,
@@ -859,13 +971,12 @@ const RootStackConfig = createWorkspaceStackNavigator({
     SettingsLegal: createNativeStackScreen({
       screen: SettingsLegalRouteScreen,
       linking: "settings/legal",
-      options: modalRoute({ header: "solid", title: "Legal" }),
+      options: modalRoute({ header: "solid" }),
     }),
     ConnectOnboarding: createNativeStackScreen({
       screen: ConnectOnboardingRouteScreen,
       linking: "connect-onboarding",
       options: sheetRoute({
-        title: "Set up T3 Connect",
         header: "solid",
         detent: 0.6,
         androidMaxDetent: 0.95,
@@ -874,12 +985,12 @@ const RootStackConfig = createWorkspaceStackNavigator({
     Connections: createNativeStackScreen({
       screen: ConnectionsRouteScreen,
       linking: "connections",
-      options: sheetRoute({ title: "Environments", detent: 0.55, maxDetent: 0.7, android: "card" }),
+      options: sheetRoute({ detent: 0.55, maxDetent: 0.7, android: "card" }),
     }),
     ConnectionsNew: createNativeStackScreen({
       screen: ConnectionsNewRouteScreen,
       linking: "connections/new",
-      options: sheetRoute({ title: "Add Environment", detent: 0.55, maxDetent: 0.7 }),
+      options: sheetRoute({ detent: 0.55, maxDetent: 0.7 }),
     }),
     NotFound: createNativeStackScreen({
       screen: NotFoundScreen,
@@ -906,15 +1017,19 @@ function GuardedScreenLayout(props: {
 
 function ScreenRenderFallback(props: RenderFailureProps & { readonly routeName: string }) {
   const navigation = useNavigation();
+  const gt = useGT();
   const exit = navigation.canGoBack()
-    ? { label: "Go back", onPress: () => navigation.goBack() }
+    ? { label: gt("Go back"), onPress: () => navigation.goBack() }
     : props.routeName === "Home"
       ? // Home itself failed, and the Settings list renders inside it; open a Settings page.
         {
-          label: "Open settings",
+          label: gt("Open settings"),
           onPress: () => openSettings(navigation, DEFAULT_SETTINGS_PAGE),
         }
-      : { label: "Return home", onPress: () => navigation.dispatch(StackActions.replace("Home")) };
+      : {
+          label: gt("Return home"),
+          onPress: () => navigation.dispatch(StackActions.replace("Home")),
+        };
 
   return <RenderFailureView {...props} exit={exit} />;
 }
@@ -930,22 +1045,32 @@ export const RootStack = RootStackConfig.with(function AdaptiveRootStack({ Navig
   const { width, height } = useWindowDimensions();
   const nativeMetrics = useNativeLayoutMetrics();
   const usesSplitView = deriveLayout({ width, height, nativeMetrics }).usesSplitView;
+  const resolve = useMessages();
 
   /* oxlint-disable react/no-unstable-nested-components -- React Navigation invokes screenLayout as a render callback. */
   return (
     <Navigator
       screenLayout={(props) => <GuardedScreenLayout {...props} />}
-      screenOptions={({ route, navigation }) =>
-        Platform.OS === "android"
-          ? {
-              animation: androidWorkspaceDestinationAnimation(
-                route,
-                navigation.getState().routes,
-                usesSplitView,
-              ),
-            }
-          : {}
-      }
+      screenOptions={({ route, navigation }) => {
+        const title =
+          route.name === "Home"
+            ? getCompactBrandHeaderOptions(undefined, resolve).title
+            : ROUTE_TITLES[route.name] === undefined
+              ? undefined
+              : resolve(ROUTE_TITLES[route.name]);
+        return {
+          ...(title === undefined ? {} : { title }),
+          ...(Platform.OS === "android"
+            ? {
+                animation: androidWorkspaceDestinationAnimation(
+                  route,
+                  navigation.getState().routes,
+                  usesSplitView,
+                ),
+              }
+            : {}),
+        };
+      }}
     />
   );
 

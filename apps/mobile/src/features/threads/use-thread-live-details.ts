@@ -1,4 +1,4 @@
-import { useAtomSet, useAtomValue } from "@effect/atom-react";
+import { useAtomValue } from "@effect/atom-react";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
   mcpApplicationSummary,
@@ -36,7 +36,7 @@ import { useSelectedThreadWorktree } from "../../state/use-selected-thread-workt
 import { enqueueThreadOutboxMessage, threadOutboxManager } from "../../state/thread-outbox";
 import { environmentThreadShells, threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
-import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
+import { mobilePreferencesAtom, saveMobilePreferences } from "../../state/preferences";
 import type { Preferences } from "../../persistence/mobile-preferences";
 import type { ThreadDetailsCollapse } from "./ThreadLiveDetailsSection";
 import {
@@ -64,7 +64,7 @@ export function useThreadDetailsCollapse(
   opened: ThreadLiveDetailsSection | undefined,
 ): ThreadDetailsCollapse {
   const collapsed = usePreferenceList("threadDetailsCollapsedSections");
-  const update = useAtomSet(updateMobilePreferencesAtom);
+  const update = useAtomCommand(saveMobilePreferences);
   const [openedSection, setOpenedSection] = useState(opened ?? null);
   return {
     isCollapsed: (id) => isThreadDetailsSectionCollapsed({ id, collapsed, opened: openedSection }),
@@ -75,7 +75,7 @@ export function useThreadDetailsCollapse(
         opened: openedSection,
       });
       if (id === openedSection) setOpenedSection(null);
-      update({
+      void update({
         transform: (current: Preferences) => ({
           threadDetailsCollapsedSections: toggleThreadDetailsSection(
             current.threadDetailsCollapsedSections ?? NO_ENTRIES,
@@ -91,12 +91,12 @@ export function useThreadDetailsCollapse(
 /** Failed agents seen on this device, by opening one or dismissing the failed badge. */
 export function useSeenFailedAgents() {
   const seen = usePreferenceList("seenFailedAgents");
-  const update = useAtomSet(updateMobilePreferencesAtom);
+  const update = useAtomCommand(saveMobilePreferences);
   return {
     seen,
     markSeen: (keys: ReadonlyArray<string>) => {
       if (keys.length === 0) return;
-      update({
+      void update({
         transform: (current: Preferences) => ({
           seenFailedAgents: markFailedAgentsSeen(current.seenFailedAgents ?? NO_ENTRIES, keys),
         }),

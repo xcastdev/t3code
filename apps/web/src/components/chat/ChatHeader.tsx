@@ -4,12 +4,14 @@ import {
   type ScopedThreadRef,
   type ThreadId,
 } from "@t3tools/contracts";
+import { contextMenuSourceOf } from "~/contextMenuSource";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
+import { T, useGT, Var } from "gt-react";
 import { BotIcon, ChevronDownIcon } from "lucide-react";
 import {
   memo,
@@ -96,7 +98,8 @@ export const ChatHeader = memo(function ChatHeader({
   const assistantHome = useAssistantThreadOwner(
     isServerThread ? { environmentId: activeThreadEnvironmentId, threadId: activeThreadId } : null,
   );
-  const activeProjectName = activeProject?.isScratch ? "No project" : activeProject?.title;
+  const gt = useGT();
+  const activeProjectName = activeProject?.isScratch ? gt("No project") : activeProject?.title;
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
   const interfaceFont = useClientSettings((settings) => settings.fontFamilySans);
   const breadcrumbContainerRef = useRef<HTMLDivElement>(null);
@@ -173,7 +176,7 @@ export const ChatHeader = memo(function ChatHeader({
   const renameCommittedRef = useRef(false);
   // Home keeps the agent's name, so the header reads "<Agent> / Home" and offers no rename.
   const isAgentHome = assistantHome?.kind === "canonical";
-  const displayTitle = isAgentHome ? "Home" : activeThreadTitle;
+  const displayTitle = isAgentHome ? gt("Home") : activeThreadTitle;
   const startRename = () => {
     const shell = readThreadShell(activeThreadRef);
     if (
@@ -198,7 +201,7 @@ export const ChatHeader = memo(function ChatHeader({
       originalTitle: renamingTitle ?? activeThreadTitle,
     });
     if (resolution.action === "reject-empty") {
-      toastManager.add({ type: "warning", title: "Thread title cannot be empty" });
+      toastManager.add({ type: "warning", title: gt("Thread title cannot be empty") });
       return;
     }
     if (resolution.action === "noop") return;
@@ -210,8 +213,8 @@ export const ChatHeader = memo(function ChatHeader({
         const error = squashAtomCommandFailure(result);
         toastManager.add({
           type: "error",
-          title: "Failed to rename thread",
-          description: error instanceof Error ? error.message : "An error occurred.",
+          title: gt("Failed to rename thread"),
+          description: error instanceof Error ? error.message : gt("An error occurred."),
         });
       }
     });
@@ -224,13 +227,13 @@ export const ChatHeader = memo(function ChatHeader({
     canShareWithGuest,
     agent: assistantHome,
   });
-  const openMenuBelow = (target: HTMLElement) => {
-    const rect = target.getBoundingClientRect();
-    openMenu({ x: rect.left, y: rect.bottom + 4 });
+  const openMenuBelow = (event: ReactMouseEvent<HTMLElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    openMenu({ x: rect.left, y: rect.bottom + 4 }, contextMenuSourceOf(event));
   };
   const openMenuFromTitle = (event: ReactMouseEvent<HTMLButtonElement>) => {
     if (isTrailingDoubleClick(event.detail)) return;
-    openMenuBelow(event.currentTarget);
+    openMenuBelow(event);
   };
   // A native menu takes the second click, so only the in-page menu lets a double-click reach here.
   const handleTitleDoubleClick = (event: ReactMouseEvent) => {
@@ -247,16 +250,17 @@ export const ChatHeader = memo(function ChatHeader({
       const api = readLocalApi();
       if (!api) return;
       void api.contextMenu
-        .show([{ id: "project-settings", label: "Project settings", icon: "settings" }], {
-          x: event.clientX,
-          y: event.clientY,
-        })
+        .show(
+          [{ id: "project-settings", label: gt("Project settings"), icon: "settings" }],
+          { x: event.clientX, y: event.clientY },
+          contextMenuSourceOf(event),
+        )
         .then((action) => {
           if (action === "project-settings") onOpenProjectSettings?.();
         });
       return;
     }
-    openMenu({ x: event.clientX, y: event.clientY });
+    openMenu({ x: event.clientX, y: event.clientY }, contextMenuSourceOf(event));
   };
   const handleRenameKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
     if (event.nativeEvent.isComposing || event.keyCode === 229) return;
@@ -281,7 +285,7 @@ export const ChatHeader = memo(function ChatHeader({
       onContextMenu={handleHeaderContextMenu}
     >
       <WorkspaceBreadcrumb
-        ariaLabel="Thread breadcrumb"
+        ariaLabel={gt("Thread breadcrumb")}
         className="flex-1 overflow-clip [overflow-clip-margin:2px]"
       >
         {assistantHome ? (
@@ -291,8 +295,8 @@ export const ChatHeader = memo(function ChatHeader({
               <button
                 type="button"
                 aria-haspopup="menu"
-                aria-label={`Options for agent ${assistantHome.name}`}
-                onClick={(event) => openMenuBelow(event.currentTarget)}
+                aria-label={gt("Options for agent {name}", { name: assistantHome.name })}
+                onClick={openMenuBelow}
                 className="inline-flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 rounded-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
               >
                 <BotIcon className="size-3.5 shrink-0" />
@@ -313,7 +317,7 @@ export const ChatHeader = memo(function ChatHeader({
                   render={
                     <button
                       type="button"
-                      aria-label={`New thread in ${activeProjectName}`}
+                      aria-label={gt("New thread in {project}", { project: activeProjectName })}
                       onClick={onNewThreadInProject}
                       className="inline-flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 rounded-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                     />
@@ -327,7 +331,11 @@ export const ChatHeader = memo(function ChatHeader({
                     variant="cap-aligned"
                   />
                 </TooltipTrigger>
-                <TooltipPopup side="top">New thread in {activeProjectName}</TooltipPopup>
+                <TooltipPopup side="top">
+                  <T>
+                    New thread in <Var>{activeProjectName}</Var>
+                  </T>
+                </TooltipPopup>
               </Tooltip>
             </WorkspaceBreadcrumbItem>
             <WorkspaceBreadcrumbSeparator>
@@ -343,7 +351,9 @@ export const ChatHeader = memo(function ChatHeader({
                   render={
                     <button
                       type="button"
-                      aria-label={`Open parent thread: ${parentThreadLink.title}`}
+                      aria-label={gt("Open parent thread: {title}", {
+                        title: parentThreadLink.title,
+                      })}
                       onClick={() => onOpenThread(parentThreadLink.threadId)}
                       className="inline-flex min-w-0 max-w-full cursor-pointer items-center rounded-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
                     />
@@ -374,7 +384,7 @@ export const ChatHeader = memo(function ChatHeader({
             <input
               autoFocus
               dir="auto"
-              aria-label="Thread title"
+              aria-label={gt("Thread title")}
               className="min-w-0 flex-1 rounded-sm bg-transparent text-sm font-medium text-foreground outline-none ring-1 ring-inset ring-ring/50 focus:ring-ring"
               defaultValue={renamingTitle}
               onBlur={(event) => {
@@ -397,7 +407,7 @@ export const ChatHeader = memo(function ChatHeader({
                 render={
                   <button
                     type="button"
-                    aria-label={`Thread actions for ${displayTitle}`}
+                    aria-label={gt("Thread actions for {title}", { title: displayTitle })}
                     aria-haspopup="menu"
                     onClick={openMenuFromTitle}
                     onDoubleClick={
@@ -437,10 +447,15 @@ export const ChatHeader = memo(function ChatHeader({
           {renamingTitle === null && activeThreadLinkOrigin ? (
             <Tooltip>
               <TooltipTrigger render={<Badge variant="info" size="sm" />}>
-                From {activeThreadLinkOrigin}
+                <T>
+                  From <Var>{activeThreadLinkOrigin}</Var>
+                </T>
               </TooltipTrigger>
               <TooltipPopup side="top">
-                Started by an agent on {activeThreadLinkOrigin} through a linked environment.
+                <T>
+                  Started by an agent on <Var>{activeThreadLinkOrigin}</Var> through a linked
+                  environment.
+                </T>
               </TooltipPopup>
             </Tooltip>
           ) : null}

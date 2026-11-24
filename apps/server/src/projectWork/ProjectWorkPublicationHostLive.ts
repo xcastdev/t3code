@@ -66,6 +66,9 @@ const make = Effect.gen(function* () {
       snapshot.manifest.taskId !== input.source.taskId
     )
       return yield* new PublicationError({ reason: "stale" });
+    // A task folder's project folder need not be a repository; Git there answers for another.
+    if ((yield* git.repositoryRoot(cwd)) !== cwd)
+      return yield* new PublicationError({ reason: "not-ready" });
     const handle = yield* registry.resolveHandle({ cwd });
     const api = handle.provider.guardedPublication;
     if (!api) return yield* new PublicationError({ reason: "unsupported" });

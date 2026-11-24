@@ -269,7 +269,7 @@ export const makeLinuxSessionDrain = (
       ? cause
       : new PtyAdapter.PtyDrainError({ reason: "inspection-failed", cause });
   const signalOwned = Effect.fn("NodePtyAdapter.signalOwned")(function* (
-    signal: "SIGTERM" | "SIGKILL",
+    signal: "SIGHUP" | "SIGTERM" | "SIGKILL",
   ) {
     yield* Effect.try({
       try: () => {

@@ -1,6 +1,7 @@
 import { RegistryContext, useAtomValue } from "@effect/atom-react";
 import {
   isAtomCommandInterrupted,
+  runAtomCommand,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import type { EnvironmentId, ExternalNotificationDestination } from "@t3tools/contracts";
@@ -26,7 +27,7 @@ import {
 } from "@t3tools/client-runtime/external-notification-presentation";
 import { SecretInput } from "./SecretInput";
 import { SettingsRow, SettingsSection } from "./settingsLayout";
-import { searchableSetting } from "./settingsSearch";
+import { useSearchableSetting } from "./settingsSearch";
 import { useSettingsScope } from "./SettingsScopeContext";
 
 const EMPTY: ReadonlyArray<ExternalNotificationDestination> = [];
@@ -47,6 +48,7 @@ function describeSaveFailure(error: unknown): string {
  * settings, never sync elsewhere, and send only new attention events.
  */
 export function ExternalNotificationsSettings() {
+  const searchableSetting = useSearchableSetting();
   const { environment } = useSettingsScope();
   const connected =
     environment?.connection.phase === "connected" && environment.serverConfig !== null;
@@ -76,6 +78,7 @@ function DestinationsEditor({
   readonly environmentId: EnvironmentId;
   readonly environmentLabel: string;
 }) {
+  const searchableSetting = useSearchableSetting();
   const registry = useContext(RegistryContext);
   const settings = useAtomValue(serverEnvironment.settingsValueAtom(environmentId));
   const saved = settings?.externalNotifications.destinations ?? EMPTY;
@@ -104,7 +107,7 @@ function DestinationsEditor({
     if (error !== null || !dirty || pending !== null) return;
     setPending("save");
     setMessage(null);
-    const result = await externalNotificationsEnvironment.updateSettings.run(registry, {
+    const result = await runAtomCommand(registry, externalNotificationsEnvironment.updateSettings, {
       environmentId,
       input: patch,
     });
@@ -125,7 +128,7 @@ function DestinationsEditor({
     if (pending !== null) return;
     setPending(destinationId);
     setMessage(null);
-    const result = await externalNotificationsEnvironment.test.run(registry, {
+    const result = await runAtomCommand(registry, externalNotificationsEnvironment.test, {
       environmentId,
       input: { destinationId },
     });

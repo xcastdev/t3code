@@ -29,6 +29,8 @@ import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as EventStore from "../orchestration-v2/EventStore.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
+import * as ThreadViewers from "../orchestration-v2/ThreadViewers.ts";
+import * as TaskFolderStore from "../workspace/TaskFolderStore.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import {
@@ -191,10 +193,11 @@ function makeUpgradeValidationRuntime(
     CommandReceiptStore.layer,
     outbox,
     TurnItemPositionStore.layer,
+    TaskFolderStore.layer,
   ).pipe(Layer.provideMerge(database));
   const admission = ProjectWorkRunAdmission.layer.pipe(Layer.provide(database));
   const sink = EventSink.layerWithAdmission.pipe(
-    Layer.provide(admission),
+    Layer.provide(Layer.merge(admission, ThreadViewers.layer)),
     Layer.provideMerge(stores),
   );
   const registries = Layer.mergeAll(
@@ -206,6 +209,7 @@ function makeUpgradeValidationRuntime(
         refreshInstance: Effect.fn("ProviderRegistry.ProviderRegistry.refreshInstance")(() =>
           Effect.succeed([]),
         ),
+        rebuildMissingAndRefresh: Effect.succeed([]),
         reloadSecretsAndRefresh: Effect.fn(
           "ProviderRegistry.ProviderRegistry.reloadSecretsAndRefresh",
         )(() => Effect.succeed([])),

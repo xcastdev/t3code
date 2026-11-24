@@ -184,7 +184,7 @@ it.live("runs and recovers real assistant routines without mutating copied sched
       yield* worker.drain();
       const terminals = yield* sink.stream({ afterSequence }).pipe(
         Stream.filter(
-          ({ event }) => event.type === "run.updated" && event.payload.status === "waiting",
+          ({ event }) => event.type === "run.updated" && event.payload.status === "completed",
         ),
         Stream.take(1),
         Stream.runCollect,

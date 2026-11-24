@@ -267,6 +267,7 @@ function fixture(
     reconcile: unused,
   });
   const auth = AuthSessions.AuthSessionRepository.of({
+    extend: unused,
     getProofKeyThumbprint: unused,
     revokeByProofKey: unused,
     getById: () =>

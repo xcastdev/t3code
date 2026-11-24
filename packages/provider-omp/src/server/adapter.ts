@@ -230,7 +230,6 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
             blocks: Map<string, string>;
           }
         | undefined;
-      const turns: OrchestrationV2ProviderTurn[] = [];
       const unfinishedTools = new Map<string, OrchestrationV2TurnItem>();
       // The orchestrator owns durable delivery; retain consumed notices across guarded restarts.
       const consumedContinuations = new Set<string>();
@@ -586,7 +585,6 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
                   : ("completed" as const),
               completedAt: now,
             };
-            turns.push(finalTurn);
             yield* emit({
               type: "provider_turn.updated",
               driver: OMP_DRIVER,
@@ -1485,7 +1483,6 @@ export const makeOmpAdapterV2 = Effect.fn("OmpAdapter.make")(function* (
         yield* projectTodos();
         return {
           providerThread: thread ?? value.providerThread,
-          providerTurns: turns,
           messages: historyMessages(history.branch()).map((message) => ({
             id: ids.derive.messageFromProviderItem({
               driver: OMP_DRIVER,

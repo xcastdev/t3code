@@ -1,3 +1,4 @@
+import { mFallback, msg } from "gt-i18n";
 import {
   ProjectWorkBoundedReadEnvelope,
   ProjectWorkRpcError,
@@ -255,6 +256,7 @@ export function normalizeProjectWorkPage(input: ProjectWorkClientRead, value: un
       return {
         value: record,
         known,
+        // oxlint-disable-next-line t3code/no-untranslated-copy -- a literal tag the record type names
         label: known ? "record" : "Unknown work record",
       };
     }),
@@ -377,7 +379,11 @@ export function createProjectWorkEnvironmentAtoms<R, E>(
           page,
           special: decodeProjectWorkSpecialRead(input, value, environmentId),
           status,
-          label: disconnected ? "Disconnected" : status === "stale" ? "Work may be stale" : null,
+          label: disconnected
+            ? mFallback(msg("Disconnected"))
+            : status === "stale"
+              ? mFallback(msg("Work may be stale"))
+              : null,
         } as const;
       },
       (refresh) => refresh(source),
@@ -432,7 +438,7 @@ export function createProjectWorkEnvironmentAtoms<R, E>(
     issue,
     delivery: {
       ...delivery,
-      run: async (
+      run: (
         registry: Parameters<typeof delivery.run>[0],
         target: {
           readonly environmentId: EnvironmentId;
@@ -441,18 +447,20 @@ export function createProjectWorkEnvironmentAtoms<R, E>(
             readonly request: ProjectWorkDeliveryRequest;
           };
         },
-      ) => {
-        const result = await delivery.run(registry, {
-          environmentId: target.environmentId,
-          input: target.input.request,
-        });
-        // A failed external write may have been accepted; refetch retained authority either way.
-        registry.update(
-          mutation(projectKey(target.environmentId, target.input.projectId)),
-          (revision) => revision + 1,
-        );
-        return result;
-      },
+      ) =>
+        delivery
+          .run(registry, { environmentId: target.environmentId, input: target.input.request })
+          .pipe(
+            // A failed external write may have been accepted; refetch retained authority either way.
+            Effect.ensuring(
+              Effect.sync(() =>
+                registry.update(
+                  mutation(projectKey(target.environmentId, target.input.projectId)),
+                  (revision) => revision + 1,
+                ),
+              ),
+            ),
+          ),
     },
     read: (target: {
       readonly environmentId: EnvironmentId;

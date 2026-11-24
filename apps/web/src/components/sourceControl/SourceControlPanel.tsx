@@ -572,6 +572,7 @@ function ChangesView(props: {
           </span>
           <GitActionsControl
             gitCwd={rootPath}
+            name={repositoryDisplayName(rootPath, props.workspaceRoot)}
             activeThreadRef={props.threadRef}
             toolbarVariant="default"
             primaryControl={{

@@ -1,3 +1,7 @@
+import { T, useGT, useMessages, Var } from "gt-react";
+import type { SideThreadOpenIntent } from "@t3tools/client-runtime/side-thread";
+import type { ThreadRunSummary } from "@t3tools/client-runtime/state/models";
+import { threadErrorText } from "@t3tools/client-runtime/state/threads";
 import { threadEnvironment } from "../../state/threads";
 import { useAtomCommand } from "../../state/use-atom-command";
 import type { ToolCallDiffTarget } from "../../diffPanelStore";
@@ -23,6 +27,7 @@ import { parseScopedThreadKey } from "@t3tools/client-runtime/environment";
 import { resolveWorkGroupScrollAnchor } from "@t3tools/client-runtime/work-log/scroll-anchor";
 import type { WorkflowOpening } from "@t3tools/client-runtime/state/subagentRuntime";
 import { observeResize } from "~/lib/observeResize";
+import { preserveReadingPosition } from "~/lib/preserveReadingPosition";
 import { useStableCallback } from "~/hooks/useStableCallback";
 
 const NOOP_USE_ARTIFACT_TEMPLATE = () => {};
@@ -99,7 +104,7 @@ import { useMediaQuery } from "~/hooks/useMediaQuery";
 import { cn } from "~/lib/utils";
 import { type ClientSettings, type TimestampFormat } from "@t3tools/contracts/settings";
 import { useClientSettings } from "../../hooks/useSettings";
-import { DiffStatLabel, hasNonZeroStat } from "./DiffStatLabel";
+import { DiffStatLabel } from "./DiffStatLabel";
 import { type HandoffTimelineRun } from "./V2LifecycleRow";
 import { TimelineSystemDivider } from "./TimelineSystemDivider";
 
@@ -234,10 +239,13 @@ interface MessagesTimelineProps {
   ) => boolean;
   onReplyToResponse?: TimelineRowSharedState["onReplyToResponse"];
   isWorking: boolean;
+  /** The thread is catching up from a cached copy, whose working state may be stale. */
+  syncing?: boolean;
   runlessWorkActive?: boolean;
   activeTurnStartedAt?: string | null;
   /** Replaces "Thinking" while the active run's provider has not started a turn. */
   providerStartingLabel?: string | null;
+  providerStarting?: NonNullable<ThreadRunSummary["providerStarting"]> | null;
   worktreeSetup?: WorktreeSetupSnapshot | null;
   onCancelWorktreeSetup?: () => void;
   retryableWorkspacePreparationRunIds?: ReadonlySet<RunId>;
@@ -254,6 +262,7 @@ interface MessagesTimelineProps {
   listRef: React.RefObject<LegendListRef | null>;
   timelineEntries: ReadonlyArray<TimelineEntry>;
   latestRun: TimelineLatestRun | null;
+  usageLimitRunId?: RunId | null;
   /** The run the screen reader announcer follows; see announcedRun. */
   announcedRun?: { readonly runId: RunId; readonly status: TimelineLatestRun["status"] } | null;
   /** See isDetailBehindShell. */
@@ -269,6 +278,8 @@ interface MessagesTimelineProps {
   onOpenThread: (
     threadId: OrchestrationV2TurnItem["threadId"],
     environmentId?: EnvironmentId,
+    /** How the click asked to open a subagent or side chat; a plain click when absent. */
+    intent?: SideThreadOpenIntent,
   ) => void;
   renderHtmlRender?: TimelineRowSharedState["renderHtmlRender"];
   turnItemSource?: TimelineRowSharedState["turnItemSource"];
@@ -282,6 +293,8 @@ interface MessagesTimelineProps {
     readonly sideChat?: boolean;
     /** Where it runs, when that is another environment. */
     readonly environmentLabel?: string;
+    /** What this thread is to it, when not its subagent or side chat: `Step of`, say. */
+    readonly relation?: { readonly label: string; readonly actionLabel: string };
     readonly open?: () => void;
   } | null;
   workflowOpening?: WorkflowOpening | null;
@@ -363,9 +376,11 @@ const ConversationTimeline = memo(function ConversationTimeline({
   onCiteAssistantText,
   onReplyToResponse,
   isWorking,
+  syncing = false,
   runlessWorkActive = false,
   activeTurnStartedAt = null,
   providerStartingLabel = null,
+  providerStarting = null,
   worktreeSetup = null,
   footer = null,
   onCancelWorktreeSetup,
@@ -385,6 +400,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
   activeFindMatch = null,
   findNavigationId = 0,
   latestRun,
+  usageLimitRunId = null,
   announcedRun = null,
   detailBehindShell = false,
   runningRunId = null,
@@ -434,6 +450,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
   historyControls,
 }: MessagesTimelineProps) {
   const { liveActivity, turnEnd, pinLastUserMessage } = useClientSettings(selectTimelineDisplay);
+  const gt = useGT();
   const listIdentityKey = displayThreadKey ?? routeThreadKey;
   // Snapshot restore positions on identity changes; ongoing scroll writes must not move them.
   // Find open at the opening is part of the snapshot: opening find later
@@ -756,6 +773,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
     timelineEntries,
     pendingApprovalRequestIds,
     latestRun,
+    usageLimitRunId,
     runningRunId,
     expandedRunIds: visibleExpandedRunIds,
     expandedAttemptIds: visibleExpandedAttemptIds,
@@ -1208,6 +1226,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
     awaitingUser: awaitingUser !== null,
     isPreparingWorktree,
     providerStartingLabel,
+    providerStarting,
     latestRunId: latestRun?.runId ?? null,
     liveAnswerPreview:
       isWorking && toolCallVisibility === "zen" ? liveAnswerPreview(timelineEntries) : null,
@@ -1238,16 +1257,31 @@ const ConversationTimeline = memo(function ConversationTimeline({
       <div className="messages-timeline-row-frame">
         <div className="chat-content-lane pt-1 sm:pt-2">
           <TimelineSystemDivider
-            label={parentThreadLink.sideChat ? "Context from" : "Subagent of"}
+            label={
+              parentThreadLink.relation?.label ??
+              (parentThreadLink.sideChat
+                ? gt("Context from", {
+                    $context: "divider label; the parent thread title follows as a link",
+                  })
+                : gt("Subagent of", {
+                    $context: "divider label; the parent thread title follows as a link",
+                  }))
+            }
             detail={
               parentThreadLink.environmentLabel === undefined
                 ? parentThreadLink.title
-                : `${parentThreadLink.title} on ${parentThreadLink.environmentLabel}`
+                : gt("{title} on {environment}", {
+                    title: parentThreadLink.title,
+                    environment: parentThreadLink.environmentLabel,
+                  })
             }
             icon={parentThreadLink.sideChat ? MessagesSquareIcon : BotIcon}
             {...(parentThreadLink.open === undefined
               ? {}
-              : { actionLabel: "Open parent thread", onAction: parentThreadLink.open })}
+              : {
+                  actionLabel: parentThreadLink.relation?.actionLabel ?? gt("Open parent thread"),
+                  onAction: parentThreadLink.open,
+                })}
           />
         </div>
       </div>
@@ -1262,6 +1296,14 @@ const ConversationTimeline = memo(function ConversationTimeline({
 
   const canvas = useChatCanvas();
   const registerTimeline = canvas?.registerTimeline;
+  const shouldPreserveReadingPosition = useStableCallback(
+    () =>
+      !liveFollowEnabled &&
+      !anchoredEndSpace &&
+      !findActive &&
+      !citationPositioning &&
+      !restoringThreadPosition,
+  );
   // Stable so the list attaches once per mount, not on every render.
   const setTimelineList = useStableCallback((list: LegendListRef | null) => {
     listRef.current = list;
@@ -1277,6 +1319,9 @@ const ConversationTimeline = memo(function ConversationTimeline({
         })
       : null;
     viewportRef.current = viewport;
+    const stopPreservingReadingPosition = scrollNode
+      ? preserveReadingPosition(scrollNode, shouldPreserveReadingPosition)
+      : undefined;
     const detachViewport = viewport ? onViewportAttach?.(viewport) : undefined;
     const stopRememberingRelease = viewport?.onFollowReleased(rememberReleasedPosition);
     const stopDisclosureReveal = viewport?.subscribe(() => {
@@ -1305,6 +1350,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
     scheduleContentSizeChanged();
     return () => {
       stopListeningToContentSize?.();
+      stopPreservingReadingPosition?.();
       stopRememberingRelease?.();
       stopDisclosureReveal?.();
       if (contentSizeFrame !== null) cancelAnimationFrame(contentSizeFrame);
@@ -1385,7 +1431,8 @@ const ConversationTimeline = memo(function ConversationTimeline({
       >
         <div
           ref={observeLaneWidth}
-          className="chat-content-lane overflow-x-clip"
+          // An HTML preview can run wider than this lane, which stays the chat column's width.
+          className={cn("chat-content-lane", item.kind !== "html-render" && "overflow-x-clip")}
           data-timeline-root="true"
         >
           <AudioPreviewUnmountContext value={onAudioUnmount}>
@@ -1428,7 +1475,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
       return (
         <>
           {activityAnnouncer}
-          <div className="h-full min-h-0 bg-background" data-timeline-loading="true" />
+          <div className="h-full min-h-0" data-timeline-loading="true" />
         </>
       );
     }
@@ -1439,7 +1486,9 @@ const ConversationTimeline = memo(function ConversationTimeline({
           className="flex h-full items-center justify-center ps-(--chat-lane-inset-start) pe-(--chat-lane-inset-end)"
           style={{ paddingBottom: emptyPlaceholderInset }}
         >
-          <p className="text-sm text-muted-foreground">Send a message to start the conversation.</p>
+          <p className="text-sm text-muted-foreground">
+            <T>Send a message to start the conversation.</T>
+          </p>
         </div>
       </>
     );
@@ -1486,14 +1535,14 @@ const ConversationTimeline = memo(function ConversationTimeline({
                 !liveFollowEnabled ||
                 fullscreenAppRowId !== null
                   ? false
-                  : isWorking && !prefersReducedMotion && settlingListIdentity === null
+                  : isWorking && !syncing && !prefersReducedMotion && settlingListIdentity === null
                     ? TIMELINE_MAINTAIN_SCROLL_AT_END_SMOOTH
                     : TIMELINE_MAINTAIN_SCROLL_AT_END
               }
+              // A restore owns the scroll position until it lands. Anchoring would
+              // move it for the previous thread's header as the list swaps threads.
               maintainVisibleContentPosition={
-                findActive ||
-                citationPositioning ||
-                (restoringThreadPosition && rememberedPosition?.atEnd === false)
+                findActive || citationPositioning || restoringThreadPosition
                   ? false
                   : maintainVisibleContentPosition
               }
@@ -1550,17 +1599,18 @@ const ConversationTimeline = memo(function ConversationTimeline({
 
 function PinnedUserMessage(props: { readonly text: string; readonly onSelect: () => void }) {
   const text = props.text.replace(/\s+/g, " ").trim();
+  const gt = useGT();
   return (
     // Same insets and padding as the messages, so it stays clear of the thread details card.
     <div className="chat-banner-lane pointer-events-none absolute top-2 z-30 px-3 sm:px-12">
       <div className="chat-content-lane flex justify-end">
         <button
           type="button"
-          aria-label="Scroll to your last message"
+          aria-label={gt("Scroll to your last message")}
           onClick={props.onSelect}
           className="pointer-events-auto max-w-[80%] cursor-pointer rounded-2xl border border-border/70 bg-secondary/95 px-4 py-2 text-left text-sm text-foreground shadow-sm backdrop-blur outline-none hover:bg-secondary focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
         >
-          <span className="line-clamp-2 break-words">{text || "Your last message"}</span>
+          <span className="line-clamp-2 break-words">{text || gt("Your last message")}</span>
         </button>
       </div>
     </div>
@@ -1568,6 +1618,8 @@ function PinnedUserMessage(props: { readonly text: string; readonly onSelect: ()
 }
 
 function TimelineHistoryControl(props: MessagesTimelineHistoryControls) {
+  const gt = useGT();
+  const messages = useMessages();
   if (!props.hasMoreHistory && props.error === null) {
     return null;
   }
@@ -1578,20 +1630,20 @@ function TimelineHistoryControl(props: MessagesTimelineHistoryControls) {
           <button
             type="button"
             disabled={props.loading}
-            aria-label="Load earlier turns"
+            aria-label={gt("Load earlier turns")}
             onClick={() => props.onLoadEarlier()}
             className="flex w-full cursor-pointer items-center gap-3 py-1.5 text-muted-foreground text-xs hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default"
           >
             <span aria-hidden="true" className="h-px flex-1 bg-border/70" />
             <span className="shrink-0">
-              {props.loading ? "Loading earlier turns…" : "Load earlier turns"}
+              {props.loading ? gt("Loading earlier turns…") : gt("Load earlier turns")}
             </span>
             <span aria-hidden="true" className="h-px flex-1 bg-border/70" />
           </button>
         ) : null}
         {props.error !== null ? (
           <p role="status" className="text-center text-muted-foreground text-xs">
-            {props.error}
+            {threadErrorText(props.error, messages)}
           </p>
         ) : null}
       </div>
@@ -1781,9 +1833,12 @@ function ContextCompactionTimelineRow({
 }: {
   row: Extract<TimelineRow, { kind: "context-compaction" }>;
 }) {
+  const gt = useGT();
   const label =
-    row.title && row.label.startsWith("Context compacted")
-      ? row.title + row.label.slice("Context compacted".length)
+    row.title && row.compacted
+      ? row.tokenCounts
+        ? gt("{title} {before} → {after} tokens", { title: row.title, ...row.tokenCounts })
+        : row.title
       : row.label;
   const content = (
     <span className="flex min-w-0 items-center gap-1.5">
@@ -1794,14 +1849,25 @@ function ContextCompactionTimelineRow({
       )}
       {row.tokenCounts ? (
         <>
-          {row.title ?? "Context compacted"} {row.tokenCounts.before}
-          <ArrowRightIcon aria-hidden="true" className="size-3" />
-          {row.tokenCounts.after} tokens
+          {row.title ? (
+            <T>
+              <Var>{row.title}</Var> <Var>{row.tokenCounts.before}</Var>
+              <ArrowRightIcon aria-hidden="true" className="size-3" />
+              <Var>{row.tokenCounts.after}</Var> tokens
+            </T>
+          ) : (
+            <T>
+              Context compacted <Var>{row.tokenCounts.before}</Var>
+              <ArrowRightIcon aria-hidden="true" className="size-3" />
+              <Var>{row.tokenCounts.after}</Var> tokens
+            </T>
+          )}
         </>
       ) : (
         label
       )}
       {row.failure ? (
+        // oxlint-disable-next-line t3code/no-untranslated-copy -- separator before server-authored failure text
         <span className="min-w-0 truncate opacity-80">&middot; {row.failure}</span>
       ) : null}
     </span>
@@ -1832,6 +1898,7 @@ function useDeferredWorkLoading(
   row: { expanded: boolean; deferredWorkItemIds?: ReadonlyArray<string> },
   onToggle: () => void,
 ) {
+  const gt = useGT();
   const ctx = use(TimelineRowCtx);
   const loadWork = useAtomCommand(threadEnvironment.loadEarlierHistory, { reportFailure: false });
   const ref = parseScopedThreadKey(ctx.routeThreadKey);
@@ -1856,7 +1923,7 @@ function useDeferredWorkLoading(
   useEffect(() => {
     if (row.expanded && anchorsKey && environmentId && threadId) loadOnExpand();
   }, [row.expanded, anchorsKey, environmentId, threadId]);
-  const error = anchorsKey && failed ? "Couldn't load work. Click to retry." : null;
+  const error = anchorsKey && failed ? gt("Couldn't load work. Click to retry.") : null;
   const loading = ref !== null && row.expanded && anchorsKey !== "" && !failed;
   const toggle = () => {
     setFailed(false);
@@ -1868,8 +1935,9 @@ function useDeferredWorkLoading(
 }
 
 function WorkHistorySkeleton() {
+  const gt = useGT();
   return (
-    <div role="status" aria-label="Loading work history" className="space-y-2 px-1 pb-1 pt-3">
+    <div role="status" aria-label={gt("Loading work history")} className="space-y-2 px-1 pb-1 pt-3">
       {[0, 1, 2].map((index) => (
         <div key={index} className="flex items-center gap-2" aria-hidden="true">
           <Skeleton className="size-3 shrink-0" />
@@ -1890,6 +1958,7 @@ function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-
   const checklist = ctx.turnChecklists.get(row.runId);
   const stillRunning = report?.latest && !isWorking ? ctx.backgroundWorkRunning : 0;
   const onOpenTurnDiff = ctx.onOpenTurnDiff;
+  const gt = useGT();
   const { loading, error, toggle } = useDeferredWorkLoading(row, () =>
     ctx.onToggleTurnFold(row.runId),
   );
@@ -1912,7 +1981,9 @@ function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-
             </span>
             {report && report.steps > 0 ? (
               <span className="text-muted-foreground/80">
-                · {report.steps} {report.steps === 1 ? "step" : "steps"}
+                {gt("· {count, plural, one {{count} step} other {{count} steps}}", {
+                  count: report.steps,
+                })}
               </span>
             ) : null}
             {row.expanded ? (
@@ -1923,11 +1994,16 @@ function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-
           </button>
           {report?.files ? (
             <TurnReportChip
-              label={`${report.files.count} ${report.files.count === 1 ? "file" : "files"} changed, open the diff`}
+              label={gt(
+                "{count, plural, one {{count} file changed, open the diff} other {{count} files changed, open the diff}}",
+                { count: report.files.count },
+              )}
               onClick={onOpenTurnDiff ? () => onOpenTurnDiff(row.runId) : undefined}
             >
-              {report.files.count} {report.files.count === 1 ? "file" : "files"}
-              {hasNonZeroStat(report.files) ? (
+              {gt("{count, plural, one {{count} file} other {{count} files}}", {
+                count: report.files.count,
+              })}
+              {report.files.additions > 0 || report.files.deletions > 0 ? (
                 <DiffStatLabel
                   additions={report.files.additions}
                   deletions={report.files.deletions}
@@ -1938,25 +2014,29 @@ function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-
           ) : null}
           {report && report.subagents > 0 ? (
             <TurnReportChip>
-              {report.subagents} {report.subagents === 1 ? "subagent" : "subagents"}
+              {gt("{count, plural, one {{count} subagent} other {{count} subagents}}", {
+                count: report.subagents,
+              })}
             </TurnReportChip>
           ) : null}
           {report && report.failed > 0 ? (
             <TurnReportChip
               tone="failed"
-              label={`${report.failed} failed, show the steps`}
+              label={gt("{count} failed, show the steps", { count: report.failed })}
               onClick={row.expanded ? undefined : toggle}
             >
-              {report.failed} failed
+              {gt("{count} failed", { count: report.failed })}
             </TurnReportChip>
           ) : null}
           {checklist && checklist.total > 0 ? (
             <TurnReportChip tone={checklist.done < checklist.total ? "warning" : "neutral"}>
-              Checklist {checklist.done}/{checklist.total}
+              {gt("Checklist {done}/{total}", { done: checklist.done, total: checklist.total })}
             </TurnReportChip>
           ) : null}
           {stillRunning > 0 ? (
-            <TurnReportChip tone="warning">{stillRunning} still running</TurnReportChip>
+            <TurnReportChip tone="warning">
+              {gt("{count} still running", { count: stillRunning })}
+            </TurnReportChip>
           ) : null}
         </div>
         <TimelineRowTimestamp
@@ -2035,7 +2115,9 @@ function AttemptFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "at
           {row.label}
           {error ? ` · ${error}` : ""}
         </span>
-        <span className="text-2xs text-muted-foreground">Cut off by a steer</span>
+        <span className="text-2xs text-muted-foreground">
+          <T>Cut off by a steer</T>
+        </span>
       </button>
       {loading ? <WorkHistorySkeleton /> : null}
     </div>

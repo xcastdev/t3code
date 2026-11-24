@@ -75,6 +75,13 @@ import * as PeerLinks from "../peer/PeerLinks.ts";
 import * as ScratchThreadPromotion from "../project/ScratchThreadPromotion.ts";
 import * as SourceControlSignIn from "../sourceControl/SourceControlSignIn.ts";
 import * as TriageService from "../triage/TriageService.ts";
+import * as FeedbackStore from "../feedback/FeedbackStore.ts";
+import * as McpSignIn from "../mcpApps/McpSignIn.ts";
+import * as PeerClientPairing from "../peer/PeerClientPairing.ts";
+import * as PeerThreadRelay from "../peer/PeerThreadRelay.ts";
+import * as ThreadIssueService from "../orchestration-v2/ThreadIssueService.ts";
+import * as WorkflowRuntime from "../workflows/WorkflowRuntime.ts";
+import * as Workflows from "../workflows/Workflows.ts";
 
 // Unrelated native and external operations fail on use; no live layer is installed.
 export const layerControlledFixtureBoundaries = Layer.mergeAll(
@@ -156,4 +163,11 @@ export const layerControlledFixtureBoundaries = Layer.mergeAll(
   Layer.mock(SecretCheck.SecretCheck)({}),
   Layer.mock(SourceControlSignIn.SourceControlSignIn)({}),
   Layer.mock(TriageService.TriageService)({}),
+  Layer.mock(FeedbackStore.FeedbackStore)({}),
+  Layer.mock(McpSignIn.McpSignIn)({}),
+  Layer.mock(PeerClientPairing.PeerClientPairing)({}),
+  Layer.mock(PeerThreadRelay.PeerThreadRelay)({}),
+  Layer.mock(ThreadIssueService.ThreadIssueService)({}),
+  Layer.mock(WorkflowRuntime.WorkflowDefinitions)({}),
+  Workflows.layerDisabled,
 );

@@ -6,7 +6,7 @@ import {
   type AssistantTone,
 } from "@t3tools/client-runtime/assistant-presentation";
 import type { AssistantId, EnvironmentId } from "@t3tools/contracts";
-import { formatDuration } from "@t3tools/shared/usageLimits";
+import { formatDuration } from "@t3tools/shared/usageLimitsCopy";
 import { useNavigate } from "@tanstack/react-router";
 import { BotIcon, BrainIcon, CalendarClockIcon } from "lucide-react";
 

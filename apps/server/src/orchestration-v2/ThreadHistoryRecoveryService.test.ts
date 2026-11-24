@@ -10,10 +10,12 @@ import * as Recovery from "./ThreadHistoryRecoveryService.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import { setup, testLayer, threadId } from "./ThreadHistoryArchiveService.test-utils.ts";
+import { layerNoTaskFolders } from "./ProviderTurnStartService.testkit.ts";
 
 const layer = Recovery.layer.pipe(
   Layer.provide(Layer.mock(ThreadManagement.ThreadManagementService)({})),
   Layer.provideMerge(ProjectStore.layer),
+  Layer.provideMerge(layerNoTaskFolders),
   Layer.provideMerge(testLayer),
 );
 it.live(

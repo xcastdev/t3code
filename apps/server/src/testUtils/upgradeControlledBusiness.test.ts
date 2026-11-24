@@ -155,7 +155,7 @@ it.live("runs assistant chat, automatic memory and staged-only Git over a contro
         Stream.filter(
           ({ event }) =>
             event.type === "run.updated" &&
-            ["waiting", "failed", "cancelled", "interrupted"].includes(event.payload.status),
+            ["completed", "failed", "cancelled", "interrupted"].includes(event.payload.status),
         ),
         Stream.take(1),
         Stream.runCollect,
@@ -164,7 +164,7 @@ it.live("runs assistant chat, automatic memory and staged-only Git over a contro
       yield* worker.drain();
       assert.equal(
         terminal[0]?.event.type === "run.updated" ? terminal[0].event.payload.status : "missing",
-        "waiting",
+        "completed",
       );
       const transcript = yield* ControlledProviderTranscript;
       assert.equal((yield* transcript.turns).length, 1);

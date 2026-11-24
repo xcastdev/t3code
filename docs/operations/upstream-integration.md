@@ -2,8 +2,8 @@
 
 This fork tracks [pingdotgg/t3code](https://github.com/pingdotgg/t3code).
 
-**Last merged upstream commit:** `6ef2c05410b43a06eea6493a0dc66c1c92f5592f`
-(`fix(server): t3_thread_send_attachments says why a send was refused (#38058)`, 2026-11-17).
+**Last merged upstream commit:** `fb04b4d1994c776e374aea8b051459dbd55b68c1`
+(`fix(desktop): remote input waits while a preview page is annotated (#41987)`, 2026-11-23).
 The next integration starts from this commit. Update this line and the table below
 in every integration.
 
@@ -14,6 +14,7 @@ in every integration.
 | 2026-11-11       | `47f2c8d29e981c7723467efe137ee19e91df924e` | `31eea883c7f7849ada6eb49265cb11fc64d2ecbd` | `bec7f5fad7167ed8e897b3d91468779216a79123` |
 | 2026-11-15       | `31eea883c7f7849ada6eb49265cb11fc64d2ecbd` | `40dcbc5f6a8c4039f5f8f0dceb1bfa17ad0e3961` | `393439fae83cb791c847f060d59d4d3c65f10f7d` |
 | 2026-11-17       | `40dcbc5f6a8c4039f5f8f0dceb1bfa17ad0e3961` | `6ef2c05410b43a06eea6493a0dc66c1c92f5592f` | `93ffae9b0350dd67dfd90b727c703ab28d63a0d1` |
+| 2026-11-24       | `6ef2c05410b43a06eea6493a0dc66c1c92f5592f` | `fb04b4d1994c776e374aea8b051459dbd55b68c1` | `09b04a5d492430296be9738698630debecc3239d` |
 
 ## Rule: nothing changes without a decision
 
@@ -143,27 +144,29 @@ perf job, so leave it out. Remove the fork-check worktree when done.
 
 ## Included upstream changes
 
-- Issues on web and mobile, with GitHub, GitLab, Azure DevOps, Forgejo and Linear
-  trackers, thread links, agent tools, filters and saved views. PRs also gain saved views.
-- Native forks of running Claude threads, missing-session and startup recovery,
-  ACP kept-history recovery, Pi extension continuity and OpenCode Stop/goal fixes.
-- Background reports survive failed turns; follow-ups wait only for their own
-  background work, and completed one-time scheduled tasks are removed.
-- Destination-bound secrets, MCP retry authorization, provider approval boundaries,
-  canonical HTML dependency validation and stream cancellation.
-- Theme backgrounds, optional terminal close confirmation, configurable interactive
-  shells, removable default shortcuts, continuous dictation across thread switches,
-  snapshot copying and native streaming transcription settings.
-- Shared Effect attachment uploads and mobile outbox delivery; mobile navigation,
-  scrolling, composer and Android usage widget improvements.
-- Bounded thread and active-shell reads, checkpoint/reflog optimizations, usage-history
-  retention and no-op migration lock avoidance. Core migrations 097–098 add tracker
-  bindings and active-shell indexes.
-- Desktop file dragging, launcher/update/SSH fixes, sparse worktrees, translation
-  checks, shared mobile build actions and Linux package compatibility fixes.
+- Durable workflows on web, mobile, CLI and MCP (`t3_workflow`), behind the Labs
+  `workflowsEnabled` setting. Agent feedback reporting (`t3_feedback`), typed turn
+  results (`t3_submit_output`), and MCP milestone events by polling, streaming and webhooks.
+- Projects covering several repositories: tracked folders, task folders with one worktree
+  per repository, per-repository checkpoints, diffs and Git actions.
+- Agents read, open, update, review and merge pull requests, land GitHub stacks, and read
+  or re-run CI through MCP tools. GitHub issue statuses, several Linear accounts and teams,
+  fork-and-upstream issue lists, and a TanStack Source forge behind a feature flag.
+- Linked environments: read another environment's threads, link several at once, renew
+  links in use, forward ports and tunnel previews to loopback ports.
+- The whole app is translated into every supported locale, including Swedish, and lint
+  fails on untranslated copy.
+- Subagents, side chats and linked threads open the same way; providers show their real
+  startup step; Cursor and Antigravity edit earlier messages by rewinding.
+- A `T3CODE_FEATURE_FLAGS` service, pairing-link sessions renewed with the device's DPoP
+  key, and a two-minute default idle timeout for providers with native resume.
+- Server performance work, server-metrics scripts, and core migrations 099–111
+  (recovery, turn-start and delegated-task indexes, thread item counts, tracker scopes and
+  accounts, tracked and task folders, agent feedback and workflows).
+- Effect 4.1.5 and the Cursor SDK 1.4.2.
 
-The [upstream comparison](https://github.com/pingdotgg/t3code/compare/40dcbc5f6a8c4039f5f8f0dceb1bfa17ad0e3961...6ef2c05410b43a06eea6493a0dc66c1c92f5592f)
-contains 218 commits since the previous integration.
+The [upstream comparison](https://github.com/pingdotgg/t3code/compare/6ef2c05410b43a06eea6493a0dc66c1c92f5592f...fb04b4d1994c776e374aea8b051459dbd55b68c1)
+contains 1,313 commits since the previous integration.
 
 ## Fork integration decisions
 
@@ -212,7 +215,10 @@ this guard.
 
 Image description and web search can't run on an upstream text generator; like
 review guides, they fall back to a capable coding agent. Memory extraction may run on
-a text generator.
+a text generator. Both also follow upstream's text-generation rules: a disabled
+provider never runs, and a model that can't generate text falls back to that provider's
+default text model. A disabled Codex therefore refuses image description, because no
+other provider can see images.
 
 Mobile thread-history operations persist through `expo-sqlite/kv-store`, since
 upstream dropped `@react-native-async-storage/async-storage`. Pending operations
@@ -223,11 +229,12 @@ gateway and connections to users' own MCP servers. `pnpm-workspace.yaml` relaxes
 `@opentelemetry/api` peer range only for the OpenTelemetry SDKs that
 `@oh-my-pi/pi-coding-agent`, a `provider-omp` dev dependency, brings in.
 
-The MCP tool list grows from 91 tools and 95,214 bytes to 99 tools and 97,623 bytes.
-No fork tools are removed. Eight issue tools account for 2,408 bytes; the existing
-`t3_theme_set` schema's CSS limit grows from 50,000 to 100,000 characters, adding
-one byte. All other existing tool names, descriptions and input schemas are
-unchanged. Claude's system append remains 5,930 bytes and Codex context 7,324.
+The MCP tool list grows from 99 tools and 97,623 bytes to 111 tools and 107,187 bytes.
+No fork tools are removed and every fork-only tool is unchanged. Upstream adds twelve
+tools: seven pull request tools, `ci_logs`, `ci_rerun`, `t3_workflow`, `t3_feedback` and
+`t3_submit_output`. Twelve existing tools take upstream's revised descriptions or
+schemas; the fork had changed none of them. Claude's system append grows from 5,930 to
+6,245 bytes and Codex context from 7,324 to 7,639, both exactly upstream's.
 
 Queued-run promotion follows upstream's recovery retry: an accepted promotion receipt
 no longer ends promotion, so a run that recovery returned to the queue is promoted again
@@ -277,6 +284,53 @@ session. Already-started follow-ups keep their session and normal idle lifecycle
 pending background work can extend that lifecycle beyond the default idle timeout. The
 delayed pass repeats shared-thread protection and detaches the stopped thread
 instead of releasing a process another thread is using.
+
+Upstream workflows, behind the Labs setting, coexist with Work, teams and assistant
+routines. They share no tables, RPC methods, routes or MCP tool names. Mobile keeps its
+Agents and Work tabs beside upstream's unlisted Workflows tab.
+
+Mobile Settings stays a header button. Upstream's new iPad tab dock and the Android tab
+bar leave it out, and the dock carries the fork's New chat and New agent long-press
+menu. Upstream's iOS question-card placement and its TalkBack spacer fix are dropped:
+they position the in-flow card that the fork's live bar replaced.
+
+Web right-panel tabs use upstream's thread and linked-thread surfaces; the side-chat
+kind is gone and saved side-chat tabs migrate. The fork's grouped rail stays, gains one
+Linked items action for upstream's linked pull requests and issues, and keeps Terminal
+off the launcher. Sidebar search still collapses to an icon and expands into upstream's
+combobox. Thread details keeps its Agents title and collapsed summaries and adds
+upstream's workflow rows and open target. The fork's turn-fold changed-files chip
+stays although upstream removed the changed-files card. The fork's checklist label stays.
+Upstream's no-worktree rule for thread details applies only in the composer, because
+the fork removed the Workspace section there.
+
+Fork copy inside upstream files is wrapped for translation. Fork-only files with
+English copy are listed in a `no-untranslated-copy` override in `vite.config.ts`;
+a follow-up translates them, empties the list, and replaces the English that the other
+locales show for the fork's new keys.
+
+A Work task targets one repository. Dispatch takes an optional repository; without one
+it uses the project folder's repository, or the only tracked repository, and refuses
+when the choice is ambiguous. The task folder holds only that repository, and the run
+binding records its worktree, so verification, review and guarded publication still
+compare one repository, one reviewed head and one authorization record. Verification
+and publication refuse a target that is not its repository's top level. Web and mobile
+show a repository picker when the project tracks Git folders. Issue bindings still use
+the project folder.
+
+Closing a shared project terminal sends SIGHUP before SIGTERM, as upstream does for
+other terminals, through the owned-process signal path that keeps the drain proof.
+
+Secret requests keep the fork's execution pinning and whitespace-significant single
+secrets and add upstream's multi-field values. Upstream's per-run idempotency key
+applies. Native provider prompts accept only a single secret.
+
+A native turn resume on a provider without native resume fails, as upstream does,
+instead of starting a fresh turn that reports a resume.
+
+The server's core WebSocket RPC group is split in two, by tag prefix, to stay under the
+type checker's instantiation depth; otherwise importers infer `unknown` layers depending
+on check order.
 
 ## Validation
 
@@ -456,3 +510,46 @@ read (HTTP 401). MCP eval unit tests and a credential-free request dry run pass.
 Browser verification is the component suite; no full-client visual pass, native
 device build/test, paid model eval or real provider turn was performed. Main has
 not been advanced; nothing was pushed or deployed, and live userdata was not written.
+
+### Integration through `fb04b4d199` (2026-11-24)
+
+The merge had 218 conflicted files. Every workspace package and app, including evals,
+typechecks; the server typecheck is stable across repeated parallel and single-threaded
+runs. Formatting, lint, knip and the translation-catalog check pass.
+
+Web unit tests pass (6,153 tests). The four browser shards pass 1,649 of 1,650: the
+file preview "keeps an upward drag whose anchor unmounts" case fails identically on pure
+upstream. Mobile passes 3,974 tests; desktop 1,315 with one skipped; client-runtime
+2,747; contracts 274; shared 2,056 with five skipped; evals 1,055. Provider packages
+pass 1,718 of 1,720: the ACP Registry readiness-version and OpenCode in-place upgrade
+tests fail identically at the pre-merge fork.
+
+The server halves ran in full. Orchestration passes all 3,656 tests. Outside
+orchestration, 7,762 of 7,780 pass with 16 skipped. The background Git fetch case fails
+identically at the pre-merge fork; the other failure, a fork test schema without
+upstream's `tracked_folders_json`, was fixed and rerun.
+
+Regressions fixed before committing include a native-start admission race that stopped
+an already finished turn, now covered by a test; a desktop attached-target mismatch
+reported as a transport error; harnesses missing upstream's new services; and stale fork
+and upstream test expectations. The queued-run lock test now asserts that the run starts
+while the other thread's lock is still held.
+
+The preservation audit at merge commit `a294fa5725` reports 237 files, 1,202 upstream
+lines and 955 fork lines. Upstream lines classify as 217 ported, 120 decision, 66
+superseded and 799 noise. 720 of the noise lines are catalog entries for strings the
+merged source no longer uses. Fork lines classify as 385 ported, 185 decision, 7
+superseded and 378 noise. Web counts are hand tallies. No line was lost. The audit found
+one unreachable mobile hint, removed as upstream removed it, and an unused thread-details
+prop.
+
+Registration checks retain every fork RPC method, web route, mobile screen, settings
+field, provider driver and feature migration. Per-tool MCP inventories at the fork, pure
+upstream and the merge match the decision above, and the measured budget test passes.
+
+An isolated worktree server applied core migration 111 to a pruned copy of real data,
+ran the feature migrations through 20, completed V2 recovery, served the web client and
+environment descriptor (HTTP 200), and refused unauthenticated WebSocket-ticket and
+pairing-token requests (HTTP 401); it was then stopped. No real-client visual pass,
+native device build, paid model eval or real provider turn was run. Main has not been
+advanced; nothing was pushed or deployed, and live userdata was not written.

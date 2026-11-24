@@ -1,3 +1,4 @@
+import { msg } from "gt-react-native";
 import {
   resolveThreadWorkingStartedAt,
   threadRuntimeIsActive,
@@ -96,13 +97,14 @@ export const SIDE_CHAT_STATUS_BUCKETS: Record<SideChatState, ThreadDetailsStatus
   idle: "done",
 };
 
+/** `msg()` labels; display sites resolve them. */
 export const SIDE_CHAT_STATE_LABELS: Record<SideChatState, string> = {
-  approval: "Needs approval",
-  input: "Needs input",
-  running: "Working",
-  failed: "Failed",
-  done: "Done",
-  idle: "Not started",
+  approval: msg("Needs approval"),
+  input: msg("Needs input"),
+  running: msg("Working", { $context: "side chat status" }),
+  failed: msg("Failed", { $context: "side chat status" }),
+  done: msg("Done", { $context: "side chat status" }),
+  idle: msg("Not started"),
 };
 
 /** What a side chat needs or is doing, from its shell; a request outranks its run's status. */

@@ -210,6 +210,9 @@ const make = Effect.gen(function* () {
       const dispatch = yield* Schema.decodeEffect(Schema.fromJsonString(importedDispatchSchema))(
         journals[0]!.request_json,
       );
+      // A task folder's project folder need not be a repository; Git there answers for another.
+      if ((yield* git(["rev-parse", "--show-toplevel"])) !== binding.worktree)
+        return yield* verificationError("changed-target");
       const head = yield* git(["rev-parse", "HEAD"]);
       const base = yield* git([
         "rev-parse",

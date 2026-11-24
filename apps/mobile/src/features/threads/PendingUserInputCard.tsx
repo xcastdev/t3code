@@ -8,6 +8,7 @@ import {
   type TextDirection,
 } from "@t3tools/shared/textDirection";
 import { useNavigation } from "@react-navigation/native";
+import { T, useGT } from "gt-react-native";
 import { Platform, Pressable, View } from "react-native";
 
 import { AppText as Text } from "../../components/ui/AppText";
@@ -108,6 +109,7 @@ function QuestionText(props: {
 
 /** The questions and answers; the live bar's request slot carries the title and collapse. */
 export function PendingUserInputCard(props: PendingUserInputCardProps) {
+  const gt = useGT();
   const canRespond = props.pendingUserInput.responseCapability !== "not_resumable";
   const isResponding = props.respondingUserInputId === props.pendingUserInput.requestId;
   const responseDisabled = !canRespond || isResponding;
@@ -124,8 +126,10 @@ export function PendingUserInputCard(props: PendingUserInputCardProps) {
     <View className="gap-2.5">
       {!canRespond ? (
         <Text className="font-sans text-sm leading-5 text-foreground-muted">
-          The provider process for this request is no longer available. Interrupt or restart the run
-          to continue.
+          <T>
+            The provider process for this request is no longer available. Interrupt or restart the
+            run to continue.
+          </T>
         </Text>
       ) : null}
       {props.pendingUserInput.questions.map((question) => {
@@ -225,7 +229,7 @@ export function PendingUserInputCard(props: PendingUserInputCardProps) {
         );
       })}
       <Button
-        label="Submit answers"
+        label={gt("Submit answers")}
         fullWidth
         tone={props.answers ? "primary" : "secondary"}
         disabled={!props.canOperateThread || responseDisabled || props.answers === null}
@@ -233,7 +237,7 @@ export function PendingUserInputCard(props: PendingUserInputCardProps) {
       />
       {props.pendingUserInput.dismissible ? (
         <Button
-          label="Dismiss without answering"
+          label={gt("Dismiss without answering")}
           tone="text"
           disabled={isResponding}
           onPress={() => void props.onDismiss()}
@@ -241,7 +245,7 @@ export function PendingUserInputCard(props: PendingUserInputCardProps) {
       ) : null}
       {!props.canOperateThread ? (
         <Text className="font-sans text-xs text-foreground-tertiary">
-          This connection cannot submit answers.
+          <T>This connection cannot submit answers.</T>
         </Text>
       ) : null}
     </View>

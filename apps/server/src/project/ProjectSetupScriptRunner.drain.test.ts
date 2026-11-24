@@ -50,6 +50,7 @@ it.effect("captures the exact terminal after an interrupted open before writing 
       ServerSettings.layerTest(),
       NodeCrypto.layer,
       Layer.mock(TerminalManager.TerminalManager)({
+        close: () => Effect.void,
         getShell: () => Effect.succeed("/bin/zsh"),
         openCaptured: () =>
           Deferred.succeed(entered, undefined).pipe(
@@ -144,6 +145,7 @@ it.effect("withholds a delayed setup write from a replacement and retains unknow
       ServerSettings.layerTest(),
       NodeCrypto.layer,
       Layer.mock(TerminalManager.TerminalManager)({
+        close: () => Effect.void,
         getShell: () => Effect.succeed("/bin/zsh"),
         openCaptured: () =>
           Effect.succeed({
@@ -248,6 +250,7 @@ it.effect("a terminal restart ends the original setup observer before replacemen
       ServerSettings.layerTest(),
       NodeCrypto.layer,
       Layer.mock(TerminalManager.TerminalManager)({
+        close: () => Effect.void,
         getShell: () => Effect.succeed("/bin/zsh"),
         openCaptured: () => Effect.succeed({ capture: handle, snapshot }),
         subscribe: events.subscribe,

@@ -9,7 +9,7 @@ import { ProviderModelPicker } from "../chat/ProviderModelPicker";
 import { toastManager } from "../ui/toast";
 import { ScopedSwitch } from "./ScopedSwitch";
 import { SETTINGS_PICKER_TRIGGER_CLASSNAME, SettingsRow, SettingsSection } from "./settingsLayout";
-import { type SettingsSearchItemId, searchableSetting } from "./settingsSearch";
+import { type SettingsSearchItemId, useSearchableSetting } from "./settingsSearch";
 import { useSettingsScope } from "./SettingsScopeContext";
 import { useScopedModelDisabledReason } from "./useScopedModelAvailability";
 import type { ScopedSettingsPatch } from "./scopedSettings";
@@ -46,6 +46,7 @@ export function DelegatedModelToolSection({
 }: {
   readonly config: DelegatedModelToolConfig;
 }) {
+  const searchableSetting = useSearchableSetting();
   const settings = useScopedSettings();
   const updateSettings = useUpdateScopedSettings();
   const mixedEnabled = useScopedSettingsMixed([config.enabledKey]);

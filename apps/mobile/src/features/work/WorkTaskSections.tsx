@@ -12,6 +12,7 @@ import type {
   ProjectWorkDeliveryRequest,
 } from "@t3tools/contracts";
 import { asProjectTeamRecord } from "@t3tools/client-runtime/project-work";
+import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { useState } from "react";
 import { View } from "react-native";
 
@@ -21,6 +22,8 @@ import { ListChoiceRow } from "../../components/ui/ListChoiceRow";
 import { ListSection } from "../../components/ui/ListSection";
 import { Notice } from "../../components/ui/Notice";
 import { uuidv4 } from "../../lib/uuid";
+import { useProject } from "../../state/entities";
+import { useWorktreeRepositoryChoices } from "../../state/use-worktree-repository-choices";
 import { useWorkProviderCatalog } from "./useWorkProviderCatalog";
 import { workRouteLabel } from "@t3tools/client-runtime/project-work-logic";
 import { WorkBlock, WorkFormActions, WorkInput, WorkReadNotice, WorkText } from "./WorkParts";
@@ -197,6 +200,10 @@ function StartWorker({ surface }: { surface: Surface }) {
   const [memberId, setMemberId] = useState<string | null>(null);
   const [baseRef, setBaseRef] = useState("");
   const [root, setRoot] = useState(false);
+  const [repository, setRepository] = useState<string | null>(null);
+  const repositoryChoices =
+    useWorktreeRepositoryChoices(useProject(scopeProjectRef(scope.environmentId, scope.projectId)))
+      .choices ?? [];
   const key = "start";
   if ("reason" in availability)
     return (
@@ -214,9 +221,12 @@ function StartWorker({ surface }: { surface: Surface }) {
     plan,
   );
   const chosen = candidates.find((entry) => entry.member.recordId === memberId) ?? null;
+  const chosenRepository = repository === null ? {} : { repository };
   const problem = startChoiceProblem(
     chosen,
-    root ? { type: "root" } : { type: "worktree", baseRef },
+    root
+      ? { type: "root", ...chosenRepository }
+      : { type: "worktree", baseRef, ...chosenRepository },
   );
   const blocked =
     model.blockedReason ??
@@ -251,7 +261,9 @@ function StartWorker({ surface }: { surface: Surface }) {
         plan,
         member: chosen.member,
         role: chosen.role,
-        workspace: root ? { type: "root" } : { type: "worktree", baseRef: baseRef.trim() },
+        workspace: root
+          ? { type: "root", ...chosenRepository }
+          : { type: "worktree", baseRef: baseRef.trim(), ...chosenRepository },
       }),
     );
     if (sent) review.close();
@@ -285,6 +297,24 @@ function StartWorker({ surface }: { surface: Surface }) {
         selected={root}
         onPress={() => setRoot(true)}
       />
+      {repositoryChoices.length > 0 ? (
+        <>
+          <ListChoiceRow
+            label="Project folder"
+            description="The repository this worker works in"
+            selected={repository === null}
+            onPress={() => setRepository(null)}
+          />
+          {repositoryChoices.map((choice) => (
+            <ListChoiceRow
+              key={choice.repositoryPath}
+              label={choice.relativePath ?? choice.name}
+              selected={repository === choice.repositoryPath}
+              onPress={() => setRepository(choice.repositoryPath)}
+            />
+          ))}
+        </>
+      ) : null}
       <WorkBlock>
         {!root ? (
           <WorkInput label="Base branch" value={baseRef} onChange={setBaseRef} maxLength={256} />

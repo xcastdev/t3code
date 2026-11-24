@@ -1,4 +1,5 @@
 import {
+  DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER,
   ProjectId,
   ProviderDriverKind,
   type ModelSelection,
@@ -59,6 +60,7 @@ interface FakeCodexInput {
   requiredCwd?: string;
   requireInstructions?: string;
   requireMcpServersOff?: ReadonlyArray<string>;
+  requireOriginator?: string;
 }
 
 function makeFakeCodexBinary(dir: string, input: FakeCodexInput) {
@@ -75,6 +77,7 @@ function makeFakeCodexBinary(dir: string, input: FakeCodexInput) {
     requiredCwd: input.requiredCwd ?? null,
     requireInstructions: input.requireInstructions ?? null,
     requireMcpServersOff: input.requireMcpServersOff ?? [],
+    requireOriginator: input.requireOriginator ?? null,
     stderr: input.stderr ?? null,
     output: input.output,
     exitCode: input.exitCode ?? 0,
@@ -157,6 +160,9 @@ function makeFakeCodexBinary(dir: string, input: FakeCodexInput) {
         "}",
         "for (const name of check.requireMcpServersOff) {",
         '  if (!offServers.has(name)) fail("MCP server left on: " + name, 13);',
+        "}",
+        "if (check.requireOriginator !== null && process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE !== check.requireOriginator) {",
+        '  fail("unexpected originator: " + process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE, 14);',
         "}",
         'if (check.requiredCwd !== null && process.cwd() !== check.requiredCwd) fail("cannot inspect checkout", 10);',
         'if (check.requireInstructions !== null && !instructions.includes(check.requireInstructions)) fail("missing writer task", 11);',
@@ -505,9 +511,10 @@ it.layer(layerCodexTextGenerationTest)("CodexTextGeneration", (it) => {
     withFakeCodexEnv(
       {
         output: JSON.stringify({ title: "Remove default shapes" }),
-        launchArgs: "--config features.plugins=true --config features.apps=true",
+        launchArgs:
+          "--config features.plugins=true --config features.apps=true --config features.connectors=true",
         requireArg:
-          "--config features.plugins=true --config features.apps=true --config features.plugins=false --config features.apps=false --ephemeral",
+          "--config features.plugins=true --config features.apps=true --config features.connectors=true --config features.connectors=false --config features.plugins=false --config features.apps=false --ephemeral",
       },
       (textGeneration) =>
         Effect.gen(function* () {
@@ -537,6 +544,21 @@ it.layer(layerCodexTextGenerationTest)("CodexTextGeneration", (it) => {
             modelSelection: DEFAULT_TEST_MODEL_SELECTION,
           });
           expect(result.title).toBe("Hookless title");
+        }),
+    ),
+  );
+
+  it.effect("identifies codex exec as T3 Code", () =>
+    withFakeCodexEnv(
+      { output: JSON.stringify({ title: "Live title" }), requireOriginator: "T3 Code" },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          const result = yield* textGeneration.generateThreadTitle({
+            cwd: process.cwd(),
+            message: "Name this thread",
+            modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+          });
+          expect(result.title).toBe("Live title");
         }),
     ),
   );
@@ -727,10 +749,14 @@ const PREFLIGHT_PRIMARY_STATES = [
   "exhausted",
   "not installed",
   "not installed, fallback disabled for project",
+  "not installed, fallback model cannot generate text",
   "signed out",
   "signed out, fallback failed",
   "cannot generate text",
   "model cannot generate text",
+  "disabled",
+  "disabled, thread default model cannot generate text",
+  "disabled, fallback disabled for project",
 ] as const;
 
 it.effect.each(PREFLIGHT_PRIMARY_STATES)("text generation preflight: %s", (primaryState) =>
@@ -793,6 +819,24 @@ it.effect.each(PREFLIGHT_PRIMARY_STATES)("text generation preflight: %s", (prima
               ],
             }
           : {}),
+        ...((primaryState === "not installed, fallback model cannot generate text" ||
+          primaryState === "disabled, thread default model cannot generate text") &&
+        instanceId === fallback
+          ? {
+              models: [
+                {
+                  slug: threadDefault.model,
+                  name: threadDefault.model,
+                  isCustom: true,
+                  supportsTextGeneration: false,
+                  capabilities: null,
+                },
+              ],
+            }
+          : {}),
+        ...(primaryState.startsWith("disabled") && instanceId === primary
+          ? { enabled: false, status: "disabled" }
+          : {}),
         ...(primaryState === "exhausted" && instanceId === primary
           ? {
               usageLimits: {
@@ -851,7 +895,7 @@ it.effect.each(PREFLIGHT_PRIMARY_STATES)("text generation preflight: %s", (prima
               },
             },
             defaultModelSelection: threadDefault,
-            ...(primaryState === "not installed, fallback disabled for project"
+            ...(primaryState.endsWith("fallback disabled for project")
               ? {
                   projectSettingsOverrides: {
                     [projectId]: { providerInstances: { [fallback]: { enabled: false } } },
@@ -867,22 +911,38 @@ it.effect.each(PREFLIGHT_PRIMARY_STATES)("text generation preflight: %s", (prima
         ),
       ),
     );
-    expect(
-      yield* service.generateThreadTitle({
+    const generated = yield* service
+      .generateThreadTitle({
         cwd: "/tmp",
         message: "hello",
         linkedContext: "",
-        modelSelection: selection,
+        modelSelection:
+          primaryState === "disabled, thread default model cannot generate text"
+            ? threadDefault
+            : selection,
         projectId,
-      }),
-    ).toEqual({ title: "Generated title" });
+      })
+      .pipe(Effect.exit);
+    if (primaryState === "disabled, fallback disabled for project") {
+      expect(Exit.isFailure(generated)).toBe(true);
+      expect(calls).toEqual([]);
+      return;
+    }
+    expect(generated).toEqual(Exit.succeed({ title: "Generated title" }));
     expect(calls).toEqual([
       primaryState === "ready" ||
       primaryState === "pending" ||
       primaryState === "not installed, fallback disabled for project" ||
       primaryState === "signed out, fallback failed"
         ? selection
-        : threadDefault,
+        : primaryState === "not installed, fallback model cannot generate text" ||
+            primaryState === "disabled, thread default model cannot generate text"
+          ? {
+              instanceId: fallback,
+              model:
+                DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER[ProviderDriverKind.make("claudeAgent")],
+            }
+          : threadDefault,
     ]);
 
     const image = {
@@ -891,15 +951,36 @@ it.effect.each(PREFLIGHT_PRIMARY_STATES)("text generation preflight: %s", (prima
       mimeType: "image/png",
       instructions: "x",
     };
-    // Only Codex and OpenCode see images, so an unusable Codex has no fallback here.
-    expect(yield* service.describeImage({ ...image, modelSelection: selection })).toEqual({
-      description: "Seen",
-    });
+    // Only Codex and OpenCode see images, so an unusable Codex has no fallback here,
+    // and a disabled one is never run.
+    const primaryDisabled = primaryState.startsWith("disabled");
+    if (primaryDisabled) {
+      const disabled = yield* Effect.flip(
+        service.describeImage({ ...image, modelSelection: selection }),
+      );
+      expect(disabled.detail).toContain("No text generation provider is available");
+    } else {
+      expect(yield* service.describeImage({ ...image, modelSelection: selection })).toEqual({
+        description: "Seen",
+      });
+    }
     const refused = yield* Effect.flip(
       service.describeImage({ ...image, modelSelection: { instanceId: fallback, model: "m" } }),
     );
     expect(refused.detail).toContain("cannot look at images");
-    expect(imageCalls).toEqual([selection]);
+    expect(imageCalls).toEqual(
+      primaryDisabled
+        ? []
+        : [
+            primaryState === "model cannot generate text"
+              ? {
+                  instanceId: primary,
+                  model:
+                    DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER[ProviderDriverKind.make("codex")],
+                }
+              : selection,
+          ],
+    );
 
     // Claude and Codex both search the web, so an unusable Codex falls back to Claude.
     // Searches carry no project, so a project's fallback opt-out does not apply.
@@ -910,11 +991,18 @@ it.effect.each(PREFLIGHT_PRIMARY_STATES)("text generation preflight: %s", (prima
       sources: [],
     });
     expect(searchCalls).toEqual([
-      primaryState !== "ready" &&
-      primaryState !== "pending" &&
-      primaryState !== "signed out, fallback failed"
-        ? threadDefault
-        : selection,
+      primaryState === "ready" ||
+      primaryState === "pending" ||
+      primaryState === "signed out, fallback failed"
+        ? selection
+        : primaryState === "not installed, fallback model cannot generate text" ||
+            primaryState === "disabled, thread default model cannot generate text"
+          ? {
+              instanceId: fallback,
+              model:
+                DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER[ProviderDriverKind.make("claudeAgent")],
+            }
+          : threadDefault,
     ]);
   }),
 );
@@ -995,6 +1083,7 @@ it.effect(
         );
       const input = {
         cwd: "/tmp",
+        projectCwd: "/tmp",
         number: 1,
         title: "Change",
         description: "",

@@ -1,5 +1,5 @@
 import type { ProjectScript } from "@t3tools/contracts";
-import { projectScriptMenuLabel } from "@t3tools/shared/projectScripts";
+import { projectScriptMenuLabel } from "@t3tools/shared/projectScriptsCopy";
 
 import type { AppSymbolName } from "../../components/ui/AppSymbol";
 import {
@@ -16,6 +16,7 @@ export type ThreadToolAction =
   | { readonly type: "browser" }
   | { readonly type: "device" }
   | { readonly type: "history" }
+  | { readonly type: "guest-share" }
   | { readonly type: "git"; readonly itemId: string }
   | { readonly type: "project"; readonly section: ProjectWorkSection };
 
@@ -78,6 +79,8 @@ export interface ThreadToolsInput {
   readonly deviceNames: ReadonlyArray<string>;
   /** Whether the thread belongs to a project with Work views. */
   readonly hasProject: boolean;
+  /** Whether this environment offers guest links for the thread. */
+  readonly canShareWithGuest: boolean;
   /** The header's former Git menu, listed as its own section. */
   readonly gitItems: ReadonlyArray<ThreadToolGitItem>;
 }
@@ -249,6 +252,19 @@ export function threadToolSections(input: ThreadToolsInput): ReadonlyArray<Threa
       disabled: !input.hasThread,
       action: { type: "history" },
     },
+    ...(input.hasThread && input.canShareWithGuest
+      ? [
+          {
+            id: "guest-share",
+            title: "Share with guest",
+            subtitle: "Invite someone to this thread",
+            icon: "person.badge.plus",
+            nested: false,
+            disabled: false,
+            action: { type: "guest-share" },
+          } satisfies ThreadToolRow,
+        ]
+      : []),
   ];
   const git = gitRows(input.gitItems);
   const project = input.hasProject

@@ -14,6 +14,7 @@ import {
 } from "@t3tools/contracts";
 import type { deriveTurnWorkCounts } from "@t3tools/shared/turnWorkCounts";
 import * as DateTime from "effect/DateTime";
+import { m } from "../../i18n/messages";
 
 import {
   deriveTurnAgentWork,
@@ -70,10 +71,15 @@ describe("resolveSubagentRowPresentation", () => {
 
   it("falls back to a trimmed prompt when the agent has no title", () => {
     const long = resolveSubagentRowPresentation({ ...base, prompt: "x".repeat(200) });
+    const emoji = resolveSubagentRowPresentation({
+      ...base,
+      prompt: `${"x".repeat(76)}😀 and more`,
+    });
     const titled = resolveSubagentRowPresentation({ ...base, title: "Subagent: /root/my_worker" });
 
     expect(long.title).toHaveLength(80);
     expect(long.title.endsWith("...")).toBe(true);
+    expect(emoji.title).toBe(`${"x".repeat(76)}...`);
     expect(titled.title).toBe("My Worker");
   });
 
@@ -412,7 +418,7 @@ describe("deriveTurnAgentWork", () => {
       history: { hasMoreHistory: true, error: null },
     });
     expect(work?.retention).toBe("partial");
-    expect(TURN_WORK_RETENTION_LABELS[work?.retention ?? "unknown"]).toBe("Loaded rows only");
+    expect(m(TURN_WORK_RETENTION_LABELS[work?.retention ?? "unknown"])).toBe("Loaded rows only");
   });
 
   it("refuses a completeness claim without usable history metadata", () => {

@@ -16,6 +16,8 @@ import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
+import { layerNoTaskFolders } from "../orchestration-v2/ProviderTurnStartService.testkit.ts";
+import type * as TaskFolders from "../workspace/TaskFolders.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
@@ -65,6 +67,8 @@ export interface HarnessOptions {
   readonly generateBranchName?: TextGeneration.TextGeneration["Service"]["generateBranchName"];
   readonly runSetup?: ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"]["runForThread"];
   readonly providers: ReadonlyArray<ServerProvider>;
+  /** Defaults to a project that tracks no Git folder. */
+  readonly taskFolders?: Layer.Layer<TaskFolders.TaskFolders>;
 }
 
 export function makeHarness(options: HarnessOptions) {
@@ -156,6 +160,7 @@ export function makeHarness(options: HarnessOptions) {
       isScratchProject: () => Effect.succeed(false),
       folderForThread: () => Effect.succeedNone,
     }),
+    options.taskFolders ?? layerNoTaskFolders,
   );
   const layerLaunch = ThreadLaunch.layer.pipe(
     Layer.provide(

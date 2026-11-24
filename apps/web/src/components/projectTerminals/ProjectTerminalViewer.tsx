@@ -11,6 +11,7 @@ import {
 } from "@t3tools/client-runtime/project-terminal-view";
 import {
   isAtomCommandInterrupted,
+  runAtomCommand,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import type {
@@ -135,20 +136,18 @@ export function ProjectTerminalViewer({
   const writeData = useEffectEvent((data: string, kind?: "binary" | "reply") => {
     const terminal = stateRef.current.terminal;
     if (!writable || terminal === null) return;
-    void projectTerminalEnvironment.write
-      .run(registry, {
-        environmentId,
-        input: {
-          ...handle,
-          data,
-          expectedGeneration: terminal.generation,
-          ...(kind ? { [kind]: true } : {}),
-        },
-      })
-      .then((result) => {
-        if (result._tag === "Failure" && !isAtomCommandInterrupted(result))
-          setNotice(describeProjectTerminalFailure(squashAtomCommandFailure(result)));
-      });
+    void runAtomCommand(registry, projectTerminalEnvironment.write, {
+      environmentId,
+      input: {
+        ...handle,
+        data,
+        expectedGeneration: terminal.generation,
+        ...(kind ? { [kind]: true } : {}),
+      },
+    }).then((result) => {
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result))
+        setNotice(describeProjectTerminalFailure(squashAtomCommandFailure(result)));
+    });
   });
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- creates the Ghostty terminal surface on the mount element, observes theme changes, and disposes both
@@ -211,7 +210,7 @@ export function ProjectTerminalViewer({
     const surface = surfaceRef.current;
     const terminal = stateRef.current.terminal;
     if (!surface || terminal === null) return;
-    const result = await projectTerminalEnvironment.resize.run(registry, {
+    const result = await runAtomCommand(registry, projectTerminalEnvironment.resize, {
       environmentId,
       input: {
         ...handle,
@@ -233,7 +232,7 @@ export function ProjectTerminalViewer({
     );
     if (!confirmed) return;
     setStopping(true);
-    const result = await projectTerminalEnvironment.kill.run(registry, {
+    const result = await runAtomCommand(registry, projectTerminalEnvironment.kill, {
       environmentId,
       input: { ...handle, expectedGeneration: terminal.generation },
     });

@@ -7,6 +7,7 @@ import {
   SettingsIcon,
 } from "lucide-react";
 import type { ReactNode } from "react";
+import { T, useGT } from "gt-react";
 import { memo } from "react";
 import { Link, useLocation, useNavigate, useRouter } from "@tanstack/react-router";
 import { listPluginPanelTargets } from "@t3tools/client-runtime/plugins/commands";
@@ -74,6 +75,7 @@ export const SidebarChromeHeader = memo(function SidebarChromeHeader({
 }) {
   const stageLabel = useEnvironmentStageLabel();
   const environmentIdentificationMode = useEnvironmentIdentificationMode();
+  const gt = useGT();
   const backdropVariant = resolveSidebarStageBackdropVariant(
     stageLabel,
     environmentIdentificationMode,
@@ -95,7 +97,7 @@ export const SidebarChromeHeader = memo(function SidebarChromeHeader({
         <SidebarTrigger
           variant={backdropVariant ? "media-navigation" : "ghost"}
           className="relative top-auto translate-y-0"
-          aria-label="Toggle main sidebar"
+          aria-label={gt("Toggle main sidebar")}
         />
       </div>
       <div className="relative z-10 flex h-8 min-w-0 flex-1 flex-wrap content-start items-center gap-x-2 overflow-hidden py-0.5">
@@ -159,7 +161,8 @@ function HistoryNavigationButton({
 }) {
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const enabled = useCanNavigateHistory(direction);
-  const label = direction === "back" ? "Go back" : "Go forward";
+  const gt = useGT();
+  const label = direction === "back" ? gt("Go back") : gt("Go forward");
   const shortcutLabel = shortcutLabelForCommand(
     keybindings,
     direction === "back" ? "navigation.back" : "navigation.forward",
@@ -193,9 +196,10 @@ function HistoryNavigationButton({
 }
 
 function SidebarBrand({ onBackdrop }: { onBackdrop: boolean }) {
+  const gt = useGT();
   return (
     <Link
-      aria-label="T3 Code home"
+      aria-label={gt("T3 Code home")}
       className={cn(
         "relative z-10 ml-[var(--workspace-titlebar-content-left)] hidden h-7 w-fit min-w-0 shrink-0 items-center overflow-hidden rounded-md outline-hidden ring-ring focus-visible:ring-2 focus-visible:ring-inset md:flex",
         onBackdrop ? "text-white" : "text-foreground",
@@ -217,7 +221,8 @@ function SidebarBrandMark({ onBackdrop }: { onBackdrop: boolean }) {
           onBackdrop ? "text-white/70" : "text-muted-foreground",
         )}
       >
-        Code
+        {/* oxlint-disable-next-line t3code/no-untranslated-copy -- product wordmark */}
+        {"Code"}
       </span>
     </span>
   );
@@ -254,13 +259,18 @@ function SidebarUtilityItem({
 
 /** The Work entry, with a red dot while any project's Work waits on the user. */
 function SidebarWorkItem(props: { readonly onClick: () => void }) {
+  const gt = useGT();
   const keys = useAllWorkAttentionKeys();
   const pulse = useAttentionArrivals(keys);
   const continuous = useAttentionPulseContinuous();
   return (
     <SidebarUtilityItem
       icon={<ListTodoIcon />}
-      label={keys.length > 0 ? `Work, ${keys.length} waiting on you` : "Work"}
+      label={
+        keys.length > 0
+          ? gt("Work, {count} waiting on you", { count: keys.length })
+          : gt("Work", { $context: "sidebar entry for project Work" })
+      }
       {...(keys.length > 0
         ? {
             indicator: (
@@ -275,6 +285,7 @@ function SidebarWorkItem(props: { readonly onClick: () => void }) {
 
 /** Every panel this device and each connected environment offers, grouped by where it runs. */
 function SidebarPluginsItem(props: { readonly onNavigate: () => void }) {
+  const gt = useGT();
   const router = useRouter();
   const panels = listPluginPanelTargets(useEnabledPluginInstalls()).filter(
     (target) => target.kind === "panel",
@@ -285,11 +296,13 @@ function SidebarPluginsItem(props: { readonly onNavigate: () => void }) {
       <Menu>
         <Tooltip>
           <TooltipTrigger
-            render={<MenuTrigger render={<SidebarMenuButton aria-label="Plugins" size="icon" />} />}
+            render={
+              <MenuTrigger render={<SidebarMenuButton aria-label={gt("Plugins")} size="icon" />} />
+            }
           >
             <PuzzleIcon />
           </TooltipTrigger>
-          <TooltipPopup side="top">Plugins</TooltipPopup>
+          <TooltipPopup side="top">{gt("Plugins")}</TooltipPopup>
         </Tooltip>
         <MenuPopup side="top" align="start">
           {scopes.map((scope) => {
@@ -319,7 +332,7 @@ function SidebarPluginsItem(props: { readonly onNavigate: () => void }) {
             }}
           >
             <MenuItemLabel>
-              {scopes.length > 0 ? "Manage plugins" : "Install a plugin"}
+              {scopes.length > 0 ? gt("Manage plugins") : gt("Install a plugin")}
             </MenuItemLabel>
           </MenuItem>
         </MenuPopup>
@@ -335,6 +348,7 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu(props: {
   const showUsage = props.view !== "projects";
   const navigate = useNavigate();
   const navigateToMainApp = useNavigateToMainApp();
+  const gt = useGT();
   const { isMobile, setOpenMobile } = useSidebar();
   const isOnUtilityPage = useLocation({
     select: (location) => isSidebarUtilityPage(location.pathname),
@@ -383,27 +397,29 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu(props: {
         <SidebarMenuItem className="min-w-0 flex-1">
           <SidebarMenuButton onClick={handleBackClick}>
             <ArrowLeftIcon />
-            <span>Back</span>
+            <span>
+              <T>Back</T>
+            </span>
           </SidebarMenuButton>
         </SidebarMenuItem>
       ) : (
         <>
           <SidebarUtilityItem
             icon={<SettingsIcon />}
-            label="Settings"
+            label={gt("Settings")}
             onClick={handleSettingsClick}
           />
           {showProjectTools && pullRequestsSupported ? (
             <SidebarUtilityItem
               icon={<PullRequestGlyph.pullRequest />}
-              label="Pull requests"
+              label={gt("Pull requests")}
               onClick={handlePullRequestsClick}
             />
           ) : null}
           {issuesSupported ? (
             <SidebarUtilityItem
               icon={<IssueGlyph.issue />}
-              label="Issues"
+              label={gt("Issues", { $context: "sidebar link to the list of issues" })}
               onClick={handleIssuesClick}
             />
           ) : null}
@@ -411,7 +427,7 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu(props: {
           {showUsage ? (
             <SidebarUtilityItem
               icon={<ChartNoAxesColumnIcon />}
-              label="Usage"
+              label={gt("Usage")}
               onClick={handleUsageClick}
             />
           ) : null}

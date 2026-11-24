@@ -107,7 +107,12 @@ export const layer: Layer.Layer<ThreadForkServiceV2> = Layer.succeed(
       const sourceProviderThread =
         input.archiveSource === undefined ? input.sourceProviderThread : undefined;
       // The remote parent delegated the source thread, not its forks.
-      const { delegatedFrom: _delegatedFrom, ...inherited } = input.sourceProjection.thread;
+      // Nor is a fork a step of the run its source was one of.
+      const {
+        delegatedFrom: _delegatedFrom,
+        workflowRun: _workflowRun,
+        ...inherited
+      } = input.sourceProjection.thread;
       const targetThread: OrchestrationV2AppThread = {
         ...inherited,
         // PR context follows the conversation; watching remains the source thread's responsibility.
@@ -118,8 +123,9 @@ export const layer: Layer.Layer<ThreadForkServiceV2> = Layer.succeed(
         creationSource: input.creationSource,
         id: input.targetThreadId,
         title: input.title ?? `${input.sourceProjection.thread.title} fork`,
-        // The source's title job completes only on the source thread.
+        // The source's title job and rename stay with the source thread.
         titleRegeneration: null,
+        titleRenamed: false,
         activeProviderThreadId: null,
         lineage: {
           parentThreadId: input.sourceProjection.thread.id,

@@ -1,6 +1,7 @@
 import type {
   CommandId,
   ProjectId,
+  ProjectTeamDispatchWorkspace,
   ProjectTeamIntegrationSource,
   ProjectTeamIntegrationSourceRef,
   ProjectTeamRecordRead,
@@ -303,7 +304,7 @@ export function startCandidates(
 /** Why Start can't be confirmed for this choice, re-checked whenever member or workspace changes. */
 export function startChoiceProblem(
   candidate: WorkStartCandidate | null,
-  workspace: { readonly type: "root" } | { readonly type: "worktree"; readonly baseRef: string },
+  workspace: ProjectTeamDispatchWorkspace,
 ): string | null {
   if (candidate === null) return "Choose a team member.";
   if (candidate.ineligible !== null) return candidate.ineligible;
@@ -492,7 +493,7 @@ export function makeDispatchIntent(
     plan: WorkStartPlan;
     member: WorkMemberRecord;
     role: WorkRoleRecord;
-    workspace: { type: "root" } | { type: "worktree"; baseRef: string };
+    workspace: ProjectTeamDispatchWorkspace;
   },
 ) {
   return {

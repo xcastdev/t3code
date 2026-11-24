@@ -16,9 +16,13 @@ import * as ThreadForkService from "../orchestration-v2/ThreadForkService.ts";
 import * as RuntimePolicy from "../orchestration-v2/RuntimePolicy.ts";
 import * as ProviderTurnStartService from "../orchestration-v2/ProviderTurnStartService.ts";
 import * as ProviderTurnControlService from "../orchestration-v2/ProviderTurnControlService.ts";
+import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
+import * as TaskFolders from "../workspace/TaskFolders.ts";
+import { ThreadWorktreeRestore } from "../workspace/restoreMissingWorktree.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as Option from "effect/Option";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
@@ -83,6 +87,9 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
           otherWorkingThreads: Effect.fn(
             "ProviderSessionManager.ProviderSessionManagerV2.otherWorkingThreads",
           )(() => Effect.succeed([])),
+          forgetLoadedProviderThread: Effect.fn(
+            "ProviderSessionManager.ProviderSessionManagerV2.forgetLoadedProviderThread",
+          )(() => Effect.void),
           subscribePromptSuggestion: () => Stream.empty,
         }),
       );
@@ -105,7 +112,15 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
         IdAllocator.layer,
         CommandPolicy.layer,
         ContextHandoffService.layer.pipe(Layer.provide(IdAllocator.layer)),
-        RuntimePolicy.layer,
+        Layer.succeed(RuntimePolicy.RuntimePolicyV2, {
+          resolve: Effect.fn("RuntimePolicy.RuntimePolicyV2.resolve")((input) =>
+            Effect.succeed({
+              runtimeMode: input.thread.runtimeMode,
+              interactionMode: input.thread.interactionMode,
+              cwd: input.thread.worktreePath,
+            }),
+          ),
+        }),
         ThreadForkService.layer,
         ProviderContinuationRequests.layer,
         Layer.mock(CheckpointService.CheckpointServiceV2)({}),
@@ -116,6 +131,16 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
           ),
         }),
         Layer.mock(GitWorkflowService.GitWorkflowService)({}),
+        Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({
+          runForThread: Effect.fn("ProjectSetupScriptRunner.ProjectSetupScriptRunner.runForThread")(
+            () => refuse("project.setup"),
+          ),
+        }),
+        Layer.mock(TaskFolders.TaskFolders)({
+          plan: () => Effect.succeed(null),
+          find: () => Effect.succeed(null),
+        }),
+        Layer.mock(ThreadWorktreeRestore)({ takeRecreated: () => Effect.undefined }),
         Layer.unwrap(
           Effect.gen(function* () {
             const projects = yield* ProjectStore.ProjectStoreV2;
@@ -208,7 +233,9 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
               ),
             );
       const start = ProviderTurnStartService.layer.pipe(Layer.provide(fakes));
-      const control = ProviderTurnControlService.layer.pipe(Layer.provide(sessions));
+      const control = ProviderTurnControlService.layer.pipe(
+        Layer.provide(Layer.merge(sessions, McpAppModelContext.layerEmpty)),
+      );
       const recovery =
         mode === "controlled-fixture"
           ? Layer.succeed(

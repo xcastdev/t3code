@@ -37,6 +37,9 @@ import { projectTeamRouteMatches, projectTeamScopeHash } from "./ProjectTeamPoli
 import { projectTaskAssignment } from "./ProjectTaskResources.ts";
 import * as Recovery from "./ProjectTeamRecovery.ts";
 import * as Reviews from "./ProjectTeamReviewFreshness.ts";
+import { selectWorkRepository } from "./ProjectWorkRepositorySelection.ts";
+import * as TaskFolders from "../workspace/TaskFolders.ts";
+import * as Path from "effect/Path";
 const hash = (value: unknown) =>
   NodeCrypto.createHash("sha256").update(canonicalProjectWorkPayload(value)).digest("hex");
 const decodeRuntimeEvent = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
@@ -45,6 +48,18 @@ const decodeControl = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OwnerDeadlineControlPayload),
 );
 const rejected = () => new Journal.ProjectTeamDispatchJournalError({ reason: "identity-conflict" });
+/** The task folder holds only the bound repository: one run, one repository's commits. */
+const launchWorkspace = (
+  workspace: ProjectTeamDispatchIntent["workspace"],
+  binding: Extract<ProjectTeamRecord, { kind: "run-binding" }>,
+): Launch.ThreadLaunchWorkspaceStrategy =>
+  workspace.type === "root"
+    ? { type: "root" }
+    : {
+        type: "worktree",
+        baseRef: workspace.baseRef,
+        repositories: binding.repository === undefined ? [] : [{ path: binding.repository }],
+      };
 export class ProjectTeamDispatch extends Context.Service<
   ProjectTeamDispatch,
   {
@@ -69,6 +84,40 @@ const make = Effect.gen(function* () {
   const terminals = yield* Effect.serviceOption(Terminals.TerminalManager);
   const eventBus = yield* Effect.serviceOption(Bus.ProjectWorkEventBus);
   const reviews = yield* Effect.serviceOption(Reviews.ProjectTeamReviewFreshness);
+  const taskFolders = yield* TaskFolders.TaskFolders;
+  const path = yield* Path.Path;
+  const selectRepository = Effect.fn("ProjectTeamDispatch.selectRepository")(function* (
+    input: ProjectTeamDispatchIntent,
+  ) {
+    const projects = yield* sql<{
+      workspace_root: string;
+    }>`SELECT workspace_root FROM projection_projects WHERE project_id=${input.projectId} AND deleted_at IS NULL`;
+    const projectRoot = projects[0]?.workspace_root;
+    if (projectRoot === undefined) return yield* rejected();
+    const plan = yield* taskFolders.plan({ projectId: input.projectId }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new Journal.ProjectTeamDispatchJournalError({
+            reason: "repository-unavailable",
+            cause,
+          }),
+      ),
+    );
+    const selection = selectWorkRepository(path, {
+      projectRoot,
+      plan,
+      requested: input.workspace.repository,
+    });
+    if (selection._tag === "refused")
+      return yield* new Journal.ProjectTeamDispatchJournalError({ reason: selection.reason });
+    return selection.repository === undefined
+      ? undefined
+      : {
+          path: selection.repository,
+          // The thread opens in the project folder's place, in the task folder or the original.
+          relative: path.relative(path.resolve(projectRoot), selection.repository),
+        };
+  });
   const publishRuntime = Effect.fn("ProjectTeamDispatch.publishRuntime")(function* (
     commandId: string,
   ) {
@@ -178,7 +227,7 @@ const make = Effect.gen(function* () {
         modelSelection: snapshot.request.modelSelection,
         runtimeMode: "full-access",
         interactionMode: "default",
-        workspaceStrategy: snapshot.request.workspace,
+        workspaceStrategy: launchWorkspace(snapshot.request.workspace, binding),
         initialMessage: {
           messageId: MessageId.make(`${snapshot.dispatchId}:message`),
           text: snapshot.assignment,
@@ -251,6 +300,7 @@ const make = Effect.gen(function* () {
           input.workspace.type !== "worktree"
         )
           return yield* rejected();
+        const selectedRepository = yield* selectRepository(input);
         const plan = records
           .filter(
             (record): record is Extract<ProjectTeamRecord, { kind: "plan-revision" }> =>
@@ -307,6 +357,7 @@ const make = Effect.gen(function* () {
           },
           workspaceState: "pending",
           workspaceKind: input.workspace.type,
+          ...(selectedRepository === undefined ? {} : { repository: selectedRepository.path }),
           worktree: null,
           branch: null,
           leaseGeneration: generation,
@@ -379,7 +430,7 @@ const make = Effect.gen(function* () {
             },
           },
         } satisfies import("@t3tools/contracts").ProjectWorkCommand;
-        const assignment = projectTaskAssignment(state, binding);
+        const assignment = projectTaskAssignment(state, binding, selectedRepository?.relative);
         const reviewAssignment = state.foundationRecords?.some(
           (record) =>
             record.kind === "task-membership" &&

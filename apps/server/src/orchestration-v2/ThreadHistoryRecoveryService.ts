@@ -25,6 +25,7 @@ import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import { isForkableSourceRunStatus } from "./ThreadForkService.ts";
 import { isCheckpointRestoreIsolated } from "./CheckpointRestoreSafety.ts";
 import { ProjectionStoreV2 } from "./ProjectionStore.ts";
+import * as TaskFolders from "../workspace/TaskFolders.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as Archive from "./ThreadHistoryArchiveService.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
@@ -144,6 +145,24 @@ const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const projects = yield* ProjectStore.ProjectStoreV2;
+  const taskFolders = yield* TaskFolders.TaskFolders;
+  // An unreadable task folder cannot prove its repository worktrees are unshared.
+  const isRestoreIsolated = Effect.fn("ThreadHistoryRecovery.isRestoreIsolated")(function* (
+    thread: Parameters<typeof isCheckpointRestoreIsolated>[0],
+    cwd: string,
+  ) {
+    const found =
+      thread.worktreePath == null
+        ? undefined
+        : yield* Effect.result(taskFolders.find(thread.worktreePath));
+    if (found?._tag === "Failure") return false;
+    return yield* isCheckpointRestoreIsolated(thread, { cwd }, found?.success ?? null, {
+      fileSystem,
+      path,
+      projections,
+      projects,
+    });
+  });
   const assertArchive = Effect.fn("ThreadHistoryRecovery.assertArchive")(function* (
     input: Identity,
   ) {
@@ -368,14 +387,7 @@ const make = Effect.gen(function* () {
             }>`SELECT checkpoint_id,cwd,retained_ref FROM t3_workflow_v2_history_archive_refs WHERE archive_id=${input.archiveId} AND commit_oid IS NOT NULL ORDER BY checkpoint_id`;
             for (const ref of refs) {
               const available = yield* Effect.gen(function* () {
-                if (
-                  !(yield* isCheckpointRestoreIsolated(
-                    current,
-                    { cwd: ref.cwd },
-                    { fileSystem, path, projections, projects },
-                  ))
-                )
-                  return false;
+                if (!(yield* isRestoreIsolated(current, ref.cwd))) return false;
                 return yield* checkpoints.hasCheckpointRef({
                   cwd: ref.cwd,
                   checkpointRef: CheckpointRef.make(ref.retained_ref),
@@ -573,14 +585,7 @@ const make = Effect.gen(function* () {
                   });
                 const current = yield* guard(source);
                 if (state === "completed") return { ...input, state };
-                if (
-                  state !== "executing" ||
-                  !(yield* isCheckpointRestoreIsolated(
-                    current,
-                    { cwd: ref.cwd },
-                    { fileSystem, path, projections, projects },
-                  ))
-                )
+                if (state !== "executing" || !(yield* isRestoreIsolated(current, ref.cwd)))
                   return yield* new HistoryRecoveryError({
                     reason: "reconciliation-required",
                   });
@@ -634,13 +639,7 @@ const make = Effect.gen(function* () {
                   });
               }
               const current = yield* guard(input);
-              if (
-                !(yield* isCheckpointRestoreIsolated(
-                  current,
-                  { cwd: ref.cwd },
-                  { fileSystem, path, projections, projects },
-                ))
-              )
+              if (!(yield* isRestoreIsolated(current, ref.cwd)))
                 return yield* new HistoryRecoveryError({
                   reason: "shared-workspace",
                 });
@@ -658,13 +657,7 @@ const make = Effect.gen(function* () {
                 Effect.gen(function* () {
                   yield* sql`UPDATE t3_workflow_v2_history_archives SET state=state WHERE 0`;
                   const latest = yield* guard(input);
-                  if (
-                    !(yield* isCheckpointRestoreIsolated(
-                      latest,
-                      { cwd: ref.cwd },
-                      { fileSystem, path, projections, projects },
-                    ))
-                  )
+                  if (!(yield* isRestoreIsolated(latest, ref.cwd)))
                     return yield* new HistoryRecoveryError({
                       reason: "shared-workspace",
                     });

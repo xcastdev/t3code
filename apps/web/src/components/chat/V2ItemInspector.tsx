@@ -1,3 +1,4 @@
+import { T, Var, useGT } from "gt-react";
 import { mergeOmpEvalDetail } from "@t3tools/client-runtime/work-log/omp-eval";
 import { OmpEvalDetail } from "./OmpEvalDetail";
 import type { ToolCallDiffTarget } from "../../diffPanelStore";
@@ -123,6 +124,7 @@ function useFetchedTurnItem(
   source: TurnItemSource | undefined,
   skip = false,
 ) {
+  const gt = useGT();
   const wireItem = projectedItem.item;
   // The wire leaves out file change diffs; an opened edit fetches its diff to show it inline.
   const fetches = !skip && (turnItemNeedsDetailFetch(wireItem) || wireItem.type === "file_change");
@@ -154,11 +156,11 @@ function useFetchedTurnItem(
       pending: ompEval ? fetches && detail.isPending : item === wireItem && detail.isPending,
       error: ompEval
         ? (detail.error ??
-          (fetches && detail.data?.item === null ? "Output is no longer available." : null))
+          (fetches && detail.data?.item === null ? gt("Output is no longer available.") : null))
         : item !== wireItem
           ? null
           : detail.data?.item === null
-            ? "Output is no longer available."
+            ? gt("Output is no longer available.")
             : detail.error,
       empty: fetches && item !== wireItem,
     },
@@ -180,12 +182,13 @@ const isImageOnlyOutput = (state: ToolOutputState) =>
   state.images.length > 0 && !state.output?.trim() && !state.error;
 
 function ToolOutputImages(props: ToolOutputState) {
+  const gt = useGT();
   return props.images.map((resource) => (
     <ChatMarkdownAssetImage
       key={resource.index}
       environmentId={props.environmentId}
       resource={resource}
-      alt="Tool output image"
+      alt={gt("Tool output image")}
       maxHeightRem={16}
       onImageExpand={props.onImageExpand}
     />
@@ -203,11 +206,19 @@ function ToolOutput(props: ToolOutputState & { readonly codePath?: string | unde
       <div className="whitespace-pre-wrap break-words">{props.output}</div>
     )
   ) : props.pending ? (
-    <div className="font-sans text-muted-foreground italic">Loading output…</div>
+    <div className="font-sans text-muted-foreground italic">
+      <T>Loading output…</T>
+    </div>
   ) : props.error ? (
-    <div className="font-sans text-destructive">Couldn&apos;t load output: {props.error}</div>
+    <div className="font-sans text-destructive">
+      <T>
+        Couldn&apos;t load output: <Var>{props.error}</Var>
+      </T>
+    </div>
   ) : props.images.length === 0 ? (
-    <div className="font-sans text-muted-foreground italic">No output.</div>
+    <div className="font-sans text-muted-foreground italic">
+      <T>No output.</T>
+    </div>
   ) : null;
   return (
     <div className="space-y-1.5">
@@ -241,19 +252,24 @@ export function FetchedToolDetail(props: {
   readonly onImageExpand?: ((preview: ExpandedImagePreview) => void) | undefined;
   readonly source?: TurnItemSource | undefined;
 }) {
+  const gt = useGT();
   const { output } = useFetchedTurnItem(props.projectedItem, props.environmentId, props.source);
   useInitialOutputReady(output.pending, props.onInitialOutputReady);
   const imageOnly = isImageOnlyOutput(output);
   return (
     <ToolDetailCard>
       {imageOnly ? (
-        <ToolDetailPane label="Output">
+        <ToolDetailPane label={gt("Output", { $context: "tool detail pane heading" })}>
           <ToolOutputImages {...output} onImageExpand={props.onImageExpand} />
         </ToolDetailPane>
       ) : null}
-      {props.input ? <ToolDetailPane label="Input">{props.input}</ToolDetailPane> : null}
+      {props.input ? (
+        <ToolDetailPane label={gt("Input", { $context: "tool detail pane heading" })}>
+          {props.input}
+        </ToolDetailPane>
+      ) : null}
       {imageOnly ? null : (
-        <ToolDetailPane label="Output">
+        <ToolDetailPane label={gt("Output", { $context: "tool detail pane heading" })}>
           <ToolOutput {...output} codePath={props.codePath} onImageExpand={props.onImageExpand} />
         </ToolDetailPane>
       )}
@@ -282,6 +298,7 @@ function ToolCallBody(
     readonly outputSlot?: ReactNode;
   },
 ) {
+  const gt = useGT();
   const call = toolCallLines({ command: props.command, args: props.args });
   const filePath = call.args ? toolArgsFilePath(call.args) : null;
   const terminal = call.command !== null;
@@ -289,17 +306,20 @@ function ToolCallBody(
   return (
     <ToolDetailCard>
       {imageOnly ? (
-        <ToolDetailPane label="Output">
+        <ToolDetailPane label={gt("Output", { $context: "tool detail pane heading" })}>
           <ToolOutputImages {...props} />
         </ToolDetailPane>
       ) : null}
       {call.command ? (
-        <ToolDetailPane label="Input" surface="terminal">
+        <ToolDetailPane
+          label={gt("Input", { $context: "tool detail pane heading" })}
+          surface="terminal"
+        >
           <TerminalCommand command={call.command} />
         </ToolDetailPane>
       ) : null}
       {call.args ? (
-        <ToolDetailPane label="Input">
+        <ToolDetailPane label={gt("Input", { $context: "tool detail pane heading" })}>
           <dl className="space-y-1.5">
             {call.args.map(([key, value]) => (
               <div key={key}>
@@ -325,19 +345,21 @@ function ToolCallBody(
         </ToolDetailPane>
       ) : null}
       {call.argsText ? (
-        <ToolDetailPane label="Input">
+        <ToolDetailPane label={gt("Input", { $context: "tool detail pane heading" })}>
           <StructuredValue value={call.argsText} highlightJson bare />
         </ToolDetailPane>
       ) : null}
       {imageOnly ? null : (
         <ToolDetailPane
-          label="Output"
+          label={gt("Output", { $context: "tool detail pane heading" })}
           surface={terminal ? "terminal" : "code"}
           scroll={props.outputSlot === undefined}
           meta={
             props.exitCode === undefined ? undefined : (
               <span className={props.exitCode === 0 ? undefined : "text-destructive"}>
-                exit {props.exitCode}
+                <T>
+                  exit <Var>{props.exitCode}</Var>
+                </T>
               </span>
             )
           }
@@ -358,11 +380,15 @@ function FileChangeOutput({
   readonly pending: boolean;
   readonly cacheKey: string;
 }) {
+  const gt = useGT();
   const patch = fileChangePatch(item);
   const message = patch === null ? item.diffStr?.trim() : undefined;
   if (patch === null && !message && !pending) return null;
   return (
-    <ToolDetailPane label="Output" scroll={patch === null}>
+    <ToolDetailPane
+      label={gt("Output", { $context: "tool detail pane heading" })}
+      scroll={patch === null}
+    >
       {patch ? (
         <div className="max-h-96 overflow-auto font-sans">
           <ToolDiff patch={patch} cacheKey={cacheKey} />
@@ -370,17 +396,22 @@ function FileChangeOutput({
       ) : message ? (
         message
       ) : (
-        <div className="font-sans text-muted-foreground italic">Loading diff…</div>
+        <div className="font-sans text-muted-foreground italic">
+          <T>Loading diff…</T>
+        </div>
       )}
     </ToolDetailPane>
   );
 }
 
 export const V2ItemInspector = memo(function V2ItemInspector(props: V2ItemInspectorProps) {
+  const gt = useGT();
   // Command rows stream their output, including the final output, from the server.
   const environmentStreamsOutput = useCommandOutputStreaming(props.environmentId);
   const streamsOutput =
-    (props.source !== undefined || environmentStreamsOutput) &&
+    (props.source === undefined
+      ? environmentStreamsOutput
+      : props.source.commandOutput !== undefined) &&
     props.projectedItem.item.type === "command_execution";
   const fetched = useFetchedTurnItem(
     props.projectedItem,
@@ -430,7 +461,7 @@ export const V2ItemInspector = memo(function V2ItemInspector(props: V2ItemInspec
       {item.type === "file_change" ? (
         <ToolDetailCard>
           <ToolDetailPane
-            label="Input"
+            label={gt("Input", { $context: "tool detail pane heading" })}
             meta={
               <>
                 {item.additions !== undefined || item.deletions !== undefined ? (
@@ -455,7 +486,7 @@ export const V2ItemInspector = memo(function V2ItemInspector(props: V2ItemInspec
                       })
                     }
                   >
-                    Open diff
+                    <T>Open diff</T>
                   </Button>
                 ) : null}
               </>
@@ -487,9 +518,11 @@ export const V2ItemInspector = memo(function V2ItemInspector(props: V2ItemInspec
       {item.type === "file_search" ? (
         <ToolDetailCard>
           {item.pattern?.trim() ? (
-            <ToolDetailPane label="Input">{item.pattern}</ToolDetailPane>
+            <ToolDetailPane label={gt("Input", { $context: "tool detail pane heading" })}>
+              {item.pattern}
+            </ToolDetailPane>
           ) : null}
-          <ToolDetailPane label="Output">
+          <ToolDetailPane label={gt("Output", { $context: "tool detail pane heading" })}>
             {item.results?.length ? (
               <ul className="space-y-1">
                 {item.results.map((result) => (
@@ -508,7 +541,9 @@ export const V2ItemInspector = memo(function V2ItemInspector(props: V2ItemInspec
                 ))}
               </ul>
             ) : (
-              <div className="font-sans text-muted-foreground italic">No matches.</div>
+              <div className="font-sans text-muted-foreground italic">
+                <T>No matches.</T>
+              </div>
             )}
           </ToolDetailPane>
         </ToolDetailCard>
@@ -517,9 +552,11 @@ export const V2ItemInspector = memo(function V2ItemInspector(props: V2ItemInspec
       {item.type === "web_search" ? (
         <ToolDetailCard>
           {item.patterns?.length ? (
-            <ToolDetailPane label="Input">{item.patterns.join("\n")}</ToolDetailPane>
+            <ToolDetailPane label={gt("Input", { $context: "tool detail pane heading" })}>
+              {item.patterns.join("\n")}
+            </ToolDetailPane>
           ) : null}
-          <ToolDetailPane label="Output">
+          <ToolDetailPane label={gt("Output", { $context: "tool detail pane heading" })}>
             {item.results?.length ? (
               <ul className="space-y-1.5 font-sans">
                 {keyedByOccurrence(item.results).map(({ key, value: result }) => {
@@ -538,7 +575,7 @@ export const V2ItemInspector = memo(function V2ItemInspector(props: V2ItemInspec
                         </a>
                       ) : (
                         <p className="font-medium text-foreground">
-                          {result.title ?? result.url ?? "Search result"}
+                          {result.title ?? result.url ?? gt("Search result")}
                         </p>
                       )}
                       {result.snippet ? (
@@ -549,7 +586,9 @@ export const V2ItemInspector = memo(function V2ItemInspector(props: V2ItemInspec
                 })}
               </ul>
             ) : (
-              <div className="font-sans text-muted-foreground italic">No results.</div>
+              <div className="font-sans text-muted-foreground italic">
+                <T>No results.</T>
+              </div>
             )}
           </ToolDetailPane>
         </ToolDetailCard>

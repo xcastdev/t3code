@@ -27,6 +27,7 @@ import * as Sqlite from "../persistence/Sqlite.ts";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
+import * as ThreadViewers from "./ThreadViewers.ts";
 import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
@@ -88,7 +89,13 @@ const withAdmission = <E>(
   Layer.mergeAll(
     layerStores,
     EventSink.layerWithAdmission.pipe(
-      Layer.provide(Layer.merge(layerStores, admission.pipe(Layer.provide(layerStores)))),
+      Layer.provide(
+        Layer.mergeAll(
+          layerStores,
+          admission.pipe(Layer.provide(layerStores)),
+          ThreadViewers.layer,
+        ),
+      ),
     ),
   );
 

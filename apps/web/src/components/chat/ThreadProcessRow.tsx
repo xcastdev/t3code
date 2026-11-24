@@ -1,4 +1,4 @@
-import { SquareIcon, Trash2Icon } from "lucide-react";
+import { CableIcon, SquareIcon, Trash2Icon } from "lucide-react";
 import { type MouseEvent, type ReactNode, useState } from "react";
 
 import { cn } from "../../lib/utils";
@@ -17,10 +17,13 @@ export function ThreadProcessRow(props: {
     readonly disabled?: boolean;
     readonly onOpen: (event: MouseEvent<HTMLElement>) => void;
   };
+  /** Forwards the process's port to this machine; an active forward keeps the actions shown. */
+  readonly forward?: RowAction & { readonly active: boolean };
   readonly stop?: RowAction;
   readonly remove?: RowAction;
 }) {
   const actions = [
+    props.forward ? { ...props.forward, icon: "forward" as const } : null,
     props.stop ? { ...props.stop, icon: "stop" as const } : null,
     props.remove ? { ...props.remove, icon: "remove" as const } : null,
   ].filter((action) => action !== null);
@@ -76,7 +79,14 @@ export function ThreadProcessRow(props: {
         </div>
       )}
       {actions.length > 0 ? (
-        <div className="pointer-events-none absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100">
+        <div
+          className={cn(
+            "absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5",
+            // A forward stays visible: it holds a port on this machine.
+            !props.forward?.active &&
+              "pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100",
+          )}
+        >
           {actions.map((action) => (
             <RowActionButton key={action.icon} action={action} />
           ))}
@@ -93,7 +103,10 @@ interface RowAction {
 }
 
 function RowActionButton(props: {
-  readonly action: RowAction & { readonly icon: "stop" | "remove" };
+  readonly action: RowAction & {
+    readonly icon: "forward" | "stop" | "remove";
+    readonly active?: boolean;
+  };
 }) {
   const [pending, setPending] = useState(false);
   const { action } = props;
@@ -105,7 +118,9 @@ function RowActionButton(props: {
             size="icon-xs"
             variant="ghost"
             part="icon"
-            tone="destructive"
+            {...(action.icon === "forward"
+              ? { "aria-pressed": action.active === true }
+              : { tone: "destructive" as const })}
             aria-label={action.label}
             disabled={pending}
             onClick={() => {
@@ -117,6 +132,8 @@ function RowActionButton(props: {
       >
         {pending ? (
           <Spinner aria-hidden size="xs" />
+        ) : action.icon === "forward" ? (
+          <CableIcon aria-hidden className={cn("size-3.5", action.active && "text-primary")} />
         ) : action.icon === "stop" ? (
           <SquareIcon aria-hidden className="size-3 fill-current" />
         ) : (

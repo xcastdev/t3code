@@ -11,11 +11,11 @@ import type { ScheduledTask } from "@t3tools/contracts";
 import {
   collectLimitAccounts,
   findThreadLimitAccount,
-  formatDuration,
   remainingPercent,
   resolveUsageLimitDriver,
   type LimitAccount,
 } from "@t3tools/shared/usageLimits";
+import { formatDuration } from "@t3tools/shared/usageLimitsCopy";
 import type { Atom } from "effect/reactivity";
 import { useMemo, useState } from "react";
 import { Pressable, View, type LayoutChangeEvent } from "react-native";

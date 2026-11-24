@@ -406,6 +406,8 @@ export const ProjectTeamRunBinding = Schema.Struct({
   }),
   workspaceState: Schema.optionalKey(Schema.Literals(["pending", "ready"])),
   workspaceKind: Schema.optionalKey(Schema.Literals(["root", "worktree"])),
+  /** The tracked Git folder the run works in; absent for the project folder's own repository. */
+  repository: Schema.optionalKey(Text),
   worktree: Schema.NullOr(Text),
   branch: Schema.NullOr(Text),
   leaseGeneration: NonNegativeInt,

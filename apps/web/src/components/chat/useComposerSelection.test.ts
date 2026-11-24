@@ -25,6 +25,10 @@ vi.mock(import("../../composerDraftStore"), async (original) => {
     ),
   };
 });
+vi.mock("gt-react", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("gt-react")>()),
+  useMessages: () => (text: string) => text,
+}));
 vi.mock("../ui/toast", () => ({ toastManager: { add: vi.fn() } }));
 vi.mock(import("./useApplyThreadModelPick"), () => ({
   useApplyThreadModelPick: () => async () => {},

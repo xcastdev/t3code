@@ -34,7 +34,14 @@ const nativeRecord: GuardedPublicationRecord = {
   mergedAt: null,
   mergedCommitSha: null,
 };
-const layer = (records: ReadonlyArray<GuardedPublicationRecord>, supported = true) => {
+const layer = (
+  records: ReadonlyArray<GuardedPublicationRecord>,
+  supported = true,
+  overrides: {
+    readonly git?: Partial<Git.GitWorkflowService["Service"]>;
+    readonly reviews?: Partial<Reviews.ProjectTeamReviewFreshness["Service"]>;
+  } = {},
+) => {
   const guardedPublication: GuardedPublicationApi = {
     capture: () => Effect.succeed(nativeRecord.target),
     read: () => Effect.succeed(records),
@@ -62,12 +69,15 @@ const layer = (records: ReadonlyArray<GuardedPublicationRecord>, supported = tru
               },
             }),
         }),
-        Layer.mock(Git.GitWorkflowService)({ invalidateStatus: () => Effect.void }),
+        Layer.mock(Git.GitWorkflowService)({
+          invalidateStatus: () => Effect.void,
+          ...overrides.git,
+        }),
         Layer.mock(PullRequests.PullRequestService)({
           refreshAfterTurn: () => Effect.void,
           invalidate: () => Effect.void,
         }),
-        Layer.mock(Reviews.ProjectTeamReviewFreshness)({}),
+        Layer.mock(Reviews.ProjectTeamReviewFreshness)({ ...overrides.reviews }),
         Sqlite.layerMemory,
       ),
     ),
@@ -112,3 +122,36 @@ it.effect("unsupported native providers refuse guarded publication without fallb
     if (result._tag === "Failure") assert.equal(result.failure.reason, "unsupported");
   }).pipe(Effect.provide(layer([], false))),
 );
+it.effect("capture refuses a reviewed target that is not its own repository's top level", () => {
+  const worktree = "/task-folders/shop/project";
+  const snapshot = {
+    manifest: {
+      projectId: decision.request.target.projectId,
+      taskId: decision.source.taskId,
+      target: { worktree, headSha: decision.source.headSha, baseSha: decision.source.baseSha },
+    },
+  } as unknown as Reviews.ReviewSnapshot;
+  return Effect.gen(function* () {
+    const host = yield* Host.ProjectWorkPublicationHost;
+    const result = yield* host
+      .capture({
+        projectId: decision.request.target.projectId,
+        source: decision.source,
+        baseRef: "main",
+      })
+      .pipe(Effect.result);
+    assert.equal(result._tag, "Failure");
+    if (result._tag === "Failure") assert.equal(result.failure.reason, "not-ready");
+  }).pipe(
+    Effect.provide(
+      layer([nativeRecord], true, {
+        // A plain project folder inside a task folder: Git answers for an enclosing repository.
+        git: { repositoryRoot: () => Effect.succeed("/task-folders") },
+        reviews: {
+          completedDispatch: () => Effect.succeed({ snapshot, proof: {} as never }),
+          assertPhysical: () => Effect.void,
+        },
+      }),
+    ),
+  );
+});

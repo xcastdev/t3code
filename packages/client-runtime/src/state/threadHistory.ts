@@ -18,6 +18,8 @@ import {
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
   type AtomCommand,
+  type AtomCommandResult,
+  runAtomCommand,
   squashAtomCommandFailure,
   followStreamInEnvironment,
 } from "./runtime.ts";
@@ -297,6 +299,16 @@ export function createThreadHistoryEnvironmentAtoms<R, E>(
             connectionEpoch: value.recoveryConnectionEpoch ?? "",
           },
   });
+  // The wrappers settle at the edge themselves, so their outcomes are not reported twice.
+  const quiet = { reportFailure: false, reportDefect: false } as const;
+  const asRun = <A, F>(
+    settle: (signal: AbortSignal) => Promise<AtomCommandResult<A, F>>,
+  ): Effect.Effect<A, F> =>
+    Effect.promise(settle).pipe(
+      Effect.flatMap((result) =>
+        result._tag === "Success" ? Effect.succeed(result.value) : Effect.failCause(result.cause),
+      ),
+    );
   const storageFailure = <A>() =>
     AsyncResult.failure<A, HistoryOperationStorageError>(
       Cause.fail(new HistoryOperationStorageError()),
@@ -323,122 +335,123 @@ export function createThreadHistoryEnvironmentAtoms<R, E>(
     recoveryInput?: (input: I) => History.ThreadHistoryRecoverInput,
     blockUncertain = false,
   ) => ({
-    run: async (
+    run: (
       registry: AtomRegistry.AtomRegistry,
       target: { readonly environmentId: EnvironmentId; readonly input: I },
-    ) => {
-      const scope = {
-        environmentId: target.environmentId,
-        ...target.input,
-      };
-      if (!(await hydrate(registry, scope))) return storageFailure<A>();
-      const state = mutationState(scope);
-      const current = registry.get(state);
-      const nextFile = fileInput?.(target.input);
-      const sameFile =
-        nextFile !== undefined &&
-        current.fileOperation !== null &&
-        nextFile.commandId === current.fileOperation.commandId &&
-        nextFile.checkpointId === current.fileOperation.checkpointId;
-      const nextRecovery = recoveryInput?.(target.input);
-      const retainedRecovery = current.recoveryOperation;
-      const sameRecovery =
-        nextRecovery !== undefined &&
-        retainedRecovery !== null &&
-        nextRecovery.commandId === retainedRecovery.commandId &&
-        nextRecovery.messageId === retainedRecovery.messageId &&
-        nextRecovery.mode === retainedRecovery.mode &&
-        nextRecovery.targetThreadId === retainedRecovery.targetThreadId;
-      if (
-        current.pending > 0 ||
-        (nextFile !== undefined && current.filesUncertain && !sameFile) ||
-        (nextRecovery !== undefined && current.recoveryUncertain && !sameRecovery) ||
-        (blockUncertain && (current.filesUncertain || current.recoveryUncertain))
-      ) {
-        return AsyncResult.failure<A, F | ThreadHistoryRpcError>(
-          Cause.fail(
-            new ThreadHistoryRpcError({
-              reason: current.pending === 0 ? "reconciliation-required" : "busy",
-            }),
-          ),
-        );
-      }
-      registry.update(state, (value) => ({
-        ...value,
-        pending: value.pending + 1,
-      }));
-      try {
-        if (fileInput !== undefined || nextRecovery !== undefined) {
-          const epoch = await connectionEpochFor(registry, target.environmentId);
-          if (epoch === null) {
-            return AsyncResult.failure<A, ThreadHistoryRpcError>(
-              Cause.fail(new ThreadHistoryRpcError({ reason: "unavailable" })),
-            );
-          }
-          registry.update(state, (value) => ({
-            ...value,
-            ...(fileInput === undefined
-              ? {}
-              : {
-                  fileOperation: fileInput(target.input),
-                  fileConnectionEpoch: value.fileConnectionEpoch ?? epoch,
-                }),
-            ...(nextRecovery === undefined
-              ? {}
-              : {
-                  recoveryOperation: nextRecovery,
-                  recoveryConnectionEpoch: value.recoveryConnectionEpoch ?? epoch,
-                }),
-          }));
-          // The identifiers must survive a crash before the transport can apply a side effect.
-          await options.operationPersistence!.save(scope, retainedFrom(registry.get(state)));
-          registry.update(state, (value) => ({
-            ...value,
-            filesUncertain: fileInput !== undefined || value.filesUncertain,
-            recoveryUncertain: nextRecovery !== undefined || value.recoveryUncertain,
-          }));
-        }
-        const result = await command.run(registry, target);
-        const definiteRefusal =
-          result._tag === "Failure" &&
-          !historyFileOutcomeIsUncertain(squashAtomCommandFailure(result));
-        const resolveFile =
-          fileInput !== undefined &&
-          (result._tag === "Success" || (definiteRefusal && !current.filesUncertain));
-        const resolveRecovery =
+    ) =>
+      asRun<A, F | HistoryOperationStorageError | ThreadHistoryRpcError>(async (signal) => {
+        const scope = {
+          environmentId: target.environmentId,
+          ...target.input,
+        };
+        if (!(await hydrate(registry, scope))) return storageFailure<A>();
+        const state = mutationState(scope);
+        const current = registry.get(state);
+        const nextFile = fileInput?.(target.input);
+        const sameFile =
+          nextFile !== undefined &&
+          current.fileOperation !== null &&
+          nextFile.commandId === current.fileOperation.commandId &&
+          nextFile.checkpointId === current.fileOperation.checkpointId;
+        const nextRecovery = recoveryInput?.(target.input);
+        const retainedRecovery = current.recoveryOperation;
+        const sameRecovery =
           nextRecovery !== undefined &&
-          (result._tag === "Success" || (definiteRefusal && !current.recoveryUncertain));
-        if (resolveFile || resolveRecovery) {
-          const resolved = {
-            ...registry.get(state),
-            ...(resolveFile
-              ? {
-                  fileOperation: null,
-                  fileConnectionEpoch: null,
-                  filesUncertain: false,
-                }
-              : {}),
-            ...(resolveRecovery
-              ? {
-                  recoveryOperation: null,
-                  recoveryConnectionEpoch: null,
-                  recoveryUncertain: false,
-                }
-              : {}),
-          };
-          await options.operationPersistence!.save(scope, retainedFrom(resolved));
-          registry.set(state, resolved);
+          retainedRecovery !== null &&
+          nextRecovery.commandId === retainedRecovery.commandId &&
+          nextRecovery.messageId === retainedRecovery.messageId &&
+          nextRecovery.mode === retainedRecovery.mode &&
+          nextRecovery.targetThreadId === retainedRecovery.targetThreadId;
+        if (
+          current.pending > 0 ||
+          (nextFile !== undefined && current.filesUncertain && !sameFile) ||
+          (nextRecovery !== undefined && current.recoveryUncertain && !sameRecovery) ||
+          (blockUncertain && (current.filesUncertain || current.recoveryUncertain))
+        ) {
+          return AsyncResult.failure<A, F | ThreadHistoryRpcError>(
+            Cause.fail(
+              new ThreadHistoryRpcError({
+                reason: current.pending === 0 ? "reconciliation-required" : "busy",
+              }),
+            ),
+          );
         }
-        return result;
-      } catch {
-        return storageFailure<A>();
-      } finally {
         registry.update(state, (value) => ({
           ...value,
-          pending: value.pending - 1,
+          pending: value.pending + 1,
         }));
-      }
-    },
+        try {
+          if (fileInput !== undefined || nextRecovery !== undefined) {
+            const epoch = await connectionEpochFor(registry, target.environmentId);
+            if (epoch === null) {
+              return AsyncResult.failure<A, ThreadHistoryRpcError>(
+                Cause.fail(new ThreadHistoryRpcError({ reason: "unavailable" })),
+              );
+            }
+            registry.update(state, (value) => ({
+              ...value,
+              ...(fileInput === undefined
+                ? {}
+                : {
+                    fileOperation: fileInput(target.input),
+                    fileConnectionEpoch: value.fileConnectionEpoch ?? epoch,
+                  }),
+              ...(nextRecovery === undefined
+                ? {}
+                : {
+                    recoveryOperation: nextRecovery,
+                    recoveryConnectionEpoch: value.recoveryConnectionEpoch ?? epoch,
+                  }),
+            }));
+            // The identifiers must survive a crash before the transport can apply a side effect.
+            await options.operationPersistence!.save(scope, retainedFrom(registry.get(state)));
+            registry.update(state, (value) => ({
+              ...value,
+              filesUncertain: fileInput !== undefined || value.filesUncertain,
+              recoveryUncertain: nextRecovery !== undefined || value.recoveryUncertain,
+            }));
+          }
+          const result = await runAtomCommand(registry, command, target, { ...quiet, signal });
+          const definiteRefusal =
+            result._tag === "Failure" &&
+            !historyFileOutcomeIsUncertain(squashAtomCommandFailure(result));
+          const resolveFile =
+            fileInput !== undefined &&
+            (result._tag === "Success" || (definiteRefusal && !current.filesUncertain));
+          const resolveRecovery =
+            nextRecovery !== undefined &&
+            (result._tag === "Success" || (definiteRefusal && !current.recoveryUncertain));
+          if (resolveFile || resolveRecovery) {
+            const resolved = {
+              ...registry.get(state),
+              ...(resolveFile
+                ? {
+                    fileOperation: null,
+                    fileConnectionEpoch: null,
+                    filesUncertain: false,
+                  }
+                : {}),
+              ...(resolveRecovery
+                ? {
+                    recoveryOperation: null,
+                    recoveryConnectionEpoch: null,
+                    recoveryUncertain: false,
+                  }
+                : {}),
+            };
+            await options.operationPersistence!.save(scope, retainedFrom(resolved));
+            registry.set(state, resolved);
+          }
+          return result;
+        } catch {
+          return storageFailure<A>();
+        } finally {
+          registry.update(state, (value) => ({
+            ...value,
+            pending: value.pending - 1,
+          }));
+        }
+      }),
   });
   const recover = createEnvironmentRpcCommand(runtime, {
     label: "environment-command:thread-history:recover",
@@ -474,49 +487,58 @@ export function createThreadHistoryEnvironmentAtoms<R, E>(
     }),
     inspectFileRestore: {
       ...inspectFileRestore,
-      run: async (
+      run: (
         registry: AtomRegistry.AtomRegistry,
         target: Parameters<typeof inspectFileRestore.run>[1],
-      ) => {
-        const scope = { environmentId: target.environmentId, ...target.input };
-        const state = mutationState(scope);
-        if (registry.get(state).pending > 0)
-          return AsyncResult.failure(Cause.fail(new ThreadHistoryRpcError({ reason: "busy" })));
-        // Both retained lanes share one durable record, so inspection owns the mutation fence too.
-        registry.update(state, (value) => ({
-          ...value,
-          pending: value.pending + 1,
-        }));
-        try {
-          if (!(await hydrate(registry, scope)))
-            return storageFailure<typeof History.ThreadHistoryFileRestoreStatusResult.Type>();
-          const result = await inspectFileRestore.run(registry, target);
-          const current = registry.get(state);
-          if (
-            result._tag === "Success" &&
-            result.value.state === "completed" &&
-            current.fileOperation?.commandId === target.input.commandId &&
-            current.fileOperation.checkpointId === target.input.checkpointId
-          ) {
-            const resolved = {
-              ...current,
-              fileOperation: null,
-              fileConnectionEpoch: null,
-              filesUncertain: false,
-            };
-            await options.operationPersistence!.save(scope, retainedFrom(resolved));
-            registry.set(state, resolved);
-          }
-          return result;
-        } catch {
-          return storageFailure<typeof History.ThreadHistoryFileRestoreStatusResult.Type>();
-        } finally {
+      ) =>
+        asRun<
+          typeof History.ThreadHistoryFileRestoreStatusResult.Type,
+          | Effect.Error<ReturnType<typeof inspectFileRestore.run>>
+          | HistoryOperationStorageError
+          | ThreadHistoryRpcError
+        >(async (signal) => {
+          const scope = { environmentId: target.environmentId, ...target.input };
+          const state = mutationState(scope);
+          if (registry.get(state).pending > 0)
+            return AsyncResult.failure(Cause.fail(new ThreadHistoryRpcError({ reason: "busy" })));
+          // Both retained lanes share one durable record, so inspection owns the mutation fence too.
           registry.update(state, (value) => ({
             ...value,
-            pending: value.pending - 1,
+            pending: value.pending + 1,
           }));
-        }
-      },
+          try {
+            if (!(await hydrate(registry, scope)))
+              return storageFailure<typeof History.ThreadHistoryFileRestoreStatusResult.Type>();
+            const result = await runAtomCommand(registry, inspectFileRestore, target, {
+              ...quiet,
+              signal,
+            });
+            const current = registry.get(state);
+            if (
+              result._tag === "Success" &&
+              result.value.state === "completed" &&
+              current.fileOperation?.commandId === target.input.commandId &&
+              current.fileOperation.checkpointId === target.input.checkpointId
+            ) {
+              const resolved = {
+                ...current,
+                fileOperation: null,
+                fileConnectionEpoch: null,
+                filesUncertain: false,
+              };
+              await options.operationPersistence!.save(scope, retainedFrom(resolved));
+              registry.set(state, resolved);
+            }
+            return result;
+          } catch {
+            return storageFailure<typeof History.ThreadHistoryFileRestoreStatusResult.Type>();
+          } finally {
+            registry.update(state, (value) => ({
+              ...value,
+              pending: value.pending - 1,
+            }));
+          }
+        }),
     },
     fileRestoreStatus: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:thread-history:file-restore-status",

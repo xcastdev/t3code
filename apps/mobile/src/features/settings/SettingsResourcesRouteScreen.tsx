@@ -1,3 +1,4 @@
+import { runAtomCommand } from "@t3tools/client-runtime/state/runtime";
 import { RegistryContext, useAtomValue } from "@effect/atom-react";
 import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { composeManagedResourceInventory } from "@t3tools/client-runtime/state/managedResources";
@@ -226,54 +227,94 @@ function useMutationRunner() {
       case "globalDelete":
         return settle(
           key,
-          skillsEnvironment.globalDelete.run(registry, { environmentId, input: mutation.input }),
+          runAtomCommand(
+            registry,
+            skillsEnvironment.globalDelete,
+            { environmentId, input: mutation.input },
+            { reportFailure: false },
+          ),
         );
       case "projectSetDisabled":
         return settle(
           key,
-          skillsEnvironment.projectSetDisabled.run(registry, {
-            environmentId,
-            input: mutation.input,
-          }),
+          runAtomCommand(
+            registry,
+            skillsEnvironment.projectSetDisabled,
+            {
+              environmentId,
+              input: mutation.input,
+            },
+            { reportFailure: false },
+          ),
         );
       case "projectDeleteState":
         return settle(
           key,
-          skillsEnvironment.projectDeleteState.run(registry, {
-            environmentId,
-            input: mutation.input,
-          }),
+          runAtomCommand(
+            registry,
+            skillsEnvironment.projectDeleteState,
+            {
+              environmentId,
+              input: mutation.input,
+            },
+            { reportFailure: false },
+          ),
         );
       case "globalCreate":
         return settle(
           key,
-          skillsEnvironment.globalCreate.run(registry, { environmentId, input: mutation.input }),
+          runAtomCommand(
+            registry,
+            skillsEnvironment.globalCreate,
+            { environmentId, input: mutation.input },
+            { reportFailure: false },
+          ),
         );
       case "globalUpdate":
         return settle(
           key,
-          skillsEnvironment.globalUpdate.run(registry, { environmentId, input: mutation.input }),
+          runAtomCommand(
+            registry,
+            skillsEnvironment.globalUpdate,
+            { environmentId, input: mutation.input },
+            { reportFailure: false },
+          ),
         );
       case "projectSetOverride":
         return settle(
           key,
-          skillsEnvironment.projectSetOverride.run(registry, {
-            environmentId,
-            input: mutation.input,
-          }),
+          runAtomCommand(
+            registry,
+            skillsEnvironment.projectSetOverride,
+            {
+              environmentId,
+              input: mutation.input,
+            },
+            { reportFailure: false },
+          ),
         );
       case "sessionSetEnabled":
         return settle(
           key,
-          skillsEnvironment.sessionSetEnabled.run(registry, {
-            environmentId,
-            input: mutation.input,
-          }),
+          runAtomCommand(
+            registry,
+            skillsEnvironment.sessionSetEnabled,
+            {
+              environmentId,
+              input: mutation.input,
+            },
+            { reportFailure: false },
+          ),
         );
       case "sessionReset":
         return settle(
           key,
-          skillsEnvironment.sessionReset.run(registry, { environmentId, input: mutation.input }),
+          runAtomCommand(
+            registry,
+            skillsEnvironment.sessionReset,
+            { environmentId, input: mutation.input },
+            { reportFailure: false },
+          ),
         );
     }
   };
@@ -283,76 +324,129 @@ function useMutationRunner() {
       case "environmentCreate":
         return settle(
           key,
-          managedTextEnvironment.environmentCreate.run(registry, {
-            ...target,
-            input: mutation.input,
-          }),
+          runAtomCommand(
+            registry,
+            managedTextEnvironment.environmentCreate,
+            {
+              ...target,
+              input: mutation.input,
+            },
+            { reportFailure: false },
+          ),
         );
       case "environmentUpdate":
         return settle(
           key,
-          managedTextEnvironment.environmentUpdate.run(registry, {
-            ...target,
-            input: mutation.input,
-          }),
+          runAtomCommand(
+            registry,
+            managedTextEnvironment.environmentUpdate,
+            {
+              ...target,
+              input: mutation.input,
+            },
+            { reportFailure: false },
+          ),
         );
       case "environmentDelete":
         return settle(
           key,
-          managedTextEnvironment.environmentDelete.run(registry, {
-            ...target,
-            input: mutation.input,
-          }),
+          runAtomCommand(
+            registry,
+            managedTextEnvironment.environmentDelete,
+            {
+              ...target,
+              input: mutation.input,
+            },
+            { reportFailure: false },
+          ),
         );
       case "environmentSetEnabled":
         return settle(
           key,
-          managedTextEnvironment.environmentSetEnabled.run(registry, {
-            ...target,
-            input: mutation.input,
-          }),
+          runAtomCommand(
+            registry,
+            managedTextEnvironment.environmentSetEnabled,
+            {
+              ...target,
+              input: mutation.input,
+            },
+            { reportFailure: false },
+          ),
         );
       case "projectSetOverride":
         return settle(
           key,
-          managedTextEnvironment.projectSetOverride.run(registry, {
-            ...target,
-            input: mutation.input,
-          }),
+          runAtomCommand(
+            registry,
+            managedTextEnvironment.projectSetOverride,
+            {
+              ...target,
+              input: mutation.input,
+            },
+            { reportFailure: false },
+          ),
         );
       case "projectSetDisabled":
         return settle(
           key,
-          managedTextEnvironment.projectSetDisabled.run(registry, {
-            ...target,
-            input: mutation.input,
-          }),
+          runAtomCommand(
+            registry,
+            managedTextEnvironment.projectSetDisabled,
+            {
+              ...target,
+              input: mutation.input,
+            },
+            { reportFailure: false },
+          ),
         );
       case "projectDeleteState":
         return settle(
           key,
-          managedTextEnvironment.projectDeleteState.run(registry, {
-            ...target,
-            input: mutation.input,
-          }),
+          runAtomCommand(
+            registry,
+            managedTextEnvironment.projectDeleteState,
+            {
+              ...target,
+              input: mutation.input,
+            },
+            { reportFailure: false },
+          ),
         );
       case "threadSetEnabled":
         return settle(
           key,
-          managedTextEnvironment.threadSetEnabled.run(registry, {
-            ...target,
-            input: mutation.input,
-          }),
+          runAtomCommand(
+            registry,
+            managedTextEnvironment.threadSetEnabled,
+            {
+              ...target,
+              input: mutation.input,
+            },
+            { reportFailure: false },
+          ),
         );
       case "threadReset":
         return settle(
           key,
-          managedTextEnvironment.threadReset.run(registry, { ...target, input: mutation.input }),
+          runAtomCommand(
+            registry,
+            managedTextEnvironment.threadReset,
+            { ...target, input: mutation.input },
+            { reportFailure: false },
+          ),
         );
     }
   };
   const runDeployment = (key: string, environmentId: EnvironmentId, input: DeploymentInput) =>
-    settle(key, skillsEnvironment.deploymentChange.run(registry, { environmentId, input }));
+    settle(
+      key,
+      runAtomCommand(
+        registry,
+        skillsEnvironment.deploymentChange,
+        { environmentId, input },
+        { reportFailure: false },
+      ),
+    );
   return {
     pending,
     failure,

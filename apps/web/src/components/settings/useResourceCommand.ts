@@ -2,6 +2,7 @@ import { RegistryContext } from "@effect/atom-react";
 import { describeResourceFailure } from "@t3tools/client-runtime/resource-actions";
 import {
   isAtomCommandInterrupted,
+  runAtomCommand,
   squashAtomCommandFailure,
   type AtomCommand,
 } from "@t3tools/client-runtime/state/runtime";
@@ -26,7 +27,7 @@ export function useResourceCommand(describe: (error: unknown) => string = descri
     busy.current = true;
     setPendingKey(key);
     setFailure(null);
-    const result = await command.run(registry, input);
+    const result = await runAtomCommand(registry, command, input);
     busy.current = false;
     setPendingKey(null);
     if (result._tag === "Success") return { ok: true, value: result.value };

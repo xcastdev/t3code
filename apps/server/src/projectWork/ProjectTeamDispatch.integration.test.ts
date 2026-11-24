@@ -28,6 +28,7 @@ import {
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as DateTime from "effect/DateTime";
 import * as Ref from "effect/Ref";
@@ -50,6 +51,7 @@ import * as Repository from "./ProjectWorkRepository.ts";
 import * as Dispatch from "./ProjectTeamDispatch.ts";
 import { planMailboxClaim } from "./ProjectTeamMailboxTurns.ts";
 import * as Journal from "./ProjectTeamDispatchJournal.ts";
+import * as TaskFolders from "../workspace/TaskFolders.ts";
 import { runtimeExternalServices } from "./ProjectWorkWorkflow.testkit.ts";
 import { makeHarness, projectId, modelSelection } from "./ProjectTeamDispatch.testkit.ts";
 
@@ -67,7 +69,7 @@ const attribution = {
 const setup = (
   options: Pick<
     Parameters<typeof makeHarness>[0],
-    "runSetup" | "closeTerminal" | "closeAndDrain" | "generateBranchName"
+    "runSetup" | "closeTerminal" | "closeAndDrain" | "generateBranchName" | "taskFolders"
   > = {},
 ) => {
   const harness = makeHarness({
@@ -98,7 +100,10 @@ const setup = (
   const environment = Layer.mock(Environment.ServerEnvironment)({
     getEnvironmentId: Effect.succeed(EnvironmentId.make("dispatch-environment")),
   });
-  return { ...harness, base: base.pipe(Layer.provideMerge(environment)) };
+  return {
+    ...harness,
+    base: base.pipe(Layer.provideMerge(environment), Layer.provideMerge(Path.layer)),
+  };
 };
 const seed = Effect.fn("DispatchIntegration.seed")(function* (
   workspace: ProjectTeamDispatchIntent["workspace"] = { type: "root" },
@@ -381,6 +386,116 @@ it.effect("the prepared task worktree agrees with its owned binding and V2 threa
     assert.equal(binding.taskId, input.taskId);
     assert.equal(binding.runId, projection.runs[0]!.id);
     assert.equal(harness.runSetup.mock.calls[0]?.[0].threadId, binding.threadId);
+  }).pipe(Effect.provide(Dispatch.layer.pipe(Layer.provideMerge(harness.base))));
+});
+
+// A plain project folder tracking two repositories: a run must work in exactly one of them.
+const multiRepository = () => {
+  const planned: Array<ReadonlyArray<{ readonly path: string }> | undefined> = [];
+  const repositories = [
+    { name: "api", path: "/repo/api" },
+    { name: "web", path: "/repo/web" },
+  ];
+  const taskFolder = {
+    root: "/task-folders/repo-1",
+    projectId,
+    projectRoot: "/repo",
+    anchor: "/repo",
+    projectPath: "/task-folders/repo-1/repo",
+    projectIsWorktree: false,
+    repositories: [
+      { repositoryPath: "/repo/api", worktreePath: "/task-folders/repo-1/repo/api", name: "api" },
+    ],
+  };
+  const layer = Layer.mock(TaskFolders.TaskFolders)({
+    plan: (input) =>
+      Effect.sync(() => {
+        planned.push(input.repositories);
+        return {
+          projectId,
+          projectRoot: "/repo",
+          projectIsRepository: false,
+          anchor: "/repo",
+          repositories: repositories.filter(
+            (folder) =>
+              input.repositories === undefined ||
+              input.repositories.some((entry) => entry.path === folder.path),
+          ),
+          trackedRepositories: repositories.map((folder) => folder.path),
+        };
+      }),
+    create: (input) =>
+      Effect.succeed({
+        taskFolder,
+        branch: input.branch,
+        laidOutByProject: false,
+        repositoriesStartedFromOrigin: false,
+      }),
+    find: () => Effect.succeed(null),
+  });
+  const record = Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`INSERT INTO task_folders (root, real_root, project_id, project_root, anchor, project_path, project_is_worktree, repositories_json, created_at) VALUES (${taskFolder.root}, ${taskFolder.root}, ${projectId}, ${taskFolder.projectRoot}, ${taskFolder.anchor}, ${taskFolder.projectPath}, 0, ${JSON.stringify(taskFolder.repositories)}, ${at})`;
+  });
+  return { layer, planned, taskFolder, record };
+};
+
+it.effect("a multi-repository dispatch that names no repository is refused before binding", () => {
+  const fixture = multiRepository();
+  const harness = setup({ taskFolders: fixture.layer });
+  return Effect.gen(function* () {
+    const input = yield* seed({ type: "worktree", baseRef: "main" });
+    const result = yield* Effect.result(
+      (yield* Dispatch.ProjectTeamDispatch).dispatch(input, attribution),
+    );
+    assert.equal(result._tag, "Failure");
+    if (result._tag === "Failure") assert.equal(result.failure.reason, "repository-required");
+    const state = yield* Repository.readCurrentState(yield* SqlClient.SqlClient, projectId);
+    assert.isFalse(state.foundationRecords!.some((record) => record.kind === "run-binding"));
+    assert.equal(harness.createWorktree.mock.calls.length, 0);
+  }).pipe(Effect.provide(Dispatch.layer.pipe(Layer.provideMerge(harness.base))));
+});
+
+it.effect("a chosen repository binds its own worktree inside the task folder", () => {
+  const fixture = multiRepository();
+  const harness = setup({ taskFolders: fixture.layer });
+  return Effect.gen(function* () {
+    yield* fixture.record;
+    const input = yield* seed({ type: "worktree", baseRef: "main", repository: "/repo/api" });
+    yield* (yield* Dispatch.ProjectTeamDispatch).dispatch(input, attribution);
+    const { sql, binding, projection } = yield* awaitPreparation;
+    // Selection asks for the defaults; the launch asks for the chosen repository alone.
+    assert.deepEqual(fixture.planned.at(-1), [{ path: "/repo/api" }]);
+    assert.equal(projection.thread.worktreePath, fixture.taskFolder.projectPath);
+    assert.equal(binding.repository, "/repo/api");
+    assert.equal(binding.worktree, "/task-folders/repo-1/repo/api");
+    assert.equal(binding.workspaceState, "ready");
+    const admission = yield* Admission.RunAdmission;
+    const check = {
+      threadId: binding.threadId,
+      runId: projection.runs[0]!.id,
+      now: DateTime.formatIso(yield* DateTime.now),
+      operation: "start" as const,
+    };
+    assert.equal((yield* admission.check(check))._tag, "admitted");
+    // The record no longer holds that repository's worktree, so the run's target moved.
+    yield* sql`UPDATE task_folders SET repositories_json='[]' WHERE root=${fixture.taskFolder.root}`;
+    const moved = yield* admission.check(check);
+    assert.equal(moved._tag, "denied");
+    if (moved._tag === "denied") assert.equal(moved.reason, "owner-target-workspace-changed");
+  }).pipe(Effect.provide(Dispatch.layer.pipe(Layer.provideMerge(harness.base))));
+});
+
+it.effect("a project-checkout run on a chosen repository works in its original checkout", () => {
+  const fixture = multiRepository();
+  const harness = setup({ taskFolders: fixture.layer });
+  return Effect.gen(function* () {
+    const input = yield* seed({ type: "root", repository: "/repo/web" });
+    yield* (yield* Dispatch.ProjectTeamDispatch).dispatch(input, attribution);
+    const { binding, projection } = yield* awaitPreparation;
+    assert.isNull(projection.thread.worktreePath);
+    assert.equal(binding.repository, "/repo/web");
+    assert.equal(binding.worktree, "/repo/web");
   }).pipe(Effect.provide(Dispatch.layer.pipe(Layer.provideMerge(harness.base))));
 });
 

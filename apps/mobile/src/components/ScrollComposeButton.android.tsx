@@ -8,6 +8,7 @@ import {
   size,
 } from "@expo/ui/jetpack-compose/modifiers";
 import type { MenuAction } from "@react-native-menu/menu";
+import { useGT } from "gt-react-native";
 import { useState } from "react";
 import { I18nManager, Pressable, View, type StyleProp, type ViewStyle } from "react-native";
 import { Menu } from "./ui/Menu";
@@ -28,6 +29,7 @@ export function ScrollComposeButton(props: {
   readonly className?: string;
   readonly style?: StyleProp<ViewStyle>;
 }) {
+  const gt = useGT();
   const { appearance, themeVariables: colors } = useAppearancePreferences();
   const typography = resolveScaledTextRole("footnote", appearance.baseFontSize);
   const { iconSize, fabSize: scaledFabSize } = useAndroidControlSizing();
@@ -86,7 +88,7 @@ export function ScrollComposeButton(props: {
                     fontWeight: "500",
                   }}
                 >
-                  New thread
+                  {gt("New thread")}
                 </Text>
               </ExtendedFloatingActionButton.Text>
             </ExtendedFloatingActionButton>
@@ -109,8 +111,8 @@ export function ScrollComposeButton(props: {
         <Pressable
           onPress={props.onPress}
           accessibilityRole="button"
-          accessibilityLabel="New thread"
-          accessibilityHint={props.menu ? "Long press for more ways to start" : undefined}
+          accessibilityLabel={gt("New thread")}
+          accessibilityHint={props.menu ? gt("Long press for more ways to start") : undefined}
           accessibilityActions={props.menu?.actions.flatMap((action) =>
             action.subactions
               ? action.subactions.map((sub) => ({

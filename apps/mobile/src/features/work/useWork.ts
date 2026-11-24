@@ -1,3 +1,4 @@
+import { runAtomCommand } from "@t3tools/client-runtime/state/runtime";
 import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
 import {
   isProjectWorkHumanCommand,
@@ -112,10 +113,15 @@ export function useWorkWriter(environmentId: EnvironmentId) {
     busy.current = true;
     setPendingKey(key);
     setFailure(null);
-    const result = await projectWorkEnvironment.write.run(appAtomRegistry, {
-      environmentId,
-      input: prepared,
-    });
+    const result = await runAtomCommand(
+      appAtomRegistry,
+      projectWorkEnvironment.write,
+      {
+        environmentId,
+        input: prepared,
+      },
+      { reportFailure: false },
+    );
     settle(
       key,
       result._tag === "Success" || isAtomCommandInterrupted(result)
@@ -129,10 +135,15 @@ export function useWorkWriter(environmentId: EnvironmentId) {
     busy.current = true;
     setPendingKey(key);
     setFailure(null);
-    const result = await projectWorkEnvironment.issue.run(appAtomRegistry, {
-      environmentId,
-      input: request,
-    });
+    const result = await runAtomCommand(
+      appAtomRegistry,
+      projectWorkEnvironment.issue,
+      {
+        environmentId,
+        input: request,
+      },
+      { reportFailure: false },
+    );
     settle(
       key,
       result._tag === "Success" || isAtomCommandInterrupted(result)
@@ -166,10 +177,15 @@ export function useWorkWriter(environmentId: EnvironmentId) {
     busy.current = true;
     setPendingKey(key);
     setFailure(null);
-    const result = await projectWorkEnvironment.delivery.run(appAtomRegistry, {
-      environmentId,
-      input: prepared,
-    });
+    const result = await runAtomCommand(
+      appAtomRegistry,
+      projectWorkEnvironment.delivery,
+      {
+        environmentId,
+        input: prepared,
+      },
+      { reportFailure: false },
+    );
     settle(
       key,
       result._tag === "Success" || isAtomCommandInterrupted(result)

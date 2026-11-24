@@ -1,3 +1,4 @@
+import { useGT, useMessages } from "gt-react-native";
 import { selectedNavigationTab, visibleNavigationTabs } from "./navigation-tab-order";
 import { Toolbar } from "../../../components/ui/Toolbar";
 import { useControlTheme } from "../../../components/ui/useControlTheme";
@@ -17,6 +18,7 @@ const ISSUE_ICON = require("../../../../assets/icons/issue.png");
 const AGENT_ICON = require("../../../../assets/icons/agent.png");
 
 export function WorkspaceTabToolbarButtons() {
+  const m = useMessages();
   const order = useNavigationTabOrder();
   const hidden = useHiddenNavigationTabs();
   const workspace = useWorkspaceTabs()!;
@@ -34,7 +36,7 @@ export function WorkspaceTabToolbarButtons() {
         <Toolbar.Button
           key={tab}
           identifier={`workspace-tab-${tab}`}
-          accessibilityLabel={WORKSPACE_TAB_LABELS[tab]}
+          accessibilityLabel={m(WORKSPACE_TAB_LABELS[tab])}
           icon={
             tab === "pullRequests"
               ? { type: "image", source: PULL_REQUEST_ICON, tinted: true }
@@ -59,6 +61,7 @@ export function WorkspaceSectionToolbar({
   readonly onNewTask: () => void;
   readonly showCompose?: boolean;
 }) {
+  const gt = useGT();
   const sidebarTabs = useSidebarWorkspaceTabs();
   const compactTabs = useCompactWorkspaceTabs();
   const deviceType = useDeviceType();
@@ -67,7 +70,7 @@ export function WorkspaceSectionToolbar({
       {showCompose && sidebarTabs !== "picker" && deviceType !== "duo-unfolded" && !compactTabs ? (
         <Toolbar placement="right">
           <Toolbar.Button
-            accessibilityLabel="New chat"
+            accessibilityLabel={gt("New chat")}
             icon="square.and.pencil"
             onPress={onNewTask}
           />

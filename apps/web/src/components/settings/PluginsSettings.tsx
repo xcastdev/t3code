@@ -71,7 +71,7 @@ import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../
 import { Switch } from "../ui/switch";
 import { toastManager } from "../ui/toast";
 import { useSettingsScope } from "./SettingsScopeContext";
-import { searchableSetting } from "./settingsSearch";
+import { useSearchableSetting } from "./settingsSearch";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
 
 const PLUGIN_PACKAGE_MIME = "application/zip";
@@ -248,6 +248,7 @@ function ConfirmDialog(props: {
 type PendingConfirm = Omit<Parameters<typeof ConfirmDialog>[0], "onClose">;
 
 export function PluginsSettings() {
+  const searchableSetting = useSearchableSetting();
   const { environment } = useSettingsScope();
   const connected = environment?.connection.phase === "connected";
   return (
@@ -267,6 +268,7 @@ export function PluginsSettings() {
 }
 
 function DevicePlugins() {
+  const searchableSetting = useSearchableSetting();
   const records = AsyncResult.getOrElse(useAtomValue(clientPluginRecordsAtom), () => []);
   const leftovers = AsyncResult.getOrElse(useAtomValue(leftoverClientPluginStateAtom), () => []);
   const [confirm, setConfirm] = useState<PendingConfirm | null>(null);
@@ -418,6 +420,7 @@ const formatBytes = (bytes: number) =>
     : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 
 function EnvironmentPlugins(props: { readonly environment: EnvironmentPresentation }) {
+  const searchableSetting = useSearchableSetting();
   const { environmentId, label } = props.environment;
   const registry = useContext(RegistryContext);
   const snapshot = useAtomValue(pluginEnvironment.registry({ environmentId, input: {} }));

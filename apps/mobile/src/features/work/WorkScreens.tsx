@@ -1,3 +1,4 @@
+import { runAtomCommand } from "@t3tools/client-runtime/state/runtime";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import {
   asProjectTeamRecord,
@@ -959,17 +960,20 @@ function Bindings({
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Issue bindings are fetched from the environment when the checkout changes.
   useEffect(() => {
     let live = true;
-    void projectWorkEnvironment.issue
-      .run(appAtomRegistry, {
+    void runAtomCommand(
+      appAtomRegistry,
+      projectWorkEnvironment.issue,
+      {
         environmentId: scope.environmentId,
         input: { operation: "list", input: { projectId: scope.projectId } },
-      })
-      .then((result) => {
-        if (!live) return;
-        const decoded =
-          result._tag === "Success" ? Option.getOrNull(decodeBindings(result.value)) : null;
-        setItems(decoded === null ? "unavailable" : decoded.items);
-      });
+      },
+      { reportFailure: false },
+    ).then((result) => {
+      if (!live) return;
+      const decoded =
+        result._tag === "Success" ? Option.getOrNull(decodeBindings(result.value)) : null;
+      setItems(decoded === null ? "unavailable" : decoded.items);
+    });
     return () => {
       live = false;
     };

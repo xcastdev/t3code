@@ -24,6 +24,7 @@ import * as RunAdmission from "./RunAdmission.ts";
 
 import * as Sqlite from "../persistence/Sqlite.ts";
 import * as EventSink from "./EventSink.ts";
+import * as ThreadViewers from "./ThreadViewers.ts";
 import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
@@ -53,6 +54,7 @@ const makeLayer = (admissionLayer = layerAdmission) =>
         ProjectStore.layer,
         TurnItemPositionStore.layer,
         admissionLayer,
+        ThreadViewers.layer,
       ),
     ),
     Layer.provideMerge(Sqlite.layerMemory),

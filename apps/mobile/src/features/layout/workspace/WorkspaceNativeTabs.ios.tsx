@@ -1,3 +1,4 @@
+import { useGT, useMessages } from "gt-react-native";
 import {
   WORKSPACE_TAB_LABELS,
   NAVIGATION_TAB_ICONS,
@@ -12,7 +13,7 @@ import {
   type ReactNode,
   type SetStateAction,
 } from "react";
-import { View, useWindowDimensions, type NativeSyntheticEvent } from "react-native";
+import { View, type NativeSyntheticEvent } from "react-native";
 import { Tabs, type TabSelectedEvent, type TabSelectionRejectedEvent } from "react-native-screens";
 
 import { WorkspaceTabsContext, useWorkspaceTabs } from "./WorkspaceTabsContext";
@@ -28,18 +29,12 @@ import {
   WorkspaceSlotOptionsContext,
 } from "../../../native/v5-workspace-context";
 import type { NativeLayoutMetrics } from "../../../lib/reserved-regions";
-import {
-  useCompactWorkspaceTabs,
-  useFloatingWorkspaceTabs,
-  useSystemWorkspaceTabBar,
-} from "./useSystemWorkspaceTabBar";
+import { useCompactWorkspaceTabs, useSystemWorkspaceTabBar } from "./useSystemWorkspaceTabBar";
 import { useControlTheme } from "../../../components/ui/useControlTheme";
 import { useDeviceType } from "../../../native/native-layout-metrics";
-import { WorkspaceSidebarTabs } from "./WorkspaceSidebarTabs";
+import { WorkspaceTabDock } from "./WorkspaceTabDock";
 import { useAdaptiveWorkspaceLayout, useWorkspacePaneState } from "../AdaptiveWorkspaceLayout";
 import { useSelectWorkspaceTab } from "./useSelectWorkspaceTab";
-import { useWorkspaceCompose } from "./useWorkspaceCompose";
-import { useComposeMenu } from "./useComposeMenu";
 import { useWorkTabAttention } from "../../work/workAttention";
 
 const PULL_REQUEST_ICON = require("../../../../assets/icons/pull-request.png");
@@ -153,6 +148,8 @@ export function WorkspaceNativeTabs(props: {
   /** The sidebar column draws the tabs itself, so they leave with it. */
   readonly tabsInSidebarColumn?: boolean;
 }) {
+  const gt = useGT();
+  const m = useMessages();
   const workspace = useWorkspaceTabs()!;
   const slotTabs = useEnabledNavigationTabs().slice(0, NATIVE_WORKSPACE_TAB_SLOTS.length);
   const workAttention = useWorkTabAttention(slotTabs.includes("work"));
@@ -169,8 +166,6 @@ export function WorkspaceNativeTabs(props: {
     layout.usesSplitView &&
     workspaceUsesColumns(workspace.state.selectedTab, workspace.settingsOpen) &&
     !panes.primarySidebarVisible;
-  const floatingTabs = useFloatingWorkspaceTabs();
-  const { width } = useWindowDimensions();
   const { colors } = useControlTheme();
   const selectedTab = workspace.state.selectedTab;
   // Settings, and a section the bar has no room for, open in the last slot.
@@ -239,7 +234,9 @@ export function WorkspaceNativeTabs(props: {
                 key={slot}
                 screenKey={slot}
                 title=""
-                tabBarItemAccessibilityLabel={settings ? "Settings" : WORKSPACE_TAB_LABELS[tab]}
+                tabBarItemAccessibilityLabel={
+                  settings ? gt("Settings") : m(WORKSPACE_TAB_LABELS[tab])
+                }
                 // An empty badge is dropped before UIKit sees it, so a space draws the dot without a count.
                 badgeValue={!settings && tab === "work" && workAttention ? " " : undefined}
                 ios={{
@@ -284,39 +281,8 @@ export function WorkspaceNativeTabs(props: {
       !props.hidden &&
       !props.tabsInSidebarColumn &&
       !hiddenWithSidebar ? (
-        <View
-          pointerEvents="box-none"
-          style={{
-            position: "absolute",
-            left: 0,
-            bottom: 0,
-            // UIKit can shrink the sidebar to 280pt independently of its preferred width.
-            width:
-              deviceType === "pad" && (floatingTabs || layout.usesSplitView)
-                ? Math.min(280, layout.listPaneWidth ?? width, width)
-                : (layout.listPaneWidth ?? width),
-            height: 128,
-          }}
-        >
-          <WorkspaceSidebarTabsFooter />
-        </View>
+        <WorkspaceTabDock placement="window" />
       ) : null}
     </View>
-  );
-}
-
-/** The workspace tabs at the foot of the sidebar. */
-export function WorkspaceSidebarTabsFooter() {
-  const compose = useWorkspaceCompose();
-  const compact = useFloatingWorkspaceTabs();
-  const onNewTask = compact ? compose?.onPress : undefined;
-  const composeMenu = useComposeMenu(onNewTask !== undefined);
-  return (
-    <WorkspaceSidebarTabs
-      compact={compact}
-      reserveComposeSpace={compact}
-      onNewTask={onNewTask}
-      composeMenu={onNewTask ? composeMenu : undefined}
-    />
   );
 }

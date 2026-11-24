@@ -262,6 +262,7 @@ const fixture = Effect.fn("OpenCode2Test.fixture")(function* (
   );
   const server = OpenCode2Server.OpenCode2Server.of({
     forget: Effect.void,
+    connections: Stream.never,
     withConnection: (use) =>
       Effect.gen(function* () {
         const ordinal = ++connections;
@@ -1015,13 +1016,6 @@ it.effect.each(["interrupted", "succeeded", "failed"] as const)(
       );
       assert.equal(terminals[0]?.providerTurnId, firstTurnId);
       assert.notEqual(terminals[1]?.providerTurnId, firstTurnId);
-      const persisted = yield* test.runtime.readThreadSnapshot({
-        providerThread: test.providerThread,
-      });
-      assert.deepEqual(
-        persisted.providerTurns.map((turn) => turn.status),
-        [outcome === "succeeded" ? "completed" : outcome, "completed"],
-      );
     }).pipe(Effect.scoped, Effect.provide(layer)),
 );
 
@@ -1072,13 +1066,6 @@ it.effect("OpenCode 2 cannot fence a successor when its predecessor's Stop times
         durable: { aggregateID: "ses_root", seq: 2, version: 1 },
         data: { sessionID: "ses_root" },
       }),
-    );
-    const persisted = yield* test.runtime.readThreadSnapshot({
-      providerThread: test.providerThread,
-    });
-    assert.deepEqual(
-      persisted.providerTurns.map((turn) => turn.status),
-      ["interrupted", "completed"],
     );
     const terminals = [...(yield* Fiber.join(ended))];
     assert.deepEqual(

@@ -311,6 +311,13 @@ const ISSUE_FAILURE_MESSAGES: Record<string, string> = {
     "GitHub issue intake is unavailable. Check the environment's GitHub connection and try again.",
 };
 
+const WORKSPACE_FAILURE_MESSAGES: Record<string, string> = {
+  "repository-required":
+    "This project covers several repositories. Choose the repository this worker works in.",
+  "repository-unavailable":
+    "That repository is not one of this project's Git repositories. Choose another one.",
+};
+
 const FAILURE_MESSAGES: Record<string, string> = {
   forbidden: "This connection is not allowed to change Work here.",
   rejected: "The server rejected this change. Someone may have changed the task; review it again.",
@@ -324,7 +331,16 @@ export function describeWorkFailure(error: unknown): string {
     if (error._tag === "ProjectWorkRpcError" && "reason" in error) {
       const issueMessage =
         "issueReason" in error ? ISSUE_FAILURE_MESSAGES[String(error.issueReason)] : undefined;
-      return issueMessage ?? FAILURE_MESSAGES[String(error.reason)] ?? "The change failed.";
+      const workspaceMessage =
+        "workspaceReason" in error
+          ? WORKSPACE_FAILURE_MESSAGES[String(error.workspaceReason)]
+          : undefined;
+      return (
+        issueMessage ??
+        workspaceMessage ??
+        FAILURE_MESSAGES[String(error.reason)] ??
+        "The change failed."
+      );
     }
     if (error._tag === "EnvironmentAuthorizationError")
       return "This connection lacks permission to change Work on this environment.";

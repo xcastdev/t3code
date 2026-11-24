@@ -1,3 +1,6 @@
+import { msg, T, useGT, useMessages } from "gt-react";
+import { contextMenuSourceOf } from "../contextMenuSource";
+import { m, type MessageResolver } from "../i18n/messages";
 import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
 import { parsePluginPanelKey, type PluginPanelKey } from "@t3tools/client-runtime/plugins/commands";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
@@ -25,7 +28,8 @@ import type {
   ResolvedKeybindingsConfig,
   ThreadId,
 } from "@t3tools/contracts";
-import { getTerminalLabel } from "@t3tools/shared/terminalLabels";
+import { getTerminalLabel } from "@t3tools/shared/terminalLabelsCopy";
+import { formatSubagentDisplayTitle } from "@t3tools/client-runtime/state/subagent-display";
 import {
   closestCenter,
   DndContext,
@@ -38,6 +42,7 @@ import { restrictToFirstScrollableAncestor, restrictToHorizontalAxis } from "@dn
 import { horizontalListSortingStrategy, SortableContext, useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import {
+  Bot,
   CircleDotIcon,
   Smartphone,
   ChevronLeft,
@@ -72,6 +77,7 @@ import {
 
 import { isElectron } from "~/env";
 import type { DesktopPreviewOverlay } from "~/previewStateStore";
+import { linkedThreadTitle } from "~/linkedThreadSurface";
 import type { RightPanelSurface } from "~/rightPanelStore";
 import { cn } from "~/lib/utils";
 import { issueStatePresentation } from "~/components/issue/issuePresentation";
@@ -155,11 +161,16 @@ export interface RightPanelTabsProps {
   onActivate: (surface: RightPanelSurface) => void;
   onRenameDevice?: (surfaceId: string, title: string) => void;
   onCloseSurface: (surface: RightPanelSurface) => void;
+  /** Moves a subagent, side chat or linked thread tab to the main screen. */
+  onOpenInMainView?: (
+    surface: Extract<RightPanelSurface, { kind: "thread" | "linked-thread" }>,
+  ) => void;
   onCloseOtherSurfaces: (surface: RightPanelSurface) => void;
   onCloseSurfacesToRight: (surface: RightPanelSurface) => void;
   onCloseAllSurfaces: () => void;
   onMoveSurface?: (surfaceId: string, toIndex: number) => void;
   onCopyFilePath: (relativePath: string) => void;
+  onDuplicateBrowser?: (surface: RightPanelSurface) => void;
   onAddBrowser: () => void;
   /** Keep separate from the DOM click handler so a MouseEvent cannot become a profile id. */
   onAddBrowserInProfile: (profileId: string) => void;
@@ -167,6 +178,8 @@ export interface RightPanelTabsProps {
   onAddFiles: () => void;
   onAddPullRequest: () => void;
   onAddDevice: () => void;
+  /** Absent where the thread's linked items are not offered, such as the pull request list. */
+  onAddPullRequests?: () => void;
   /** Absent where there is no workspace to inspect, such as the pull request list. */
   onAddSourceControl?: () => void;
   /** Absent without a project to show Work for. */
@@ -177,6 +190,7 @@ export interface RightPanelTabsProps {
   diffAvailable: boolean;
   filesAvailable: boolean;
   pullRequestAvailable: boolean;
+  pullRequestsAvailable?: boolean;
   deviceAvailable: boolean;
   sideChatAvailable?: boolean;
   /** Overrides the default reason while side chats are available but cannot start. */
@@ -210,14 +224,15 @@ function shouldOpenDefaultBrowserProfileFromMenuClick(pointerType: string | unde
 }
 
 const SURFACE_DISABLED_REASONS = {
-  browser: "Browser previews are only available in the T3 Code desktop app.",
-  files: "Files are only available when a project is open.",
-  diff: "Diff is only available for server threads in Git repositories.",
-  sourceControl: "Source control is only available when a project is open.",
-  pullRequest: "This thread's branch has no pull request yet.",
-  device: "Devices are only available from a thread.",
-  work: "Work is only available when a project is open.",
-  sideChat: "Side chats start after the first message.",
+  browser: msg("Browser previews are only available in the T3 Code desktop app."),
+  files: msg("Files are only available when a project is open."),
+  diff: msg("Diff is only available for server threads in Git repositories."),
+  sourceControl: msg("Source control is only available when a project is open."),
+  pullRequest: msg("This thread's branch has no pull request yet."),
+  pullRequests: msg("This thread has no linked items."),
+  device: msg("Devices are only available from a thread."),
+  work: msg("Work is only available when a project is open."),
+  sideChat: msg("Side chats start after the first message."),
 } as const;
 
 // Closed keepMounted popups must stop blocking shortcuts once their exit transition ends.
@@ -235,19 +250,22 @@ const LAUNCHER_SHORTCUT_BLOCKING_LAYERS = [
   .join(",");
 
 const SURFACE_UNAVAILABLE_HINTS = {
-  browser: "Only available in the desktop app.",
-  files: "Available when a project is open.",
-  diff: "Available for Git repositories.",
-  sourceControl: "Available when a project is open.",
-  pullRequest: "No pull request on this branch yet.",
-  device: "Available from a thread.",
-  work: "Available when a project is open.",
-  sideChat: "Available after the first message.",
+  browser: msg("Only available in the desktop app."),
+  files: msg("Available when a project is open."),
+  diff: msg("Available for Git repositories."),
+  sourceControl: msg("Available when a project is open."),
+  pullRequest: msg("No pull request on this branch yet."),
+  pullRequests: msg("No linked items available."),
+  device: msg("Available from a thread."),
+  work: msg("Available when a project is open."),
+  sideChat: msg("Available after the first message."),
 } as const;
 
 type TabContextMenuAction =
+  | "open-in-main-view"
   | "rename"
   | "copy-path"
+  | "duplicate"
   | "toggle-mute"
   | "close"
   | "close-others"
@@ -274,13 +292,16 @@ function previewTabIdOf(
  * resolve while the preview manager's createTab is still in flight, and muting
  * then fails with a PreviewTabNotFoundError nothing surfaces to the user.
  */
-function tabMuteMenuItem(input: {
-  overlay: DesktopPreviewOverlay | null;
-  canResolveRuntimeTabId: boolean;
-}): { label: string; disabled: boolean } {
+function tabMuteMenuItem(
+  input: {
+    overlay: DesktopPreviewOverlay | null;
+    canResolveRuntimeTabId: boolean;
+  },
+  resolve: MessageResolver = m,
+): { label: string; disabled: boolean } {
   const muted = input.overlay?.audioMuted ?? false;
   return {
-    label: muted ? "Unmute tab" : "Mute tab",
+    label: muted ? resolve(msg("Unmute tab")) : resolve(msg("Mute tab")),
     disabled: input.overlay === null || !input.canResolveRuntimeTabId,
   };
 }
@@ -366,6 +387,8 @@ function RightPanelEmptyState(props: {
   onAddFiles: () => void;
   onAddPullRequest: () => void;
   onAddDevice: () => void;
+  /** Absent where the thread's linked items are not offered, such as the pull request list. */
+  onAddPullRequests?: () => void;
   /** Absent where there is no workspace to inspect, such as the pull request list. */
   onAddSourceControl?: () => void;
   /** Absent without a project to show Work for. */
@@ -376,113 +399,126 @@ function RightPanelEmptyState(props: {
   diffAvailable: boolean;
   filesAvailable: boolean;
   pullRequestAvailable: boolean;
+  pullRequestsAvailable?: boolean;
   deviceAvailable: boolean;
   sideChatAvailable: boolean;
   sideChatDisabledReason: string | null;
   workAttention?: WorkAttentionKeys | undefined;
   pluginActions: ReadonlyArray<PluginSurfaceAction>;
 }) {
+  const gt = useGT();
+  const messages = useMessages();
   const builtInActions = [
     ...(props.onAddSideChat
       ? [
           {
-            label: "Side chat",
+            label: gt("Side chat"),
             group: "chat",
-            description: "Ask a side question while this thread keeps working.",
+            description: gt("Ask a side question while this thread keeps working."),
             icon: MessagesSquare,
             shortcut: "S",
             available: props.sideChatAvailable && !props.sideChatDisabledReason,
-            disabledReason: props.sideChatDisabledReason ?? SURFACE_UNAVAILABLE_HINTS.sideChat,
+            disabledReason:
+              props.sideChatDisabledReason ?? messages(SURFACE_UNAVAILABLE_HINTS.sideChat),
             onClick: props.onAddSideChat,
           },
         ]
       : []),
     {
-      label: "Files",
+      label: gt("Files"),
       group: "chat",
       icon: Files,
       shortcut: "F",
       available: props.filesAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.files,
+      disabledReason: messages(SURFACE_UNAVAILABLE_HINTS.files),
       onClick: props.onAddFiles,
     },
     {
-      label: "Diff",
+      label: gt("Diff"),
       group: "git",
       icon: FileDiff,
       shortcut: "D",
       available: props.diffAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.diff,
+      disabledReason: messages(SURFACE_UNAVAILABLE_HINTS.diff),
       onClick: props.onAddDiff,
     },
     {
-      label: "Source control",
+      label: gt("Source control"),
       group: "git",
       icon: GitBranch,
       shortcut: "G",
       available: props.onAddSourceControl !== undefined,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.sourceControl,
+      disabledReason: messages(SURFACE_UNAVAILABLE_HINTS.sourceControl),
       onClick: () => props.onAddSourceControl?.(),
     },
     {
-      label: "Pull request",
+      label: gt("Pull request"),
       group: "git",
       icon: PullRequestGlyph.pullRequest,
       shortcut: "P",
       available: props.pullRequestAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.pullRequest,
+      disabledReason: messages(SURFACE_UNAVAILABLE_HINTS.pullRequest),
       onClick: props.onAddPullRequest,
     },
     {
-      label: "Work overview",
+      label: gt("Linked items"),
+      group: "git",
+      icon: PullRequestGlyph.link,
+      shortcut: "L",
+      available: props.onAddPullRequests !== undefined && props.pullRequestsAvailable === true,
+      disabledReason: messages(SURFACE_UNAVAILABLE_HINTS.pullRequests),
+      onClick: () => props.onAddPullRequests?.(),
+    },
+    {
+      label: gt("Work overview"),
       group: "work",
-      description: "The project's work at a glance.",
+      description: gt("The project's work at a glance."),
       icon: LayoutDashboard,
       shortcut: "O",
       available: props.onAddWork !== undefined,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.work,
+      disabledReason: messages(SURFACE_UNAVAILABLE_HINTS.work),
       onClick: () => props.onAddWork?.("overview"),
       attention: props.workAttention?.overview ?? NO_ATTENTION,
     },
     {
-      label: "Tasks",
+      label: gt("Tasks"),
       group: "work",
-      description: "The project's tasks.",
+      description: gt("The project's tasks."),
       icon: ListTodo,
       shortcut: "T",
       available: props.onAddWork !== undefined,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.work,
+      disabledReason: messages(SURFACE_UNAVAILABLE_HINTS.work),
       onClick: () => props.onAddWork?.("tasks"),
       attention: props.workAttention?.tasks ?? NO_ATTENTION,
     },
     {
-      label: "Knowledge",
+      label: gt("Knowledge"),
       group: "work",
-      description: "What the project's agents have learned.",
+      description: gt("What the project's agents have learned."),
       icon: BookOpen,
       shortcut: "K",
       available: props.onAddWork !== undefined,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.work,
+      disabledReason: messages(SURFACE_UNAVAILABLE_HINTS.work),
       onClick: () => props.onAddWork?.("knowledge"),
     },
     {
       id: BROWSER_ACTION_ID,
-      label: "Browser",
+      label: gt("Browser"),
       group: "workspace",
       icon: Globe2,
       shortcut: "B",
       available: props.browserAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.browser,
+      disabledReason: messages(SURFACE_UNAVAILABLE_HINTS.browser),
       onClick: props.onAddBrowser,
     },
     {
-      label: "Device",
+      label: gt("Device"),
       group: "workspace",
-      description: "Watch an iOS Simulator or Android Emulator.",
+      description: gt("Watch an iOS Simulator or Android Emulator."),
       icon: Smartphone,
       shortcut: "M",
       available: props.deviceAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.device,
+      disabledReason: messages(SURFACE_UNAVAILABLE_HINTS.device),
       onClick: props.onAddDevice,
     },
   ] as const;
@@ -492,7 +528,7 @@ function RightPanelEmptyState(props: {
       id: action.panelKey,
       label: action.label,
       group: "plugins",
-      description: "Right-click to unpin.",
+      description: gt("Right-click to unpin."),
       icon: action.icon,
       shortcut: "",
       available: true,
@@ -558,7 +594,7 @@ const showUnpinMenu = async (event: ReactMouseEvent, onUnpin: () => void) => {
   event.preventDefault();
   const api = readLocalApi();
   if (!api) return;
-  const action = await api.contextMenu.show([{ id: "unpin", label: "Unpin" }], {
+  const action = await api.contextMenu.show([{ id: "unpin", label: m(msg("Unpin")) }], {
     x: event.clientX,
     y: event.clientY,
   });
@@ -610,6 +646,7 @@ function RightPanelSurfaceLauncher(props: {
   browserProfiles: ReadonlyArray<{ readonly id: string; readonly name: string }>;
   onAddBrowserInProfile: (profileId: string) => void;
 }) {
+  const gt = useGT();
   const browserButtonRef = useRef<HTMLButtonElement>(null);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const hasProfileChoice = props.browserProfiles.length > 1;
@@ -672,7 +709,7 @@ function RightPanelSurfaceLauncher(props: {
     const hint = !action.available
       ? action.disabledReason
       : browserMenu
-        ? "Right-click to choose a profile."
+        ? gt("Right-click to choose a profile.")
         : action.description;
     return (
       <Tooltip disabled={browserMenu && profileMenuOpen}>
@@ -702,7 +739,9 @@ function RightPanelSurfaceLauncher(props: {
     <>
       {list ? (
         <div className="flex h-(--workspace-topbar-height) shrink-0 items-center gap-2 pr-3 pl-4.5">
-          <span className="min-w-0 flex-1 truncate font-medium text-sm">Open a surface</span>
+          <span className="min-w-0 flex-1 truncate font-medium text-sm">
+            <T>Open a surface</T>
+          </span>
           {props.layoutControls}
         </div>
       ) : (
@@ -716,7 +755,7 @@ function RightPanelSurfaceLauncher(props: {
           data-workspace-focus-default
           tabIndex={-1}
           onKeyDown={handleKeyDown}
-          aria-label="Open a surface"
+          aria-label={gt("Open a surface")}
           data-surface-launcher-keys={props.launcherKeys}
           className="flex min-h-0 flex-1 flex-col outline-none"
         >
@@ -776,12 +815,13 @@ function surfaceTitle(
   surface: RightPanelSurface,
   sessions: Readonly<Record<string, PreviewSessionSnapshot>>,
   terminalLabelsById: ReadonlyMap<string, string>,
+  resolve: MessageResolver = m,
 ): string {
   switch (surface.kind) {
     case "diff":
-      return "Diff";
+      return resolve(msg("Diff"));
     case "files":
-      return "Files";
+      return resolve(msg("Files"));
     case "file":
       return surface.relativePath.slice(
         Math.max(surface.relativePath.lastIndexOf("/"), surface.relativePath.lastIndexOf("\\")) + 1,
@@ -789,35 +829,41 @@ function surfaceTitle(
     case "terminal":
       return (
         terminalLabelsById.get(surface.activeTerminalId) ??
-        getTerminalLabel(surface.activeTerminalId)
+        getTerminalLabel(surface.activeTerminalId, resolve)
       );
     case "pull-request":
       return `#${surface.number}`;
     case "pull-requests":
-      return "Pull requests";
+      return resolve(msg("Linked items"));
     case "source-control":
-      return "Source control";
+      return resolve(msg("Source control"));
     case "work":
       return WORK_SECTION_LABELS[surface.view];
     case "work-task":
-      return surface.title ?? "Task";
+      return surface.title ?? resolve(msg("Task"));
     case "issue":
       // A git host numbers its issues; a tracker with keys of its own, such as Linear, names them.
       return /^\d+$/.test(surface.key) ? `#${surface.key}` : surface.key;
     case "device":
-      return surface.title ?? surface.target?.name ?? "Device";
-    case "side-chat":
-      return "Side chat";
+      return surface.title ?? surface.target?.name ?? resolve(msg("Device"));
+    case "thread":
+      // Until the thread's own title loads.
+      return resolve(msg("Thread"));
+    case "linked-thread":
+      return linkedThreadTitle(
+        surface,
+        resolve(msg("Thread on {label}", { label: surface.label })),
+      );
     case "plugin":
       return surface.title;
     case "preview": {
       const snapshot = surface.resourceId ? sessions[surface.resourceId] : null;
-      if (!snapshot || snapshot.navStatus._tag === "Idle") return "Browser";
+      if (!snapshot || snapshot.navStatus._tag === "Idle") return resolve(msg("Browser"));
       if (snapshot.navStatus.title.trim().length > 0) return snapshot.navStatus.title;
       try {
-        return new URL(snapshot.navStatus.url).host || "Browser";
+        return new URL(snapshot.navStatus.url).host || resolve(msg("Browser"));
       } catch {
-        return "Browser";
+        return resolve(msg("Browser"));
       }
     }
   }
@@ -906,10 +952,12 @@ function SurfaceIcon({
       return <SquareCheckBig className="size-3 shrink-0" />;
     case "issue":
       return <IssueSurfaceIcon surface={surface} environmentId={environmentId} />;
-    case "side-chat":
+    case "thread":
       return <SideChatTabIcon environmentId={environmentId} threadId={surface.threadId} />;
     case "plugin":
       return <PluginSurfaceIcon panelKey={surface.panelKey} />;
+    case "linked-thread":
+      return <MessagesSquare className="size-3 shrink-0" />;
     case "device":
       return surface.target?.platform === "ios" ? (
         <AppleIcon className="size-3 shrink-0" />
@@ -932,6 +980,12 @@ function PluginSurfaceIcon(props: { panelKey: PluginPanelKey }) {
   return createElement(pluginPanelIcon(name), { className: "size-3 shrink-0" });
 }
 
+const SIDE_CHAT_STATE_LABELS = {
+  "needs approval": msg("needs approval"),
+  "needs input": msg("needs input"),
+  running: msg("running", { $context: "side chat status" }),
+} as const;
+
 /** What a side chat tab's dot shows and its title's accessible name says. */
 function sideChatTabState(shell: EnvironmentThreadShell | null) {
   if (shell === null) return null;
@@ -944,16 +998,16 @@ function sideChatTabState(shell: EnvironmentThreadShell | null) {
   return threadRuntimeIsActive(shell.runtime) ? "running" : null;
 }
 
-// Static dots: a side chat tab can stay open for a whole run.
+// Static dots: a side chat or subagent tab can stay open for a whole run.
 function SideChatTabIcon(props: { environmentId: EnvironmentId | null; threadId: ThreadId }) {
-  const state = sideChatTabState(
-    useQuietThreadShell(
-      props.environmentId === null ? null : scopeThreadRef(props.environmentId, props.threadId),
-    ),
+  const shell = useQuietThreadShell(
+    props.environmentId === null ? null : scopeThreadRef(props.environmentId, props.threadId),
   );
+  const state = sideChatTabState(shell);
+  const Icon = shell !== null && shell.lineage.sideChat !== true ? Bot : MessagesSquare;
   return (
     <>
-      <MessagesSquare className="size-3 shrink-0" />
+      <Icon className="size-3 shrink-0" />
       {state === null ? null : (
         <span
           className={cn(
@@ -1153,6 +1207,8 @@ function RightPanelTab(
     ownsDesktopTitleBar: boolean;
   },
 ) {
+  const gt = useGT();
+  const messages = useMessages();
   const {
     surface,
     audio,
@@ -1169,15 +1225,20 @@ function RightPanelTab(
     disabled: props.dragDisabled,
   });
   const sideChatShell = useQuietThreadShell(
-    surface.kind === "side-chat" && props.environmentId !== null
+    surface.kind === "thread" && props.environmentId !== null
       ? scopeThreadRef(props.environmentId, surface.threadId)
       : null,
   );
-  const title = sideChatShell?.title ?? props.title;
+  const title =
+    sideChatShell === null
+      ? props.title
+      : sideChatShell.lineage.sideChat === true
+        ? sideChatShell.title
+        : formatSubagentDisplayTitle(sideChatShell.title);
   const sideChatState = sideChatTabState(sideChatShell);
   const content = (
     <>
-      <PanelTabCloseButton label={`Close ${title}`} onClick={() => onClose(surface)}>
+      <PanelTabCloseButton label={gt("Close {title}", { title })} onClick={() => onClose(surface)}>
         <AttentionIcon attention={props.attention}>
           <SurfaceIcon
             surface={surface}
@@ -1202,7 +1263,11 @@ function RightPanelTab(
               <button
                 type="button"
                 className="cursor-pointer flex size-4 shrink-0 items-center justify-center rounded-sm hover:bg-muted"
-                aria-label={audio === "muted" ? `Unmute ${title}` : `Mute ${title}`}
+                aria-label={
+                  audio === "muted"
+                    ? gt("Unmute {title}", { title })
+                    : gt("Mute {title}", { title })
+                }
                 onClick={(event) => {
                   event.stopPropagation();
                   void previewBridge
@@ -1218,12 +1283,12 @@ function RightPanelTab(
               </button>
             }
           />
-          <TooltipPopup>{audio === "muted" ? "Unmute tab" : "Mute tab"}</TooltipPopup>
+          <TooltipPopup>{audio === "muted" ? gt("Unmute tab") : gt("Mute tab")}</TooltipPopup>
         </Tooltip>
       )}
       {props.renaming ? (
         <input
-          aria-label="Device tab name"
+          aria-label={gt("Device tab name")}
           className="w-24 min-w-0 rounded-sm bg-background px-1 outline-none ring-1 ring-inset ring-ring"
           defaultValue={title}
           ref={(element) => {
@@ -1251,7 +1316,14 @@ function RightPanelTab(
                   if (surface.kind === "device" && props.canRename) onStartRename(surface.id);
                 }}
                 className="cursor-pointer flex min-w-0 items-center"
-                aria-label={sideChatState === null ? undefined : `${title}, ${sideChatState}`}
+                aria-label={
+                  sideChatState === null
+                    ? undefined
+                    : gt("{title}, {state}", {
+                        title,
+                        state: messages(SIDE_CHAT_STATE_LABELS[sideChatState]),
+                      })
+                }
                 onClick={() => onActivate(surface)}
               >
                 <span className="truncate">{title}</span>
@@ -1298,6 +1370,8 @@ function RightPanelTab(
 }
 
 export function RightPanelTabs(props: RightPanelTabsProps) {
+  const gt = useGT();
+  const messages = useMessages();
   const focusedSurface = props.surfaces.find((surface) => surface.id === props.activeSurfaceId);
   const ownsDesktopTitleBar = isElectron && props.mode === "inline";
   const railLayout = props.activeSurfaceId === null;
@@ -1315,6 +1389,8 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
 
   if ((props.open === false || railLayout) && addSurfaceMenuOpen) setAddSurfaceMenuOpen(false);
 
+  const addSurfaceMenuBlocked = () =>
+    !addSurfaceMenuOpen && document.querySelector(LAUNCHER_SHORTCUT_BLOCKING_LAYERS) !== null;
   const onNewSurfaceKeyDown = useEffectEvent((event: KeyboardEvent) => {
     if (event.defaultPrevented || event.isComposing) return;
     if (
@@ -1323,7 +1399,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       }) !== "rightPanel.new"
     )
       return;
-    if (!addSurfaceMenuOpen && document.querySelector(LAUNCHER_SHORTCUT_BLOCKING_LAYERS)) return;
+    if (addSurfaceMenuBlocked()) return;
     event.preventDefault();
     event.stopPropagation();
     if (event.repeat) return;
@@ -1334,11 +1410,20 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
     addSurfaceTriggerRef.current?.focus();
     setAddSurfaceMenuOpen(true);
   });
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- subscribes a document keydown listener for the new surface shortcut while the panel is open
+  // Forwarded from a focused browser page. Focusing the trigger here would let ChatView's
+  // window-focus handler see a plain button and refocus the composer, closing the menu.
+  const onMenuAction = useEffectEvent((action: string) => {
+    if (action === "rightPanel.new" && !addSurfaceMenuBlocked()) setAddSurfaceMenuOpen(true);
+  });
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- subscribes document keydown and the desktop menu action (forwarded from a focused browser page) for the new surface shortcut while the panel is open
   useEffect(() => {
     if (props.open === false) return;
     document.addEventListener("keydown", onNewSurfaceKeyDown, true);
-    return () => document.removeEventListener("keydown", onNewSurfaceKeyDown, true);
+    const unsubscribe = window.desktopBridge?.onMenuAction(onMenuAction);
+    return () => {
+      document.removeEventListener("keydown", onNewSurfaceKeyDown, true);
+      unsubscribe?.();
+    };
   }, [props.open]);
 
   const updateTabScrollState = (viewport: HTMLDivElement) => {
@@ -1374,69 +1459,80 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
     ...(props.onAddSideChat
       ? [
           {
-            label: "Side chat",
+            label: msg("Side chat"),
             icon: MessagesSquare,
             shortcut: "S",
             available: props.sideChatAvailable === true && !props.sideChatDisabledReason,
-            disabledReason: props.sideChatDisabledReason ?? SURFACE_DISABLED_REASONS.sideChat,
+            disabledReason:
+              props.sideChatDisabledReason ?? messages(SURFACE_DISABLED_REASONS.sideChat),
             onClick: props.onAddSideChat,
           },
         ]
       : []),
     {
-      label: "Files",
+      label: msg("Files"),
       icon: Files,
       shortcut: "F",
       available: props.filesAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.files,
+      disabledReason: messages(SURFACE_DISABLED_REASONS.files),
       onClick: props.onAddFiles,
     },
     {
-      label: "Diff",
+      label: msg("Diff"),
       icon: FileDiff,
       shortcut: "D",
       available: props.diffAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.diff,
+      disabledReason: messages(SURFACE_DISABLED_REASONS.diff),
       onClick: props.onAddDiff,
     },
     {
-      label: "Source control",
+      label: msg("Source control"),
       icon: GitBranch,
       shortcut: "G",
       available: props.onAddSourceControl !== undefined,
-      disabledReason: SURFACE_DISABLED_REASONS.sourceControl,
+      disabledReason: messages(SURFACE_DISABLED_REASONS.sourceControl),
       onClick: () => props.onAddSourceControl?.(),
     },
     {
-      label: "Pull request",
+      label: msg("Pull request"),
       icon: PullRequestGlyph.pullRequest,
       shortcut: "P",
       available: props.pullRequestAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.pullRequest,
+      disabledReason: messages(SURFACE_DISABLED_REASONS.pullRequest),
       onClick: props.onAddPullRequest,
     },
     {
-      label: "Work",
+      label: msg("Linked items"),
+      icon: PullRequestGlyph.link,
+      shortcut: "L",
+      available: props.onAddPullRequests !== undefined && props.pullRequestsAvailable === true,
+      disabledReason: messages(SURFACE_DISABLED_REASONS.pullRequests),
+      onClick: () => props.onAddPullRequests?.(),
+    },
+    {
+      id: "work",
+      label: msg("Work"),
       icon: ListTodo,
       shortcut: "W",
       available: props.onAddWork !== undefined,
-      disabledReason: SURFACE_DISABLED_REASONS.work,
+      disabledReason: messages(SURFACE_DISABLED_REASONS.work),
       onClick: () => props.onAddWork?.("tasks"),
     },
     {
-      label: "Browser",
+      id: BROWSER_ACTION_ID,
+      label: msg("Browser"),
       icon: Globe2,
       shortcut: "B",
       available: props.browserAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.browser,
+      disabledReason: messages(SURFACE_DISABLED_REASONS.browser),
       onClick: props.onAddBrowser,
     },
     {
-      label: "Device",
+      label: msg("Device"),
       icon: Smartphone,
       shortcut: "M",
       available: props.deviceAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.device,
+      disabledReason: messages(SURFACE_DISABLED_REASONS.device),
       onClick: props.onAddDevice,
     },
   ] as const;
@@ -1461,44 +1557,64 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
     if (surfaceIndex < 0) return;
 
     const items: ContextMenuItem<TabContextMenuAction>[] = [];
+    if ((surface.kind === "thread" || surface.kind === "linked-thread") && props.onOpenInMainView) {
+      items.push({ id: "open-in-main-view", label: gt("Open in main view") });
+    }
     if (surface.kind === "device" && props.onRenameDevice)
-      items.push({ id: "rename", label: "Rename" });
+      items.push({ id: "rename", label: gt("Rename") });
     if (surface.kind === "file" && surface.attachment === undefined) {
-      items.push({ id: "copy-path", label: "Copy path" });
+      items.push({ id: "copy-path", label: gt("Copy path") });
     }
     const menuPreviewTabId = previewTabIdOf(surface, props.previewSessions);
     const menuOverlay = menuPreviewTabId ? (props.desktopByTabId[menuPreviewTabId] ?? null) : null;
     const menuMuted = menuOverlay?.audioMuted ?? false;
     if (surface.kind === "preview") {
       items.push({
+        id: "duplicate",
+        label: gt("Duplicate"),
+        disabled: !props.browserAvailable || !menuPreviewTabId || !props.onDuplicateBrowser,
+      });
+      items.push({
         id: "toggle-mute",
-        ...tabMuteMenuItem({
-          overlay: menuOverlay,
-          canResolveRuntimeTabId: props.previewRuntimeTabId !== undefined,
-        }),
+        ...tabMuteMenuItem(
+          {
+            overlay: menuOverlay,
+            canResolveRuntimeTabId: props.previewRuntimeTabId !== undefined,
+          },
+          messages,
+        ),
       });
     }
     items.push(
-      { id: "close", label: "Close" },
+      { id: "close", label: gt("Close") },
       {
         id: "close-others",
-        label: "Close others",
+        label: gt("Close others"),
         disabled: props.surfaces.length <= 1,
       },
       {
         id: "close-to-right",
-        label: "Close to the right",
+        label: gt("Close to the right"),
         disabled: surfaceIndex >= props.surfaces.length - 1,
       },
       {
         id: "close-all",
-        label: "Close all",
+        label: gt("Close all"),
         disabled: props.surfaces.length === 0,
       },
     );
 
-    const action = await api.contextMenu.show(items, { x: event.clientX, y: event.clientY });
+    const action = await api.contextMenu.show(
+      items,
+      { x: event.clientX, y: event.clientY },
+      contextMenuSourceOf(event),
+    );
     switch (action) {
+      case "open-in-main-view":
+        if (surface.kind === "thread" || surface.kind === "linked-thread") {
+          props.onOpenInMainView?.(surface);
+        }
+        break;
       case "rename":
         setRenamingDevice(surface.id);
         break;
@@ -1506,6 +1622,9 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
         if (surface.kind === "file" && surface.attachment === undefined) {
           props.onCopyFilePath(surface.relativePath);
         }
+        break;
+      case "duplicate":
+        props.onDuplicateBrowser?.(surface);
         break;
       case "toggle-mute": {
         const runtimeTabId =
@@ -1602,8 +1721,15 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       workspaceFocusKey={`panel:${props.environmentId}:${props.activeSurfaceId ?? "empty"}`}
       workspaceLabel={
         focusedSurface
-          ? `Workspace panel: ${surfaceTitle(focusedSurface, props.previewSessions, props.terminalLabelsById)}`
-          : "Workspace panel"
+          ? gt("Workspace panel: {title}", {
+              title: surfaceTitle(
+                focusedSurface,
+                props.previewSessions,
+                props.terminalLabelsById,
+                messages,
+              ),
+            })
+          : gt("Workspace panel")
       }
       mode={props.mode}
       {...(props.maximized !== undefined ? { maximized: props.maximized } : {})}
@@ -1662,7 +1788,12 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                       }
                       active={surface.id === props.activeSurfaceId}
                       pending={props.pendingSurfaceIds.has(surface.id)}
-                      title={surfaceTitle(surface, props.previewSessions, props.terminalLabelsById)}
+                      title={surfaceTitle(
+                        surface,
+                        props.previewSessions,
+                        props.terminalLabelsById,
+                        messages,
+                      )}
                       audio={tabAudioState(
                         previewTabId ? (props.desktopByTabId[previewTabId] ?? null) : null,
                       )}
@@ -1702,7 +1833,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                     ref={addSurfaceTriggerRef}
                     render={
                       <Button
-                        aria-label="Add panel surface"
+                        aria-label={gt("Add panel surface")}
                         className="shrink-0"
                         size="icon-xs"
                         variant="ghost-muted"
@@ -1720,7 +1851,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                     {addSurfaceActions.map((action) => {
                       const Icon = action.icon;
                       const onAddWork = props.onAddWork;
-                      if (action.label === "Work" && onAddWork) {
+                      if ("id" in action && action.id === "work" && onAddWork) {
                         return (
                           <MenuSub key={action.label}>
                             <MenuSubTrigger
@@ -1728,7 +1859,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                               aria-keyshortcuts={action.shortcut}
                             >
                               <Icon />
-                              {action.label}
+                              {messages(action.label)}
                               <MenuShortcut>{action.shortcut}</MenuShortcut>
                             </MenuSubTrigger>
                             <MenuSubPopup className="max-w-56">
@@ -1747,7 +1878,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                           </MenuSub>
                         );
                       }
-                      if (action.label === "Browser" && action.available) {
+                      if ("id" in action && action.id === BROWSER_ACTION_ID && action.available) {
                         return (
                           <MenuSub key={action.label}>
                             <MenuSubTrigger
@@ -1766,7 +1897,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                               }}
                             >
                               <Icon />
-                              {action.label}
+                              {messages(action.label)}
                               <MenuShortcut>{action.shortcut}</MenuShortcut>
                             </MenuSubTrigger>
                             <MenuSubPopup className="max-w-56">
@@ -1791,7 +1922,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                           onClick={action.onClick}
                         >
                           <Icon />
-                          {action.label}
+                          {messages(action.label)}
                         </SurfaceMenuItem>
                       );
                     })}
@@ -1814,14 +1945,14 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             <div
               className="flex shrink-0 items-center gap-0.5 [-webkit-app-region:no-drag]"
               role="group"
-              aria-label="Scroll panel tabs"
+              aria-label={gt("Scroll panel tabs")}
             >
               <Tooltip>
                 <TooltipTrigger
                   render={
                     <span className="inline-flex">
                       <Button
-                        aria-label="Scroll tabs left"
+                        aria-label={gt("Scroll tabs left")}
                         disabled={!tabScrollState.canScrollLeft}
                         onClick={() => scrollTabs(-1)}
                         size="icon-xs"
@@ -1832,14 +1963,16 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                     </span>
                   }
                 />
-                <TooltipPopup>Scroll tabs left</TooltipPopup>
+                <TooltipPopup>
+                  <T>Scroll tabs left</T>
+                </TooltipPopup>
               </Tooltip>
               <Tooltip>
                 <TooltipTrigger
                   render={
                     <span className="inline-flex">
                       <Button
-                        aria-label="Scroll tabs right"
+                        aria-label={gt("Scroll tabs right")}
                         disabled={!tabScrollState.canScrollRight}
                         onClick={() => scrollTabs(1)}
                         size="icon-xs"
@@ -1850,7 +1983,9 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                     </span>
                   }
                 />
-                <TooltipPopup>Scroll tabs right</TooltipPopup>
+                <TooltipPopup>
+                  <T>Scroll tabs right</T>
+                </TooltipPopup>
               </Tooltip>
             </div>
           ) : null}
@@ -1878,6 +2013,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             onAddFiles={props.onAddFiles}
             onAddPullRequest={props.onAddPullRequest}
             onAddDevice={props.onAddDevice}
+            {...(props.onAddPullRequests ? { onAddPullRequests: props.onAddPullRequests } : {})}
             {...(props.onAddSourceControl ? { onAddSourceControl: props.onAddSourceControl } : {})}
             {...(props.onAddWork ? { onAddWork: props.onAddWork } : {})}
             onAddSideChat={props.onAddSideChat}
@@ -1885,6 +2021,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             diffAvailable={props.diffAvailable}
             filesAvailable={props.filesAvailable}
             pullRequestAvailable={props.pullRequestAvailable}
+            pullRequestsAvailable={props.pullRequestsAvailable === true}
             deviceAvailable={props.deviceAvailable}
             sideChatAvailable={props.sideChatAvailable === true}
             sideChatDisabledReason={props.sideChatDisabledReason ?? null}
@@ -1904,6 +2041,7 @@ function DeviceTabTooltip(props: {
   environmentId: EnvironmentId | null;
   title: string;
 }) {
+  const gt = useGT();
   const target = props.surface.target;
   const { state } = useDeviceState(target ? props.environmentId : null);
   const device = target
@@ -1915,7 +2053,7 @@ function DeviceTabTooltip(props: {
       <span>{props.title}</span>
       {target ? (
         <span className="text-muted-foreground">
-          {host?.label ?? "Device host"} ·{" "}
+          {host?.label ?? gt("Device host")} ·{" "}
           {device?.version ?? (target.platform === "ios" ? "iOS" : "Android")}
         </span>
       ) : null}

@@ -2,6 +2,7 @@ import { useNavigation } from "@react-navigation/native";
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { useState } from "react";
 import { Platform } from "react-native";
+import { useGT, useMessages } from "gt-react-native";
 import { AppBar } from "../../components/ui/AppBar";
 import type { AppBarAction, AppBarMenu, AppBarMenuItem } from "../../components/ui/AppBar.types";
 import { ScreenHeaderButton } from "../../components/ui/ScreenHeaderButton";
@@ -21,6 +22,7 @@ import {
 import type { ThreadToolAction } from "./thread-tools-panel";
 import { ThreadToolsPanel } from "./ThreadToolsPanel";
 import { useThreadSelection } from "../../state/use-thread-selection";
+import { useCanShareWithGuest } from "./useCanShareWithGuest";
 
 export function ThreadHeader(props: {
   readonly title: string;
@@ -32,6 +34,8 @@ export function ThreadHeader(props: {
   readonly inspectorMode: ThreadInspectorMode | null;
   readonly onOpenFilesInspector: () => void;
 }) {
+  const gt = useGT();
+  const m = useMessages();
   const goBack = useWorkspaceBackNavigation();
   const navigation = useNavigation();
   const environmentId = EnvironmentId.make(String(props.gitControls.environmentId));
@@ -45,6 +49,7 @@ export function ThreadHeader(props: {
   const [toolsOpen, setToolsOpen] = useState(false);
   // Phones move Files, Terminal and History into the tools panel; columns keep the inspector.
   const compact = !layout.usesSplitView;
+  const canShareWithGuest = useCanShareWithGuest(props.draft ? null : environmentId);
   const filesVisible = props.inspectorMode === "files" && panes.auxiliaryPaneVisible;
   const openHistory = () => navigation.navigate("ThreadHistory", { environmentId, threadId });
   const agentAction: AppBarAction | null =
@@ -56,7 +61,7 @@ export function ThreadHeader(props: {
           onPress: agentLink.open,
         };
   const toolsAction: AppBarAction = {
-    accessibilityLabel: "Open tools",
+    accessibilityLabel: gt("Open tools"),
     icon: "sidebar.right",
     separateBackground: false,
     onPress: () => setToolsOpen(true),
@@ -66,7 +71,7 @@ export function ThreadHeader(props: {
   const detailsAction: AppBarAction | null = props.draft
     ? null
     : {
-        accessibilityLabel: "Thread details",
+        accessibilityLabel: gt("Thread details"),
         icon: "info.circle",
         separateBackground: false,
         onPress: () => navigation.navigate("ThreadLiveDetails", { environmentId, threadId }),
@@ -81,7 +86,7 @@ export function ThreadHeader(props: {
         ...(props.hasThreadCwd
           ? [
               {
-                accessibilityLabel: filesVisible ? "Close files" : "Open files",
+                accessibilityLabel: filesVisible ? gt("Close files") : gt("Open files"),
                 icon: "folder",
                 selected: filesVisible,
                 disabled: !props.gitControls.canOpenFiles,
@@ -91,12 +96,12 @@ export function ThreadHeader(props: {
             ]
           : []),
         ...(agentAction === null ? [] : [agentAction]),
-        { accessibilityLabel: "Thread history", icon: "clock", onPress: openHistory },
+        { accessibilityLabel: gt("Thread history"), icon: "clock", onPress: openHistory },
       ];
   // Phones list Git in the tools panel; the header slot opens the thread details instead.
   const menus = [
     compact ? null : gitMenu,
-    compact ? null : threadTerminalMenu(props.gitControls),
+    compact ? null : threadTerminalMenu(props.gitControls, m),
   ].filter((menu): menu is AppBarMenu => menu !== null);
 
   const runTool = (action: ThreadToolAction) => {
@@ -119,6 +124,8 @@ export function ThreadHeader(props: {
           section: action.section,
         });
     } else if (action.type === "git") findGitItem(gitPanelItems, action.itemId)?.onPress();
+    else if (action.type === "guest-share")
+      navigation.navigate("ThreadGuestShare", { environmentId, threadId });
     else openHistory();
   };
 
@@ -132,7 +139,7 @@ export function ThreadHeader(props: {
         backInSplitView={
           props.onReturnToThread
             ? {
-                accessibilityLabel: "Return to chat",
+                accessibilityLabel: gt("Return to chat"),
                 icon: "chevron.left",
                 onPress: props.onReturnToThread,
               }
@@ -143,7 +150,7 @@ export function ThreadHeader(props: {
         trailing={
           compact && !toolsFirst ? (
             <ScreenHeaderButton
-              accessibilityLabel="Open tools"
+              accessibilityLabel={gt("Open tools")}
               icon="sidebar.right"
               separateBackground={false}
               onPress={() => setToolsOpen(true)}
@@ -166,6 +173,7 @@ export function ThreadHeader(props: {
             canOpenFiles: props.gitControls.canOpenFiles,
             gitItems: gitPanelItems,
             hasProject: projectId !== null,
+            canShareWithGuest,
           }}
           onSelect={runTool}
           onClosed={() => setToolsOpen(false)}

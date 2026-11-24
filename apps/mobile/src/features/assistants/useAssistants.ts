@@ -1,3 +1,4 @@
+import { runAtomCommand } from "@t3tools/client-runtime/state/runtime";
 import { useAtomValue } from "@effect/atom-react";
 import {
   isAtomCommandInterrupted,
@@ -143,7 +144,12 @@ export function useAssistantWriter(environmentId: EnvironmentId) {
     busy.current = true;
     setPendingKey(key);
     setFailure(null);
-    const result = await command.run(appAtomRegistry, { environmentId, input });
+    const result = await runAtomCommand(
+      appAtomRegistry,
+      command,
+      { environmentId, input },
+      { reportFailure: false },
+    );
     busy.current = false;
     setPendingKey(null);
     if (result._tag === "Success") return result.value;

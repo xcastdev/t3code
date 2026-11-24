@@ -1,3 +1,4 @@
+import { runAtomCommand } from "@t3tools/client-runtime/state/runtime";
 import { RegistryContext, useAtomValue } from "@effect/atom-react";
 import {
   isAtomCommandInterrupted,
@@ -363,7 +364,9 @@ function ArchiveDetail(props: {
     const prepared = prepareHistoryMutation({ selected, current: now, input });
     if (prepared === null) return;
     setMessage(null);
-    const result = await threadHistoryEnvironment.recover.run(registry, prepared);
+    const result = await runAtomCommand(registry, threadHistoryEnvironment.recover, prepared, {
+      reportFailure: false,
+    });
     if (result._tag === "Failure") {
       if (!isAtomCommandInterrupted(result) && currentNow() !== null)
         setMessage(failureText(result));
@@ -392,7 +395,12 @@ function ArchiveDetail(props: {
           });
           if (prepared === null) return;
           setMessage(null);
-          const result = await threadHistoryEnvironment.restoreFiles.run(registry, prepared);
+          const result = await runAtomCommand(
+            registry,
+            threadHistoryEnvironment.restoreFiles,
+            prepared,
+            { reportFailure: false },
+          );
           if (currentNow() === null) return;
           if (result._tag === "Success") setMessage("Files restored.");
           else if (!isAtomCommandInterrupted(result)) setMessage(failureText(result));
@@ -405,10 +413,15 @@ function ArchiveDetail(props: {
   const inspectFiles = async () => {
     const operation = mutation.fileOperation;
     if (operation === null || readLiveEpoch(registry, environmentId) === null) return;
-    const result = await threadHistoryEnvironment.inspectFileRestore.run(registry, {
-      environmentId,
-      input: operation,
-    });
+    const result = await runAtomCommand(
+      registry,
+      threadHistoryEnvironment.inspectFileRestore,
+      {
+        environmentId,
+        input: operation,
+      },
+      { reportFailure: false },
+    );
     if (currentNow() === null) return;
     if (result._tag === "Success")
       setCheckedStatus({ commandId: operation.commandId, status: result.value });
@@ -444,7 +457,12 @@ function ArchiveDetail(props: {
           });
           if (prepared === null) return;
           setMessage(null);
-          const result = await threadHistoryEnvironment.restoreFiles.run(registry, prepared);
+          const result = await runAtomCommand(
+            registry,
+            threadHistoryEnvironment.restoreFiles,
+            prepared,
+            { reportFailure: false },
+          );
           if (currentNow() === null) return;
           if (result._tag === "Success") setMessage("Files restored.");
           else if (!isAtomCommandInterrupted(result)) setMessage(failureText(result));
@@ -464,10 +482,15 @@ function ArchiveDetail(props: {
   const reconcileFiles = async () => {
     if (compareBlocked || fileStatus === null || mutation.fileOperation === null) return;
     if (currentNow() === null) return;
-    const result = await threadHistoryEnvironment.reconcile.run(registry, {
-      environmentId,
-      input: { threadId: fileStatus.threadId, archiveId: fileStatus.archiveId },
-    });
+    const result = await runAtomCommand(
+      registry,
+      threadHistoryEnvironment.reconcile,
+      {
+        environmentId,
+        input: { threadId: fileStatus.threadId, archiveId: fileStatus.archiveId },
+      },
+      { reportFailure: false },
+    );
     if (currentNow() === null) return;
     if (result._tag === "Failure" && !isAtomCommandInterrupted(result))
       setMessage(failureText(result));
@@ -492,7 +515,12 @@ function ArchiveDetail(props: {
             input: { threadId, archiveId },
           });
           if (prepared === null) return;
-          const result = await threadHistoryEnvironment.release.run(registry, prepared);
+          const result = await runAtomCommand(
+            registry,
+            threadHistoryEnvironment.release,
+            prepared,
+            { reportFailure: false },
+          );
           if (result._tag === "Failure" && !isAtomCommandInterrupted(result) && currentNow())
             setMessage(failureText(result));
         })();

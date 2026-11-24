@@ -2092,6 +2092,24 @@ export const ProjectTeamMessageAttentionIntent = Schema.Struct({
 });
 export type ProjectTeamMessageAttentionIntent = typeof ProjectTeamMessageAttentionIntent.Type;
 
+/**
+ * A tracked Git folder's path as the project lists it. Omitted, the run works in the project
+ * folder's repository, or in the project's only repository when the folder is not one.
+ */
+const ProjectTeamDispatchRepository = TrimmedNonEmptyString.check(Schema.isMaxLength(4_000));
+export const ProjectTeamDispatchWorkspace = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("root"),
+    repository: Schema.optionalKey(ProjectTeamDispatchRepository),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("worktree"),
+    baseRef: GuidedId,
+    repository: Schema.optionalKey(ProjectTeamDispatchRepository),
+  }),
+]);
+export type ProjectTeamDispatchWorkspace = typeof ProjectTeamDispatchWorkspace.Type;
+
 export const ProjectTeamDispatchIntent = Schema.Struct({
   type: Schema.Literal("project-team.dispatch"),
   projectId: ProjectId,
@@ -2105,10 +2123,7 @@ export const ProjectTeamDispatchIntent = Schema.Struct({
   expectedGateRevision: NonNegativeInt,
   modelSelection: ModelSelection,
   reviewVerificationJobId: Schema.optionalKey(GuidedId),
-  workspace: Schema.Union([
-    Schema.Struct({ type: Schema.Literal("root") }),
-    Schema.Struct({ type: Schema.Literal("worktree"), baseRef: GuidedId }),
-  ]),
+  workspace: ProjectTeamDispatchWorkspace,
 });
 export type ProjectTeamDispatchIntent = typeof ProjectTeamDispatchIntent.Type;
 

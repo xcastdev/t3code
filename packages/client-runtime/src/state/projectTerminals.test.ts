@@ -1,4 +1,5 @@
 import { expect, it } from "@effect/vitest";
+import { runAtomCommand } from "./runtime.ts";
 import {
   AuthTerminalOperateScope,
   EnvironmentId,
@@ -126,15 +127,15 @@ it.effect("guards project mutations using the actual destination environment", (
       expect(registry.get(terminals.write.permissionAtom(origin))).toBe(true);
       expect(registry.get(terminals.write.permissionAtom(destination))).toBe(false);
       const writes = [
-        terminals.write.run(registry, {
+        runAtomCommand(registry, terminals.write, {
           environmentId: destination,
           input: { ...handle, data: "x" },
         }),
-        terminals.resize.run(registry, {
+        runAtomCommand(registry, terminals.resize, {
           environmentId: destination,
           input: { ...handle, cols: 80, rows: 24 },
         }),
-        terminals.kill.run(registry, { environmentId: destination, input: handle }),
+        runAtomCommand(registry, terminals.kill, { environmentId: destination, input: handle }),
       ];
       for (const result of yield* Effect.promise(() => Promise.all(writes))) {
         expect(result._tag).toBe("Failure");

@@ -1,4 +1,5 @@
 import * as Deferred from "effect/Deferred";
+import { runAtomCommand } from "./runtime.ts";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -267,14 +268,16 @@ it.effect(
             checkpointId: CheckpointId.make("checkpoint"),
           },
         };
-        const denied = yield* Effect.promise(() => atoms.restoreFiles.run(registry, target));
+        const denied = yield* Effect.promise(() =>
+          runAtomCommand(registry, atoms.restoreFiles, target),
+        );
         expect(denied._tag).toBe("Failure");
         expect(writes).toBe(0);
         expect(registry.get(atoms.mutationState(selection)).filesUncertain).toBe(false);
         registry.set(sessions(environmentId), AsyncResult.success(auth));
         for (const command of [atoms.recover, atoms.restoreFiles, atoms.release, atoms.reconcile])
           expect(registry.get(command.permissionAtom(environmentId))).toBe(true);
-        const pending = atoms.restoreFiles.run(registry, target);
+        const pending = runAtomCommand(registry, atoms.restoreFiles, target);
         yield* Deferred.await(started);
         expect(registry.get(atoms.mutationState(selection))).toMatchObject({
           pending: 1,
@@ -288,7 +291,7 @@ it.effect(
             checkpointId: CheckpointId.make("replacement-checkpoint"),
           },
         };
-        const concurrent = atoms.restoreFiles.run(registry, replacement);
+        const concurrent = runAtomCommand(registry, atoms.restoreFiles, replacement);
         yield* Deferred.succeed(finish, undefined);
         const concurrentResult = yield* Effect.promise(() => concurrent);
         expect(concurrentResult._tag).toBe("Failure");
@@ -315,7 +318,7 @@ it.effect(
           AsyncResult.success({ ...auth, scopes: [], permissions: [] }),
         );
         const replacementDenied = yield* Effect.promise(() =>
-          atoms.restoreFiles.run(registry, replacement),
+          runAtomCommand(registry, atoms.restoreFiles, replacement),
         );
         expect(replacementDenied._tag).toBe("Failure");
         expect(writes).toBe(1);
@@ -324,15 +327,17 @@ it.effect(
           filesUncertain: true,
           fileOperation: target.input,
         });
-        yield* Effect.promise(() => atoms.inspectFileRestore.run(registry, replacement));
+        yield* Effect.promise(() =>
+          runAtomCommand(registry, atoms.inspectFileRestore, replacement),
+        );
         expect(registry.get(atoms.mutationState(selection)).filesUncertain).toBe(true);
         registry.set(sessions(environmentId), AsyncResult.success(auth));
         pauseRemoval = true;
-        const inspection = atoms.inspectFileRestore.run(registry, target);
+        const inspection = runAtomCommand(registry, atoms.inspectFileRestore, target);
         yield* Deferred.await(inspectionSaving);
         const inspectionPending = registry.get(atoms.mutationState(selection)).pending;
         const overlappingRecovery = yield* Effect.promise(() =>
-          atoms.recover.run(registry, {
+          runAtomCommand(registry, atoms.recover, {
             environmentId,
             input: {
               threadId: selection.threadId,
@@ -366,9 +371,9 @@ it.effect(
             targetThreadId: ThreadId.make("exact-fork-target"),
           },
         };
-        expect((yield* Effect.promise(() => atoms.recover.run(registry, recovery)))._tag).toBe(
-          "Failure",
-        );
+        expect(
+          (yield* Effect.promise(() => runAtomCommand(registry, atoms.recover, recovery)))._tag,
+        ).toBe("Failure");
         const secondFile = {
           ...target,
           input: {
@@ -377,10 +382,13 @@ it.effect(
           },
         };
         expect(
-          (yield* Effect.promise(() => atoms.restoreFiles.run(registry, secondFile)))._tag,
+          (yield* Effect.promise(() => runAtomCommand(registry, atoms.restoreFiles, secondFile)))
+            ._tag,
         ).toBe("Failure");
         expect(
-          (yield* Effect.promise(() => atoms.inspectFileRestore.run(registry, secondFile)))._tag,
+          (yield* Effect.promise(() =>
+            runAtomCommand(registry, atoms.inspectFileRestore, secondFile),
+          ))._tag,
         ).toBe("Success");
         expect(registry.get(atoms.mutationState(selection))).toMatchObject({
           pending: 0,
@@ -418,24 +426,26 @@ it.effect(
           }),
         ).toEqual(recovery);
         expect(
-          (yield* Effect.promise(() => atoms.recover.run(registry, replacementRecovery)))._tag,
+          (yield* Effect.promise(() =>
+            runAtomCommand(registry, atoms.recover, replacementRecovery),
+          ))._tag,
         ).toBe("Failure");
         expect(recoveries).toBe(1);
         registry.set(
           sessions(environmentId),
           AsyncResult.success({ ...auth, scopes: [], permissions: [] }),
         );
-        expect((yield* Effect.promise(() => atoms.recover.run(registry, recovery)))._tag).toBe(
-          "Failure",
-        );
+        expect(
+          (yield* Effect.promise(() => runAtomCommand(registry, atoms.recover, recovery)))._tag,
+        ).toBe("Failure");
         expect(registry.get(atoms.mutationState(selection)).recoveryOperation).toEqual(
           recovery.input,
         );
         expect(recoveries).toBe(1);
         registry.set(sessions(environmentId), AsyncResult.success(auth));
-        expect((yield* Effect.promise(() => atoms.recover.run(registry, recovery)))._tag).toBe(
-          "Success",
-        );
+        expect(
+          (yield* Effect.promise(() => runAtomCommand(registry, atoms.recover, recovery)))._tag,
+        ).toBe("Success");
         expect(recoveries).toBe(2);
         const failedPersistence = createThreadHistoryEnvironmentAtoms(runtime, {
           operationPersistence: {
@@ -446,7 +456,9 @@ it.effect(
           },
         });
         expect(
-          (yield* Effect.promise(() => failedPersistence.restoreFiles.run(registry, target)))._tag,
+          (yield* Effect.promise(() =>
+            runAtomCommand(registry, failedPersistence.restoreFiles, target),
+          ))._tag,
         ).toBe("Failure");
         expect(writes).toBe(2);
         const malformedPersistence = createThreadHistoryEnvironmentAtoms(runtime, {
@@ -460,7 +472,9 @@ it.effect(
           },
         });
         expect(
-          (yield* Effect.promise(() => malformedPersistence.recover.run(registry, recovery)))._tag,
+          (yield* Effect.promise(() =>
+            runAtomCommand(registry, malformedPersistence.recover, recovery),
+          ))._tag,
         ).toBe("Failure");
         expect(registry.get(malformedPersistence.mutationState(selection)).hydration).toBe(
           "failed",
@@ -479,8 +493,9 @@ it.effect(
           },
         };
         expect(
-          (yield* Effect.promise(() => atoms.restoreFiles.run(registry, lostBeforePreparation)))
-            ._tag,
+          (yield* Effect.promise(() =>
+            runAtomCommand(registry, atoms.restoreFiles, lostBeforePreparation),
+          ))._tag,
         ).toBe("Failure");
         atoms = createThreadHistoryEnvironmentAtoms(runtime, {
           operationPersistence,
@@ -488,7 +503,7 @@ it.effect(
         yield* Effect.promise(() => atoms.hydrate(registry, selection));
         fileStatusState = "not-started";
         const missingStatus = yield* Effect.promise(() =>
-          atoms.inspectFileRestore.run(registry, lostBeforePreparation),
+          runAtomCommand(registry, atoms.inspectFileRestore, lostBeforePreparation),
         );
         if (missingStatus._tag !== "Success")
           return yield* Effect.die(
@@ -508,15 +523,17 @@ it.effect(
         });
         expect(storage.size).toBe(1);
         expect(
-          (yield* Effect.promise(() => atoms.restoreFiles.run(registry, replacement)))._tag,
+          (yield* Effect.promise(() => runAtomCommand(registry, atoms.restoreFiles, replacement)))
+            ._tag,
         ).toBe("Failure");
         registry.set(
           sessions(environmentId),
           AsyncResult.success({ ...auth, scopes: [], permissions: [] }),
         );
         expect(
-          (yield* Effect.promise(() => atoms.restoreFiles.run(registry, lostBeforePreparation)))
-            ._tag,
+          (yield* Effect.promise(() =>
+            runAtomCommand(registry, atoms.restoreFiles, lostBeforePreparation),
+          ))._tag,
         ).toBe("Failure");
         expect(registry.get(atoms.mutationState(selection)).fileOperation).toEqual(
           lostBeforePreparation.input,
@@ -525,8 +542,9 @@ it.effect(
         registry.set(sessions(environmentId), AsyncResult.success(auth));
         completeOriginalRetry = true;
         expect(
-          (yield* Effect.promise(() => atoms.restoreFiles.run(registry, lostBeforePreparation)))
-            ._tag,
+          (yield* Effect.promise(() =>
+            runAtomCommand(registry, atoms.restoreFiles, lostBeforePreparation),
+          ))._tag,
         ).toBe("Success");
         expect(writes).toBe(4);
         expect(storage.size).toBe(0);

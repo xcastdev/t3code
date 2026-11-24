@@ -27,6 +27,7 @@ import {
 import { formatDuration } from "@t3tools/shared/orchestrationTiming";
 import { getTerminalLabel } from "@t3tools/shared/terminalLabels";
 import { Atom } from "effect/reactivity";
+import { useGT, useMessages } from "gt-react-native";
 import { useRef, useState } from "react";
 import {
   Pressable,
@@ -577,11 +578,12 @@ function SideChatsSection(props: {
       [props.target.environmentId, ...sideChats.map((sideChat) => sideChat.id)].join("\u0000"),
     ),
   );
+  const gt = useGT();
   if (sideChats.length === 0) return null;
   return (
     <LiveSection
       id="sideChats"
-      title="Side chats"
+      title={gt("Side chats")}
       onLayout={props.onLayout}
       summary={
         <StatusBadges
@@ -625,17 +627,22 @@ function SideChatRow(props: {
   readonly first: boolean;
   readonly onOpen: OpenThread;
 }) {
+  const gt = useGT();
+  const messages = useMessages();
   const shell = useAtomValue(
     environmentThreadShells.threadShellAtom(scopeThreadRef(props.environmentId, props.threadId)),
   );
   if (shell === null) return null;
   const state = sideChatState(shell);
   const mark = SIDE_CHAT_MARKS[state];
-  const label = SIDE_CHAT_STATE_LABELS[state];
+  const label = messages(SIDE_CHAT_STATE_LABELS[state]);
   return (
     <Pressable
       accessibilityRole="link"
-      accessibilityLabel={`Open side chat ${shell.title}, ${label}`}
+      accessibilityLabel={gt("Open side chat {title}, {state}", {
+        title: shell.title,
+        state: label,
+      })}
       onPress={() => props.onOpen({ environmentId: props.environmentId, threadId: shell.id })}
       className={
         props.first

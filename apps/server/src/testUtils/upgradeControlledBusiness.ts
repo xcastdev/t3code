@@ -30,6 +30,10 @@ import * as Setup from "../project/ProjectSetupScriptRunner.ts";
 import * as GitManager from "../git/GitManager.ts";
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import * as Git from "../vcs/GitVcsDriver.ts";
+import * as PullRequestService from "../pullRequest/PullRequestService.ts";
+import * as TaskFolders from "../workspace/TaskFolders.ts";
+import * as WorkspaceFolders from "../workspace/WorkspaceFolders.ts";
+import { layerThreadWorktreeRestore } from "../workspace/restoreMissingWorktree.ts";
 import * as VcsConfig from "../vcs/VcsProjectConfig.ts";
 import * as VcsRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
@@ -53,6 +57,7 @@ import * as HistoryRecovery from "../orchestration-v2/ThreadHistoryRecoveryServi
 import * as HistoryPolicy from "../orchestration-v2/ThreadHistoryRecoveryAssistantPolicy.ts";
 import * as History from "../orchestration-v2/ThreadHistoryService.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
+import * as ThreadViewers from "../orchestration-v2/ThreadViewers.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as TurnItemPositionStore from "../orchestration-v2/TurnItemPositionStore.ts";
 import * as LegacyV1ThreadImporter from "../orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
@@ -116,6 +121,8 @@ export function layerControlledBusiness(snapshot: UpgradeSnapshot) {
       resolve: Effect.fn("Identity.RepositoryIdentityResolver.resolve")(() => Effect.succeed(null)),
     }),
     WorktreeSetupTracker.layer,
+    // Forge reads and pull-request actions stay outside the fixture.
+    Layer.mock(PullRequestService.PullRequestService)({}),
     CloneTracker.layer.pipe(
       Layer.provide(Layer.mock(SourceRepositories.SourceControlRepositoryService)({})),
     ),
@@ -149,7 +156,10 @@ export function layerControlledBusiness(snapshot: UpgradeSnapshot) {
     Layer.provideMerge(resources),
   );
   const admission = AssistantAdmission.layer.pipe(Layer.provideMerge(workAdmission));
-  const sink = Layer.fresh(EventSink.layerWithAdmission).pipe(Layer.provideMerge(admission));
+  const sink = Layer.fresh(EventSink.layerWithAdmission).pipe(
+    Layer.provide(ThreadViewers.layer),
+    Layer.provideMerge(admission),
+  );
   const commands = ThreadCommandExecutor.layer.pipe(Layer.provideMerge(sink));
   const legacy = LegacyV1ThreadImporter.layer.pipe(Layer.provideMerge(commands));
   const enrichment = ProjectEnrichment.layer.pipe(Layer.provideMerge(legacy));
@@ -176,7 +186,11 @@ export function layerControlledBusiness(snapshot: UpgradeSnapshot) {
   const setup = Setup.layer.pipe(Layer.provideMerge(registeredProjects));
   const manager = GitManager.layer.pipe(Layer.provideMerge(setup));
   const workflow = GitWorkflow.layer.pipe(Layer.provideMerge(manager));
-  const folders = Folders.layer.pipe(Layer.provideMerge(workflow));
+  const taskFolders = Layer.merge(WorkspaceFolders.layer, layerThreadWorktreeRestore).pipe(
+    Layer.provideMerge(TaskFolders.layer),
+    Layer.provideMerge(workflow),
+  );
+  const folders = Folders.layer.pipe(Layer.provideMerge(taskFolders));
   const claimedFolders = Layer.effect(
     Folders.ManagedProjectFolders,
     Effect.gen(function* () {

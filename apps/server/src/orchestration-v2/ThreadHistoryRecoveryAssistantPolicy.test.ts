@@ -24,6 +24,7 @@ import { makeAssistantHistoryPolicy } from "../assistants/AssistantHistoryPolicy
 import { makeAssistantMemoryContext } from "../assistants/AssistantMemory.ts";
 import { assistantMemoryContextHash } from "../assistants/AssistantResources.ts";
 import * as Handoffs from "./ContextHandoffService.ts";
+import { layerNoTaskFolders } from "./ProviderTurnStartService.testkit.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import {
   sourceTuple,
@@ -423,7 +424,9 @@ const recoveryWithSqlDelivery = Effect.fn("test.assistantArchive.recovery")(func
     ),
   });
   return yield* Recovery.ThreadHistoryRecoveryService.pipe(
-    Effect.provide(Layer.fresh(Recovery.layer).pipe(Layer.provide(delivery))),
+    Effect.provide(
+      Layer.fresh(Recovery.layer).pipe(Layer.provide(Layer.merge(delivery, layerNoTaskFolders))),
+    ),
   );
 });
 

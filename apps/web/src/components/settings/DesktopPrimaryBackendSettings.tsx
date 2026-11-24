@@ -23,7 +23,7 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Spinner } from "../ui/spinner";
 import { SettingsRow, SettingsSection } from "./settingsLayout";
-import { searchableSetting } from "./settingsSearch";
+import { useSearchableSetting } from "./settingsSearch";
 
 // The bridge method's name reads as a React hook to lint, so it is addressed by key.
 const SWITCH_TO_MANAGED_BACKEND = "useManagedPrimaryBackend" satisfies keyof DesktopBridge;
@@ -238,6 +238,7 @@ function OwnershipDescription({ state }: { readonly state: DesktopPrimaryBackend
  * the main process, so it keeps working while the attached server is unreachable.
  */
 export function DesktopPrimaryBackendSettings() {
+  const searchableSetting = useSearchableSetting();
   const bridge = window.desktopBridge;
   const state = useEnvironmentQuery(bridge ? desktopPrimaryBackendStateAtom : null);
   if (!bridge) return null;

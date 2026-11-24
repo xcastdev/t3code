@@ -1,3 +1,4 @@
+import { useGT } from "gt-react-native";
 import { useAndroidFloatingTabs } from "../../settings/appearance/AppearancePreferencesProvider";
 import { WorkspaceNoTabs } from "./WorkspaceNoTabs";
 import { useEnabledNavigationTabs } from "./navigation-tabs";
@@ -26,7 +27,7 @@ import { WorkspaceTabPanes } from "./WorkspaceTabPanes";
 import { WorkspaceAppBarScope } from "../../../components/ui/WorkspaceAppBar.android";
 import { usePaneRole } from "../../../components/ui/Pane";
 import { AndroidWorkspaceSidebar } from "./AndroidWorkspaceSidebar.android";
-import type { WorkspaceTab } from "./workspace-tabs-state";
+import { workspaceUsesColumns, type WorkspaceTab } from "./workspace-tabs-state";
 import { useSelectWorkspaceTab } from "./useSelectWorkspaceTab";
 import { useHardwareBack } from "../../../lib/backHandler";
 
@@ -37,6 +38,7 @@ export function WorkspaceRootScreen() {
 }
 
 function WorkspaceRoot() {
+  const gt = useGT();
   const floatingTabsEnabled = useAndroidFloatingTabs();
   const { layout, startNewTask, workspacePageWidth } = useAdaptiveWorkspaceLayout();
   const workspace = useWorkspaceTabs()!;
@@ -78,7 +80,7 @@ function WorkspaceRoot() {
             layout.usesSplitView
               ? insets
               : floatingTabsEnabled
-                ? tab === "usage"
+                ? !workspaceUsesColumns(tab)
                   ? { ...insets, bottom: context.bottomClearance }
                   : insets
                 : { ...insets, bottom: 0 }
@@ -104,23 +106,30 @@ function WorkspaceRoot() {
                     layout.usesSplitView ? (
                       <>
                         <NativeStackScreenOptions options={{ headerShown: false }} />
-                        <AppBar embedded title="Work" />
+                        <AppBar embedded title={gt("Work")} />
                         <WorkTab mode="detail" />
                       </>
                     ) : (
                       <>
-                        <AppBar embedded title="Work" />
+                        <AppBar embedded title={gt("Work")} />
                         <WorkTab />
                       </>
                     )
-                  ) : tab === "usage" ? (
+                  ) : tab === "usage" || tab === "workflows" ? (
                     <WorkspacePageFrame width={workspacePageWidth ?? null}>
                       <WorkspaceExtraTab tab={tab} />
                     </WorkspacePageFrame>
                   ) : layout.usesSplitView ? (
                     <>
                       <NativeStackScreenOptions options={{ headerShown: false }} />
-                      <AppBar embedded title={tab === "issues" ? "Issues" : "Pull requests"} />
+                      <AppBar
+                        embedded
+                        title={
+                          tab === "issues"
+                            ? gt("Issues", { $context: "screen title, list of issues" })
+                            : gt("Pull requests")
+                        }
+                      />
                       <WorkspaceEmptyDetail tab={tab} />
                     </>
                   ) : tab === "issues" ? (

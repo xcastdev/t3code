@@ -43,6 +43,10 @@ approved, choose **Start worker** and confirm the team member. Approval never st
 itself. Workers can ask questions, send messages or block on a task; answer questions and resolve
 messages from the task or the overview.
 
+A worker works in one repository. In a [project that covers several repositories](multi-repo-projects.md),
+choose it under **Repository** when you start the worker. Without a choice, the worker uses the
+project folder's repository, or the only repository when the project folder is not one.
+
 The overview starts with **Needs you**, which links to questions, blockers and decisions. **Inbox**
 shows messages from workers, and the team roster shows who is working, paused or waiting. Use the
 status filters in **Tasks** to focus on work in one state.

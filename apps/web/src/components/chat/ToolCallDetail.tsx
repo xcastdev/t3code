@@ -36,7 +36,7 @@ export function ToolDetailPane({
   scroll = true,
   children,
 }: {
-  label: "Input" | "Output";
+  label: string;
   meta?: ReactNode;
   surface?: "code" | "terminal";
   /** Off when the content scrolls itself, like streaming command output that follows its end. */

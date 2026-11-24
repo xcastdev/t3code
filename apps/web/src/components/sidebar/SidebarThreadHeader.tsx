@@ -1,4 +1,5 @@
-import { ChevronDownIcon, FolderPlusIcon, SearchIcon, SquarePenIcon, XIcon } from "lucide-react";
+import { msg, useGT, useMessages } from "gt-react";
+import { ChevronDownIcon, SearchIcon, SquarePenIcon, XIcon } from "lucide-react";
 import {
   type ComponentProps,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -16,10 +17,10 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 
 export type SidebarView = "projects" | "agents";
 
-const SIDEBAR_VIEW_LABELS: Record<SidebarView, string> = {
-  projects: "Projects",
-  agents: "Agents",
-};
+const SIDEBAR_VIEW_LABELS = {
+  projects: msg("Projects"),
+  agents: msg("Agents"),
+} satisfies Record<SidebarView, string>;
 
 export interface SidebarThreadHeaderProps {
   searchFieldRef?: RefObject<HTMLDivElement | null>;
@@ -27,7 +28,6 @@ export interface SidebarThreadHeaderProps {
   onViewChange: (view: SidebarView) => void;
   hasProjects: boolean;
   projectScope: ReactNode;
-  onNewProject: () => void;
   onNewThread: (event: ReactMouseEvent) => void;
   newThreadDisabled: boolean;
   newThreadShortcutLabel: string | null | undefined;
@@ -51,7 +51,6 @@ export function SidebarThreadHeader({
   onViewChange,
   hasProjects,
   projectScope,
-  onNewProject,
   onNewThread,
   newThreadDisabled,
   newThreadShortcutLabel,
@@ -67,6 +66,8 @@ export function SidebarThreadHeader({
   onClearSearch,
   agentActions,
 }: SidebarThreadHeaderProps) {
+  const gt = useGT();
+  const messages = useMessages();
   const [searchExpanded, setSearchExpanded] = useState(false);
   const searchOpen = searchExpanded || searchQuery.length > 0;
   const closeSearch = () => {
@@ -77,9 +78,9 @@ export function SidebarThreadHeader({
   // Shrinking results can remove the active option; never leave aria-activedescendant pointing at it.
   const activeResultExists = resultsVisible && activeSearchResultIndex < searchResultCount;
   const newThreadLabel = newThreadShortcutLabel
-    ? `New thread (${newThreadShortcutLabel})`
-    : "New thread";
-  const searchLabel = view === "agents" ? "Search agents" : "Search threads";
+    ? gt("New thread ({shortcut})", { shortcut: newThreadShortcutLabel })
+    : gt("New thread");
+  const searchLabel = view === "agents" ? gt("Search agents") : gt("Search threads");
 
   return (
     <div ref={searchFieldRef} className="flex items-center gap-1">
@@ -104,7 +105,11 @@ export function SidebarThreadHeader({
             onBlur={() => {
               if (searchQuery.length === 0) setSearchExpanded(false);
             }}
-            placeholder={view === "agents" ? "Search agents" : "Search"}
+            placeholder={
+              view === "agents"
+                ? gt("Search agents")
+                : gt("Search", { $context: "search field placeholder" })
+            }
             aria-label={searchLabel}
             role="combobox"
             aria-autocomplete="list"
@@ -122,9 +127,16 @@ export function SidebarThreadHeader({
             size="icon-micro"
             variant="ghost-muted"
             className="shrink-0"
-            aria-label="Close search"
+            aria-label={isSearching ? gt("Clear thread search") : gt("Close search")}
             onPointerDown={(event) => event.preventDefault()}
-            onClick={closeSearch}
+            onClick={() => {
+              if (!isSearching) {
+                closeSearch();
+                return;
+              }
+              onClearSearch();
+              searchInputRef.current?.focus();
+            }}
           >
             <XIcon className="size-3" />
           </Button>
@@ -137,11 +149,13 @@ export function SidebarThreadHeader({
                 <button
                   type="button"
                   className="flex h-8 min-w-0 items-center gap-1 rounded-md px-2 text-sm font-semibold text-sidebar-foreground outline-none hover:bg-sidebar-row-hover focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring/70 data-popup-open:bg-sidebar-row-hover"
-                  aria-label={`Sidebar view: ${SIDEBAR_VIEW_LABELS[view]}`}
+                  aria-label={gt("Sidebar view: {view}", {
+                    view: messages(SIDEBAR_VIEW_LABELS[view]),
+                  })}
                 />
               }
             >
-              <span className="truncate">{SIDEBAR_VIEW_LABELS[view]}</span>
+              <span className="truncate">{messages(SIDEBAR_VIEW_LABELS[view])}</span>
               <ChevronDownIcon className="size-3.5 shrink-0 text-(--sidebar-icon-color)" />
             </MenuTrigger>
             <MenuPopup align="start" className="min-w-40">
@@ -152,10 +166,10 @@ export function SidebarThreadHeader({
                 }}
               >
                 <MenuRadioItem value="projects" closeOnClick>
-                  {SIDEBAR_VIEW_LABELS.projects}
+                  {messages(SIDEBAR_VIEW_LABELS.projects)}
                 </MenuRadioItem>
                 <MenuRadioItem value="agents" closeOnClick>
-                  {SIDEBAR_VIEW_LABELS.agents}
+                  {messages(SIDEBAR_VIEW_LABELS.agents)}
                 </MenuRadioItem>
               </MenuRadioGroup>
             </MenuPopup>
@@ -168,28 +182,24 @@ export function SidebarThreadHeader({
             <SearchIcon />
           </SidebarHeaderIconButton>
         )}
-        {view === "projects" && hasProjects ? (
-          <>
-            {projectScope}
-            <SidebarHeaderIconButton label="Add project" onClick={onNewProject}>
-              <FolderPlusIcon />
-            </SidebarHeaderIconButton>
-          </>
-        ) : null}
+        {view === "projects" && hasProjects ? projectScope : null}
         {view === "agents" && agentActions !== undefined ? (
           agentActions
         ) : (
           <SidebarHeaderIconButton
-            label={view === "agents" ? "New agent" : "New thread"}
+            label={view === "agents" ? gt("New agent") : gt("New thread")}
             tooltip={
               view === "agents" ? (
-                "New agent"
+                gt("New agent")
               ) : showNewThreadInProjectHint ? (
                 <span className="flex flex-col gap-0.5">
                   <span>{newThreadLabel}</span>
                   <span className="text-muted-foreground">
-                    New thread in current project: Shift+click
-                    {newThreadInProjectShortcutLabel ? ` (${newThreadInProjectShortcutLabel})` : ""}
+                    {newThreadInProjectShortcutLabel
+                      ? gt("New thread in current project: Shift+click ({shortcut})", {
+                          shortcut: newThreadInProjectShortcutLabel,
+                        })
+                      : gt("New thread in current project: Shift+click")}
                   </span>
                 </span>
               ) : (

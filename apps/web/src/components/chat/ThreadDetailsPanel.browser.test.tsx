@@ -161,6 +161,7 @@ function Panel({ fixture }: { fixture: ReturnType<typeof setup> }) {
         usageLimitSources={[]}
         providerInstanceId={null}
         usageProviderInstanceId={null}
+        usageModel={null}
         branch={null}
         plans={[]}
         runs={[]}
