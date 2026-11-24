@@ -585,6 +585,23 @@ A second round found three more, also fixed:
 
 Mobile automation schedules also follow the app language now.
 
+A third round found five more, also fixed:
+
+- **Work recovery:** assistant recovery compared a multi-repo binding with the thread's
+  folder and quarantined healthy runs. It now resolves the bound worktree as admission does.
+- **Setup interrupt:** upstream's interrupt handler closed a setup terminal the fork retains
+  for its owned-process drain. It no longer closes retained terminals.
+- **Rewind archive:** the archive now begins immediately before the provider rewind and file
+  restore, so a failed session open no longer leaves it executing.
+- **ACP receipts:** ACP no longer marks managed instructions applied on a refused or failed
+  prompt, and clears them when a session is replaced, restarted or compacted.
+- **Cursor Stop:** Cursor background commands, new upstream, now stop from Processes.
+
+Known gaps: upstream's setup run for a restored worktree during turn start does not use the
+fork's drain options, so a Stop during it cannot prove its processes ended. The OMP adapter
+does not take upstream's agent-feedback line or multi-folder workspace list, as upstream's
+own Pi and Grok adapters do not.
+
 Untranslated checklist titles, Work section labels and the folded thought count in
 upstream files are now translated. A raw-path task-folder lookup in run admission was
 checked and left as is: the thread's path is written from the same task-folder value.

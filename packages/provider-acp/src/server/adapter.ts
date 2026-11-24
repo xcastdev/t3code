@@ -2433,6 +2433,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         >(null);
         const promptInstructionStates = yield* Ref.make(new Map<string, T3AcpInstructionState>());
         const promptRuntimeInstructions = yield* Ref.make(new Map<string, string>());
+        const appliedInstructions = new Map<
+          OrchestrationV2ProviderThread["id"],
+          NonNullable<ProviderAdapter.ProviderAdapterV2TurnInput["instructionSnapshot"]>
+        >();
+        const latestInstructionTurns = new Map<
+          OrchestrationV2ProviderThread["id"],
+          ProviderAdapter.ProviderAdapterV2TurnInput
+        >();
         const deliveredAppContext = yield* Ref.make(new Map<string, ReadonlyMap<string, string>>());
         // Unique markers keep delayed prompt completions from clearing later compactions.
         const compactionMarkers = yield* Ref.make(new Map<string, symbol>());
@@ -2456,6 +2464,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           yield* Ref.update(compactionMarkers, (current) =>
             new Map(current).set(sessionId, Symbol()),
           );
+          const compactedThread = (yield* Ref.get(providerThreadByNativeSessionId)).get(sessionId);
+          if (compactedThread !== undefined) appliedInstructions.delete(compactedThread.id);
           yield* Ref.update(deliveredAppContext, (current) => {
             if (!current.has(sessionId)) return current;
             const updated = new Map(current);
@@ -8218,6 +8228,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             yield* Ref.set(activeInteractionMode, null);
             yield* Ref.set(promptInstructionStates, new Map());
             yield* Ref.set(promptRuntimeInstructions, new Map());
+            appliedInstructions.clear();
             yield* Ref.set(deliveredAppContext, new Map());
             yield* Ref.set(compactionMarkers, new Map());
             yield* Ref.set(completedCompactionIds, new Set());
@@ -8281,14 +8292,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           flavor.forkFromTurn?.supported(started.initializeResult) === true,
           steersWithPrompt,
         );
-        const appliedInstructions = new Map<
-          OrchestrationV2ProviderThread["id"],
-          NonNullable<ProviderAdapter.ProviderAdapterV2TurnInput["instructionSnapshot"]>
-        >();
-        const latestInstructionTurns = new Map<
-          OrchestrationV2ProviderThread["id"],
-          ProviderAdapter.ProviderAdapterV2TurnInput
-        >();
         const canLoadSession = started.initializeResult.agentCapabilities?.loadSession === true;
         const canResumeSession =
           started.initializeResult.agentCapabilities?.sessionCapabilities?.resume != null;
@@ -9432,6 +9435,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           // A failed prompt may have been dropped, so the fresh runtime sends T3's notes again.
           yield* Ref.set(promptInstructionStates, new Map());
           yield* Ref.set(promptRuntimeInstructions, new Map());
+          appliedInstructions.clear();
           yield* Ref.set(deliveredAppContext, new Map());
           yield* Ref.set(compactionMarkers, new Map());
           yield* Ref.set(completedCompactionIds, new Set());
@@ -9535,7 +9539,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     settle.compactSession === undefined &&
                     latestInstructionTurns.get(instructionTurn.providerThread.id) ===
                       instructionTurn &&
-                    result.stopReason !== "cancelled"
+                    result.stopReason !== "cancelled" &&
+                    result.stopReason !== "refusal" &&
+                    result.stopReason !== "error"
                   ) {
                     appliedInstructions.set(instructionTurn.providerThread.id, managedInstructions);
                     yield* (

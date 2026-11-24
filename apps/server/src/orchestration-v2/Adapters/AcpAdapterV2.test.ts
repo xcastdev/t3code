@@ -3105,6 +3105,13 @@ describe("AcpAdapterV2", () => {
       yield* runTurn("Continue without the image.", "completed", snapshot);
       assert.deepEqual(yield* runTurn.applied(), snapshot);
       assert.deepEqual(runTurn.receipts, [snapshot, snapshot]);
+      // The compacted session may no longer hold the delivered instructions.
+      yield* runTurn.idleSessionUpdate({
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-applied",
+        status: "completed",
+      });
+      assert.equal(yield* runTurn.applied(), undefined);
     }).pipe(Effect.provide(layerTest), Effect.scoped),
   );
 
@@ -3160,13 +3167,32 @@ describe("AcpAdapterV2", () => {
         assert.equal(runTurn.runtimeStarts(), 1);
         yield* runTurn("Try this failed prompt.", "failed", first);
         assert.equal(yield* runTurn.applied(), undefined);
+        // Refusals discard the prompt, and errors need a retry.
+        for (const stopReason of ["refusal", "error"] as const) {
+          yield* runTurn.reportNextPromptStopped(stopReason);
+          yield* runTurn(`Prompt stopped by ${stopReason}.`, "failed", first);
+          assert.equal(yield* runTurn.applied(), undefined);
+        }
         assert.deepEqual(yield* runTurn("  /repro-skill", "completed", second), [
           { type: "text", text: "  /repro-skill" },
         ]);
         assert.equal(yield* runTurn.applied(), undefined);
         yield* runTurn("Resume ordinary chat.");
         assert.equal(yield* runTurn.applied(), undefined);
-        assert.deepEqual(runTurn.receipts, [first, second]);
+        yield* runTurn("Apply the fix again.", "completed", second);
+        assert.deepEqual(yield* runTurn.applied(), second);
+        // A replacement session holds none of the delivered instructions.
+        yield* runTurn.runtime.rollbackThread({
+          providerThread: runTurn.providerThread,
+          providerThreadTurns: [],
+          target: {
+            type: "thread_start",
+            checkpointId: CheckpointId.make("checkpoint-acp-instruction-rollback"),
+            appRunOrdinal: 0,
+          },
+        });
+        assert.equal(yield* runTurn.applied(), undefined);
+        assert.deepEqual(runTurn.receipts, [first, second, second]);
         assert.isTrue(Object.isFrozen(runTurn.receipts[0]));
         assert.isTrue(Object.isFrozen(runTurn.receipts[0]?.toolIds));
       }).pipe(Effect.provide(layerTest), Effect.scoped),

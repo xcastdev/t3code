@@ -682,7 +682,12 @@ export const make = Effect.gen(function* () {
       Effect.onInterrupt(() =>
         Fiber.interrupt(commandWriter).pipe(
           Effect.andThen(Effect.sync(() => readiness.unsubscribe())),
-          Effect.andThen(terminalManager.close({ threadId: input.threadId, terminalId })),
+          // A retained terminal is closed by the owner's drain, which needs the live session.
+          Effect.andThen(
+            input.retainTerminalForDrain
+              ? Effect.void
+              : terminalManager.close({ threadId: input.threadId, terminalId }),
+          ),
           Effect.ignore,
         ),
       ),

@@ -15,6 +15,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   ProviderSessionId,
+  ProviderThreadId,
   RunAttemptId,
   RunId,
   ThreadId,
@@ -3101,6 +3102,16 @@ describe("CursorAdapterV2", () => {
         assert.deepStrictEqual(yield* nextUpdate, [
           { tasks: ["7 awaited", "8"], sessionScoped: true },
         ]);
+        // Processes Stop names a shell by its id, only on the provider thread that started it.
+        assert.isFalse(yield* runtime.stopBackgroundTask!({ providerThread, taskId: "missing" }));
+        assert.isFalse(
+          yield* runtime.stopBackgroundTask!({
+            providerThread: { ...providerThread, id: ProviderThreadId.make("other-thread") },
+            taskId: "8",
+          }),
+        );
+        assert.isTrue(yield* runtime.stopBackgroundTask!({ providerThread, taskId: "8" }));
+        assert.deepStrictEqual(stopped, ["8"]);
 
         yield* report({
           ...shell("8"),
@@ -3121,7 +3132,7 @@ describe("CursorAdapterV2", () => {
           },
           providerThreadTurns: [],
         });
-        assert.deepStrictEqual(stopped, ["7"]);
+        assert.deepStrictEqual(stopped, ["8", "7"]);
         // A wake still queued when the rollback landed is dropped.
         assert.deepStrictEqual(
           yield* wakes[0]!.dispatchIfCurrent!(Effect.succeed("woken")),
@@ -3143,10 +3154,10 @@ describe("CursorAdapterV2", () => {
           providerTurnId: terminal.providerTurnId,
           requestRuntimeRestart: true,
         });
-        assert.deepStrictEqual(stopped, ["7"]);
+        assert.deepStrictEqual(stopped, ["8", "7"]);
         // A shell of the stopped run that is reported late is stopped, not kept.
         yield* report({ ...shell("9"), type: "started", stop: () => stopped.push("9") });
-        assert.deepStrictEqual(stopped, ["7", "9"]);
+        assert.deepStrictEqual(stopped, ["8", "7", "9"]);
         assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
 
         assert.deepStrictEqual(

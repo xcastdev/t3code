@@ -106,6 +106,23 @@ interface ThreadRow {
   readonly payload_json: string;
 }
 type Binding = Extract<ProjectTeamRecord, { kind: "run-binding" }>;
+/**
+ * Where a binding's run works, given its thread's folder. A tracked repository's worktree comes
+ * from the task folder record, never from path arithmetic: a plain project folder links to the
+ * original checkouts. Undefined when that folder holds no worktree of the repository.
+ */
+export const resolveBindingWorktree = Effect.fn("ProjectWorkRunAdmission.bindingWorktree")(
+  function* (sql: SqlClient.SqlClient, binding: Binding, threadRoot: string | undefined) {
+    if (threadRoot === undefined || binding.repository === undefined) return threadRoot;
+    if (binding.workspaceKind !== "worktree") return binding.repository;
+    const rows = yield* sql<{
+      repositories_json: string;
+    }>`SELECT repositories_json FROM task_folders WHERE project_path=${threadRoot}`;
+    if (rows.length !== 1) return undefined;
+    const repositories = yield* decodeTaskFolderRepositories(rows[0]!.repositories_json);
+    return repositories.find((entry) => entry.repositoryPath === binding.repository)?.worktreePath;
+  },
+);
 type Row = {
   admission_id: string;
   project_id: string;
@@ -230,24 +247,8 @@ const make = Effect.gen(function* () {
       (a, b) => b.leaseGeneration - a.leaseGeneration || b.revision - a.revision,
     )[0];
   });
-  /**
-   * Where a binding's run works, given its thread's folder. A tracked repository's worktree comes
-   * from the task folder record, never from path arithmetic: a plain project folder links to the
-   * original checkouts. Undefined when that folder holds no worktree of the repository.
-   */
-  const bindingWorktree = Effect.fn("ProjectWorkRunAdmission.bindingWorktree")(function* (
-    binding: Binding,
-    threadRoot: string | undefined,
-  ) {
-    if (threadRoot === undefined || binding.repository === undefined) return threadRoot;
-    if (binding.workspaceKind !== "worktree") return binding.repository;
-    const rows = yield* sql<{
-      repositories_json: string;
-    }>`SELECT repositories_json FROM task_folders WHERE project_path=${threadRoot}`;
-    if (rows.length !== 1) return undefined;
-    const repositories = yield* decodeTaskFolderRepositories(rows[0]!.repositories_json);
-    return repositories.find((entry) => entry.repositoryPath === binding.repository)?.worktreePath;
-  });
+  const bindingWorktree = (binding: Binding, threadRoot: string | undefined) =>
+    resolveBindingWorktree(sql, binding, threadRoot);
   const hasStoredOwner = Effect.fn("ProjectWorkRunAdmission.hasStoredOwner")(function* (
     threadId: string,
   ) {

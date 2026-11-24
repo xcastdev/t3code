@@ -61,6 +61,8 @@ interface Options {
   readonly projectIsRepository: boolean;
   /** The worktrees directory is reached through a symlink. */
   readonly symlinkedWorktrees?: boolean;
+  /** The provider session cannot be opened for the rewind. */
+  readonly sessionOpenFails?: boolean;
 }
 
 /** What the test supplies before the layer is built; the last commit's events land in `committed`. */
@@ -180,10 +182,12 @@ const layerFor = (state: State, options: Options) => {
           ThreadCommandExecutor.layer,
           Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
             open: () =>
-              Effect.succeed({
-                rollbackThread: (input: { readonly providerThread: unknown }) =>
-                  Effect.succeed({ providerThread: input.providerThread }),
-              } as never),
+              options.sessionOpenFails === true
+                ? Effect.die("provider session unavailable")
+                : Effect.succeed({
+                    rollbackThread: (input: { readonly providerThread: unknown }) =>
+                      Effect.succeed({ providerThread: input.providerThread }),
+                  } as never),
           }),
           Layer.mock(RuntimePolicy.RuntimePolicyV2)({ resolve: () => Effect.succeed({} as never) }),
           Layer.mock(ThreadHistoryArchive.ThreadHistoryArchiveService)({
@@ -658,6 +662,21 @@ it.live("refuses to restore files when a linked project folder has no repository
       assert.equal(refused.reason, "rollback-target-invalid");
       assert.deepEqual((yield* thread.recorded).runs, ["completed", "completed"]);
       // Otherwise the archive stays executing and every later rewind needs reconciliation.
+      assert.deepEqual(thread.archivesBegun, []);
+    }),
+  ),
+);
+
+it.live("a rewind whose provider session cannot open begins no archive and leaves files", () =>
+  withThread({ projectIsRepository: false, sessionOpenFails: true }, (thread) =>
+    Effect.gen(function* () {
+      const { path, folders, write, read } = thread;
+      yield* thread.turn(1, write(path.join(folders.api, "a.txt"), "1"));
+      yield* thread.turn(2, write(path.join(folders.api, "a.txt"), "2"));
+
+      yield* thread.rewind(1).pipe(Effect.exit);
+
+      assert.equal(yield* read(path.join(folders.api, "a.txt")), "2");
       assert.deepEqual(thread.archivesBegun, []);
     }),
   ),

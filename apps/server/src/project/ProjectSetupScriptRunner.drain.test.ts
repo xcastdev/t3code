@@ -294,3 +294,76 @@ it.effect("a terminal restart ends the original setup observer before replacemen
     }).pipe(Effect.provide(services));
   }),
 );
+
+it.effect.each([
+  { retainTerminalForDrain: true, closes: 0 },
+  { retainTerminalForDrain: false, closes: 1 },
+])(
+  "an interrupted setup completion closes its terminal only when not retained for drain (retain: $retainTerminalForDrain)",
+  ({ retainTerminalForDrain, closes }) =>
+    Effect.gen(function* () {
+      const events = yield* makeEvents();
+      const handle = { threadId: "setup-thread", terminalId: "setup-install" };
+      const close = vi.fn(() => Effect.void);
+      const services = Layer.mergeAll(
+        Layer.mock(Projects.ProjectService)({}),
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getThreadShell: () => Effect.succeed(null),
+        }),
+        ServerSettings.layerTest(),
+        NodeCrypto.layer,
+        Layer.mock(TerminalManager.TerminalManager)({
+          close,
+          getShell: () => Effect.succeed("/bin/zsh"),
+          openCaptured: () =>
+            Effect.succeed({
+              capture: handle,
+              snapshot: {
+                ...handle,
+                cwd: "/repo-worktree",
+                worktreePath: "/repo-worktree",
+                status: "running",
+                pid: 42,
+                history: "",
+                exitCode: null,
+                exitSignal: null,
+                label: "Setup",
+                updatedAt: "2026-01-01T00:00:00Z",
+              },
+            }),
+          subscribe: events.subscribe,
+          writeCaptured: () => Effect.void,
+        }),
+      );
+      yield* Effect.gen(function* () {
+        const runner = yield* Setup.make;
+        const setup = yield* runner.runForThread({
+          threadId: handle.threadId,
+          worktreePath: "/repo-worktree",
+          project: {
+            id: ProjectId.make("setup-project"),
+            workspaceRoot: "/repo",
+            scripts: [
+              {
+                id: "install",
+                name: "Install",
+                command: "install",
+                icon: "configure",
+                runOnWorktreeCreate: true,
+              },
+            ],
+          },
+          retainTerminalForDrain,
+          observeCompletion: {},
+          onTerminalAllocated: () => Effect.void,
+        });
+        if (setup.status !== "started" || setup.completion === undefined)
+          return yield* Effect.die("Setup observer missing");
+        const before = close.mock.calls.length;
+        const waiting = yield* setup.completion.pipe(Effect.forkScoped({ startImmediately: true }));
+        yield* Fiber.interrupt(waiting);
+        yield* Deferred.await(events.closed);
+        assert.equal(close.mock.calls.length - before, closes);
+      }).pipe(Effect.provide(services));
+    }),
+);

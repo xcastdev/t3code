@@ -9,6 +9,7 @@ import {
 } from "../projectWork/ProjectWorkRepository.ts";
 import { ProjectWorkEventBus } from "../projectWork/ProjectWorkEventBus.ts";
 import { decodeProjectWorkEvent } from "../projectWork/ProjectWorkEventStore.ts";
+import { resolveBindingWorktree } from "../projectWork/ProjectWorkRunAdmission.ts";
 
 export const reconcileWorkBindings = Effect.fn("OwnedBindingReconciliation.reconcileWorkBindings")(
   function* () {
@@ -58,7 +59,11 @@ export const reconcileWorkBindings = Effect.fn("OwnedBindingReconciliation.recon
               thread !== undefined &&
               thread.project_id === binding.projectId &&
               (binding.workspaceState !== "ready" ||
-                (thread.worktree_path ?? project.workspace_root) === binding.worktree) &&
+                (yield* resolveBindingWorktree(
+                  sql,
+                  binding,
+                  thread.worktree_path ?? project.workspace_root,
+                )) === binding.worktree) &&
               (binding.runId === undefined || run !== undefined)
             )
               return;

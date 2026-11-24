@@ -52,6 +52,8 @@ import * as Dispatch from "./ProjectTeamDispatch.ts";
 import { planMailboxClaim } from "./ProjectTeamMailboxTurns.ts";
 import * as Journal from "./ProjectTeamDispatchJournal.ts";
 import * as TaskFolders from "../workspace/TaskFolders.ts";
+import { reconcileWorkBindings } from "../assistants/OwnedBindingReconciliation.ts";
+import { ProjectWorkEventBusLive } from "./ProjectWorkEventBus.ts";
 import { runtimeExternalServices } from "./ProjectWorkWorkflow.testkit.ts";
 import { makeHarness, projectId, modelSelection } from "./ProjectTeamDispatch.testkit.ts";
 
@@ -227,6 +229,8 @@ const inspect = Effect.gen(function* () {
   );
   return { sql, state, binding, projection };
 });
+
+const reconcile = reconcileWorkBindings().pipe(Effect.provide(ProjectWorkEventBusLive));
 
 const awaitPreparation = Effect.gen(function* () {
   const { binding } = yield* inspect;
@@ -478,11 +482,15 @@ it.effect("a chosen repository binds its own worktree inside the task folder", (
       operation: "start" as const,
     };
     assert.equal((yield* admission.check(check))._tag, "admitted");
+    yield* reconcile;
+    assert.equal((yield* inspect).binding.status, binding.status);
     // The record no longer holds that repository's worktree, so the run's target moved.
     yield* sql`UPDATE task_folders SET repositories_json='[]' WHERE root=${fixture.taskFolder.root}`;
     const moved = yield* admission.check(check);
     assert.equal(moved._tag, "denied");
     if (moved._tag === "denied") assert.equal(moved.reason, "owner-target-workspace-changed");
+    yield* reconcile;
+    assert.equal((yield* inspect).binding.status, "quarantined");
   }).pipe(Effect.provide(Dispatch.layer.pipe(Layer.provideMerge(harness.base))));
 });
 
@@ -496,6 +504,8 @@ it.effect("a project-checkout run on a chosen repository works in its original c
     assert.isNull(projection.thread.worktreePath);
     assert.equal(binding.repository, "/repo/web");
     assert.equal(binding.worktree, "/repo/web");
+    yield* reconcile;
+    assert.equal((yield* inspect).binding.status, binding.status);
   }).pipe(Effect.provide(Dispatch.layer.pipe(Layer.provideMerge(harness.base))));
 });
 

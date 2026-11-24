@@ -1299,6 +1299,17 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
             }
           });
 
+        const stopBackgroundShell = (input: {
+          readonly providerThread: OrchestrationV2ProviderThread;
+          readonly taskId: string;
+        }) =>
+          Effect.sync(() => {
+            const shell = backgroundShells.get(input.taskId);
+            if (shell?.providerThreadId !== input.providerThread.id) return false;
+            shell.stop();
+            return true;
+          });
+
         const resolveItemOrdinal = (context: ActiveCursorTurn, nativeItemId: string) =>
           Effect.sync(() => {
             const existing = context.itemOrdinals.get(nativeItemId);
@@ -3541,11 +3552,8 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
             if (matched.length > 0) yield* publishBackgroundShells(providerThread.id);
             return { matched };
           }),
-          stopTask: ({ providerThread, taskId }) =>
-            Effect.sync(() => {
-              const shell = backgroundShells.get(taskId);
-              if (shell?.providerThreadId === providerThread.id) shell.stop();
-            }),
+          stopTask: (input) => Effect.asVoid(stopBackgroundShell(input)),
+          stopBackgroundTask: stopBackgroundShell,
           interruptTurn: Effect.fn("CursorAdapterV2.interruptTurn")(
             function* (turnInput: ProviderAdapter.ProviderAdapterV2InterruptInput) {
               const context = yield* Ref.get(activeTurn);
