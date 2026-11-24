@@ -1766,6 +1766,130 @@ describe("AcpAdapterV2", () => {
       assert.deepEqual(promptTexts.slice(3), ["continue"], "a turn resumes only once");
     }).pipe(Effect.provide(layerTest)),
   );
+  it.live("does not acknowledge managed instructions for an unchecked superseded prompt", () =>
+    Effect.gen(function* () {
+      const instanceId = ProviderInstanceId.make("acp-test-superseded-instructions");
+      const threadId = ThreadId.make("thread-acp-superseded-instructions");
+      const firstStarted = yield* Deferred.make<void>();
+      const releaseFirst = yield* Deferred.make<void>();
+      let prompts = 0;
+      // The superseded prompt hides an upstream failure behind its clean stop.
+      let watches = 0;
+      const adapter = yield* makeAcpAdapterV2({
+        instanceId,
+        selfInvocation: yield* resolveSelfInvocation(),
+        flavor: {
+          driver: ACP_TEST_DRIVER,
+          capabilities: AcpProviderCapabilitiesV2,
+          steersWithPrompt: () => true,
+          watchPromptOutcome: () =>
+            Effect.sync(() => {
+              watches += 1;
+              const outcome =
+                watches === 1
+                  ? {
+                      failure: {
+                        class: "provider_error",
+                        message: "Bad Gateway",
+                        code: null,
+                        retryable: true,
+                      } as const,
+                      threadDisposition: "reusable" as const,
+                    }
+                  : undefined;
+              return () => Effect.succeed(outcome);
+            }),
+          makeRuntime: makeMockRuntime({
+            childProcessSpawner: yield* ChildProcessSpawner.ChildProcessSpawner,
+            mockAgentPath: yield* bundledMockAgentPath,
+            wrapRuntime: (runtime) => ({
+              ...runtime,
+              prompt: (_payload, promptOptions) =>
+                Effect.gen(function* () {
+                  prompts += 1;
+                  if (promptOptions?.dispatched) {
+                    yield* Deferred.succeed(promptOptions.dispatched, undefined);
+                  }
+                  if (prompts === 1) {
+                    yield* Deferred.succeed(firstStarted, undefined);
+                    yield* Deferred.await(releaseFirst);
+                  }
+                  return { stopReason: "end_turn" as const };
+                }),
+            }),
+          }),
+        },
+      });
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+      const modelSelection = { instanceId, model: "default" } as const;
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-acp-superseded-instructions"),
+        modelSelection,
+        runtimePolicy,
+      });
+      const providerThread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const receipts: OrchestrationV2InstructionSnapshot[] = [];
+      const turnInput = makeTurnInput({
+        threadId,
+        providerThread,
+        instanceId,
+        runtimePolicy,
+        now: yield* DateTime.now,
+        ordinal: 1,
+      });
+      yield* runtime.startTurn({
+        ...turnInput,
+        instructionSnapshot: {
+          configurationHash: "config-1",
+          resourceRevision: "resources-1",
+          memoryEpoch: 0,
+          roleInstructions: "Review the changes and report concrete evidence.",
+          toolIds: [],
+          skillIds: [],
+        },
+        onInstructionsApplied: (snapshot) =>
+          Effect.sync(() => {
+            receipts.push(snapshot);
+          }),
+      });
+      yield* Deferred.await(firstStarted);
+      yield* runtime.steerTurn({
+        threadId,
+        runId: turnInput.runId,
+        providerThread,
+        providerTurnId: (yield* IdAllocator.IdAllocatorV2).derive.providerTurn({
+          driver: ACP_TEST_DRIVER,
+          nativeTurnId: acpScopedNativeId(
+            instanceId,
+            `${providerThread.nativeThreadRef?.nativeId}:turn:1`,
+          ),
+        }),
+        message: {
+          createdBy: "user",
+          creationSource: "web",
+          messageId: MessageId.make("steer-superseded-instructions"),
+          text: "Keep going",
+          attachments: [],
+        },
+      });
+      yield* Deferred.succeed(releaseFirst, undefined);
+      yield* runtime.events.pipe(
+        Stream.takeUntil((event) => event.type === "turn.terminal"),
+        Stream.runDrain,
+      );
+      assert.equal(yield* runtime.getAppliedInstructions!({ providerThread }), undefined);
+      assert.deepEqual(receipts, []);
+    }).pipe(Effect.provide(layerTest)),
+  );
   it.live("retains returned usage when Stop finalizes before the prompt callback", () =>
     Effect.gen(function* () {
       const instanceId = ProviderInstanceId.make("acp-test-prompt-usage-stop");

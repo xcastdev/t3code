@@ -27,6 +27,10 @@ export const isRepositoryTopLevel = Effect.fn("ProjectWorkRepositoryRoot.isRepos
       yield* real(path.dirname(resolvedWorktree)),
       path.basename(resolvedWorktree),
     );
-    return (yield* real(gitTopLevel)) === worktreeReal;
+    const topLevel = yield* real(gitTopLevel);
+    // Windows realPath returns the on-disk case; the stored last folder may differ in case only.
+    return path.sep === "\\"
+      ? topLevel.toLowerCase() === worktreeReal.toLowerCase()
+      : topLevel === worktreeReal;
   },
 );

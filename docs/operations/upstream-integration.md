@@ -598,16 +598,19 @@ A third round found five more, also fixed:
   prompt, and clears them when a session is replaced, restarted or compacted.
 - **Cursor Stop:** Cursor background commands, new upstream, now stop from Processes.
 
-A final round found four more, also fixed:
+A final round found five more, also fixed:
 
 - **Linked worktree:** the real-path root check resolved the worktree itself, so a worktree
   replaced by a link to another repository passed. Only parent folders are resolved now, and
-  a linked worktree is refused.
+  a linked worktree is refused. On Windows the comparison ignores case.
 - **Rewind identity:** a refused file-restoring rewind and a conversation-only rewind of the
   same checkpoint shared an archive id and conflicted. Whether files are restored is now part
   of the identity.
 - **ACP receipts:** managed instructions are acknowledged only after the prompt outcome check
   passes, and not for a turn already failed or compacted during the prompt.
+- **Superseded ACP prompt:** a prompt a steer superseded skipped the outcome check, so its
+  managed instructions were acknowledged even if it hid a failure. Flavors that check
+  outcomes no longer acknowledge on that path; the next turn re-sends them.
 - **Root-kind binding:** a project-checkout Work binding on a chosen repository is refused
   once its thread moves into a worktree.
 

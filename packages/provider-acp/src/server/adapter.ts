@@ -9611,7 +9611,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     rollbackOfferedAppContext();
                   }
                   if (context.finalized || followsAgentWorkState || superseded()) {
-                    yield* acknowledgeInstructions;
+                    // Unchecked, a clean stop may hide a failure; the next turn resends instead.
+                    if (settle.checkPromptOutcome === undefined) yield* acknowledgeInstructions;
                     return;
                   }
                   // ACP v2 reports a failed prompt through its idle stop reason, not an RPC error.
