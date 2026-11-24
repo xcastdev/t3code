@@ -553,3 +553,23 @@ environment descriptor (HTTP 200), and refused unauthenticated WebSocket-ticket 
 pairing-token requests (HTTP 401); it was then stopped. No real-client visual pass,
 native device build, paid model eval or real provider turn was run. Main has not been
 advanced; nothing was pushed or deployed, and live userdata was not written.
+
+### Adversarial review (2026-11-24)
+
+Independent audits on Claude Opus 5.5 and Gemini 4 Neon found five losses, fixed in a
+follow-up commit:
+
+- **Work target check:** compared Git's top level and the stored worktree as strings, so
+  symlinked or Windows paths were refused. Both now compare real locations, covered by a
+  symlink test.
+- **Image hold:** an image-encoding send hold dropped the fork's plugin references from
+  the refreshed draft.
+- **Usage summary:** the collapsed summary ignored upstream's pooled hub limits.
+- **Empty Version Control:** the titled section rendered an empty heading when only
+  upstream's repository rows were enabled and rendered nothing.
+- **Mobile drawer:** the live-details drawer did not pass upstream's tracked-repositories
+  flag, so plain project folders could not review turn diffs from it.
+
+Untranslated checklist titles, Work section labels and the folded thought count in
+upstream files are now translated. A raw-path task-folder lookup in run admission was
+checked and left as is: the thread's path is written from the same task-folder value.

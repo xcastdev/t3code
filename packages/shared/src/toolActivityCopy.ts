@@ -16,6 +16,10 @@ export function dynamicToolTitle(
       return undefined;
     case "title":
       return title.title;
+    case "checklist":
+      return title.action === "update"
+        ? resolve(msg("Updated checklist"))
+        : resolve(msg("Read checklist"));
     case "computer-use":
       return resolve(msg("Computer use"));
     case "run-javascript":

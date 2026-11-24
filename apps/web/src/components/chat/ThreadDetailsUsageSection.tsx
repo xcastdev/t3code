@@ -324,7 +324,23 @@ export default function ThreadDetailsUsageSection(props: {
   const threadDriver = threadAccount?.driver ?? provider?.driver ?? null;
   const showsThread =
     threadAccount !== null || pool !== null || ownNotice !== null || ownWindows.length > 0;
-  const summaryWindows = usageSummaryWindows(threadAccount?.limits.windows ?? ownWindows);
+  // The collapsed summary follows the same precedence: a hub's pool wins.
+  const poolSummary: ReadonlyArray<ServerProviderUsageWindow> | null =
+    pool === null
+      ? null
+      : pool.map((window) => {
+          const reset = nextPoolReset(window, now);
+          return {
+            id: window.id,
+            kind: window.kind,
+            label: window.label,
+            usedPercent: window.usedPercent,
+            ...(reset === null ? {} : { resetsAt: new Date(reset.at).toISOString() }),
+          };
+        });
+  const summaryWindows = usageSummaryWindows(
+    poolSummary ?? threadAccount?.limits.windows ?? ownWindows,
+  );
   const others = showsThread
     ? accounts.filter((account) => account.key !== threadAccount?.key)
     : [];

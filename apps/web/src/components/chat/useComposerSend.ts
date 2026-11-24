@@ -567,6 +567,7 @@ export function useComposerSend(input: ComposerSendInput) {
           reviewComments: draftAfterHold.reviewComments,
           threadContexts: draftAfterHold.threadContexts,
           environmentContexts: draftAfterHold.environmentContexts,
+          pluginReferences: draftAfterHold.pluginReferences,
         };
       }
     }

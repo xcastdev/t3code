@@ -1,6 +1,9 @@
 import { assert, it } from "@effect/vitest";
 import { SourceControlProviderKind } from "@t3tools/contracts";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Layer from "effect/Layer";
 import type {
   GuardedPublicationRecord,
@@ -79,6 +82,7 @@ const layer = (
         }),
         Layer.mock(Reviews.ProjectTeamReviewFreshness)({ ...overrides.reviews }),
         Sqlite.layerMemory,
+        NodeServices.layer,
       ),
     ),
   );
@@ -155,3 +159,43 @@ it.effect("capture refuses a reviewed target that is not its own repository's to
     ),
   );
 });
+
+it.effect("capture accepts a worktree reached through a symlink, as Git reports it resolved", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-publication-root-" });
+    const real = path.join(dir, "real");
+    const worktree = path.join(dir, "link");
+    yield* fs.makeDirectory(real);
+    yield* fs.symlink(real, worktree);
+    const snapshot = {
+      manifest: {
+        projectId: decision.request.target.projectId,
+        taskId: decision.source.taskId,
+        target: { worktree, headSha: decision.source.headSha, baseSha: decision.source.baseSha },
+      },
+    } as unknown as Reviews.ReviewSnapshot;
+    const result = yield* Effect.gen(function* () {
+      const host = yield* Host.ProjectWorkPublicationHost;
+      return yield* host.capture({
+        projectId: decision.request.target.projectId,
+        source: decision.source,
+        baseRef: "main",
+      });
+    }).pipe(
+      Effect.result,
+      Effect.provide(
+        layer([nativeRecord], true, {
+          // Git resolves symlinks in --show-toplevel.
+          git: { repositoryRoot: () => fs.realPath(worktree).pipe(Effect.orDie) },
+          reviews: {
+            completedDispatch: () => Effect.succeed({ snapshot, proof: {} as never }),
+            assertPhysical: () => Effect.void,
+          },
+        }),
+      ),
+    );
+    assert.equal(result._tag, "Success");
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);

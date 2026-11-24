@@ -1,16 +1,17 @@
 import { ProjectWorkTaskId } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
+import { msg } from "gt-react";
 
 export const WORK_SECTIONS = ["overview", "tasks", "team", "knowledge", "intake"] as const;
 export type WorkSection = (typeof WORK_SECTIONS)[number];
 
-export const WORK_SECTION_LABELS: Record<WorkSection, string> = {
-  overview: "Overview",
-  tasks: "Tasks",
-  team: "Team",
-  knowledge: "Knowledge",
-  intake: "Intake",
-};
+export const WORK_SECTION_LABELS = {
+  overview: msg("Overview", { $context: "Work section" }),
+  tasks: msg("Tasks", { $context: "Work section" }),
+  team: msg("Team", { $context: "Work section" }),
+  knowledge: msg("Knowledge", { $context: "Work section" }),
+  intake: msg("Intake", { $context: "Work section" }),
+} satisfies Record<WorkSection, ReturnType<typeof msg>>;
 
 export interface WorkRouteSearch {
   readonly section: WorkSection;

@@ -45,18 +45,19 @@ export function dynamicToolSurface(toolName: string | null | undefined, input: u
 }
 
 // Each provider names its agent checklist tool differently; users see one name for all of them.
-const CHECKLIST_TOOL_TITLES: ReadonlyMap<string, string> = new Map([
-  ["todowrite", "Updated checklist"],
-  ["todo_write", "Updated checklist"],
-  ["write_todos", "Updated checklist"],
-  ["update_plan", "Updated checklist"],
-  ["todoread", "Read checklist"],
-  ["todo_read", "Read checklist"],
-  ["read_todos", "Read checklist"],
+const CHECKLIST_TOOL_TITLES: ReadonlyMap<string, "update" | "read"> = new Map([
+  ["todowrite", "update"],
+  ["todo_write", "update"],
+  ["write_todos", "update"],
+  ["update_plan", "update"],
+  ["todoread", "read"],
+  ["todo_read", "read"],
+  ["read_todos", "read"],
 ]);
 
 export type DynamicToolTitle =
   | { readonly kind: "title"; readonly title: string }
+  | { readonly kind: "checklist"; readonly action: "update" | "read" }
   | { readonly kind: "computer-use" }
   | { readonly kind: "run-javascript" }
   | { readonly kind: "skill"; readonly name: string };
@@ -66,8 +67,8 @@ export function describeDynamicToolTitle(
   input: unknown,
   retainedTitle?: string | null,
 ): DynamicToolTitle | undefined {
-  const checklistTitle = toolName ? CHECKLIST_TOOL_TITLES.get(toolName.toLowerCase()) : undefined;
-  if (checklistTitle !== undefined) return { kind: "title", title: checklistTitle };
+  const checklist = toolName ? CHECKLIST_TOOL_TITLES.get(toolName.toLowerCase()) : undefined;
+  if (checklist !== undefined) return { kind: "checklist", action: checklist };
   if (isJavaScriptReplTool(toolName)) {
     const title = asTrimmedString(retainedTitle);
     const meaningfulTitle =
@@ -95,6 +96,8 @@ export function dynamicToolTitle(
       return undefined;
     case "title":
       return title.title;
+    case "checklist":
+      return title.action === "update" ? "Updated checklist" : "Read checklist";
     case "computer-use":
       return "Computer use";
     case "run-javascript":

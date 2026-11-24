@@ -78,9 +78,11 @@ export function ThreadDetailsSection({
       // A row can still render nothing (a fresh draft quiets Git actions), so an empty section
       // collapses, and a divider only follows a section that has content.
       className={cn(
-        "px-2 pt-2 has-[>div:last-child:empty]:hidden",
+        // Rows sit in a wrapper div, so a wrapper with no rendered rows also counts as empty.
+        "px-2 pt-2 has-[>div:last-child:empty]:hidden has-[>div:last-child>div:only-child:empty]:hidden",
         collapsed ? "pb-1" : "pb-2.5",
-        separated && "border-border/65 [section:not(:has(>div:last-child:empty))~&]:border-t",
+        separated &&
+          "border-border/65 [section:not(:has(>div:last-child:empty)):not(:has(>div:last-child>div:only-child:empty))~&]:border-t",
       )}
     >
       <div

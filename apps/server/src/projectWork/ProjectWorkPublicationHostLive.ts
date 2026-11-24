@@ -10,6 +10,8 @@ import type {
 } from "@t3tools/source-control-core/server/SourceControlProvider";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -19,6 +21,7 @@ import * as PullRequests from "../pullRequest/PullRequestService.ts";
 import * as Reviews from "./ProjectTeamReviewFreshness.ts";
 import { readCurrentState } from "./ProjectWorkRepository.ts";
 import * as Host from "./ProjectWorkPublicationHost.ts";
+import { isRepositoryTopLevel } from "./ProjectWorkRepositoryRoot.ts";
 import {
   PublicationError,
   publicationHash,
@@ -52,6 +55,8 @@ const make = Effect.gen(function* () {
   const reviews = yield* Reviews.ProjectTeamReviewFreshness;
   const git = yield* Git.GitWorkflowService;
   const pullRequests = yield* PullRequests.PullRequestService;
+  const fileSystem = yield* FileSystem.FileSystem;
+  const paths = yield* Path.Path;
   const capture: Host.ProjectWorkPublicationHost["Service"]["capture"] = Effect.fn(
     "ProjectWorkPublicationHost.capture",
   )(function* (input) {
@@ -67,7 +72,14 @@ const make = Effect.gen(function* () {
     )
       return yield* new PublicationError({ reason: "stale" });
     // A task folder's project folder need not be a repository; Git there answers for another.
-    if ((yield* git.repositoryRoot(cwd)) !== cwd)
+    const root = yield* git.repositoryRoot(cwd);
+    if (
+      root === null ||
+      !(yield* isRepositoryTopLevel(root, cwd).pipe(
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.provideService(Path.Path, paths),
+      ))
+    )
       return yield* new PublicationError({ reason: "not-ready" });
     const handle = yield* registry.resolveHandle({ cwd });
     const api = handle.provider.guardedPublication;

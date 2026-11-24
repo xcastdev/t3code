@@ -1,3 +1,4 @@
+import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import {
   CommandId,
@@ -30,6 +31,7 @@ import {
 } from "./ProjectTeamPolicy.ts";
 import type { ProjectWorkPrincipal } from "./ProjectWorkGateway.ts";
 import { verificationError } from "./ProjectWorkVerificationError.ts";
+import { isRepositoryTopLevel } from "./ProjectWorkRepositoryRoot.ts";
 
 export class ProjectWorkVerificationGateway extends Context.Service<
   ProjectWorkVerificationGateway,
@@ -56,6 +58,7 @@ const make = Effect.gen(function* () {
   const runner = yield* Runner.ProcessRunner;
   const environment = yield* Environment.ServerEnvironment;
   const paths = yield* Path.Path;
+  const fileSystem = yield* FileSystem.FileSystem;
   const assertHuman = (principal: ProjectWorkPrincipal) =>
     authorization
       .assertHuman(principal)
@@ -211,8 +214,12 @@ const make = Effect.gen(function* () {
         journals[0]!.request_json,
       );
       // A task folder's project folder need not be a repository; Git there answers for another.
-      if ((yield* git(["rev-parse", "--show-toplevel"])) !== binding.worktree)
-        return yield* verificationError("changed-target");
+      const topLevel = yield* git(["rev-parse", "--show-toplevel"]);
+      const ownTopLevel = yield* isRepositoryTopLevel(topLevel, binding.worktree!).pipe(
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.provideService(Path.Path, paths),
+      );
+      if (!ownTopLevel) return yield* verificationError("changed-target");
       const head = yield* git(["rev-parse", "HEAD"]);
       const base = yield* git([
         "rev-parse",

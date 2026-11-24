@@ -328,9 +328,9 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
                   collapsedSummary={
                     <VersionControlSummary
                       threadRef={activeThreadRef}
-                      gitCwd={offersGit && folderIsRepo ? props.gitCwd : null}
+                      gitCwd={offersGit && folderIsRepo && visible.changes ? props.gitCwd : null}
                       workspaceMutationId={props.workspaceMutationId}
-                      branch={props.branch}
+                      branch={visible.branch ? props.branch : null}
                     />
                   }
                 >

@@ -1,4 +1,5 @@
 import { Link } from "@tanstack/react-router";
+import { useMessages } from "gt-react";
 import { scopeProjectRef } from "@t3tools/client-runtime/environment";
 import type { ProjectWorkScope } from "@t3tools/client-runtime/project-work";
 import type { EnvironmentId, ProjectId, ProjectWorkTaskId } from "@t3tools/contracts";
@@ -43,6 +44,7 @@ export function WorkPage({
   readonly search: WorkRouteSearch;
   readonly onSearchChange: (search: WorkRouteSearch) => void;
 }) {
+  const messages = useMessages();
   const project = useProject(scopeProjectRef(environmentId, projectId));
   const projectsReady = useAllEnvironmentProjectSnapshotsReady();
   const environment = useEnvironment(environmentId);
@@ -122,7 +124,7 @@ export function WorkPage({
               >
                 {WORK_SECTIONS.map((value) => (
                   <Toggle key={value} value={value}>
-                    {WORK_SECTION_LABELS[value]}
+                    {messages(WORK_SECTION_LABELS[value])}
                   </Toggle>
                 ))}
               </ToggleGroup>

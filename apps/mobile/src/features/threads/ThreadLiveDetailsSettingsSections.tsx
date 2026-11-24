@@ -420,12 +420,15 @@ export function ThreadSourceControlSection(props: {
     runId: useAtomValue(threadAtom, selectMergeBackRunId),
     onMerged: props.onOpenThread,
   });
+  // A plain project folder can still track repositories whose turn diffs are reviewable.
+  const tracksRepositories = (selectedThreadProject?.trackedFolders?.length ?? 0) > 0;
   const gitItems = useThreadGitPanelItems({
     environmentId,
     threadId,
     currentBranch: selectedThread?.branch ?? null,
     gitStatus: status.data,
     gitOperationLabel: operation.currentLabel,
+    tracksRepositories,
     ...(onMergeBack ? { onMergeBack } : {}),
     onPull: gitActions.onPullSelectedThreadBranch,
     onRunAction: gitActions.onRunSelectedThreadGitAction,
@@ -460,7 +463,11 @@ export function ThreadSourceControlSection(props: {
       title="Source control"
       summary={
         data !== null && !isRepo ? (
-          "Not a repo"
+          tracksRepositories ? (
+            "Repositories"
+          ) : (
+            "Not a repo"
+          )
         ) : hasChanges || branch ? (
           <View className="min-w-0 shrink flex-row items-center gap-1.5">
             {hasChanges ? (

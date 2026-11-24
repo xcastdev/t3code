@@ -838,7 +838,7 @@ function surfaceTitle(
     case "source-control":
       return resolve(msg("Source control"));
     case "work":
-      return WORK_SECTION_LABELS[surface.view];
+      return resolve(WORK_SECTION_LABELS[surface.view]);
     case "work-task":
       return surface.title ?? resolve(msg("Task"));
     case "issue":
@@ -1871,7 +1871,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                                     onAddWork(view);
                                   }}
                                 >
-                                  {WORK_SECTION_LABELS[view]}
+                                  {messages(WORK_SECTION_LABELS[view])}
                                 </MenuItem>
                               ))}
                             </MenuSubPopup>

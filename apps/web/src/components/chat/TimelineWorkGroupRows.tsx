@@ -753,7 +753,9 @@ export function ThoughtsTimelineRow({ row }: { row: Extract<TimelineRow, { kind:
         />
         <span className="shrink-0 font-medium">{label}</span>
         {count > 1 && (
-          <span className="shrink-0 tabular-nums text-muted-foreground">· {count} thoughts</span>
+          <span className="shrink-0 tabular-nums text-muted-foreground">
+            {gt("· {count} thoughts", { count })}
+          </span>
         )}
         {!open && (
           <span className="min-w-0 flex-1 truncate text-left font-normal text-muted-foreground">
