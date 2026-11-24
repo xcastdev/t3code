@@ -4,7 +4,9 @@ import * as Path from "effect/Path";
 
 /**
  * Whether Git's `--show-toplevel` answer names the stored worktree. Git resolves symlinks
- * and prints forward slashes on Windows, so both sides compare by their real location.
+ * and prints forward slashes on Windows, so the worktree's parent folders compare by their
+ * real location. The worktree itself must not be a link: one to another repository would
+ * otherwise pass as that repository's top level.
  */
 export const isRepositoryTopLevel = Effect.fn("ProjectWorkRepositoryRoot.isRepositoryTopLevel")(
   function* (gitTopLevel: string, worktree: string) {
@@ -15,6 +17,16 @@ export const isRepositoryTopLevel = Effect.fn("ProjectWorkRepositoryRoot.isRepos
         Effect.map((resolved) => path.resolve(resolved)),
         Effect.orElseSucceed(() => path.resolve(target)),
       );
-    return (yield* real(gitTopLevel)) === (yield* real(worktree));
+    const isLink = yield* fs.readLink(worktree).pipe(
+      Effect.as(true),
+      Effect.orElseSucceed(() => false),
+    );
+    if (isLink) return false;
+    const resolvedWorktree = path.resolve(worktree);
+    const worktreeReal = path.join(
+      yield* real(path.dirname(resolvedWorktree)),
+      path.basename(resolvedWorktree),
+    );
+    return (yield* real(gitTopLevel)) === worktreeReal;
   },
 );

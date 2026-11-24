@@ -160,15 +160,16 @@ it.effect("capture refuses a reviewed target that is not its own repository's to
   );
 });
 
-it.effect("capture accepts a worktree reached through a symlink, as Git reports it resolved", () =>
+it.effect("capture accepts a worktree under a symlinked folder, as Git reports it resolved", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-publication-root-" });
+    // A worktree inside a worktrees folder reached through a link.
     const real = path.join(dir, "real");
-    const worktree = path.join(dir, "link");
-    yield* fs.makeDirectory(real);
-    yield* fs.symlink(real, worktree);
+    yield* fs.makeDirectory(path.join(real, "task"), { recursive: true });
+    yield* fs.symlink(real, path.join(dir, "link"));
+    const worktree = path.join(dir, "link", "task");
     const snapshot = {
       manifest: {
         projectId: decision.request.target.projectId,

@@ -561,7 +561,8 @@ fixed in a follow-up commit:
 
 - **Work target check:** guarded publication's new check compared Git's top level and
   the stored worktree as strings, so a symlinked or Windows worktree path was refused.
-  Publication and verification now compare real locations, covered by a symlink test.
+  Publication and verification now compare the worktree's real parent folders and refuse a
+  worktree that is itself a link, covered by symlink tests.
   Verification execution still requires a canonical worktree path, as it did before the
   merge.
 - **Image hold:** an image-encoding send hold dropped the fork's plugin references from
@@ -602,8 +603,9 @@ fork's drain options, so a Stop during it cannot prove its processes ended. The 
 does not take upstream's agent-feedback line or multi-folder workspace list, as upstream's
 own Pi and Grok adapters do not.
 
-Untranslated checklist titles, Work section labels and the folded thought count in
-upstream files are now translated. A raw-path task-folder lookup in run admission was
+Checklist titles, Work section labels and the folded thought count in upstream files are
+now wrapped for translation; like the fork's other new keys, the other locales show English
+until the translation follow-up. A raw-path task-folder lookup in run admission was
 checked and left as is: the thread's path is written from the same task-folder value.
 Shared project terminals already get SIGHUP, because node-pty's default kill signal is
 SIGHUP.
