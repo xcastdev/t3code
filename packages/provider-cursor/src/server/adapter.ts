@@ -3693,6 +3693,11 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
                   Ref.set(resumedAgent, null),
                   // A shell the discarded runs left running must not wake the rewound thread.
                   stopBackgroundShells(rollbackInput.providerThread.id),
+                  // Instructions a discarded run delivered may be gone; the next turn re-sends them.
+                  Effect.sync(() => {
+                    deliveredInstructions.delete(rollbackInput.providerThread.id);
+                    appliedInstructions.delete(rollbackInput.providerThread.id);
+                  }),
                 ]);
               const now = yield* DateTime.now;
               if (target.type === "provider_turn") {

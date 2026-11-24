@@ -1095,7 +1095,7 @@ export const makeCursorAgentSdkProcessRunner = Effect.fn("makeCursorAgentSdkProc
                   result === null ? undefined : (result as CursorAgentSdk.CursorContextUsage),
                 ),
               ),
-            runCheckpointed: (runId) =>
+            runCheckpointed: (runId, options) =>
               worker
                 .request(
                   (id) => ({
@@ -1103,6 +1103,7 @@ export const makeCursorAgentSdkProcessRunner = Effect.fn("makeCursorAgentSdkProc
                     type: "runCheckpointed",
                     sessionId,
                     ...(runId === undefined ? {} : { runId }),
+                    ...(options?.current === true ? { current: true } : {}),
                   }),
                   "agent.run.get",
                 )

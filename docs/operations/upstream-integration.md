@@ -556,12 +556,14 @@ advanced; nothing was pushed or deployed, and live userdata was not written.
 
 ### Adversarial review (2026-11-24)
 
-Independent audits on Claude Opus 5.5 and Gemini 4 Neon found five losses, fixed in a
-follow-up commit:
+Independent audits on Claude Opus 5.5 and Gemini 4 Neon found five losses in a first round,
+fixed in a follow-up commit:
 
-- **Work target check:** compared Git's top level and the stored worktree as strings, so
-  symlinked or Windows paths were refused. Both now compare real locations, covered by a
-  symlink test.
+- **Work target check:** guarded publication's new check compared Git's top level and
+  the stored worktree as strings, so a symlinked or Windows worktree path was refused.
+  Publication and verification now compare real locations, covered by a symlink test.
+  Verification execution still requires a canonical worktree path, as it did before the
+  merge.
 - **Image hold:** an image-encoding send hold dropped the fork's plugin references from
   the refreshed draft.
 - **Usage summary:** the collapsed summary ignored upstream's pooled hub limits.
@@ -570,6 +572,21 @@ follow-up commit:
 - **Mobile drawer:** the live-details drawer did not pass upstream's tracked-repositories
   flag, so plain project folders could not review turn diffs from it.
 
+A second round found three more, also fixed:
+
+- **Cursor resume proof in the worker:** upstream's out-of-process Cursor worker, which
+  production uses, did not carry the fork's current-checkpoint check. Native resume
+  accepted any run that had ever checkpointed.
+- **Cursor rewind:** upstream's Cursor rewind kept the fork's delivered and applied
+  instruction snapshots, so a resume could trust instructions a discarded turn delivered.
+- **Rewind archive lock:** the fork's history archive began executing before upstream's
+  multi-repo checks could refuse a rewind, so a refused rewind blocked every later rewind
+  on that thread.
+
+Mobile automation schedules also follow the app language now.
+
 Untranslated checklist titles, Work section labels and the folded thought count in
 upstream files are now translated. A raw-path task-folder lookup in run admission was
 checked and left as is: the thread's path is written from the same task-folder value.
+Shared project terminals already get SIGHUP, because node-pty's default kill signal is
+SIGHUP.

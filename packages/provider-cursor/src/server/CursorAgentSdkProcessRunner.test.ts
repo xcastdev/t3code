@@ -132,7 +132,8 @@ rl.on("line", (line) => {
     return;
   }
   if (req.type === "runCheckpointed") {
-    send({ type: "response", id: req.id, ok: true, result: req.runId === "run-worker-1" });
+    // run-worker-1 checkpointed, but a later checkpoint is the one Cursor would resume from.
+    send({ type: "response", id: req.id, ok: true, result: req.runId === "run-worker-1" && req.current !== true });
     return;
   }
   if (req.type === "rewindAfterRun") {
@@ -362,6 +363,8 @@ describe("CursorAgentSdkProcessRunner", () => {
           assert.deepEqual(usage, { usedTokens: 120, maxTokens: 1000 });
           assert.isTrue(yield* session.runCheckpointed!("run-worker-1"));
           assert.isFalse(yield* session.runCheckpointed!("other"));
+          // Resume proof: an older checkpoint must not pass as the one Cursor resumes from.
+          assert.isFalse(yield* session.runCheckpointed!("run-worker-1", { current: true }));
           yield* session.rewindAfterRun!("run-worker-1");
           yield* session.close;
           assert.isFalse(session.isAlive?.());

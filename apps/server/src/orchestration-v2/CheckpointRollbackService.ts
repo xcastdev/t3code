@@ -373,8 +373,6 @@ export const layer: Layer.Layer<
       }
 
       if (restoreFiles && !(yield* isolated)) return yield* sharedWorkspace();
-      yield* archives.prepare(preparation);
-      yield* archives.beginExternal(archive);
 
       // Before the provider conversation changes: a rewind with nothing to restore is refused.
       const readable =
@@ -429,6 +427,9 @@ export const layer: Layer.Layer<
         ...repositoryTargets,
       ];
       if (restoreFiles && restoreTargets.length === 0) return yield* invalidTarget();
+      // Only once nothing above can refuse: a begun archive blocks later rewinds until it ends.
+      yield* archives.prepare(preparation);
+      yield* archives.beginExternal(archive);
 
       const modelSelection = context.thread.modelSelection;
       const resolvedRuntimePolicy = yield* runtimePolicy.resolve({

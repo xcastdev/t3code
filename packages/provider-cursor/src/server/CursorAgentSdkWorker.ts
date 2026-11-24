@@ -439,7 +439,9 @@ const runCursorSdkWorkerWithStdio = Effect.fn("CursorAgentSdkWorker.run")(functi
           writeMessage({ type: "response", id: req.id, ok: true, result: false });
           return;
         }
-        const exit = yield* Effect.exit(session.runCheckpointed(req.runId));
+        const exit = yield* Effect.exit(
+          session.runCheckpointed(req.runId, req.current === true ? { current: true } : undefined),
+        );
         if (Exit.isFailure(exit)) {
           writeMessage({
             type: "response",

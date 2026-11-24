@@ -66,6 +66,8 @@ interface Options {
 /** What the test supplies before the layer is built; the last commit's events land in `committed`. */
 interface State extends TaskFoldersTestState {
   readonly committed: Array<OrchestrationV2DomainEvent>;
+  /** History archives a rewind began executing; a refused rewind must begin none. */
+  readonly archivesBegun: Array<unknown>;
 }
 
 const layerFor = (state: State, options: Options) => {
@@ -187,7 +189,10 @@ const layerFor = (state: State, options: Options) => {
           Layer.mock(ThreadHistoryArchive.ThreadHistoryArchiveService)({
             prepareIntent: () => Effect.void,
             prepare: () => Effect.void,
-            beginExternal: () => Effect.void,
+            beginExternal: (archive: unknown) =>
+              Effect.sync(() => {
+                state.archivesBegun.push(archive);
+              }),
             completeExternal: () => Effect.void,
           }),
         ),
@@ -481,6 +486,7 @@ const taskFolderThread = Effect.fn(function* (state: State, options: Options) {
     recorded,
     records,
     apply,
+    archivesBegun: state.archivesBegun,
   };
 });
 
@@ -490,7 +496,13 @@ const withThread = <A, E>(
     thread: Effect.Success<ReturnType<typeof taskFolderThread>>,
   ) => Effect.Effect<A, E, Layer.Success<ReturnType<typeof layerFor>>>,
 ) => {
-  const state: State = { workspaceRoot: "/unset", trackedFolders: [], thread: null, committed: [] };
+  const state: State = {
+    workspaceRoot: "/unset",
+    trackedFolders: [],
+    thread: null,
+    committed: [],
+    archivesBegun: [],
+  };
   return taskFolderThread(state, options).pipe(
     Effect.flatMap(test),
     Effect.provide(layerFor(state, options)),
@@ -645,6 +657,8 @@ it.live("refuses to restore files when a linked project folder has no repository
 
       assert.equal(refused.reason, "rollback-target-invalid");
       assert.deepEqual((yield* thread.recorded).runs, ["completed", "completed"]);
+      // Otherwise the archive stays executing and every later rewind needs reconciliation.
+      assert.deepEqual(thread.archivesBegun, []);
     }),
   ),
 );

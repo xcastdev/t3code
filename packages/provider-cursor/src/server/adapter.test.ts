@@ -10,6 +10,7 @@ import {
   EnvironmentId,
   MessageId,
   NodeId,
+  type OrchestrationV2InstructionSnapshot,
   type OrchestrationV2ProviderTurn,
   ProjectId,
   ProviderInstanceId,
@@ -1329,6 +1330,7 @@ describe("CursorAdapterV2", () => {
           readonly model?: string;
           readonly status?: "finished" | "error";
           readonly summaryCompleted?: { readonly failed?: boolean };
+          readonly instructionSnapshot?: OrchestrationV2InstructionSnapshot;
         },
       ) {
         runOrdinal += 1;
@@ -1342,6 +1344,9 @@ describe("CursorAdapterV2", () => {
           modelSelection: turnModelSelection,
           runtimePolicy,
           ...(nativeThreadHasTurns === undefined ? {} : { nativeThreadHasTurns }),
+          ...(options?.instructionSnapshot === undefined
+            ? {}
+            : { instructionSnapshot: options.instructionSnapshot }),
           runId: RunId.make(`cursor-device-run-${runOrdinal}`),
           runOrdinal,
           providerTurnOrdinal: runOrdinal,
@@ -1449,6 +1454,14 @@ describe("CursorAdapterV2", () => {
       );
 
       const keptTurn = lastProviderTurn!;
+      const discardedSnapshot = {
+        configurationHash: "config-discarded",
+        resourceRevision: "resources-discarded",
+        memoryEpoch: 0,
+        roleInstructions: "Instructions only the discarded turn carried.",
+        toolIds: [],
+        skillIds: [],
+      };
       yield* send(false, undefined, { model: "gemini-4-neon" });
       const rollbackToKept = runtime.rollbackThread({
         providerThread,
@@ -1468,7 +1481,19 @@ describe("CursorAdapterV2", () => {
         told(false, false, false),
         "a failed rewind leaves the conversation, and what it was told, unchanged",
       );
+      yield* send(false, true, {
+        model: "gemini-4-neon",
+        instructionSnapshot: discardedSnapshot,
+      });
+      assert.deepEqual(
+        yield* runtime.getAppliedInstructions!({ providerThread }),
+        discardedSnapshot,
+      );
       const rewound = yield* rollbackToKept;
+      assert.isUndefined(
+        yield* runtime.getAppliedInstructions!({ providerThread }),
+        "a rewind drops instructions only a discarded turn delivered",
+      );
       assert.deepEqual(rewoundAfter, [keptTurn.nativeTurnRef?.nativeId]);
       assert.deepEqual(
         rewound.providerThread.nativeThreadRef,

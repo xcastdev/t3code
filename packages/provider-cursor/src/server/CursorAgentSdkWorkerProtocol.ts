@@ -106,6 +106,7 @@ export type CursorWorkerRequest =
       readonly type: "runCheckpointed";
       readonly sessionId: number;
       readonly runId?: string;
+      readonly current?: boolean;
     }
   | {
       readonly id: number;

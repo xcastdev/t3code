@@ -1,3 +1,4 @@
+import { useLocale, useMessages } from "gt-react-native";
 import { useAtomMount, useAtomValue } from "@effect/atom-react";
 import { resolveMergeBackTargetThreadId } from "@t3tools/client-runtime/state/thread-relationships";
 import { resolveLatestMergeBackRun } from "@t3tools/client-runtime/state/thread-workflows";
@@ -257,6 +258,8 @@ const RUN_STATUS_DOT: Record<ScheduledTask["lastRunStatus"], string> = {
 /** Scheduled tasks bound to this thread, each with Run now and its on/off switch. */
 export function ThreadAutomationsSection(props: { readonly target: LiveDetailsTarget }) {
   const { environmentId, threadId } = props.target;
+  const m = useMessages();
+  const locale = useLocale();
   const navigation = useNavigation();
   const tasks = useEnvironmentQuery(
     serverEnvironment.scheduledTasksLive({ environmentId, input: {} }),
@@ -318,7 +321,7 @@ export function ThreadAutomationsSection(props: { readonly target: LiveDetailsTa
       }
     >
       {bound.map((task, index) => {
-        const schedule = `${describeSchedule(task, tasks.data?.timeZone)}${
+        const schedule = `${describeSchedule(task, tasks.data?.timeZone, m, locale)}${
           task.blockedByPolicy !== undefined
             ? ` · ${task.blockedByPolicy}`
             : !task.enabled
