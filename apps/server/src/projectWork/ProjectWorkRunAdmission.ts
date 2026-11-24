@@ -107,14 +107,22 @@ interface ThreadRow {
 }
 type Binding = Extract<ProjectTeamRecord, { kind: "run-binding" }>;
 /**
- * Where a binding's run works, given its thread's folder. A tracked repository's worktree comes
- * from the task folder record, never from path arithmetic: a plain project folder links to the
- * original checkouts. Undefined when that folder holds no worktree of the repository.
+ * Where a binding's run works, given its thread's worktree and project root. A tracked
+ * repository's worktree comes from the task folder record, never from path arithmetic: a plain
+ * project folder links to the original checkouts. Undefined when the thread's folder holds no
+ * worktree of the repository, or a project-checkout run's thread left the project checkout.
  */
 export const resolveBindingWorktree = Effect.fn("ProjectWorkRunAdmission.bindingWorktree")(
-  function* (sql: SqlClient.SqlClient, binding: Binding, threadRoot: string | undefined) {
+  function* (
+    sql: SqlClient.SqlClient,
+    binding: Binding,
+    worktreePath: string | null,
+    workspaceRoot: string | undefined,
+  ) {
+    const threadRoot = worktreePath ?? workspaceRoot;
     if (threadRoot === undefined || binding.repository === undefined) return threadRoot;
-    if (binding.workspaceKind !== "worktree") return binding.repository;
+    if (binding.workspaceKind !== "worktree")
+      return worktreePath === null ? binding.repository : undefined;
     const rows = yield* sql<{
       repositories_json: string;
     }>`SELECT repositories_json FROM task_folders WHERE project_path=${threadRoot}`;
@@ -247,8 +255,11 @@ const make = Effect.gen(function* () {
       (a, b) => b.leaseGeneration - a.leaseGeneration || b.revision - a.revision,
     )[0];
   });
-  const bindingWorktree = (binding: Binding, threadRoot: string | undefined) =>
-    resolveBindingWorktree(sql, binding, threadRoot);
+  const bindingWorktree = (
+    binding: Binding,
+    worktreePath: string | null,
+    workspaceRoot: string | undefined,
+  ) => resolveBindingWorktree(sql, binding, worktreePath, workspaceRoot);
   const hasStoredOwner = Effect.fn("ProjectWorkRunAdmission.hasStoredOwner")(function* (
     threadId: string,
   ) {
@@ -333,7 +344,7 @@ const make = Effect.gen(function* () {
         return denied("owner-configuration-disabled");
       if (
         binding.workspaceState === "ready" &&
-        (yield* bindingWorktree(binding, thread.worktree_path ?? project[0]?.workspace_root)) !==
+        (yield* bindingWorktree(binding, thread.worktree_path, project[0]?.workspace_root)) !==
           binding.worktree
       )
         return denied("owner-target-workspace-changed");
@@ -536,7 +547,11 @@ const make = Effect.gen(function* () {
           (persisted.worktree_path === null || fields.branch === null))
       )
         return denied("workspace-preparation-pending");
-      const worktree = yield* bindingWorktree(binding, root);
+      const worktree = yield* bindingWorktree(
+        binding,
+        persisted.worktree_path,
+        projects[0]?.workspace_root,
+      );
       if (worktree === undefined) return denied("workspace-repository-unavailable");
       const configuration = decodeConfiguration(existing.snapshot_json);
       const compositionInput: CompositionInput = {

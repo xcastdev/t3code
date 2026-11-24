@@ -598,6 +598,19 @@ A third round found five more, also fixed:
   prompt, and clears them when a session is replaced, restarted or compacted.
 - **Cursor Stop:** Cursor background commands, new upstream, now stop from Processes.
 
+A final round found four more, also fixed:
+
+- **Linked worktree:** the real-path root check resolved the worktree itself, so a worktree
+  replaced by a link to another repository passed. Only parent folders are resolved now, and
+  a linked worktree is refused.
+- **Rewind identity:** a refused file-restoring rewind and a conversation-only rewind of the
+  same checkpoint shared an archive id and conflicted. Whether files are restored is now part
+  of the identity.
+- **ACP receipts:** managed instructions are acknowledged only after the prompt outcome check
+  passes, and not for a turn already failed or compacted during the prompt.
+- **Root-kind binding:** a project-checkout Work binding on a chosen repository is refused
+  once its thread moves into a worktree.
+
 Known gaps: upstream's setup run for a restored worktree during turn start does not use the
 fork's drain options, so a Stop during it cannot prove its processes ended. The OMP adapter
 does not take upstream's agent-feedback line or multi-folder workspace list, as upstream's

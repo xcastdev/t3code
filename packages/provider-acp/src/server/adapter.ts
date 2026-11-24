@@ -9530,24 +9530,33 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 settle.generation,
                 Effect.gen(function* () {
                   // The ACP prompt response is the first native delivery acknowledgment.
-                  const instructionTurn = settle.instructionTurn;
-                  const managedInstructions = settle.promptParts?.managedInstructions;
-                  if (
-                    instructionTurn !== undefined &&
-                    managedInstructions !== undefined &&
-                    !context.interrupted &&
-                    settle.compactSession === undefined &&
-                    latestInstructionTurns.get(instructionTurn.providerThread.id) ===
-                      instructionTurn &&
-                    result.stopReason !== "cancelled" &&
-                    result.stopReason !== "refusal" &&
-                    result.stopReason !== "error"
-                  ) {
+                  const acknowledgeInstructions = Effect.gen(function* () {
+                    const instructionTurn = settle.instructionTurn;
+                    const managedInstructions = settle.promptParts?.managedInstructions;
+                    // Success bookkeeping clears the observed marker; a compaction sets a new one.
+                    const compactionMarker = (yield* Ref.get(compactionMarkers)).get(
+                      context.nativeThreadId,
+                    );
+                    if (
+                      instructionTurn === undefined ||
+                      managedInstructions === undefined ||
+                      context.interrupted ||
+                      (context.finalized && context.finalizedStatus !== "completed") ||
+                      settle.compactSession !== undefined ||
+                      (compactionMarker !== undefined &&
+                        compactionMarker !== settle.promptParts?.compactionMarker) ||
+                      latestInstructionTurns.get(instructionTurn.providerThread.id) !==
+                        instructionTurn ||
+                      result.stopReason === "cancelled" ||
+                      result.stopReason === "refusal" ||
+                      result.stopReason === "error"
+                    )
+                      return;
                     appliedInstructions.set(instructionTurn.providerThread.id, managedInstructions);
                     yield* (
                       instructionTurn.onInstructionsApplied?.(managedInstructions) ?? Effect.void
                     );
-                  }
+                  });
                   // Record delivery only for this runtime: a replacement can reuse the session id.
                   // Grok cancels locally, refusals discard the prompt, and errors need a retry.
                   // Native compaction sends no prompt, and the compacted session needs the notes.
@@ -9601,7 +9610,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   } else {
                     rollbackOfferedAppContext();
                   }
-                  if (context.finalized || followsAgentWorkState || superseded()) return;
+                  if (context.finalized || followsAgentWorkState || superseded()) {
+                    yield* acknowledgeInstructions;
+                    return;
+                  }
                   // ACP v2 reports a failed prompt through its idle stop reason, not an RPC error.
                   const hiddenFailure =
                     settle.checkPromptOutcome === undefined ||
@@ -9610,6 +9622,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     result.stopReason === "cancelled"
                       ? undefined
                       : yield* settle.checkPromptOutcome(result);
+                  if (hiddenFailure === undefined) yield* acknowledgeInstructions;
                   const resumeWith = hiddenFailure?.resumeWith;
                   if (
                     hiddenFailure !== undefined &&

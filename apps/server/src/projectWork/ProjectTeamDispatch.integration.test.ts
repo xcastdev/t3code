@@ -500,12 +500,27 @@ it.effect("a project-checkout run on a chosen repository works in its original c
   return Effect.gen(function* () {
     const input = yield* seed({ type: "root", repository: "/repo/web" });
     yield* (yield* Dispatch.ProjectTeamDispatch).dispatch(input, attribution);
-    const { binding, projection } = yield* awaitPreparation;
+    const { sql, binding, projection } = yield* awaitPreparation;
     assert.isNull(projection.thread.worktreePath);
     assert.equal(binding.repository, "/repo/web");
     assert.equal(binding.worktree, "/repo/web");
+    const admission = yield* Admission.RunAdmission;
+    const check = {
+      threadId: binding.threadId,
+      runId: projection.runs[0]!.id,
+      now: DateTime.formatIso(yield* DateTime.now),
+      operation: "start" as const,
+    };
+    assert.equal((yield* admission.check(check))._tag, "admitted");
     yield* reconcile;
     assert.equal((yield* inspect).binding.status, binding.status);
+    // The thread left the project checkout, so the original checkout is no longer its folder.
+    yield* sql`UPDATE orchestration_v2_projection_threads SET payload_json=json_set(payload_json,'$.worktreePath','/repo-worktrees/elsewhere') WHERE thread_id=${binding.threadId}`;
+    const moved = yield* admission.check(check);
+    assert.equal(moved._tag, "denied");
+    if (moved._tag === "denied") assert.equal(moved.reason, "owner-target-workspace-changed");
+    yield* reconcile;
+    assert.equal((yield* inspect).binding.status, "quarantined");
   }).pipe(Effect.provide(Dispatch.layer.pipe(Layer.provideMerge(harness.base))));
 });
 

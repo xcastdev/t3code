@@ -62,7 +62,8 @@ export const reconcileWorkBindings = Effect.fn("OwnedBindingReconciliation.recon
                 (yield* resolveBindingWorktree(
                   sql,
                   binding,
-                  thread.worktree_path ?? project.workspace_root,
+                  thread.worktree_path,
+                  project.workspace_root,
                 )) === binding.worktree) &&
               (binding.runId === undefined || run !== undefined)
             )

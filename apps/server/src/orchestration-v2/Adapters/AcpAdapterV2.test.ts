@@ -28,6 +28,7 @@ import {
   MessageId,
   type ModelSelection,
   type OrchestrationV2InstructionSnapshot,
+  type OrchestrationV2ProviderFailure,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
@@ -842,6 +843,8 @@ const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
     | undefined;
   let duringNextPreparation: Effect.Effect<void, EffectAcpErrors.AcpError> = Effect.void;
   let nextPromptStopReason: "cancelled" | "refusal" | "error" | undefined;
+  let duringNextPromptCompletion: Effect.Effect<void, EffectAcpErrors.AcpError> = Effect.void;
+  let nextPromptOutcomeFailure: OrchestrationV2ProviderFailure | undefined;
   const prepare = Effect.suspend(() => {
     const during = duringNextPreparation;
     duringNextPreparation = Effect.void;
@@ -853,6 +856,16 @@ const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
       driver: ACP_TEST_DRIVER,
       capabilities: AcpProviderCapabilitiesV2,
       supportsCompaction: true,
+      watchPromptOutcome: () =>
+        Effect.succeed(() =>
+          Effect.sync(() => {
+            const failure = nextPromptOutcomeFailure;
+            nextPromptOutcomeFailure = undefined;
+            return failure === undefined
+              ? undefined
+              : { failure, threadDisposition: "reusable" as const };
+          }),
+        ),
       rewriteUserText: (text) =>
         harnessOptions.prepareAttachments ? Effect.succeed(text) : prepare.pipe(Effect.as(text)),
       ...(harnessOptions.prepareAttachments
@@ -902,6 +915,11 @@ const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
             prompt: (payload, options) =>
               runtime.prompt(payload, options).pipe(
                 Effect.tap(() => runtime.drainEvents),
+                Effect.tap(() => {
+                  const during = duringNextPromptCompletion;
+                  duringNextPromptCompletion = Effect.void;
+                  return during;
+                }),
                 Effect.tap(() => harnessOptions.beforePromptAcknowledged ?? Effect.void),
                 Effect.map((result) => {
                   if (nextPromptStopReason === undefined) return result;
@@ -981,6 +999,18 @@ const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
     reportNextPromptStopped: (stopReason: "cancelled" | "refusal" | "error") =>
       Effect.sync(() => {
         nextPromptStopReason = stopReason;
+      }),
+    sessionUpdateDuringNextPrompt: (update: EffectAcpSchema.SessionUpdate) =>
+      Effect.sync(() => {
+        duringNextPromptCompletion = Effect.suspend(() => {
+          assert.isDefined(sessionUpdate);
+          return sessionUpdate({ sessionId, update });
+        });
+      }),
+    /** The next prompt stops cleanly, but its outcome check finds a hidden failure. */
+    failNextPromptOutcome: (failure: OrchestrationV2ProviderFailure) =>
+      Effect.sync(() => {
+        nextPromptOutcomeFailure = failure;
       }),
     sessionUpdateDuringNextPreparation: (update: EffectAcpSchema.SessionUpdate) =>
       Effect.sync(() => {
@@ -3178,6 +3208,22 @@ describe("AcpAdapterV2", () => {
         ]);
         assert.equal(yield* runTurn.applied(), undefined);
         yield* runTurn("Resume ordinary chat.");
+        assert.equal(yield* runTurn.applied(), undefined);
+        // A compaction during the prompt may have dropped the instructions it carried.
+        yield* runTurn.sessionUpdateDuringNextPrompt({
+          sessionUpdate: "compaction_update",
+          compactionId: "compact-during-prompt",
+          status: "completed",
+        });
+        yield* runTurn("Compact while applying the fix.", "completed", second);
+        assert.equal(yield* runTurn.applied(), undefined);
+        yield* runTurn.failNextPromptOutcome({
+          class: "provider_error",
+          message: "Bad Gateway",
+          code: null,
+          retryable: true,
+        });
+        yield* runTurn("Fail behind a clean stop.", "failed", second);
         assert.equal(yield* runTurn.applied(), undefined);
         yield* runTurn("Apply the fix again.", "completed", second);
         assert.deepEqual(yield* runTurn.applied(), second);

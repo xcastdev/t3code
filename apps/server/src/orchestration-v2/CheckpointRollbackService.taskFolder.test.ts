@@ -70,6 +70,8 @@ interface State extends TaskFoldersTestState {
   readonly committed: Array<OrchestrationV2DomainEvent>;
   /** History archives a rewind began executing; a refused rewind must begin none. */
   readonly archivesBegun: Array<unknown>;
+  /** Each prepared archive id's operation. */
+  readonly archivesPrepared: Map<string, string>;
 }
 
 const layerFor = (state: State, options: Options) => {
@@ -191,7 +193,18 @@ const layerFor = (state: State, options: Options) => {
           }),
           Layer.mock(RuntimePolicy.RuntimePolicyV2)({ resolve: () => Effect.succeed({} as never) }),
           Layer.mock(ThreadHistoryArchive.ThreadHistoryArchiveService)({
-            prepareIntent: () => Effect.void,
+            // As the real archive does, a different operation under a prepared archive id conflicts.
+            prepareIntent: (input: { readonly archiveId: string; readonly operation?: unknown }) =>
+              Effect.suspend(() => {
+                const operation = JSON.stringify(input.operation);
+                const prepared = state.archivesPrepared.get(input.archiveId);
+                if (prepared !== undefined && prepared !== operation)
+                  return Effect.fail(
+                    new ThreadHistoryArchive.HistoryArchiveError({ reason: "conflict" }),
+                  );
+                state.archivesPrepared.set(input.archiveId, operation);
+                return Effect.void;
+              }),
             prepare: () => Effect.void,
             beginExternal: (archive: unknown) =>
               Effect.sync(() => {
@@ -450,8 +463,12 @@ const taskFolderThread = Effect.fn(function* (state: State, options: Options) {
         ),
     ),
   );
-  /** Rewinds to the end of run `ordinal`, restoring files. */
-  const rewind = Effect.fnUntraced(function* (ordinal: number, requestId?: CommandId) {
+  /** Rewinds to the end of run `ordinal`, restoring files unless `restoreFiles` is false. */
+  const rewind = Effect.fnUntraced(function* (
+    ordinal: number,
+    requestId?: CommandId,
+    restoreFiles?: boolean,
+  ) {
     const checkpointId = yield* ids.allocate
       .checkpoint({ checkpointScopeId: rootScope.id, name: String(ordinal) })
       .pipe(Effect.orDie);
@@ -461,6 +478,7 @@ const taskFolderThread = Effect.fn(function* (state: State, options: Options) {
       checkpointId,
       scopeId: rootScope.id,
       ...(requestId === undefined ? {} : { requestId }),
+      ...(restoreFiles === undefined ? {} : { restoreFiles }),
     });
   });
   /** Run statuses by ordinal, and each folder's checkpoint statuses by ordinal. */
@@ -506,6 +524,7 @@ const withThread = <A, E>(
     thread: null,
     committed: [],
     archivesBegun: [],
+    archivesPrepared: new Map(),
   };
   return taskFolderThread(state, options).pipe(
     Effect.flatMap(test),
@@ -651,20 +670,26 @@ it.live.each([
   ),
 );
 
-it.live("refuses to restore files when a linked project folder has no repository to restore", () =>
-  withThread({ projectIsRepository: false }, (thread) =>
-    Effect.gen(function* () {
-      yield* thread.turn(1, Effect.void);
-      yield* thread.turn(2, Effect.void);
+it.live(
+  "refuses to restore files when a linked project folder has no repository to restore, then rewinds the conversation only",
+  () =>
+    withThread({ projectIsRepository: false }, (thread) =>
+      Effect.gen(function* () {
+        yield* thread.turn(1, Effect.void);
+        yield* thread.turn(2, Effect.void);
 
-      const refused = yield* thread.rewind(1).pipe(Effect.flip);
+        const refused = yield* thread.rewind(1).pipe(Effect.flip);
 
-      assert.equal(refused.reason, "rollback-target-invalid");
-      assert.deepEqual((yield* thread.recorded).runs, ["completed", "completed"]);
-      // Otherwise the archive stays executing and every later rewind needs reconciliation.
-      assert.deepEqual(thread.archivesBegun, []);
-    }),
-  ),
+        assert.equal(refused.reason, "rollback-target-invalid");
+        assert.deepEqual((yield* thread.recorded).runs, ["completed", "completed"]);
+        // Otherwise the archive stays executing and every later rewind needs reconciliation.
+        assert.deepEqual(thread.archivesBegun, []);
+
+        yield* thread.rewind(1, undefined, false);
+        assert.deepEqual((yield* thread.recorded).runs.slice(0, 1), ["completed"]);
+        assert.equal(thread.archivesBegun.length, 1);
+      }),
+    ),
 );
 
 it.live("a rewind whose provider session cannot open begins no archive and leaves files", () =>

@@ -261,6 +261,7 @@ export const layer: Layer.Layer<
         input.checkpointId,
         providerThread,
         runsToRollback.map((run) => run.id),
+        restoreFiles,
       ]);
       const archiveId = Hex.encode(
         yield* digest.digest(Digest.sha256, new TextEncoder().encode(operationIdentity)),
@@ -274,7 +275,7 @@ export const layer: Layer.Layer<
           checkpointId: input.checkpointId,
           scopeId: input.scopeId,
           providerThreadId: input.providerThreadId,
-          restoreFiles: input.restoreFiles !== false,
+          restoreFiles,
         },
       };
       yield* archives.prepareIntent(preparation);
