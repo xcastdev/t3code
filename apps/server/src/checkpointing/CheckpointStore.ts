@@ -124,6 +124,17 @@ export class CheckpointStore extends Context.Service<
     readonly deleteCheckpointRefs: (
       input: DeleteCheckpointRefsInput,
     ) => Effect.Effect<void, CheckpointStoreError>;
+
+    /**
+     * Deletes a releasing archive's retained Git refs in one batch, from the first of `cwds` that
+     * is still a repository: refs live in the shared repository, so a removed worktree falls back
+     * to the project root. No claim check, since only that archive names them. False when none
+     * of `cwds` is reachable.
+     */
+    readonly deleteRetainedRefs: (input: {
+      readonly cwds: ReadonlyArray<string>;
+      readonly refs: ReadonlyArray<CheckpointRef>;
+    }) => Effect.Effect<boolean, CheckpointStoreError>;
   }
 >()("t3/checkpointing/CheckpointStore") {}
 
@@ -231,6 +242,33 @@ export const make = Effect.gen(function* () {
       );
   });
 
+  const deleteRetainedRefs: CheckpointStore["Service"]["deleteRetainedRefs"] = Effect.fn(
+    "CheckpointStore.deleteRetainedRefs",
+  )(function* (input) {
+    const git = yield* vcsRegistry.get("git");
+    for (const cwd of input.cwds) {
+      // A missing folder fails the spawn, and a folder outside any repository exits non-zero.
+      const probe = yield* git
+        .execute({
+          operation: "CheckpointStore.deleteRetainedRefs",
+          cwd,
+          args: ["rev-parse", "--git-common-dir"],
+          allowNonZeroExit: true,
+        })
+        .pipe(Effect.option);
+      if (Option.isNone(probe) || probe.value.exitCode !== 0) continue;
+      if (input.refs.length > 0)
+        yield* git.execute({
+          operation: "CheckpointStore.deleteRetainedRefs",
+          cwd,
+          args: ["update-ref", "--no-deref", "-z", "--stdin"],
+          stdin: input.refs.map((ref) => `delete ${ref}\0\0`).join(""),
+        });
+      return true;
+    }
+    return false;
+  });
+
   return CheckpointStore.of({
     isGitRepository,
     matchesCheckpoint: Effect.fn("CheckpointStore.matchesCheckpoint")(function* (input) {
@@ -261,6 +299,7 @@ export const make = Effect.gen(function* () {
     diffCheckpoints,
     listAuthoredPaths,
     deleteCheckpointRefs,
+    deleteRetainedRefs,
   });
 });
 

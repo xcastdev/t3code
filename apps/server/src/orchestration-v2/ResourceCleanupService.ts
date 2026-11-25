@@ -18,14 +18,7 @@ import * as TerminalManager from "../terminal/Manager.ts";
 export class ResourceCleanupError extends Schema.TaggedError<ResourceCleanupError>()(
   "ResourceCleanupError",
   {
-    operation: Schema.Literals([
-      "terminal",
-      "preview",
-      "device",
-      "attachment",
-      "scheduled-tasks",
-      "history-archive",
-    ]),
+    operation: Schema.Literals(["terminal", "preview", "device", "attachment", "scheduled-tasks"]),
     threadId: Schema.optional(Schema.String),
     attachmentId: Schema.optional(Schema.String),
     cause: Schema.Defect(),
@@ -41,10 +34,11 @@ export class ResourceCleanupService extends Context.Reference<{
   readonly cleanupAttachments: (
     attachmentIds: ReadonlyArray<string>,
   ) => Effect.Effect<void, ResourceCleanupError>;
-  /** Releases purged threads' rewind archives: their rows, Git refs and attachment claims. */
-  readonly cleanupHistoryArchives: (
-    threadIds: ReadonlyArray<ThreadId>,
-  ) => Effect.Effect<void, ResourceCleanupError>;
+  /**
+   * Releases purged threads' rewind archives: their rows, Git refs and attachment claims. Never
+   * fails: a thread whose release fails is logged and left to the purged-thread release worker.
+   */
+  readonly cleanupHistoryArchives: (threadIds: ReadonlyArray<ThreadId>) => Effect.Effect<void>;
 }>("t3/orchestration-v2/ResourceCleanupService", {
   defaultValue: () => ({
     cleanupScheduledTasks: () => Effect.void,
@@ -183,14 +177,14 @@ export const layer = Layer.effect(
         return Effect.forEach(
           threadIds,
           (threadId) =>
-            archives
-              .releaseThread(threadId)
-              .pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new ResourceCleanupError({ operation: "history-archive", threadId, cause }),
-                ),
+            archives.releaseThread(threadId).pipe(
+              Effect.catch((cause) =>
+                Effect.logWarning("Purged thread's history archives remain pending.", {
+                  threadId,
+                  cause,
+                }),
               ),
+            ),
           { discard: true },
         );
       }),

@@ -308,9 +308,15 @@ it.effect.each([
 );
 
 it.effect.each([
-  { name: "releases the archives of every thread it purged", purged: true },
-  { name: "keeps the archives of a thread it could not purge yet", purged: false },
-])("thread purge $name", ({ purged }) =>
+  { name: "releases the archives of every thread it purged", purged: true, filesFail: false },
+  {
+    name: "keeps the archives of a thread it could not purge yet",
+    purged: false,
+    filesFail: false,
+  },
+  // A failed purge keeps the deleted thread's worktree, so leftover files must not fail it.
+  { name: "still succeeds when freeing the files fails", purged: true, filesFail: true },
+])("thread purge $name", ({ purged, filesFail }) =>
   Effect.gen(function* () {
     const now = yield* DateTime.now;
     const events = yield* Ref.make<ReadonlyArray<string>>([]);
@@ -329,7 +335,19 @@ it.effect.each([
     const cleanup = ResourceCleanupService.ResourceCleanupService.of({
       ...ResourceCleanupService.ResourceCleanupService.defaultValue(),
       cleanupHistoryArchives: (threadIds) => record(`archives:${threadIds.join(",")}`),
-      cleanupAttachments: (attachmentIds) => record(`attachments:${attachmentIds.join(",")}`),
+      cleanupAttachments: (attachmentIds) =>
+        record(`attachments:${attachmentIds.join(",")}`).pipe(
+          Effect.andThen(
+            filesFail
+              ? Effect.fail(
+                  new ResourceCleanupService.ResourceCleanupError({
+                    operation: "attachment",
+                    cause: new Error("busy"),
+                  }),
+                )
+              : Effect.void,
+          ),
+        ),
     });
     yield* Effect.gen(function* () {
       const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;

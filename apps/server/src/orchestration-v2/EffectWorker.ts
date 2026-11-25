@@ -703,10 +703,18 @@ export const layerExecutor: Layer.Layer<
                 effect.threadId,
               );
               if (purgedThreadIds.length === 0) return;
+              // Best effort from here: a failed purge would keep the deleted thread's worktree.
               yield* resourceCleanup.cleanupHistoryArchives(purgedThreadIds);
               // The attachment cleanup ran first and skipped the files these archives claimed.
               // Files of messages a rewind removed are not in this list and stay on disk.
-              yield* resourceCleanup.cleanupAttachments(request.attachmentIds ?? []);
+              yield* resourceCleanup.cleanupAttachments(request.attachmentIds ?? []).pipe(
+                Effect.catch((cause) =>
+                  Effect.logWarning("Failed to free a purged thread's archived files", {
+                    effectId: effect.id,
+                    cause,
+                  }),
+                ),
+              );
             }).pipe(
               Effect.mapError(
                 (cause) =>

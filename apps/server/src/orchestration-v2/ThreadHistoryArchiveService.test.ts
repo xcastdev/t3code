@@ -1,5 +1,5 @@
 import { assert, it } from "@effect/vitest";
-import { CheckpointRef, ThreadId } from "@t3tools/contracts";
+import { CheckpointRef, ThreadId, VcsProcessExitError } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
@@ -419,30 +419,34 @@ it.live("a thread the maintenance sweep purges has its archives released by the 
     yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert({ ...rows[0]!, thread_id: live })}`;
     yield* archives.prepare({ threadId, archiveId: "swept", reason: "rollback" });
     yield* archives.prepare({ threadId: live, archiveId: "kept", reason: "rollback" });
+    // A rewind whose provider call failed before the thread was deleted; nothing can settle it now.
+    yield* archives.prepare({ threadId, archiveId: "swept-executing", reason: "rollback" });
+    yield* archives.beginExternal({ threadId, archiveId: "swept-executing" });
     const retained = yield* sql<{
       retained_ref: string;
-    }>`SELECT retained_ref FROM t3_workflow_v2_history_archive_refs WHERE archive_id='swept'`;
+    }>`SELECT retained_ref FROM t3_workflow_v2_history_archive_refs WHERE archive_id IN ('swept','swept-executing')`;
     yield* sql`UPDATE orchestration_v2_projection_threads SET deleted_at='2026-10-02T00:00:00.000Z' WHERE thread_id=${threadId}`;
 
     // Deleted but not yet purged: its content, and so its archives, stay.
-    assert.equal(yield* archives.releasePurgedThreads, 0);
-    assert.lengthOf(yield* archives.list({ threadId }), 1);
+    assert.equal(yield* archives.releasePurgedThreads(), 0);
+    assert.lengthOf(yield* archives.list({ threadId }), 2);
 
     const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
     assert.isAbove((yield* maintenance.pruneEventStore()).purgedRowCount, 0);
-    assert.equal(yield* archives.releasePurgedThreads, 1);
-    assert.equal(yield* archives.releasePurgedThreads, 0);
+    assert.equal(yield* archives.releasePurgedThreads(), 1);
+    assert.equal(yield* archives.releasePurgedThreads(), 0);
 
     assert.isEmpty(yield* archives.list({ threadId }));
     assert.isEmpty(
-      yield* sql`SELECT 1 FROM t3_workflow_v2_history_archive_attachments WHERE archive_id='swept'`,
+      yield* sql`SELECT 1 FROM t3_workflow_v2_history_archive_attachments WHERE archive_id IN ('swept','swept-executing')`,
     );
-    assert.isFalse(
-      yield* checkpoints.hasCheckpointRef({
-        cwd,
-        checkpointRef: CheckpointRef.make(retained[0]!.retained_ref),
-      }),
-    );
+    for (const { retained_ref } of retained)
+      assert.isFalse(
+        yield* checkpoints.hasCheckpointRef({
+          cwd,
+          checkpointRef: CheckpointRef.make(retained_ref),
+        }),
+      );
     assert.deepEqual(
       (yield* archives.list({ threadId: live })).map((archive) => archive.archive_id),
       ["kept"],
@@ -451,4 +455,88 @@ it.live("a thread the maintenance sweep purges has its archives released by the 
     Effect.scoped,
     Effect.provide(ProjectionMaintenance.layer.pipe(Layer.provideMerge(testLayer))),
   ),
+);
+
+it.live("release deletes refs through the project root once the worktree is gone", () =>
+  Effect.gen(function* () {
+    const { cwd, sql, command } = yield* setup();
+    const archives = yield* Archive.ThreadHistoryArchiveService;
+    const checkpoints = yield* CheckpointStore.CheckpointStore;
+    const worktree = `${cwd}/managed-worktree`;
+    yield* command(["worktree", "add", "-b", "removed-branch", worktree]);
+    yield* sql`UPDATE orchestration_v2_projection_checkpoint_scopes SET payload_json=json_set(payload_json,'$.cwd',${worktree}) WHERE scope_id='scope-stable'`;
+    yield* sql`UPDATE orchestration_v2_projection_threads SET payload_json=json_set(payload_json,'$.worktreePath',${worktree}) WHERE thread_id=${threadId}`;
+    yield* sql`INSERT INTO projection_projects(project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES('archive-project','Archive',${cwd},'[]','2026-10-01T00:00:00.000Z','2026-10-01T00:00:00.000Z')`;
+    yield* archives.prepare({ threadId, archiveId: "gone-worktree", reason: "rollback" });
+    yield* archives.prepare({ threadId, archiveId: "gone-repository", reason: "rollback" });
+    yield* command(["worktree", "remove", worktree]);
+    const retained = (archiveId: string) =>
+      checkpoints.hasCheckpointRef({
+        cwd,
+        checkpointRef: CheckpointRef.make(`refs/t3/history-archives/${archiveId}/0`),
+      });
+    assert.isTrue(yield* retained("gone-worktree"));
+
+    yield* archives.release({ threadId, archiveId: "gone-worktree" });
+    assert.isFalse(yield* retained("gone-worktree"));
+
+    // No folder left to reach the refs from: the release finishes and logs the skip.
+    yield* sql`UPDATE projection_projects SET workspace_root=${`${cwd}/missing-project`}`;
+    yield* archives.release({ threadId, archiveId: "gone-repository" });
+    assert.isEmpty(yield* archives.list({ threadId }));
+    assert.isEmpty(
+      yield* sql`SELECT 1 FROM t3_workflow_v2_history_archive_refs WHERE archive_id='gone-repository'`,
+    );
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.live("the reconcile moves past threads whose release keeps failing", () =>
+  Effect.gen(function* () {
+    const { sql } = yield* setup();
+    const checkpoints = yield* CheckpointStore.CheckpointStore;
+    const rows = yield* sql<
+      Record<string, string | number | null>
+    >`SELECT * FROM orchestration_v2_projection_threads WHERE thread_id=${threadId}`;
+    const purgedThread = (id: string) => ({
+      ...rows[0]!,
+      thread_id: id,
+      title: ProjectionMaintenance.DELETED_THREAD_TITLE,
+      deleted_at: "2026-10-02T00:00:00.000Z",
+    });
+    for (const index of Array.from({ length: 51 }, (_, index) => index)) {
+      const id = index < 50 ? `purged-failing-${String(index).padStart(2, "0")}` : "purged-last";
+      yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert(purgedThread(id))}`;
+      yield* sql`INSERT INTO t3_workflow_v2_history_archives(archive_id,thread_id,reason,state) VALUES(${id},${id},'rollback','ready')`;
+      yield* sql`INSERT INTO t3_workflow_v2_history_archive_refs(archive_id,checkpoint_id,cwd,source_ref,retained_ref) VALUES(${id},'checkpoint','/repository','refs/t3/test-checkpoint',${`refs/t3/history-archives/${id}/0`})`;
+    }
+    const refuseFailing = (input: unknown) =>
+      JSON.stringify(input).includes("purged-failing")
+        ? Effect.fail(
+            new VcsProcessExitError({
+              operation: "test.refuseFailingRefs",
+              command: "git update-ref",
+              cwd: "/repository",
+              exitCode: 1,
+              detail: "Ref lock held.",
+            }),
+          )
+        : Effect.succeed(true);
+    const archives = yield* Archive.ThreadHistoryArchiveService.pipe(
+      Effect.provide(Layer.fresh(Archive.layer)),
+      Effect.provideService(CheckpointStore.CheckpointStore, {
+        ...checkpoints,
+        deleteCheckpointRefs: (input) => refuseFailing(input).pipe(Effect.asVoid),
+        deleteRetainedRefs: refuseFailing,
+      }),
+    );
+
+    // Each pass takes the next page, so 50 lasting failures cannot hide the thread after them.
+    assert.equal(yield* archives.releasePurgedThreads(), 0);
+    assert.equal(yield* archives.releasePurgedThreads(), 1);
+    assert.isEmpty(yield* archives.list({ threadId: ThreadId.make("purged-last") }));
+    assert.deepEqual(
+      yield* sql`SELECT state FROM t3_workflow_v2_history_archives WHERE archive_id='purged-failing-00'`,
+      [{ state: "releasing" }],
+    );
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
 );
