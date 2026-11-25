@@ -7,7 +7,6 @@ import type {
 } from "@t3tools/contracts";
 import {
   collectLimitAccounts,
-  findThreadLimitAccount,
   type LimitAccount,
   type LimitPace,
   type LimitPoolWindow,
@@ -39,6 +38,7 @@ import {
   poolSources,
   resolveThreadDetailsLimits,
   resolveThreadHttpQuotas,
+  resolveThreadLimitAccount,
 } from "./ThreadDetailsUsage.logic";
 
 const PACE_LABEL: Record<LimitPace, string> = {
@@ -307,11 +307,6 @@ export default function ThreadDetailsUsageSection(props: {
     ]),
   ).filter((account) => account.limits.windows.length > 0);
   const provider = props.providers.find((entry) => entry.instanceId === props.providerInstanceId);
-  const threadAccount = findThreadLimitAccount(accounts, {
-    environmentId: props.environmentId,
-    instanceId: props.providerInstanceId,
-    driver: resolveUsageLimitDriver({ provider, mapping }),
-  });
   const resolved = resolveThreadDetailsLimits(
     props.providerInstanceId,
     props.model,
@@ -320,6 +315,13 @@ export default function ThreadDetailsUsageSection(props: {
     now,
   );
   const quotas = resolveThreadHttpQuotas(props.providerInstanceId, props.usageLimitSources);
+  const threadAccount = resolveThreadLimitAccount(accounts, {
+    environmentId: props.environmentId,
+    instanceId: props.providerInstanceId,
+    driver: resolveUsageLimitDriver({ provider, mapping }),
+    ownLimits: resolved,
+    hasOwnQuotas: quotas.length > 0,
+  });
   // A hub's pool wins: the instance it routes reads no limits of its own.
   const pool = resolved?.kind === "pool" ? resolved.windows : null;
   // Without a matching account, the instance's own snapshot can still explain why it has none.

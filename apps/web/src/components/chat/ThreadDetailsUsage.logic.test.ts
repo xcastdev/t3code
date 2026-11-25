@@ -1,4 +1,5 @@
 import {
+  EnvironmentId,
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
@@ -6,12 +7,14 @@ import {
   type UsageLimitSourceSnapshot,
   UsageLimitSourceId,
 } from "@t3tools/contracts";
+import type { LimitAccount } from "@t3tools/shared/usageLimits";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   poolSources,
   resolveThreadDetailsLimits,
   resolveThreadHttpQuotas,
+  resolveThreadLimitAccount,
 } from "./ThreadDetailsUsage.logic";
 
 const now = Date.parse("2026-10-30T12:00:00.000Z");
@@ -174,5 +177,37 @@ describe("resolveThreadHttpQuotas", () => {
       resolveThreadHttpQuotas(instanceId, [source]).map((quota) => quota.accountLabel),
     ).toEqual(["Work plan"]);
     expect(resolveThreadHttpQuotas(null, [source])).toEqual([]);
+  });
+});
+
+describe("resolveThreadLimitAccount", () => {
+  const environmentId = EnvironmentId.make("environment");
+  const account = (key: string): LimitAccount => ({
+    key,
+    driver: claude,
+    displayName: key,
+    email: undefined,
+    plan: undefined,
+    accentColor: undefined,
+    environments: [{ environmentId, label: "" }],
+    sourceLabel: null,
+    redeem: null,
+    limits: limitsAt(40),
+  });
+  const own = account(`${environmentId}:${instanceId}`);
+  const other = account(`${environmentId}:claude-personal`);
+  const resolve = (accounts: readonly LimitAccount[], hasOwnQuotas: boolean) =>
+    resolveThreadLimitAccount(accounts, {
+      environmentId,
+      instanceId,
+      driver: claude,
+      ownLimits: { kind: "instance", limits: unsupported },
+      hasOwnQuotas,
+    })?.key;
+
+  it("borrows another same-driver account only while the instance has no quota rows", () => {
+    expect(resolve([other], false)).toBe(other.key);
+    expect(resolve([other], true)).toBeUndefined();
+    expect(resolve([other, own], true)).toBe(own.key);
   });
 });

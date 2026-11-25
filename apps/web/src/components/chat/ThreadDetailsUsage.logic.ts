@@ -1,5 +1,6 @@
 import {
   EnvironmentId,
+  type ProviderDriverKind,
   type ProviderInstanceId,
   type ServerProvider,
   type ServerProviderUsageLimits,
@@ -11,8 +12,10 @@ import {
   collectLimitPools,
   collectProviderUsageLimits,
   displayLimitWindows,
+  findThreadLimitAccount,
   hubRoutes,
   instanceHubs,
+  type LimitAccount,
   type LimitPoolWindow,
 } from "@t3tools/shared/usageLimits";
 import { limitsNotice } from "@t3tools/shared/usageLimitsCopy";
@@ -64,6 +67,29 @@ export function resolveThreadHttpQuotas(
         )
       : [],
   );
+}
+
+/**
+ * The thread's plan account. Another account of the same driver stands in only while the
+ * instance reports nothing of its own; its HTTP quota rows win over that guess.
+ */
+export function resolveThreadLimitAccount(
+  accounts: readonly LimitAccount[],
+  input: {
+    readonly environmentId: EnvironmentId;
+    readonly instanceId: ProviderInstanceId | null;
+    readonly driver: ProviderDriverKind | null;
+    readonly ownLimits: ThreadDetailsLimits | null;
+    readonly hasOwnQuotas: boolean;
+  },
+): LimitAccount | null {
+  const account = findThreadLimitAccount(accounts, input);
+  if (account === null || !input.hasOwnQuotas) return account;
+  const ownWindows =
+    input.ownLimits?.kind === "instance" && limitsNotice(input.ownLimits.limits) === null;
+  return ownWindows || account.key === `${input.environmentId}:${input.instanceId}`
+    ? account
+    : null;
 }
 
 export function nextPoolReset(window: LimitPoolWindow, now: number) {
