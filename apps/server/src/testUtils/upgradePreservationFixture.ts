@@ -430,6 +430,7 @@ export const seedUpgradePreservation = Effect.fn("upgradeFixture.seedPreservatio
         "inline_work_output",
         "INTEGER NOT NULL DEFAULT 0",
       ],
+      ["orchestration_v2_projection_threads", "fork_run_ids_json", "TEXT"],
     ],
     sink.commitCommand({
       commandId: preservationIds.command,
@@ -455,33 +456,40 @@ export const seedUpgradePreservation = Effect.fn("upgradeFixture.seedPreservatio
   );
   const outbox = yield* Outbox.EffectOutboxV2;
   yield* outbox.claimNext({ workerId: "previous-fixture-worker" });
-  yield* sink.commitCommand({
-    commandId: CommandId.make("preservation-fork-create"),
-    threadId: preservationIds.fork,
-    commandType: "thread.fork",
-    acceptedAt: at,
-    effects: [],
-    events: [
-      {
-        id: EventId.make("preservation-fork-created"),
-        type: "thread.created",
-        threadId: preservationIds.fork,
-        occurredAt: at,
-        payload: {
-          ...thread,
-          id: preservationIds.fork,
-          title: "Saved fork",
-          activeProviderThreadId: null,
-          lineage: {
-            parentThreadId: preservationIds.thread,
-            relationshipToParent: "fork",
-            rootThreadId: preservationIds.thread,
+  yield* withLaterColumns(
+    [["orchestration_v2_projection_threads", "fork_run_ids_json", "TEXT"]],
+    sink.commitCommand({
+      commandId: CommandId.make("preservation-fork-create"),
+      threadId: preservationIds.fork,
+      commandType: "thread.fork",
+      acceptedAt: at,
+      effects: [],
+      events: [
+        {
+          id: EventId.make("preservation-fork-created"),
+          type: "thread.created",
+          threadId: preservationIds.fork,
+          occurredAt: at,
+          payload: {
+            ...thread,
+            id: preservationIds.fork,
+            title: "Saved fork",
+            activeProviderThreadId: null,
+            lineage: {
+              parentThreadId: preservationIds.thread,
+              relationshipToParent: "fork",
+              rootThreadId: preservationIds.thread,
+            },
+            forkedFrom: {
+              type: "run",
+              threadId: preservationIds.thread,
+              runId: preservationIds.run,
+            },
           },
-          forkedFrom: { type: "run", threadId: preservationIds.thread, runId: preservationIds.run },
         },
-      },
-    ],
-  });
+      ],
+    }),
+  );
   yield* (yield* ProviderRuntime.ProviderSessionRuntimeRepository).upsert({
     threadId: preservationIds.thread,
     providerName: "codex",
