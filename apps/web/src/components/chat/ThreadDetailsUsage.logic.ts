@@ -4,6 +4,7 @@ import {
   type ProviderInstanceId,
   type ServerProvider,
   type ServerProviderUsageLimits,
+  type ServerProviderUsageWindow,
   type UsageLimitSourceSnapshots,
 } from "@t3tools/contracts";
 import {
@@ -70,26 +71,64 @@ export function resolveThreadHttpQuotas(
 }
 
 /**
- * The thread's plan account. Another account of the same driver stands in only while the
- * instance reports nothing of its own; its HTTP quota rows win over that guess.
+ * What the thread's usage shows, for the collapsed summary and the section alike. Another
+ * same-driver account stands in only while the instance has no HTTP quota rows of its own; with
+ * them, only the instance's own account counts, else its own limits and rows show.
  */
-export function resolveThreadLimitAccount(
+export function resolveThreadUsage(
   accounts: readonly LimitAccount[],
   input: {
     readonly environmentId: EnvironmentId;
     readonly instanceId: ProviderInstanceId | null;
     readonly driver: ProviderDriverKind | null;
     readonly ownLimits: ThreadDetailsLimits | null;
-    readonly hasOwnQuotas: boolean;
+    readonly quotas: ReturnType<typeof resolveThreadHttpQuotas>;
+    readonly now: number;
   },
-): LimitAccount | null {
-  const account = findThreadLimitAccount(accounts, input);
-  if (account === null || !input.hasOwnQuotas) return account;
-  const ownWindows =
-    input.ownLimits?.kind === "instance" && limitsNotice(input.ownLimits.limits) === null;
-  return ownWindows || account.key === `${input.environmentId}:${input.instanceId}`
-    ? account
-    : null;
+) {
+  const { ownLimits, quotas } = input;
+  const ownKey = `${input.environmentId}:${input.instanceId}`;
+  const account =
+    quotas.length === 0
+      ? findThreadLimitAccount(accounts, input)
+      : (accounts.find((entry) => entry.key === ownKey && entry.driver === input.driver) ?? null);
+  // A hub's pool wins: the instance it routes reads no limits of its own.
+  const pool = ownLimits?.kind === "pool" ? ownLimits.windows : null;
+  // Without an account, the instance's own snapshot can still show windows or explain why it has none.
+  const snapshot =
+    pool === null && account === null && ownLimits?.kind === "instance" ? ownLimits.limits : null;
+  const readable = snapshot !== null && limitsNotice(snapshot) === null;
+  const windows = account?.limits.windows ?? (readable ? snapshot.windows : []);
+  // HTTP quota rows answer for the instance, so its "no limits" notice steps aside.
+  const notice = snapshot !== null && !readable && quotas.length === 0 ? snapshot : null;
+  const summaryWindows: readonly ServerProviderUsageWindow[] =
+    pool !== null
+      ? pool.map((window) => {
+          const reset = nextPoolReset(window, input.now);
+          return {
+            id: window.id,
+            kind: window.kind,
+            label: window.label,
+            usedPercent: window.usedPercent,
+            ...(reset === null ? {} : { resetsAt: new Date(reset.at).toISOString() }),
+          };
+        })
+      : windows.length > 0
+        ? windows
+        : quotas.map((quota) => quota.window);
+  return {
+    account,
+    pool,
+    notice,
+    windows,
+    summaryWindows,
+    shown:
+      account !== null ||
+      pool !== null ||
+      notice !== null ||
+      windows.length > 0 ||
+      quotas.length > 0,
+  };
 }
 
 export function nextPoolReset(window: LimitPoolWindow, now: number) {

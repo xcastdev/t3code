@@ -7,14 +7,15 @@ import {
   type UsageLimitSourceSnapshot,
   UsageLimitSourceId,
 } from "@t3tools/contracts";
-import type { LimitAccount } from "@t3tools/shared/usageLimits";
+import type { LimitAccount, LimitPoolWindow } from "@t3tools/shared/usageLimits";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   poolSources,
   resolveThreadDetailsLimits,
   resolveThreadHttpQuotas,
-  resolveThreadLimitAccount,
+  resolveThreadUsage,
+  type ThreadDetailsLimits,
 } from "./ThreadDetailsUsage.logic";
 
 const now = Date.parse("2026-10-30T12:00:00.000Z");
@@ -180,7 +181,7 @@ describe("resolveThreadHttpQuotas", () => {
   });
 });
 
-describe("resolveThreadLimitAccount", () => {
+describe("resolveThreadUsage", () => {
   const environmentId = EnvironmentId.make("environment");
   const account = (key: string): LimitAccount => ({
     key,
@@ -195,19 +196,124 @@ describe("resolveThreadLimitAccount", () => {
     limits: limitsAt(40),
   });
   const own = account(`${environmentId}:${instanceId}`);
+  // Another login of the driver, or one collectLimitAccounts merged this instance into.
   const other = account(`${environmentId}:claude-personal`);
-  const resolve = (accounts: readonly LimitAccount[], hasOwnQuotas: boolean) =>
-    resolveThreadLimitAccount(accounts, {
+  const ownWindows: ServerProviderUsageLimits = {
+    checkedAt,
+    windows: [{ id: "weekly", kind: "weekly", label: "Weekly", usedPercent: 20 }],
+  };
+  const poolWindow: LimitPoolWindow = {
+    id: "pooled",
+    kind: "session",
+    label: "Session",
+    members: [],
+    columns: [],
+    remainingPercent: 90,
+    usedPercent: 10,
+    pace: null,
+    resets: [],
+  };
+  const quota = {
+    key: "quota",
+    accountLabel: "Work plan",
+    window: { id: "monthly", kind: "monthly", label: "Monthly", usedPercent: 35 },
+  } as const;
+  const shown = (
+    accounts: readonly LimitAccount[],
+    ownLimits: ThreadDetailsLimits | null,
+    hasQuotas: boolean,
+  ) => {
+    const usage = resolveThreadUsage(accounts, {
       environmentId,
       instanceId,
       driver: claude,
-      ownLimits: { kind: "instance", limits: unsupported },
-      hasOwnQuotas,
-    })?.key;
+      ownLimits,
+      quotas: hasQuotas ? [quota] : [],
+      now,
+    });
+    return {
+      account: usage.account?.key ?? null,
+      pool: usage.pool?.map((window) => window.id) ?? null,
+      notice: usage.notice !== null,
+      windows: usage.windows.map((window) => window.id),
+      summary: usage.summaryWindows.map((window) => window.id),
+    };
+  };
 
-  it("borrows another same-driver account only while the instance has no quota rows", () => {
-    expect(resolve([other], false)).toBe(other.key);
-    expect(resolve([other], true)).toBeUndefined();
-    expect(resolve([other, own], true)).toBe(own.key);
+  it.each([
+    {
+      name: "borrows another account while the instance has no quota rows",
+      accounts: [other],
+      ownLimits: { kind: "instance", limits: unsupported },
+      quotas: false,
+      expected: {
+        account: other.key,
+        pool: null,
+        notice: false,
+        windows: ["five_hour"],
+        summary: ["five_hour"],
+      },
+    },
+    {
+      name: "explains an instance with no limits, no quota rows and no account",
+      accounts: [],
+      ownLimits: { kind: "instance", limits: unsupported },
+      quotas: false,
+      expected: { account: null, pool: null, notice: true, windows: [], summary: [] },
+    },
+    {
+      name: "shows the instance's own windows beside its quota rows",
+      accounts: [other],
+      ownLimits: { kind: "instance", limits: ownWindows },
+      quotas: true,
+      expected: {
+        account: null,
+        pool: null,
+        notice: false,
+        windows: ["weekly"],
+        summary: ["weekly"],
+      },
+    },
+    {
+      name: "shows a hub's pool beside the instance's quota rows",
+      accounts: [other],
+      ownLimits: { kind: "pool", windows: [poolWindow] },
+      quotas: true,
+      expected: {
+        account: null,
+        pool: ["pooled"],
+        notice: false,
+        windows: [],
+        summary: ["pooled"],
+      },
+    },
+    {
+      name: "shows quota rows alone when the instance reports nothing",
+      accounts: [other],
+      ownLimits: null,
+      quotas: true,
+      expected: { account: null, pool: null, notice: false, windows: [], summary: ["monthly"] },
+    },
+    {
+      name: "keeps the instance's own account beside its quota rows",
+      accounts: [other, own],
+      ownLimits: { kind: "instance", limits: ownWindows },
+      quotas: true,
+      expected: {
+        account: own.key,
+        pool: null,
+        notice: false,
+        windows: ["five_hour"],
+        summary: ["five_hour"],
+      },
+    },
+  ] satisfies ReadonlyArray<{
+    name: string;
+    accounts: readonly LimitAccount[];
+    ownLimits: ThreadDetailsLimits | null;
+    quotas: boolean;
+    expected: ReturnType<typeof shown>;
+  }>)("$name", ({ accounts, ownLimits, quotas, expected }) => {
+    expect(shown(accounts, ownLimits, quotas)).toEqual(expected);
   });
 });
