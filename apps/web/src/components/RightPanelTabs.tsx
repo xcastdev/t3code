@@ -1497,7 +1497,8 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       onClick: props.onAddDevice,
     },
   ] as const;
-  const canAddSurface = addSurfaceActions.some((action) => action.available);
+  const canAddSurface =
+    pluginActions.length > 0 || addSurfaceActions.some((action) => action.available);
 
   if ((props.open === false || railLayout || !canAddSurface) && addSurfaceMenuOpen) {
     setAddSurfaceMenuOpen(false);

@@ -1,6 +1,7 @@
 import "~/index.css";
 
-import { EnvironmentId } from "@t3tools/contracts";
+import { pluginPanelKey } from "@t3tools/client-runtime/plugins/commands";
+import { EnvironmentId, PluginContributionId, PluginId } from "@t3tools/contracts";
 import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { page, userEvent } from "vite-plus/test/browser";
@@ -9,7 +10,11 @@ import { InputGroup, InputGroupAddon, InputGroupInput } from "~/components/ui/in
 import type { RightPanelSurface } from "~/rightPanelStore";
 import { act, render, stubGlobal } from "../../test/render";
 import { HistorySwipeNavigation } from "./HistorySwipeNavigation";
-import { RightPanelTabs, type RightPanelTabsProps } from "./RightPanelTabs";
+import {
+  RightPanelTabs,
+  type PluginSurfaceAction,
+  type RightPanelTabsProps,
+} from "./RightPanelTabs";
 import { subscribePreviewAction } from "./preview/previewActionBus";
 
 const navigateHistory = vi.hoisted(() => vi.fn());
@@ -287,7 +292,7 @@ describe("device tab rename", () => {
 });
 
 describe("add surface launcher", () => {
-  it("hides the button, closes the open menu and stops taking Mod+T and the desktop menu action once no surface can be added", async () => {
+  it("hides the button, closes the open menu and stops taking Mod+T and the desktop menu action once no surface can be added, and a pinned plugin panel alone keeps them", async () => {
     const menuListeners = new Set<(action: string) => void>();
     using _bridge = stubGlobal("desktopBridge", {
       onMenuAction: (listener: (action: string) => void) => {
@@ -296,7 +301,18 @@ describe("add surface launcher", () => {
       },
     });
     using _platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
-    const tabs = (sideChatAvailable: boolean) => (
+    const pluginAction: PluginSurfaceAction = {
+      panelKey: pluginPanelKey(
+        "client",
+        PluginId.make("inspector"),
+        PluginContributionId.make("requests"),
+      ),
+      label: "Requests",
+      icon: () => null,
+      onClick: () => {},
+      onUnpin: () => {},
+    };
+    const tabs = (sideChatAvailable: boolean, pluginActions: PluginSurfaceAction[] = []) => (
       <RightPanelTabs
         {...(panel(DIFF_SURFACE).props as RightPanelTabsProps)}
         open
@@ -309,6 +325,7 @@ describe("add surface launcher", () => {
         deviceAvailable={false}
         onAddSideChat={() => {}}
         sideChatAvailable={sideChatAvailable}
+        pluginActions={pluginActions}
       >
         {null}
       </RightPanelTabs>
@@ -339,5 +356,11 @@ describe("add surface launcher", () => {
     expect(menuListeners.size).toBe(0);
     expect(await pressModT()).toBe(false);
     expect(page.getByRole("menu").query()).toBeNull();
+
+    await screen.rerender(tabs(false, [pluginAction]));
+    await expect.element(addButton).toBeInTheDocument();
+    expect(menuListeners.size).toBe(1);
+    expect(await pressModT()).toBe(true);
+    await expect.element(page.getByRole("menuitem", { name: "Requests" })).toBeVisible();
   });
 });
