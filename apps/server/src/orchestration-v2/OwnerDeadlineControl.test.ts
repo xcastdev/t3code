@@ -24,6 +24,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as Sqlite from "../persistence/Sqlite.ts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Outbox from "./EffectOutbox.ts";
+import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as Worker from "./EffectWorker.ts";
 import * as Deadline from "./OwnerDeadlineControl.ts";
@@ -340,6 +341,7 @@ it.effect(
           Layer.mergeAll(
             deadlines,
             Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
+            Layer.mock(ProjectionMaintenance.ProjectionMaintenanceV2)({}),
             Layer.mock(ProviderSessions.ProviderSessionManagerV2)({}),
             Layer.mock(RunFinalization.RunFinalizationService)({
               finalize: ({ threadId }) => block(threadId),

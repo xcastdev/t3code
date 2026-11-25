@@ -146,6 +146,7 @@ import { resolveThreadReferenceCopyTarget } from "@t3tools/client-runtime/thread
 import { resolveTerminalSessionLabel } from "@t3tools/shared/terminalLabelsCopy";
 import { useAtomValue } from "@effect/atom-react";
 import {
+  type CSSProperties,
   type MouseEvent as ReactMouseEvent,
   type SetStateAction,
   use,
@@ -341,7 +342,7 @@ import { useRemoteOpenState } from "~/remoteOpen";
 import { shouldShowOpenInPicker } from "./chat/OpenInPicker.logic";
 import { OpenInPicker } from "./chat/OpenInPicker";
 import ProjectScriptsControl from "./ProjectScriptsControl";
-import { useT3ProjectFileScripts } from "../hooks/useT3ProjectFileScripts";
+import { useT3ProjectFileState } from "../hooks/useT3ProjectFileScripts";
 import { useOpenFavoriteEditorShortcut } from "./chat/OpenInPickerShortcut";
 import {
   PanelLayoutControls,
@@ -1913,7 +1914,7 @@ export default function ChatView(props: ChatViewProps) {
     hostEnvironmentId,
     remoteOpenMode: remoteOpenState.mode,
   });
-  const projectFileScripts = useT3ProjectFileScripts(
+  const projectFile = useT3ProjectFileState(
     activeThread?.environmentId ?? environmentId,
     activeProject ? gitCwd : null,
   );
@@ -3734,7 +3735,8 @@ export default function ChatView(props: ChatViewProps) {
     <ProjectScriptsControl
       environmentId={activeThread.environmentId}
       scripts={activeProjectScripts}
-      fileScripts={projectFileScripts}
+      fileScripts={projectFile.scripts}
+      onActionsMenuOpen={projectFile.refresh}
       preferredScriptId={lastInvokedScriptByProjectId[activeProject.id] ?? null}
       onRunScript={runProjectScriptStable}
       onAddScript={saveProjectScriptStable}
@@ -3793,6 +3795,11 @@ export default function ChatView(props: ChatViewProps) {
         )}
         data-chat-column-maximized-away={rightPanelMaximized ? "true" : "false"}
         data-chat-column
+        style={
+          {
+            "--chat-header-height": embedded ? "0px" : "var(--workspace-topbar-height)",
+          } as CSSProperties
+        }
         inert={rightPanelMaximized}
         onMouseUp={preventMiddleClickPasteOutsideEditable}
       >

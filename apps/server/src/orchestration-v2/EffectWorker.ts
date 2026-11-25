@@ -23,6 +23,7 @@ import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ResourceCleanupService from "./ResourceCleanupService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as OwnerDeadlineControl from "./OwnerDeadlineControl.ts";
+import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as CheckpointRollbackService from "./CheckpointRollbackService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
@@ -102,6 +103,7 @@ export const layerExecutor: Layer.Layer<
   | ThreadTitleRegenerationService.ThreadTitleRegenerationService
   | ThreadManagementService.ThreadManagementService
   | ProjectionStore.ProjectionStoreV2
+  | ProjectionMaintenance.ProjectionMaintenanceV2
   | ServerSettings.ServerSettingsService
   | OwnerDeadlineControl.OwnerDeadlineControl
 > = Layer.effect(
@@ -118,6 +120,7 @@ export const layerExecutor: Layer.Layer<
       yield* ThreadTitleRegenerationService.ThreadTitleRegenerationService;
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+    const projectionMaintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
     const settings = yield* ServerSettings.ServerSettingsService;
     const ownerDeadlines = yield* OwnerDeadlineControl.OwnerDeadlineControl;
     const startRun = (
@@ -693,6 +696,18 @@ export const layerExecutor: Layer.Layer<
               ),
             );
           }
+          case "thread-content.purge":
+            return projectionMaintenance.purgeDeletedThread(effect.threadId).pipe(
+              Effect.asVoid,
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationEffectExecutionError({
+                    effectId: effect.id,
+                    effectType: effect.request.type,
+                    cause,
+                  }),
+              ),
+            );
           case "thread-title.generate":
             return threadTitleRegeneration
               .execute({

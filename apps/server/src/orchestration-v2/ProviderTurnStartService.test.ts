@@ -87,6 +87,7 @@ import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationService.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
+import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
@@ -228,6 +229,7 @@ function startWithMissingWorktree(
             Effect.succeedSome({ workspaceRoot: "/tmp/provider-turn-start-project" } as never),
         }),
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getForkSourceRunIds: () => Effect.succeed(projection.runs.map((run) => run.id)),
           getThreadRecords: () => {
             projectionReadCount += 1;
             return Effect.succeed(projection);
@@ -1249,40 +1251,39 @@ function makeLocalCommandHarness(input: {
     rollbackThread: () => Effect.die("Unused rollback"),
     forkThread: () => Effect.die("Unused fork"),
   };
-  const open = vi.fn(
-    (): ReturnType<ProviderSessionManager.ProviderSessionManagerV2Shape["open"]> =>
-      input.nativeStart !== undefined
-        ? Effect.as(input.afterOpen ?? Effect.void, nativeSession)
-        : input.sideChat !== undefined
-          ? Effect.succeed(sideChatSession as never)
-          : input.interruptOpen === true
-            ? Effect.interrupt
-            : "historyReadFailureAfterFallback" in input || "resumeFailure" in input
-              ? Effect.succeed(resumeFallbackSession as never)
-              : "ensureThreadFailure" in input
-                ? Effect.succeed({ driver: providerThread.driver, ensureThread } as never)
-                : "openFailure" in input
-                  ? Effect.sync(() => {
-                      if (input.interruptRunBeforeOpenFailure === true) interruptRun();
-                    }).pipe(
-                      Effect.andThen(
-                        Effect.fail(
-                          new ProviderSessionManager.ProviderSessionOpenError({
-                            instanceId: newInstanceId,
-                            providerSessionId,
-                            cause: input.openFailure,
-                          }),
-                        ),
+  const open = vi.fn((): ReturnType<ProviderSessionManager.ProviderSessionManagerV2Shape["open"]> =>
+    input.nativeStart !== undefined
+      ? Effect.as(input.afterOpen ?? Effect.void, nativeSession)
+      : input.sideChat !== undefined
+        ? Effect.succeed(sideChatSession as never)
+        : input.interruptOpen === true
+          ? Effect.interrupt
+          : "historyReadFailureAfterFallback" in input || "resumeFailure" in input
+            ? Effect.succeed(resumeFallbackSession as never)
+            : "ensureThreadFailure" in input
+              ? Effect.succeed({ driver: providerThread.driver, ensureThread } as never)
+              : "openFailure" in input
+                ? Effect.sync(() => {
+                    if (input.interruptRunBeforeOpenFailure === true) interruptRun();
+                  }).pipe(
+                    Effect.andThen(
+                      Effect.fail(
+                        new ProviderSessionManager.ProviderSessionOpenError({
+                          instanceId: newInstanceId,
+                          providerSessionId,
+                          cause: input.openFailure,
+                        }),
                       ),
-                    )
-                  : input.failReadsAfterRunning === true || input.previousTurn !== undefined
-                    ? Effect.succeed({
-                        driver: providerThread.driver,
-                        providerSession,
-                        ensureThread: () => Effect.succeed(providerThread),
-                        resumeThread: () => Effect.succeed(projection.providerThreads[0]),
-                      } as never)
-                    : Effect.die("A local command must not open a native session."),
+                    ),
+                  )
+                : input.failReadsAfterRunning === true || input.previousTurn !== undefined
+                  ? Effect.succeed({
+                      driver: providerThread.driver,
+                      providerSession,
+                      ensureThread: () => Effect.succeed(providerThread),
+                      resumeThread: () => Effect.succeed(projection.providerThreads[0]),
+                    } as never)
+                  : Effect.die("A local command must not open a native session."),
   );
   const startRootRun = vi.fn<RunExecutionService.RunExecutionServiceV2Shape["startRootRun"]>(
     (startInput) =>
@@ -1523,6 +1524,7 @@ function makeLocalCommandHarness(input: {
             } as never),
         }),
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getForkSourceRunIds: () => Effect.succeed(parentRecords.runs.map((run) => run.id)),
           getThreadRecords,
           getTurnStartContext,
           getRuntimeRecoveryProjection,
@@ -1625,6 +1627,7 @@ function layerStartEffectWorker(
         Layer.mock(ThreadTitleRegenerationService.ThreadTitleRegenerationService)({}),
         Layer.mock(ThreadManagementService.ThreadManagementService)({}),
         Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
+        Layer.mock(ProjectionMaintenance.ProjectionMaintenanceV2)({}),
         ServerSettings.layerTest(),
       ),
     ),

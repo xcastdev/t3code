@@ -8,6 +8,7 @@ import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
 import {
   CommandId,
+  isDelegatedAppThread,
   isOrchestrationV2WorkActive,
   type ThreadId,
   type OrchestrationV2DomainEvent,
@@ -382,13 +383,15 @@ export const make = Effect.gen(function* () {
     for (const [key, readAtMs] of quietOpenReadAt) {
       if (nowMs - readAtMs >= QUIET_SYNC_INTERVAL_MS) quietOpenReadAt.delete(key);
     }
-    const settlesWithParent = (thread: ProjectionStore.ProjectionSettlementCandidate) =>
-      thread.lineage.relationshipToParent === "subagent" && !thread.parentIsAssistantHome;
+    // A task delegated from a linked environment has no parent here, so it settles once its own
+    // work is done. Subagents of an assistant Home follow their project's settings instead.
+    const settlesAsDelegate = (thread: ProjectionStore.ProjectionSettlementCandidate) =>
+      isDelegatedAppThread(thread) && !thread.parentIsAssistantHome;
     // Merge events resweep all candidates because unlinked threads settle through branch lookup.
     // An agent's Home is its backing project's root thread and never settles.
     const candidates = threads.filter(
       (thread) =>
-        (automaticSettlementEnabled || settlesWithParent(thread)) &&
+        (automaticSettlementEnabled || settlesAsDelegate(thread)) &&
         isAutoSettlementCandidate(thread, nowMs) &&
         !(
           thread.lineage.parentThreadId === null &&
@@ -399,7 +402,7 @@ export const make = Effect.gen(function* () {
     // Runs per candidate thread, thousands per sweep on busy servers; the sweep owns the span.
     const settleThread = Effect.fnUntraced(
       function* (thread: (typeof candidates)[number], pullRequest: SettlementPullRequest | null) {
-        if (settlesWithParent(thread)) {
+        if (settlesAsDelegate(thread)) {
           if (yield* terminals.hasActiveSubprocess({ threadId: thread.id })) return null;
           // Ordinary subagents become candidates only once their parent is done.
           const uuid = yield* random.uuidV4();
@@ -455,7 +458,7 @@ export const make = Effect.gen(function* () {
     const lookupCandidates = (yield* Effect.forEach(
       candidates,
       (thread) => {
-        if (settlesWithParent(thread)) return settleThread(thread, null);
+        if (settlesAsDelegate(thread)) return settleThread(thread, null);
         const projectSettings = resolveProjectSettings(settings, thread.projectId).settings;
         // Skip no-op decisions; actual settlement still reads fresh settings before dispatch.
         const settledAt = resolveAutoSettlementAt({

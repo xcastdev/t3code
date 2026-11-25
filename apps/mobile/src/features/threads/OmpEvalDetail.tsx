@@ -31,19 +31,19 @@ export function OmpEvalDetail(props: {
     theme: props.themeAppearance,
     enabled: true,
   });
-  let tokenOffset = 0;
-  const code = codeLines?.flatMap((line, lineIndex) => [
-    lineIndex > 0 ? "\n" : "",
-    ...line.map((token) => {
-      const key = tokenOffset;
-      tokenOffset += token.content.length;
+  const code = codeLines?.flatMap((line, lineIndex) => {
+    let offset = 0;
+    const tokens = line.map((token) => {
+      const key = `${lineIndex}:${offset}`;
+      offset += token.content.length;
       return (
         <Text key={key} style={token.color ? { color: token.color } : undefined}>
           {token.content}
         </Text>
       );
-    }),
-  ]);
+    });
+    return lineIndex > 0 ? ["\n", ...tokens] : tokens;
+  });
   return (
     <View className="overflow-hidden rounded-lg border border-border" style={{ backgroundColor }}>
       <View className="px-2.5 py-2">

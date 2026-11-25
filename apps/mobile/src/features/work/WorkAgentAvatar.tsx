@@ -13,11 +13,8 @@ import Animated, {
 import Svg, { Circle, G, Path, Rect } from "react-native-svg";
 import { withUniwind } from "uniwind";
 import { AppText } from "../../components/ui/AppText";
-import {
-  projectAutoMonogram,
-  projectIconColorClassNames,
-  projectMonogram,
-} from "../../lib/projectIcon";
+import { projectMonogram } from "@t3tools/shared/projectMonogram";
+import { projectAutoMonogram, projectIconColorClassNames } from "../../lib/projectIcon";
 import type { TeamRole } from "@t3tools/client-runtime/project-work-logic";
 
 const ThemedSvg = withUniwind(Svg);

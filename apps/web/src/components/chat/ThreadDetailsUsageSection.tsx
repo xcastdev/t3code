@@ -34,7 +34,12 @@ import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
 import { ThreadDetailsControl } from "./ThreadDetailsControl";
 import { ThreadDetailsRing } from "./ThreadDetailsRing";
 import { ThreadDetailsSection, ThreadDetailsSummary } from "./ThreadDetailsSection";
-import { nextPoolReset, poolSources, resolveThreadDetailsLimits } from "./ThreadDetailsUsage.logic";
+import {
+  nextPoolReset,
+  poolSources,
+  resolveThreadDetailsLimits,
+  resolveThreadHttpQuotas,
+} from "./ThreadDetailsUsage.logic";
 
 const PACE_LABEL: Record<LimitPace, string> = {
   ahead: msg("Ahead of pace"),
@@ -113,6 +118,7 @@ function LimitWindowRow(props: {
   readonly window: ServerProviderUsageWindow;
   readonly color: string;
   readonly now: number;
+  readonly accountLabel?: string;
 }) {
   const gt = useGT();
   const m = useMessages();
@@ -136,6 +142,9 @@ function LimitWindowRow(props: {
           <span className="text-foreground">
             {gt("{label}: {left}% left", { label: window.label, left })}
           </span>
+          {props.accountLabel ? (
+            <span className="text-muted-foreground">{props.accountLabel}</span>
+          ) : null}
           {pace && timeLeft !== null ? (
             <span className="text-muted-foreground">
               {m(PACE_LABEL[pace])} · {gt("{timeLeft}% of the window left", { timeLeft })}
@@ -310,20 +319,30 @@ export default function ThreadDetailsUsageSection(props: {
     props.usageLimitSources,
     now,
   );
+  const quotas = resolveThreadHttpQuotas(props.providerInstanceId, props.usageLimitSources);
   // A hub's pool wins: the instance it routes reads no limits of its own.
   const pool = resolved?.kind === "pool" ? resolved.windows : null;
   // Without a matching account, the instance's own snapshot can still explain why it has none.
-  const ownNotice =
+  const instanceNotice =
     pool === null && threadAccount === null && resolved?.kind === "instance"
       ? limitsNotice(resolved.limits, m)
       : null;
+  // HTTP quota rows answer for the instance, so its "no limits" notice steps aside.
+  const ownNotice = quotas.length > 0 ? null : instanceNotice;
   const ownWindows =
-    pool === null && threadAccount === null && resolved?.kind === "instance" && ownNotice === null
+    pool === null &&
+    threadAccount === null &&
+    resolved?.kind === "instance" &&
+    instanceNotice === null
       ? resolved.limits.windows
       : [];
   const threadDriver = threadAccount?.driver ?? provider?.driver ?? null;
   const showsThread =
-    threadAccount !== null || pool !== null || ownNotice !== null || ownWindows.length > 0;
+    threadAccount !== null ||
+    pool !== null ||
+    ownNotice !== null ||
+    ownWindows.length > 0 ||
+    quotas.length > 0;
   // The collapsed summary follows the same precedence: a hub's pool wins.
   const poolSummary: ReadonlyArray<ServerProviderUsageWindow> | null =
     pool === null
@@ -338,8 +357,9 @@ export default function ThreadDetailsUsageSection(props: {
             ...(reset === null ? {} : { resetsAt: new Date(reset.at).toISOString() }),
           };
         });
+  const threadWindows = poolSummary ?? threadAccount?.limits.windows ?? ownWindows;
   const summaryWindows = usageSummaryWindows(
-    poolSummary ?? threadAccount?.limits.windows ?? ownWindows,
+    threadWindows.length > 0 ? threadWindows : quotas.map((quota) => quota.window),
   );
   const others = showsThread
     ? accounts.filter((account) => account.key !== threadAccount?.key)
@@ -423,6 +443,15 @@ export default function ThreadDetailsUsageSection(props: {
                   />
                 ))
               )}
+              {quotas.map(({ key, accountLabel, window }) => (
+                <LimitWindowRow
+                  key={key}
+                  window={window}
+                  accountLabel={accountLabel}
+                  color={barColor(threadDriver)}
+                  now={now}
+                />
+              ))}
             </div>
           ) : null}
           {(showsThread ? (showAll ? others : []) : accounts).map((account) => (

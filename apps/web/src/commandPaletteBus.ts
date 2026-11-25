@@ -5,6 +5,7 @@ import {
   dispatchCommandPalette,
   isCommandPaletteMounted,
 } from "./commandPaletteStore";
+import type { DraftId } from "./composerDraftStore";
 
 export interface CommandPaletteLinkedThreads {
   readonly environmentId: EnvironmentId;
@@ -13,6 +14,8 @@ export interface CommandPaletteLinkedThreads {
 
 export interface CommandPaletteOpenDetail {
   readonly open?: "add-project" | "new-thread-in" | "new-agent-chat";
+  /** With add-project: the draft the new project is picked for. */
+  readonly draftId?: DraftId | null;
   readonly query?: string;
   readonly linkedThreads?: CommandPaletteLinkedThreads;
 }
@@ -26,7 +29,10 @@ export function openCommandPalette(detail: CommandPaletteOpenDetail = {}): void 
   } else if (detail.open === "new-agent-chat") {
     dispatchCommandPalette({ _tag: "OpenNewAgentChat" });
   } else if (detail.open === "add-project") {
-    dispatchCommandPalette({ _tag: "OpenAddProject" });
+    dispatchCommandPalette({
+      _tag: "OpenAddProject",
+      ...(detail.draftId ? { draftId: detail.draftId } : {}),
+    });
   } else if (detail.query !== undefined) {
     dispatchCommandPalette({
       _tag: "OpenSearch",

@@ -32,6 +32,9 @@ import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import * as Git from "../vcs/GitVcsDriver.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as TaskFolders from "../workspace/TaskFolders.ts";
+import * as LayoutCommandApprovals from "../workspace/LayoutCommandApprovals.ts";
+import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
+import * as ProjectionMaintenance from "../orchestration-v2/ProjectionMaintenance.ts";
 import * as WorkspaceFolders from "../workspace/WorkspaceFolders.ts";
 import {
   layerRestoredWorktreeSetups,
@@ -193,7 +196,14 @@ export function layerControlledBusiness(snapshot: UpgradeSnapshot) {
     WorkspaceFolders.layer,
     layerThreadWorktreeRestore,
     layerRestoredWorktreeSetups,
-  ).pipe(Layer.provideMerge(TaskFolders.layer), Layer.provideMerge(workflow));
+  ).pipe(
+    Layer.provideMerge(
+      TaskFolders.layer.pipe(
+        Layer.provide(Layer.merge(LayoutCommandApprovals.layer, ManagedPolicy.layerTest())),
+      ),
+    ),
+    Layer.provideMerge(workflow),
+  );
   const folders = Folders.layer.pipe(Layer.provideMerge(taskFolders));
   const claimedFolders = Layer.effect(
     Folders.ManagedProjectFolders,
@@ -258,7 +268,10 @@ export function layerControlledBusiness(snapshot: UpgradeSnapshot) {
       ),
     }),
   ).pipe(Layer.provideMerge(rollback));
-  const executor = EffectWorker.layerExecutor.pipe(Layer.provideMerge(title));
+  const executor = EffectWorker.layerExecutor.pipe(
+    Layer.provide(ProjectionMaintenance.layer),
+    Layer.provideMerge(title),
+  );
   const work = Work.coreLayer.pipe(Layer.provide(Supervision.layer), Layer.provideMerge(executor));
   const memoryActivity = AssistantMemoryActivity.layer.pipe(Layer.provideMerge(work));
   const memoryServices = AssistantMemoryLayers.layer.pipe(Layer.provideMerge(memoryActivity));

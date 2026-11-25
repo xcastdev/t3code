@@ -59,6 +59,8 @@ import * as ProviderInstallation from "../provider/providerInstallation.ts";
 import * as TextGenerators from "../textGeneration/TextGenerators.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as DatabaseMigrationProgress from "../persistence/DatabaseMigrationProgress.ts";
+import * as LayoutCommandApprovalWrites from "../workspace/LayoutCommandApprovalWrites.ts";
 import * as Analytics from "../telemetry/AnalyticsService.ts";
 import * as ServerStartup from "../serverRuntimeStartup.ts";
 import * as ServerLifecycleEvents from "../serverLifecycleEvents.ts";
@@ -265,6 +267,7 @@ export function controlledUpgradeApplicationLayer(
     // The fixture installs no providers and runs no standalone text generators.
     Layer.mock(ProviderInstallation.ProviderInstallation)({}),
     Layer.mock(TextGenerators.TextGenerators)({}),
+    LayoutCommandApprovalWrites.layer,
   ).pipe(Layer.provideMerge(base));
   const terminals = layerControlledTerminal(snapshot).pipe(Layer.provideMerge(safeServices));
   const business = layerControlledBusiness(snapshot).pipe(Layer.provideMerge(terminals));
@@ -338,7 +341,9 @@ export function controlledUpgradeApplicationLayer(
     ServerHttp.withUntracedRequests,
     Layer.provideMerge(consuming),
     Layer.provideMerge(
-      layerApplicationHttpServer.pipe(Layer.provide(Layer.merge(config, NetService.layer))),
+      layerApplicationHttpServer.pipe(
+        Layer.provide(Layer.mergeAll(config, NetService.layer, DatabaseMigrationProgress.layer)),
+      ),
     ),
     Layer.provideMerge(Layer.merge(NodeServices.layer, PlatformNodeCrypto.layer)),
   );

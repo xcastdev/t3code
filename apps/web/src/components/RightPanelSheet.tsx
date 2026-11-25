@@ -18,10 +18,13 @@ export function RightPanelSheet(props: {
   return (
     <Sheet
       open={props.open}
-      onOpenChange={(open) => {
-        if (!open) {
-          props.onClose();
+      onOpenChange={(open, eventDetails) => {
+        if (open) return;
+        // Base UI's dismiss handler fires on held Esc repeats after a nested popup closes.
+        if (eventDetails.reason === "escape-key" && eventDetails.event.repeat) {
+          return eventDetails.cancel();
         }
+        props.onClose();
       }}
     >
       {/* On phones the left edge clears the fixed sidebar toggle (2rem) and bell (2.25rem), which sit above the sheet. */}
