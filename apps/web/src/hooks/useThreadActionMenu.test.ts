@@ -21,6 +21,7 @@ const state = vi.hoisted(() => ({
   granted: new Set<string>(),
   effects: [] as string[],
   completed: deferred<void>(),
+  navigations: [] as unknown[],
   show: vi.fn<
     (
       items: ReadonlyArray<ContextMenuItem<ThreadActionMenuId>>,
@@ -41,7 +42,12 @@ vi.mock(import("react"), async (importOriginal) => ({
   useMemo: <T>(factory: () => T) => factory(),
 }));
 vi.mock("@tanstack/react-router", () => ({
-  useRouter: () => ({ navigate: async () => recordEffect("project-settings") }),
+  useRouter: () => ({
+    navigate: async (options: unknown) => {
+      state.navigations.push(options);
+      recordEffect("navigate");
+    },
+  }),
 }));
 vi.mock("../state/session", () => ({
   readEnvironmentScope: (environmentId: string, scope: string) =>
@@ -84,8 +90,8 @@ vi.mock("../localApi", () => ({
   }),
 }));
 vi.mock("@t3tools/client-runtime/state/project-grouping", () => ({
-  deriveLogicalProjectKeyFromSettings: () => "project",
-  derivePhysicalProjectKey: () => "project",
+  deriveLogicalProjectKeyFromSettings: () => "logical-project",
+  derivePhysicalProjectKey: () => "physical-project",
   selectProjectGroupingSettings: () => ({}),
 }));
 vi.mock("../sidebarProjectGrouping", () => ({
@@ -167,6 +173,7 @@ const createMenu = (options: { readonly onFind?: (threadRef: typeof target) => v
 beforeEach(() => {
   state.granted = new Set(["primary"]);
   state.effects = [];
+  state.navigations = [];
   state.completed = deferred<void>();
   state.show.mockReset().mockResolvedValue(null);
 });
@@ -198,5 +205,22 @@ describe("thread menu permissions", () => {
     expect(items[0]?.disabled).not.toBe(true);
     expect(state.effects).toEqual(["find"]);
     expect(onFind).toHaveBeenCalledExactlyOnceWith(target);
+  });
+
+  it("opens the thread's skills, commands and MCP settings", async () => {
+    state.show.mockResolvedValue("thread-resources");
+    createMenu().openMenu(position);
+    await state.completed.promise;
+    expect(state.navigations).toEqual([
+      {
+        to: "/settings/resources",
+        search: {
+          project: "logical-project",
+          machine: "secondary",
+          checkout: "physical-project",
+          thread: "thread",
+        },
+      },
+    ]);
   });
 });

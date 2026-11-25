@@ -241,19 +241,28 @@ export function useThreadActionMenu(input: {
         case "find":
           onFind?.(threadRef);
           return;
-        case "project-settings": {
+        case "project-settings":
+        case "thread-resources": {
           const project = projects.find(
             (candidate) =>
               candidate.environmentId === thread.environmentId && candidate.id === thread.projectId,
           );
           if (!project) return;
+          const physicalProjectKey = derivePhysicalProjectKey(project);
           const projectKey =
-            logicalProjectKeyByPhysicalKey.get(derivePhysicalProjectKey(project)) ??
+            logicalProjectKeyByPhysicalKey.get(physicalProjectKey) ??
             deriveLogicalProjectKeyFromSettings(project, projectGroupingSettings);
-          void router.navigate({
-            to: "/projects/$projectKey",
-            params: { projectKey },
-          });
+          void (action === "project-settings"
+            ? router.navigate({ to: "/projects/$projectKey", params: { projectKey } })
+            : router.navigate({
+                to: "/settings/resources",
+                search: {
+                  project: projectKey,
+                  machine: thread.environmentId,
+                  checkout: physicalProjectKey,
+                  thread: thread.id,
+                },
+              }));
           return;
         }
         case "new-thread-on-branch": {
