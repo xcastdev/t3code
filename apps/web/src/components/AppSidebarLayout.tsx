@@ -414,9 +414,11 @@ function SidebarControl({ showSidebar }: { readonly showSidebar: boolean }) {
                 : gt("Toggle main sidebar")}
             </TooltipPopup>
           </Tooltip>
-          {/* The sidebar header carries its own bell. This one shows where the titlebar inset
-          (workspaceTitlebar.ts) leaves room for it, so it follows a drag before pointer-up. */}
-          <AttentionBell className="pointer-events-auto md:[[data-sidebar-drag-state=expanded]_&]:hidden md:[[data-sidebar-state=expanded]:not([data-sidebar-drag-state=collapsed])_&]:hidden" />
+          {/* The sidebar header carries the bell; with the sidebar closed it rides here instead,
+          hidden while a drag would restore the sidebar over it. Unmounting closes its menu. */}
+          {isSidebarVisible ? null : (
+            <AttentionBell className="pointer-events-auto md:[[data-sidebar-drag-state=expanded]_&]:hidden" />
+          )}
         </>
       ) : null}
     </div>

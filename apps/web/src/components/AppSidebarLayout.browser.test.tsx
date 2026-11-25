@@ -39,4 +39,20 @@ describe("sidebar toggle shortcut", () => {
     await userEvent.keyboard("{Control>}b{/Control}");
     await vi.waitFor(() => expect(wrapper.getAttribute("data-sidebar-state")).toBe("collapsed"));
   });
+
+  it("closes the floating bell's menu when the sidebar opens", async () => {
+    await page.viewport(1280, 800);
+    using _platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
+    localStorage.setItem("chat_thread_sidebar_open", "false");
+    await using screen = await render(<AppSidebarLayout>{null}</AppSidebarLayout>);
+    const wrapper = screen.container.querySelector('[data-slot="sidebar-wrapper"]')!;
+    expect(wrapper.getAttribute("data-sidebar-state")).toBe("collapsed");
+
+    await userEvent.click(screen.getByRole("button", { name: "Notifications" }));
+    await expect.element(page.getByText("Nothing needs you")).toBeVisible();
+
+    await userEvent.keyboard("{Control>}b{/Control}");
+    await vi.waitFor(() => expect(wrapper.getAttribute("data-sidebar-state")).toBe("expanded"));
+    await expect.element(page.getByText("Nothing needs you")).not.toBeInTheDocument();
+  });
 });
