@@ -36,7 +36,7 @@ const TerminalLaunchEnvironment = Schema.Record(TerminalEnvKey, TerminalEnvValue
 );
 const TerminalCols = TerminalResizeInput.fields.cols;
 const TerminalRows = TerminalResizeInput.fields.rows;
-const TerminalData = TerminalWriteInput.fields.data;
+const TerminalData = TerminalWriteInput.fields.data.check(Schema.isNonEmpty());
 const TerminalReadCursor = Schema.String.check(Schema.isNonEmpty()).check(
   Schema.isMaxLength(4_096),
 );

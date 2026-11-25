@@ -83,6 +83,11 @@ describe("project terminal wire boundaries", () => {
     expect(() => decode({ ...handle, data: "x", expectedGeneration: "" })).toThrow();
   });
 
+  it("rejects empty writes", () => {
+    const decode = Schema.decodeUnknownSync(ProjectTerminalWriteInput);
+    expect(() => decode({ ...handle, data: "" })).toThrow();
+  });
+
   it("requires cursor reader, generation and expiration claims", () => {
     const decode = Schema.decodeUnknownSync(ProjectTerminalReadCursorClaims);
     const claims = {
