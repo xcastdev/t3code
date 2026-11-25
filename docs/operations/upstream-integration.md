@@ -2,8 +2,8 @@
 
 This fork tracks [pingdotgg/t3code](https://github.com/pingdotgg/t3code).
 
-**Last merged upstream commit:** `fb04b4d1994c776e374aea8b051459dbd55b68c1`
-(`fix(desktop): remote input waits while a preview page is annotated (#41987)`, 2026-11-23).
+**Last merged upstream commit:** `7d8c03fd999467843c70178fe655e05eeab2aeb5`
+(`fix(terminal): keep other input out of large bracketed pastes (#42948)`, 2026-11-25).
 The next integration starts from this commit. Update this line and the table below
 in every integration.
 
@@ -15,6 +15,7 @@ in every integration.
 | 2026-11-15       | `31eea883c7f7849ada6eb49265cb11fc64d2ecbd` | `40dcbc5f6a8c4039f5f8f0dceb1bfa17ad0e3961` | `393439fae83cb791c847f060d59d4d3c65f10f7d` |
 | 2026-11-17       | `40dcbc5f6a8c4039f5f8f0dceb1bfa17ad0e3961` | `6ef2c05410b43a06eea6493a0dc66c1c92f5592f` | `93ffae9b0350dd67dfd90b727c703ab28d63a0d1` |
 | 2026-11-24       | `6ef2c05410b43a06eea6493a0dc66c1c92f5592f` | `fb04b4d1994c776e374aea8b051459dbd55b68c1` | `09b04a5d492430296be9738698630debecc3239d` |
+| 2026-11-25       | `fb04b4d1994c776e374aea8b051459dbd55b68c1` | `7d8c03fd999467843c70178fe655e05eeab2aeb5` | `701f7e1477d7f02137f3bb0a4906a9b8838427a2` |
 
 ## Rule: nothing changes without a decision
 
@@ -144,29 +145,24 @@ perf job, so leave it out. Remove the fork-check worktree when done.
 
 ## Included upstream changes
 
-- Durable workflows on web, mobile, CLI and MCP (`t3_workflow`), behind the Labs
-  `workflowsEnabled` setting. Agent feedback reporting (`t3_feedback`), typed turn
-  results (`t3_submit_output`), and MCP milestone events by polling, streaming and webhooks.
-- Projects covering several repositories: tracked folders, task folders with one worktree
-  per repository, per-repository checkpoints, diffs and Git actions.
-- Agents read, open, update, review and merge pull requests, land GitHub stacks, and read
-  or re-run CI through MCP tools. GitHub issue statuses, several Linear accounts and teams,
-  fork-and-upstream issue lists, and a TanStack Source forge behind a feature flag.
-- Linked environments: read another environment's threads, link several at once, renew
-  links in use, forward ports and tunnel previews to loopback ports.
-- The whole app is translated into every supported locale, including Swedish, and lint
-  fails on untranslated copy.
-- Subagents, side chats and linked threads open the same way; providers show their real
-  startup step; Cursor and Antigravity edit earlier messages by rewinding.
-- A `T3CODE_FEATURE_FLAGS` service, pairing-link sessions renewed with the device's DPoP
-  key, and a two-minute default idle timeout for providers with native resume.
-- Server performance work, server-metrics scripts, and core migrations 099–111
-  (recovery, turn-start and delegated-task indexes, thread item counts, tracker scopes and
-  accounts, tracked and task folders, agent feedback and workflows).
-- Effect 4.1.5 and the Cursor SDK 1.4.2.
+- Workflow pools that cap concurrent runs and queue the rest; questions with described
+  choices, required reasons, links, kinds and a recorded answerer; withdrawing a waiting
+  question; run tags; indexed run queries.
+- Command palette thread actions (settle, pin, snooze and more), dragging the sidebar to
+  hide or restore it, quoted-phrase search, terminal cycling keybindings and
+  user-hosted HTTP quota sources.
+- Worktree layout commands that need a person's approval, deleted threads whose content
+  is purged after deletion, startup migration progress, and checkpoint captures that
+  reuse a per-thread index.
+- Privacy fixes: `DO_NOT_TRACK`, no account ids or caller addresses in analytics and
+  relay traces, per-device Android push hashes, and relay data deleted with the account.
+- Many attachment-text, Esc/IME, emoji and Pi, OpenCode and Antigravity fixes; Expo SDK
+  58 patches, react-native-screens 5.0.0-beta.2 and vite-plus 1.8.0.
+- Core migrations 112–118 (layout command approvals, skipped runs, run indexes and tags,
+  fork history membership, mail sender, pools).
 
-The [upstream comparison](https://github.com/pingdotgg/t3code/compare/6ef2c05410b43a06eea6493a0dc66c1c92f5592f...fb04b4d1994c776e374aea8b051459dbd55b68c1)
-contains 1,313 commits since the previous integration.
+The [upstream comparison](https://github.com/pingdotgg/t3code/compare/fb04b4d1994c776e374aea8b051459dbd55b68c1...7d8c03fd999467843c70178fe655e05eeab2aeb5)
+contains 358 commits since the previous integration.
 
 ## Fork integration decisions
 
@@ -331,6 +327,22 @@ instead of starting a fresh turn that reports a resume.
 The server's core WebSocket RPC group is split in two, by tag prefix, to stay under the
 type checker's instantiation depth; otherwise importers infer `unknown` layers depending
 on check order.
+
+The item inspector's Input card always shows a search's pattern; upstream hides it when
+the row title already shows it. Its results use upstream's matched-line list and links.
+
+Upstream re-reads `t3.json` when the project actions menu opens. The fork has no Scripts
+section in Thread details, so the re-read lives in the chat header's scripts control.
+
+Deleting a thread also releases its rewind history archives: archived rows, retained
+refs and attachment claims. The content purge releases them best effort, and a
+background pass releases archives of threads any purge path already emptied, including
+archives left `executing`, which a deleted thread can no longer settle. A release never
+fails the purge. Files of messages a rewind removed are not freed, as with a manual release.
+
+A thread instance's own HTTP quota rows win: with quota rows, Thread details shows only
+that instance's own account, limits or pool beside them, never another account of the
+same provider.
 
 ## Validation
 
@@ -629,3 +641,53 @@ until the translation follow-up. A raw-path task-folder lookup in run admission 
 checked and left as is: the thread's path is written from the same task-folder value.
 Shared project terminals already get SIGHUP, because node-pty's default kill signal is
 SIGHUP.
+
+### Integration through `7d8c03fd99` (2026-11-25)
+
+The merge had 56 conflicted files and no feature collision beyond the decisions above.
+Every workspace package and app typechecks. Formatting, lint, knip and the translation
+check pass.
+
+Web unit tests pass (6,239). The four browser shards pass 1,766 of 1,767; the file
+preview upward-drag case fails on pure upstream. Mobile passes 3,992; desktop 1,341 with
+one skipped; client-runtime 2,781; contracts 283; shared 2,099 with five skipped; evals
+1,055. Provider packages pass apart from the ACP Registry readiness-version and OpenCode
+in-place upgrade tests, which fail identically at the pre-merge fork. Orchestration passes
+all 3,712 server tests; outside it 8,030 of 8,048 pass with 17 skipped, and the background
+Git fetch case fails identically at the pre-merge fork.
+
+The preservation audit reports 48 files, 117 upstream lines and 74 fork lines. Every
+line was classified by hand as ported, decision, superseded or noise; translation catalog
+entries are reordering and trailing-comma artifacts, or keys for upstream copy in screens
+the fork rewrote. No line was lost. Per-category counts were not tallied.
+
+The per-tool MCP inventory differs from the fork only in upstream's `t3_workflow` (+211
+bytes) and `pull_request_review` (+135) descriptions; the list is 111 tools and 107,533
+bytes. Registration checks retain every fork RPC method, settings field, provider driver
+and feature migration.
+
+An isolated worktree server applied core migrations 111–118 to a pruned copy of real
+data, ran the feature migrations through 20, reported ready, and refused unauthenticated
+WebSocket-ticket and pairing-token requests (HTTP 401); it was then stopped. No
+real-client visual pass, native device build, paid model eval or real provider turn was
+run.
+
+### Review (2026-11-25)
+
+Opus 5.5 and Gemini 4 Neon reviews found these, all fixed with tests where behavioral:
+
+- **Terminal writes:** the fork's project terminal write borrowed upstream's data field,
+  whose non-empty check upstream moved to a struct filter, so empty writes passed.
+- **Plugin panels:** the add-surface button and Mod+T ignored pinned plugin panels.
+- **Command palette:** upstream's palette thread actions listed the fork's
+  thread-resources item as a dead row; the chat header's copy of it did nothing either.
+- **Sidebar drag:** the floating notification bell now hides during a drag toward an
+  open sidebar, and the titlebar leaves no bell gap while an open sidebar is dragged shut.
+- **Usage, archives:** the two decisions above.
+- **Fixture:** the upgrade-preservation fixture adds upstream's `fork_run_ids_json` for its
+  migration-66 writes.
+
+Known gaps: a release that cannot start Git in any candidate folder marks the archive
+released and leaves its refs; a folder that now holds a different repository leaves them
+too. A database copied into a dev worktree that shares the live repository can release
+refs the live install still uses. The OMP adapter gap above remains.
