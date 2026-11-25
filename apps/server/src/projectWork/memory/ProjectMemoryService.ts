@@ -395,7 +395,7 @@ const make = Effect.gen(function* () {
           forgotten.length &&
           !(yield* (
             ownerAuthority.value.authorizeForgottenCapture?.({ ...input, source }) ??
-              Effect.succeed(false)
+            Effect.succeed(false)
           ))
         )
           return yield* new ProjectMemoryError({ reason: "forgotten" });

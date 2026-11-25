@@ -327,7 +327,7 @@ export const make = Effect.gen(function* () {
     };
     yield* (
       options?.progressReporter?.publish({ ...base, kind: "action_started", phases: ["push"] }) ??
-        Effect.void
+      Effect.void
     );
     yield* (
       options?.progressReporter?.publish({
@@ -358,7 +358,7 @@ export const make = Effect.gen(function* () {
     };
     yield* (
       options?.progressReporter?.publish({ ...base, kind: "action_finished", result }) ??
-        Effect.void
+      Effect.void
     );
     return result;
   });

@@ -258,10 +258,7 @@ export const makeWorkerConnection = Effect.fn("PluginWorkerSupervisor.makeWorker
             `${encodeMessage(id === undefined ? { jsonrpc: "2.0", method, params } : { jsonrpc: "2.0", id, method, params })}\n`,
           ).pipe(Effect.asVoid);
 
-    const reply = (
-      id: string,
-      outcome: { result: unknown } | { error: Record<string, unknown> },
-    ) =>
+    const reply = (id: string, outcome: { result: unknown } | { error: Record<string, unknown> }) =>
       ended
         ? Effect.void
         : Queue.offer(output, `${encodeMessage({ jsonrpc: "2.0", id, ...outcome })}\n`).pipe(
