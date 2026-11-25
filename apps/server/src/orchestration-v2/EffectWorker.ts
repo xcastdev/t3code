@@ -705,6 +705,7 @@ export const layerExecutor: Layer.Layer<
               if (purgedThreadIds.length === 0) return;
               yield* resourceCleanup.cleanupHistoryArchives(purgedThreadIds);
               // The attachment cleanup ran first and skipped the files these archives claimed.
+              // Files of messages a rewind removed are not in this list and stay on disk.
               yield* resourceCleanup.cleanupAttachments(request.attachmentIds ?? []);
             }).pipe(
               Effect.mapError(

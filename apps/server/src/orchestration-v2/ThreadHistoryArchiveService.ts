@@ -6,11 +6,15 @@ import {
   type ProviderThreadId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
+import { forkParked } from "../serverActivation.ts";
+import { DELETED_THREAD_CONTENT_TABLES, DELETED_THREAD_TITLE } from "./ProjectionMaintenance.ts";
 import { ProjectionStoreV2 } from "./ProjectionStore.ts";
 
 export class HistoryArchiveError extends Schema.TaggedError<HistoryArchiveError>()(
@@ -101,6 +105,12 @@ export class ThreadHistoryArchiveService extends Context.Service<
     readonly release: (input: Identity) => Effect.Effect<void, HistoryArchiveError>;
     /** Releases every archive of a purged thread; an uncertain restore fails it for a retry. */
     readonly releaseThread: (threadId: ThreadId) => Effect.Effect<void, HistoryArchiveError>;
+    /**
+     * Releases the archives of deleted threads whose content is already purged, whichever pass
+     * purged it. Returns the number of threads fully released. Files only an archive referenced
+     * stay on disk, as after `release`: no message points at them, so nothing frees them.
+     */
+    readonly releasePurgedThreads: Effect.Effect<number, HistoryArchiveError>;
     readonly isCheckpointRetained: (ref: string) => Effect.Effect<boolean, HistoryArchiveError>;
     readonly isAttachmentRetained: (id: string) => Effect.Effect<boolean, HistoryArchiveError>;
   }
@@ -345,6 +355,17 @@ const make = Effect.gen(function* () {
       }),
     );
   });
+  const releaseThread = Effect.fnUntraced(function* (threadId: ThreadId) {
+    const pending = yield* sql<{
+      readonly archive_id: string;
+    }>`SELECT archive_id FROM t3_workflow_v2_history_archives WHERE thread_id=${threadId} AND state!='released' ORDER BY archive_id`;
+    const [, failures] = yield* Effect.partition(
+      pending,
+      ({ archive_id }) => release({ archiveId: archive_id, threadId }),
+      { concurrency: 1 },
+    );
+    if (failures[0] !== undefined) return yield* failures[0];
+  });
   const protect = <A, E>(effect: Effect.Effect<A, E>) =>
     effect.pipe(
       Effect.mapError((cause) =>
@@ -420,19 +441,43 @@ const make = Effect.gen(function* () {
     ),
     release: Effect.fn("ThreadHistoryArchive.release")((input) => protect(release(input))),
     releaseThread: Effect.fn("ThreadHistoryArchive.releaseThread")((threadId) =>
-      protect(
-        Effect.gen(function* () {
-          const pending = yield* sql<{
-            readonly archive_id: string;
-          }>`SELECT archive_id FROM t3_workflow_v2_history_archives WHERE thread_id=${threadId} AND state!='released' ORDER BY archive_id`;
-          const [, failures] = yield* Effect.partition(
-            pending,
-            ({ archive_id }) => release({ archiveId: archive_id, threadId }),
-            { concurrency: 1 },
+      protect(releaseThread(threadId)),
+    ),
+    releasePurgedThreads: protect(
+      Effect.gen(function* () {
+        // The purge retitles the thread last, so the title marks a finished purge; no content
+        // left rules out a live thread that only shares the placeholder title.
+        const purged = yield* sql<{ readonly thread_id: ThreadId }>`
+          SELECT DISTINCT archive.thread_id
+          FROM t3_workflow_v2_history_archives AS archive
+          JOIN orchestration_v2_projection_threads AS thread USING (thread_id)
+          WHERE archive.state != 'released'
+            AND thread.deleted_at IS NOT NULL
+            AND thread.title = ${DELETED_THREAD_TITLE}
+            AND ${sql.and(
+              DELETED_THREAD_CONTENT_TABLES.map(
+                (table) =>
+                  sql`NOT EXISTS (SELECT 1 FROM ${sql(table)} WHERE thread_id = thread.thread_id)`,
+              ),
+            )}
+          ORDER BY archive.thread_id
+          LIMIT 50
+        `;
+        let released = 0;
+        for (const { thread_id: threadId } of purged) {
+          const done = yield* releaseThread(threadId).pipe(
+            Effect.as(true),
+            Effect.catch((cause) =>
+              Effect.logWarning("Purged thread's history archives remain pending.", {
+                threadId,
+                cause,
+              }).pipe(Effect.as(false)),
+            ),
           );
-          if (failures[0] !== undefined) return yield* failures[0];
-        }),
-      ),
+          if (done) released++;
+        }
+        return released;
+      }),
     ),
     isCheckpointRetained: Effect.fn("ThreadHistoryArchiveService.isCheckpointRetained")((ref) =>
       protect(
@@ -451,3 +496,19 @@ const make = Effect.gen(function* () {
   });
 });
 export const layer = Layer.effect(ThreadHistoryArchiveService, make);
+
+// The maintenance sweep, and a purge effect that ran out of retries, purge content without
+// releasing the thread's archives; this catches up with both.
+export const layerPurgedThreadReleaseWorker = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const archives = yield* ThreadHistoryArchiveService;
+    yield* forkParked(
+      archives.releasePurgedThreads.pipe(
+        Effect.catch((cause) =>
+          Effect.logWarning("Failed to release purged threads' history archives", { cause }),
+        ),
+        Effect.repeat(Schedule.spaced(Duration.hours(1))),
+      ),
+    );
+  }),
+);

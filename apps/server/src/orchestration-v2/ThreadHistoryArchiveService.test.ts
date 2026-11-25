@@ -5,6 +5,7 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
+import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import { ProjectionStoreV2 } from "./ProjectionStore.ts";
 import * as Archive from "./ThreadHistoryArchiveService.ts";
 import { setup, testLayer, threadId } from "./ThreadHistoryArchiveService.test-utils.ts";
@@ -404,4 +405,50 @@ it.live("releasing a thread's archives frees its claims and keeps other threads'
     // The live fork's archive still claims the blob it inherited from the released thread.
     assert.isTrue(yield* archives.isAttachmentRetained("retained-blob"));
   }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);
+
+it.live("a thread the maintenance sweep purges has its archives released by the reconcile", () =>
+  Effect.gen(function* () {
+    const { sql, cwd } = yield* setup();
+    const archives = yield* Archive.ThreadHistoryArchiveService;
+    const checkpoints = yield* CheckpointStore.CheckpointStore;
+    const live = ThreadId.make("archive-live");
+    const rows = yield* sql<
+      Record<string, string | number | null>
+    >`SELECT * FROM orchestration_v2_projection_threads WHERE thread_id=${threadId}`;
+    yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert({ ...rows[0]!, thread_id: live })}`;
+    yield* archives.prepare({ threadId, archiveId: "swept", reason: "rollback" });
+    yield* archives.prepare({ threadId: live, archiveId: "kept", reason: "rollback" });
+    const retained = yield* sql<{
+      retained_ref: string;
+    }>`SELECT retained_ref FROM t3_workflow_v2_history_archive_refs WHERE archive_id='swept'`;
+    yield* sql`UPDATE orchestration_v2_projection_threads SET deleted_at='2026-10-02T00:00:00.000Z' WHERE thread_id=${threadId}`;
+
+    // Deleted but not yet purged: its content, and so its archives, stay.
+    assert.equal(yield* archives.releasePurgedThreads, 0);
+    assert.lengthOf(yield* archives.list({ threadId }), 1);
+
+    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    assert.isAbove((yield* maintenance.pruneEventStore()).purgedRowCount, 0);
+    assert.equal(yield* archives.releasePurgedThreads, 1);
+    assert.equal(yield* archives.releasePurgedThreads, 0);
+
+    assert.isEmpty(yield* archives.list({ threadId }));
+    assert.isEmpty(
+      yield* sql`SELECT 1 FROM t3_workflow_v2_history_archive_attachments WHERE archive_id='swept'`,
+    );
+    assert.isFalse(
+      yield* checkpoints.hasCheckpointRef({
+        cwd,
+        checkpointRef: CheckpointRef.make(retained[0]!.retained_ref),
+      }),
+    );
+    assert.deepEqual(
+      (yield* archives.list({ threadId: live })).map((archive) => archive.archive_id),
+      ["kept"],
+    );
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(ProjectionMaintenance.layer.pipe(Layer.provideMerge(testLayer))),
+  ),
 );

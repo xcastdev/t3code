@@ -661,6 +661,7 @@ export const layerProduction = Layer.mergeAll(
   layerAssistantRosterStream,
   layerAssistantRoutineGateway,
   layerHistoryArchive,
+  ThreadHistoryArchive.layerPurgedThreadReleaseWorker.pipe(Layer.provide(layerHistoryArchive)),
   layerHistoryRecovery,
   layerAssistantMemoryGateway,
   AssistantMemoryRuntime.workerLayer.pipe(
