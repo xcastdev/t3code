@@ -52,8 +52,12 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as TerminalManager from "../terminal/Manager.ts";
 import {
   makeRestoreMissingWorktree,
+  type RestoredWorktreeSetup,
+  RestoredWorktreeSetupDrainError,
+  RestoredWorktreeSetups,
   ThreadWorktreeRestore,
 } from "../workspace/restoreMissingWorktree.ts";
 import type * as TaskFolders from "../workspace/TaskFolders.ts";
@@ -313,6 +317,8 @@ export const layer: Layer.Layer<
   | RunAdmission.RunAdmission
   | TurnItemPositionStore.TurnItemPositionStoreV2
   | TaskFolders.TaskFolders
+  | TerminalManager.TerminalManager
+  | RestoredWorktreeSetups
   | ThreadWorktreeRestore
 > = Layer.effect(
   ProviderTurnStartServiceV2,
@@ -325,6 +331,8 @@ export const layer: Layer.Layer<
     const path = yield* Path.Path;
     const projects = yield* ProjectService.ProjectService;
     const setupScripts = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
+    const terminals = yield* TerminalManager.TerminalManager;
+    const restoredSetups = yield* RestoredWorktreeSetups;
     const providerAuth = yield* ProviderAuthService.ProviderAuthService;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
@@ -582,6 +590,7 @@ export const layer: Layer.Layer<
         readonly willRetry?: boolean;
       },
       captureStartingRun: (run: OrchestrationV2Run) => void,
+      captureRestoredSetup: (setup: RestoredWorktreeSetup) => void,
     ) {
       const { runId } = input;
       const projection = yield* projectionStore.getTurnStartContext(input.threadId, runId);
@@ -639,6 +648,13 @@ export const layer: Layer.Layer<
         return admission;
       });
       const initialAdmission = yield* checkAdmission();
+      // As in thread launch's managed preparation, an owned run's restored setup waits for
+      // its owner's drain. Registered before the restore, so Work's stop never misses it.
+      const restoredSetup =
+        initialAdmission._tag === "admitted" && projection.thread.worktreePath !== null
+          ? yield* restoredSetups.track(projection.thread.id)
+          : undefined;
+      if (restoredSetup !== undefined) captureRestoredSetup(restoredSetup);
       const instructionSnapshot =
         initialAdmission._tag === "admitted" &&
         initialAdmission.owner.configuration.instructionSnapshot !== undefined
@@ -953,20 +969,49 @@ export const layer: Layer.Layer<
         (recreatedBeforeDispatch?.worktreePath === projection.thread.worktreePath
           ? recreatedBeforeDispatch
           : undefined);
-      if (recreated !== undefined) {
+      if (recreated === undefined) yield* restoredSetup?.release ?? Effect.void;
+      else {
         const { project, worktreePath } = recreated;
+        const threadId = projection.thread.id;
+        // Owned setups keep their terminal until their owner proves it drained.
+        const drainSetup =
+          restoredSetup === undefined
+            ? Effect.void
+            : restoredSetup.drain.pipe(
+                Effect.catch((error) =>
+                  Effect.logError("Restored workspace setup drain failed", { threadId, error }),
+                ),
+              );
         // Opening the setup terminal takes its own workspace lease.
         return {
           worktreeSetup: Effect.gen(function* () {
             const setupResult = yield* Effect.result(
               Effect.gen(function* () {
                 const setup = yield* setupScripts.runForThread({
-                  threadId: projection.thread.id,
+                  threadId,
                   projectId: project.id,
                   projectCwd: project.workspaceRoot,
                   worktreePath,
                   project,
                   observeCompletion: {},
+                  ...(restoredSetup === undefined
+                    ? {}
+                    : {
+                        retainTerminalForDrain: true,
+                        onTerminalAllocated: (
+                          terminalId: string,
+                          capture: TerminalManager.TerminalDrainHandle,
+                        ) =>
+                          restoredSetup.attach(
+                            Effect.suspend(() =>
+                              terminals.closeAndDrain({ threadId, terminalId, capture }),
+                            ).pipe(
+                              Effect.mapError(
+                                (cause) => new RestoredWorktreeSetupDrainError({ threadId, cause }),
+                              ),
+                            ),
+                          ),
+                      }),
                 });
                 if (setup.status !== "started" || !setup.completion) return;
                 if (setup.async) {
@@ -976,7 +1021,7 @@ export const layer: Layer.Layer<
                   if (exitCode !== 0)
                     return yield* new WorktreeSetupScriptFailedError({ worktreePath, exitCode });
                 }
-              }),
+              }).pipe(Effect.onError(() => drainSetup)),
             );
             if (setupResult._tag === "Failure") {
               yield* settleStartFailure({
@@ -2681,6 +2726,10 @@ export const layer: Layer.Layer<
         const captureStartingRun = (run: OrchestrationV2Run) => {
           startingRun = run;
         };
+        let releaseRestoredSetup: Effect.Effect<void> = Effect.void;
+        const captureRestoredSetup = (setup: RestoredWorktreeSetup) => {
+          releaseRestoredSetup = setup.release;
+        };
         return yield* Effect.gen(function* () {
           // Storage cleanup removes worktrees under the same lease. Only startup
           // holds it; the provider turn runs after it is released.
@@ -2690,18 +2739,16 @@ export const layer: Layer.Layer<
             (yield* projects
               .getById(thread.projectId, { includeDeleted: true })
               .pipe(Effect.map((project) => Option.getOrUndefined(project)?.workspaceRoot)));
+          const startRun = start(input, captureStartingRun, captureRestoredSetup);
           const providerTurn = yield* cwd === undefined
-            ? start(input, captureStartingRun)
+            ? startRun
             : withTurnStartReservation(
                 fileSystem,
                 path,
                 path.resolve(cwd),
                 thread.worktreePath === null
-                  ? start(input, captureStartingRun)
-                  : withWorkspaceLease(
-                      path.resolve(thread.worktreePath),
-                      start(input, captureStartingRun),
-                    ),
+                  ? startRun
+                  : withWorkspaceLease(path.resolve(thread.worktreePath), startRun),
               );
           if (providerTurn !== undefined && "worktreeSetup" in providerTurn) {
             yield* providerTurn.worktreeSetup;
@@ -2721,6 +2768,7 @@ export const layer: Layer.Layer<
             );
           }
         }).pipe(
+          Effect.ensuring(Effect.suspend(() => releaseRestoredSetup)),
           Effect.catchCauseIf(
             (cause) => !Cause.hasInterruptsOnly(cause),
             (cause) =>

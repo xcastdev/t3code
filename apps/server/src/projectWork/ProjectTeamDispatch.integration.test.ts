@@ -52,6 +52,10 @@ import * as Dispatch from "./ProjectTeamDispatch.ts";
 import { planMailboxClaim } from "./ProjectTeamMailboxTurns.ts";
 import * as Journal from "./ProjectTeamDispatchJournal.ts";
 import * as TaskFolders from "../workspace/TaskFolders.ts";
+import {
+  RestoredWorktreeSetupDrainError,
+  RestoredWorktreeSetups,
+} from "../workspace/restoreMissingWorktree.ts";
 import { reconcileWorkBindings } from "../assistants/OwnedBindingReconciliation.ts";
 import { ProjectWorkEventBusLive } from "./ProjectWorkEventBus.ts";
 import { runtimeExternalServices } from "./ProjectWorkWorkflow.testkit.ts";
@@ -922,6 +926,147 @@ it.effect(
         );
       }).pipe(Effect.provide(Dispatch.layer.pipe(Layer.provideMerge(harness.base))));
     }).pipe(Effect.scoped),
+);
+
+it.effect("a failed restored setup drain does not skip draining the launch's own setup", () =>
+  Effect.gen(function* () {
+    const closeEntered = yield* Deferred.make<void>();
+    const harness = setup({
+      closeAndDrain: () => Deferred.succeed(closeEntered, undefined),
+      runSetup: (input) =>
+        Effect.gen(function* () {
+          yield* (
+            input.onTerminalAllocated?.("finished-setup-terminal", {
+              threadId: input.threadId,
+              terminalId: "finished-setup-terminal",
+            }) ?? Effect.void
+          );
+          return {
+            status: "started",
+            scriptId: "setup",
+            scriptName: "Setup",
+            scriptCommand: "finished setup",
+            terminalId: "finished-setup-terminal",
+            cwd: "/repo-worktrees/feature",
+            async: false,
+            completion: Effect.succeed({ exitCode: 0, durationMs: 0 }),
+          };
+        }),
+    });
+    yield* Effect.gen(function* () {
+      const input = yield* seed({ type: "worktree", baseRef: "main" });
+      const dispatch = yield* Dispatch.ProjectTeamDispatch;
+      yield* dispatch.dispatch(input, attribution);
+      const { sql, binding } = yield* awaitPreparation;
+      const restored = yield* (yield* RestoredWorktreeSetups).track(binding.threadId);
+      yield* restored.attach(
+        Effect.fail(
+          new RestoredWorktreeSetupDrainError({ threadId: binding.threadId, cause: "uncertain" }),
+        ),
+      );
+      const state = yield* Repository.readCurrentState(sql, projectId);
+      const task = state.tasks.find((task) => task.taskId === input.taskId)!;
+      yield* (yield* Repository.ProjectWorkRepository).execute({
+        type: "project-work.foundation.commit",
+        projectId,
+        commandId: CommandId.make("pause-failed-restored-drain"),
+        expectedRevision: state.revision,
+        attribution,
+        committedAt: at,
+        records: [],
+        guided: {
+          intent: {
+            type: "project-team.task.control",
+            projectId,
+            taskId: input.taskId,
+            commandId: CommandId.make("pause-failed-restored-drain"),
+            expectedRevision: state.revision,
+            expectedTaskRevision: task.revision,
+            control: { action: "pause", reason: "Stop with an unproven restored setup" },
+          },
+        },
+      });
+      yield* dispatch.reconcile;
+      yield* Deferred.await(closeEntered);
+      assert.deepEqual(
+        harness.closeAndDrain.mock.calls.map(([call]) => call.terminalId),
+        ["finished-setup-terminal"],
+      );
+      yield* dispatch.reconcile;
+      assert.isTrue(yield* (yield* Launch.ThreadLaunchService).preparationActive(binding.threadId));
+      const waiting = yield* Repository.readCurrentState(sql, projectId);
+      assert.notEqual(
+        waiting.foundationRecords!.find((record) => record.recordId === binding.recordId)?.status,
+        "settled",
+      );
+    }).pipe(Effect.provide(Dispatch.layer.pipe(Layer.provideMerge(harness.base))));
+  }).pipe(Effect.scoped),
+);
+
+it.effect("stop waits for a restored worktree setup to drain before settling Work", () =>
+  Effect.gen(function* () {
+    const drainEntered = yield* Deferred.make<void>();
+    const allowDrain = yield* Deferred.make<void>();
+    const harness = setup();
+    yield* Effect.gen(function* () {
+      const input = yield* seed();
+      const dispatch = yield* Dispatch.ProjectTeamDispatch;
+      yield* dispatch.dispatch(input, attribution);
+      const { sql, binding } = yield* awaitPreparation;
+      // Turn start registers the setup it runs for a worktree it restored.
+      const restored = yield* (yield* RestoredWorktreeSetups).track(binding.threadId);
+      yield* restored.attach(
+        Deferred.succeed(drainEntered, undefined).pipe(Effect.andThen(Deferred.await(allowDrain))),
+      );
+      const state = yield* Repository.readCurrentState(sql, projectId);
+      const task = state.tasks.find((task) => task.taskId === input.taskId)!;
+      yield* (yield* Repository.ProjectWorkRepository).execute({
+        type: "project-work.foundation.commit",
+        projectId,
+        commandId: CommandId.make("pause-restored-setup"),
+        expectedRevision: state.revision,
+        attribution,
+        committedAt: at,
+        records: [],
+        guided: {
+          intent: {
+            type: "project-team.task.control",
+            projectId,
+            taskId: input.taskId,
+            commandId: CommandId.make("pause-restored-setup"),
+            expectedRevision: state.revision,
+            expectedTaskRevision: task.revision,
+            control: { action: "pause", reason: "Stop restored setup" },
+          },
+        },
+      });
+      yield* dispatch.reconcile;
+      const draining = yield* Repository.readCurrentState(sql, projectId);
+      assert.notEqual(
+        draining.foundationRecords!.find((record) => record.recordId === binding.recordId)?.status,
+        "settled",
+      );
+      yield* Deferred.await(drainEntered);
+      const launches = yield* Launch.ThreadLaunchService;
+      const drained = yield* Stream.toPull(
+        launches.preparationChanges.pipe(
+          Stream.filter((threadId) => threadId === binding.threadId),
+          Stream.filterEffect(() =>
+            launches.preparationActive(binding.threadId).pipe(Effect.map((active) => !active)),
+          ),
+        ),
+      );
+      const setupDrained = yield* drained.pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.succeed(allowDrain, undefined);
+      yield* Fiber.join(setupDrained);
+      yield* dispatch.reconcile;
+      const stopped = yield* Repository.readCurrentState(sql, projectId);
+      assert.equal(
+        stopped.foundationRecords!.find((record) => record.recordId === binding.recordId)?.status,
+        "settled",
+      );
+    }).pipe(Effect.provide(Dispatch.layer.pipe(Layer.provideMerge(harness.base))));
+  }).pipe(Effect.scoped),
 );
 
 it.effect(

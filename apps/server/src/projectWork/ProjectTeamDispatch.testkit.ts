@@ -18,6 +18,7 @@ import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import { layerNoTaskFolders } from "../orchestration-v2/ProviderTurnStartService.testkit.ts";
 import type * as TaskFolders from "../workspace/TaskFolders.ts";
+import { layerRestoredWorktreeSetups } from "../workspace/restoreMissingWorktree.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
@@ -161,6 +162,7 @@ export function makeHarness(options: HarnessOptions) {
       folderForThread: () => Effect.succeedNone,
     }),
     options.taskFolders ?? layerNoTaskFolders,
+    layerRestoredWorktreeSetups,
   );
   const layerLaunch = ThreadLaunch.layer.pipe(
     Layer.provide(

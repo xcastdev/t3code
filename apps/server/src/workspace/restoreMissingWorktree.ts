@@ -10,7 +10,10 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
+import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../config.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
@@ -288,6 +291,92 @@ export const layerThreadWorktreeRestore = Layer.effect(
         return result;
       }),
     };
+  }),
+);
+
+export class RestoredWorktreeSetupDrainError extends Schema.TaggedError<RestoredWorktreeSetupDrainError>()(
+  "RestoredWorktreeSetupDrainError",
+  { threadId: Schema.String, cause: Schema.Defect() },
+) {
+  override get message(): string {
+    return `Could not prove the restored workspace setup for thread '${this.threadId}' ended.`;
+  }
+}
+
+export interface RestoredWorktreeSetup {
+  /** Gives the setup its terminal drain; from then only a successful drain forgets it. */
+  readonly attach: (
+    drain: Effect.Effect<void, RestoredWorktreeSetupDrainError>,
+  ) => Effect.Effect<void>;
+  /** Drains once; without a terminal it does nothing and the setup stays registered. */
+  readonly drain: Effect.Effect<void, RestoredWorktreeSetupDrainError>;
+  /** Forgets a setup that never got a terminal. */
+  readonly release: Effect.Effect<void>;
+}
+
+/** Work-owned setups that turn start runs for a restored worktree, visible to Work's stop. */
+export class RestoredWorktreeSetups extends Context.Service<
+  RestoredWorktreeSetups,
+  {
+    readonly track: (threadId: ThreadId) => Effect.Effect<RestoredWorktreeSetup>;
+    readonly active: (threadId: ThreadId) => Effect.Effect<boolean>;
+    readonly drainThread: (
+      threadId: ThreadId,
+    ) => Effect.Effect<void, RestoredWorktreeSetupDrainError>;
+    readonly changes: Stream.Stream<ThreadId>;
+  }
+>()("t3/workspace/restoreMissingWorktree/RestoredWorktreeSetups") {}
+
+export const layerRestoredWorktreeSetups = Layer.effect(
+  RestoredWorktreeSetups,
+  Effect.gen(function* () {
+    const changes = yield* PubSub.unbounded<ThreadId>();
+    const setups = new Map<RestoredWorktreeSetup, ThreadId>();
+    const forget = (setup: RestoredWorktreeSetup) =>
+      Effect.suspend(() => {
+        const threadId = setups.get(setup);
+        if (threadId === undefined) return Effect.void;
+        setups.delete(setup);
+        return PubSub.publish(changes, threadId);
+      });
+    return RestoredWorktreeSetups.of({
+      track: Effect.fn("RestoredWorktreeSetups.track")(function* (threadId) {
+        const lock = yield* Semaphore.make(1);
+        let terminalDrain: Effect.Effect<void, RestoredWorktreeSetupDrainError> | undefined;
+        const setup: RestoredWorktreeSetup = {
+          attach: (drain) =>
+            Effect.suspend(() => {
+              terminalDrain = drain;
+              return PubSub.publish(changes, threadId);
+            }),
+          drain: lock.withPermits(1)(
+            Effect.suspend(() =>
+              terminalDrain === undefined || !setups.has(setup)
+                ? Effect.void
+                : terminalDrain.pipe(Effect.andThen(forget(setup))),
+            ),
+          ),
+          release: Effect.suspend(() =>
+            terminalDrain === undefined ? forget(setup) : Effect.void,
+          ),
+        };
+        setups.set(setup, threadId);
+        yield* PubSub.publish(changes, threadId);
+        return setup;
+      }),
+      active: Effect.fn("RestoredWorktreeSetups.active")(function (threadId) {
+        return Effect.sync(() => [...setups.values()].includes(threadId));
+      }),
+      drainThread: Effect.fn("RestoredWorktreeSetups.drainThread")(function* (threadId) {
+        const drained = yield* Effect.forEach(
+          [...setups].flatMap(([setup, owner]) => (owner === threadId ? [setup] : [])),
+          (setup) => Effect.result(setup.drain),
+        );
+        const failed = drained.find((result) => result._tag === "Failure");
+        if (failed?._tag === "Failure") return yield* failed.failure;
+      }),
+      changes: Stream.fromPubSub(changes),
+    });
   }),
 );
 

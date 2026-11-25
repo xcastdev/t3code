@@ -59,13 +59,17 @@ import {
 } from "../workspace/workspaceLease.ts";
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import {
+  layerRestoredWorktreeSetups,
   layerThreadWorktreeRestore,
+  RestoredWorktreeSetupDrainError,
+  RestoredWorktreeSetups,
   ThreadWorktreeRestore,
 } from "../workspace/restoreMissingWorktree.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { layerNoTaskFolders, layerRealGit } from "./ProviderTurnStartService.testkit.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
+import * as TerminalManager from "../terminal/Manager.ts";
 import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as ContextHandoffService from "./ContextHandoffService.ts";
@@ -190,6 +194,8 @@ function startWithMissingWorktree(
         Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({
           runForThread: () => Effect.succeed({ status: "no-script" }),
         }),
+        layerRestoredWorktreeSetups,
+        Layer.mock(TerminalManager.TerminalManager)({}),
         Layer.mock(ThreadWorktreeRestore)({ takeRecreated: () => Effect.undefined }),
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
         Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
@@ -499,6 +505,8 @@ function makeLocalCommandHarness(input: {
   readonly gitWorkflow?: GitWorkflow.GitWorkflowService["Service"];
   readonly fileSystem?: FileSystem.FileSystem;
   readonly runSetup?: ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"]["runForThread"];
+  readonly closeAndDrain?: TerminalManager.TerminalManager["Service"]["closeAndDrain"];
+  readonly restoredSetups?: RestoredWorktreeSetups["Service"];
   readonly recreatedBeforeDispatch?: boolean;
   readonly previousNativeSession?: boolean;
   readonly previousMessages?: ReadonlyArray<string>;
@@ -1448,6 +1456,12 @@ function makeLocalCommandHarness(input: {
     ),
   );
   const recreatedBeforeDispatch = { pending: input.recreatedBeforeDispatch === true };
+  const closeAndDrain = vi.fn<TerminalManager.TerminalManager["Service"]["closeAndDrain"]>(
+    input.closeAndDrain ?? (() => Effect.void),
+  );
+  const closeIdle = vi.fn<TerminalManager.TerminalManager["Service"]["closeIdle"]>(
+    () => Effect.void,
+  );
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
@@ -1470,6 +1484,10 @@ function makeLocalCommandHarness(input: {
         Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({
           runForThread: input.runSetup ?? (() => Effect.succeed({ status: "no-script" })),
         }),
+        input.restoredSetups === undefined
+          ? layerRestoredWorktreeSetups
+          : Layer.succeed(RestoredWorktreeSetups, input.restoredSetups),
+        Layer.mock(TerminalManager.TerminalManager)({ closeAndDrain, closeIdle }),
         Layer.mock(ThreadWorktreeRestore)({
           takeRecreated: () =>
             Effect.sync(() => {
@@ -1561,6 +1579,8 @@ function makeLocalCommandHarness(input: {
     },
     resolveRuntimePolicy,
     createWorktree,
+    closeAndDrain,
+    closeIdle,
     open,
     fallbackEnsureThread,
     writeIfRunCurrent,
@@ -2284,6 +2304,247 @@ effectIt.effect.each([
       ]);
     }
   }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+);
+
+const uncertainDrain: TerminalManager.TerminalManager["Service"]["closeAndDrain"] = (input) =>
+  Effect.fail(
+    new TerminalManager.TerminalDrainError({
+      threadId: input.threadId,
+      terminalId: input.terminalId,
+      reason: "owned-processes-uncertain",
+    }),
+  );
+
+const makeRestoredSetup = Effect.fn("test.makeRestoredSetup")(function* (options: {
+  readonly owned: boolean;
+  readonly async?: boolean;
+  readonly completion?: Effect.Effect<ProjectSetupScriptRunner.ProjectSetupScriptCompletion>;
+  readonly failAfterAllocation?: ProjectSetupScriptRunner.ProjectSetupScriptUnsupportedShellError;
+  readonly closeAndDrain?: TerminalManager.TerminalManager["Service"]["closeAndDrain"];
+  readonly beforeRecreate?: Effect.Effect<void>;
+}) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const setups = yield* RestoredWorktreeSetups;
+  const worktreesDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-restore-own-" });
+  const worktreePath = path.join(worktreesDir, "project", "restore");
+  const setupStarted = yield* Deferred.make<void>();
+  const runSetup = vi.fn<
+    ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"]["runForThread"]
+  >((setupInput) =>
+    Effect.gen(function* () {
+      yield* (
+        setupInput.onTerminalAllocated?.("setup-test", {
+          threadId: setupInput.threadId,
+          terminalId: "setup-test",
+        }) ?? Effect.void
+      );
+      yield* Deferred.succeed(setupStarted, undefined);
+      if (options.failAfterAllocation !== undefined) return yield* options.failAfterAllocation;
+      return {
+        status: "started",
+        scriptId: "setup",
+        scriptName: "Setup",
+        scriptCommand: "setup",
+        terminalId: "setup-test",
+        cwd: worktreePath,
+        async: options.async ?? false,
+        completion: options.completion ?? Effect.never,
+      } as const;
+    }),
+  );
+  const harness = makeLocalCommandHarness({
+    text: "Continue",
+    worktreesDir,
+    worktreePath,
+    fileSystem,
+    failReadsAfterRunning: true,
+    runSetup,
+    restoredSetups: setups,
+    ...(options.closeAndDrain === undefined ? {} : { closeAndDrain: options.closeAndDrain }),
+    ...(options.owned ? { admission: ownedStartAdmission().service } : {}),
+  });
+  harness.createWorktree.mockImplementation(() =>
+    (options.beforeRecreate ?? Effect.void).pipe(
+      Effect.andThen(
+        fileSystem.makeDirectory(path.join(worktreePath, ".git"), { recursive: true }),
+      ),
+      Effect.as({} as never),
+      Effect.orDie,
+    ),
+  );
+  return { harness, runSetup, setupStarted, setups, threadId: harness.projection().thread.id };
+});
+
+const layerRestoredSetupTest = Layer.mergeAll(
+  NodeServices.layer,
+  NodeCrypto.layer,
+  layerRestoredWorktreeSetups,
+);
+
+effectIt.effect("a Stop during a non-Work restored setup keeps upstream's terminal handling", () =>
+  Effect.gen(function* () {
+    const { harness, runSetup, setupStarted, setups, threadId } = yield* makeRestoredSetup({
+      owned: false,
+      closeAndDrain: uncertainDrain,
+    });
+    const startup = yield* harness.start.pipe(Effect.forkChild({ startImmediately: true }));
+    yield* Deferred.await(setupStarted);
+    expect(yield* setups.active(threadId)).toBe(false);
+    yield* Fiber.interrupt(startup);
+    const exit = yield* Fiber.await(startup);
+
+    expect(exit._tag === "Failure" && Cause.hasInterruptsOnly(exit.cause)).toBe(true);
+    expect(runSetup.mock.calls[0]?.[0]).not.toHaveProperty("retainTerminalForDrain");
+    expect(runSetup.mock.calls[0]?.[0]).not.toHaveProperty("onTerminalAllocated");
+    expect(harness.closeAndDrain).not.toHaveBeenCalled();
+  }).pipe(Effect.scoped, Effect.provide(layerRestoredSetupTest)),
+);
+
+effectIt.effect.each([false, true])(
+  "an unsupported shell after allocation still fails the start visibly (owned=%s)",
+  (owned) =>
+    Effect.gen(function* () {
+      const { harness, setups, threadId } = yield* makeRestoredSetup({
+        owned,
+        failAfterAllocation: new ProjectSetupScriptRunner.ProjectSetupScriptUnsupportedShellError({
+          shell: "cmd.exe",
+        }),
+        closeAndDrain: uncertainDrain,
+      });
+      yield* harness.start;
+
+      expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+      expect(harness.projection().turnItems).toMatchObject([
+        { type: "error", title: "Couldn't set up restored workspace" },
+      ]);
+      expect(harness.closeAndDrain).toHaveBeenCalledTimes(owned ? 1 : 0);
+      // An unproven drain keeps a Work-owned setup visible to Work's stop.
+      expect(yield* setups.active(threadId)).toBe(owned);
+    }).pipe(Effect.scoped, Effect.provide(layerRestoredSetupTest)),
+);
+
+effectIt.effect.each([
+  { drain: "proven", active: false },
+  { drain: "uncertain", active: true },
+] as const)("a Stop during a Work-owned restored setup drains it ($drain)", (input) =>
+  Effect.gen(function* () {
+    let drained = false;
+    const { harness, runSetup, setupStarted, setups, threadId } = yield* makeRestoredSetup({
+      owned: true,
+      closeAndDrain:
+        input.drain === "proven"
+          ? () =>
+              Effect.yieldNow.pipe(
+                Effect.andThen(
+                  Effect.sync(() => {
+                    drained = true;
+                  }),
+                ),
+              )
+          : uncertainDrain,
+    });
+    const startup = yield* harness.start.pipe(Effect.forkChild({ startImmediately: true }));
+    yield* Deferred.await(setupStarted);
+    expect(yield* setups.active(threadId)).toBe(true);
+    yield* Fiber.interrupt(startup);
+    const exit = yield* Fiber.await(startup);
+
+    expect(exit._tag === "Failure" && Cause.hasInterruptsOnly(exit.cause)).toBe(true);
+    expect(runSetup).toHaveBeenCalledWith(
+      expect.objectContaining({ retainTerminalForDrain: true }),
+    );
+    expect(harness.closeAndDrain).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threadId,
+        terminalId: "setup-test",
+        capture: { threadId, terminalId: "setup-test" },
+      }),
+    );
+    expect(drained).toBe(input.drain === "proven");
+    expect(yield* setups.active(threadId)).toBe(input.active);
+    expect(harness.open).not.toHaveBeenCalled();
+  }).pipe(Effect.scoped, Effect.provide(layerRestoredSetupTest)),
+);
+
+effectIt.effect("a Work-owned setup is registered before its worktree is recreated", () =>
+  Effect.gen(function* () {
+    const recreating = yield* Deferred.make<void>();
+    const { harness, runSetup, setups, threadId } = yield* makeRestoredSetup({
+      owned: true,
+      beforeRecreate: Deferred.succeed(recreating, undefined).pipe(Effect.andThen(Effect.never)),
+    });
+    const startup = yield* harness.start.pipe(Effect.forkChild({ startImmediately: true }));
+    yield* Deferred.await(recreating);
+    expect(yield* setups.active(threadId)).toBe(true);
+    yield* Fiber.interrupt(startup);
+
+    expect(runSetup).not.toHaveBeenCalled();
+    expect(harness.closeAndDrain).not.toHaveBeenCalled();
+    expect(yield* setups.active(threadId)).toBe(false);
+  }).pipe(Effect.scoped, Effect.provide(layerRestoredSetupTest)),
+);
+
+effectIt.effect.each([false, true])(
+  "a Work-owned setup stays registered after the turn starts until drained (async=%s)",
+  (async) =>
+    Effect.gen(function* () {
+      const { harness, setups, threadId } = yield* makeRestoredSetup({
+        owned: true,
+        async,
+        completion: async ? Effect.never : Effect.succeed({ exitCode: 0, durationMs: 0 }),
+      });
+      yield* harness.start;
+
+      expect(harness.open).toHaveBeenCalledOnce();
+      expect(harness.closeIdle).not.toHaveBeenCalled();
+      expect(harness.closeAndDrain).not.toHaveBeenCalled();
+      expect(yield* setups.active(threadId)).toBe(true);
+
+      yield* setups.drainThread(threadId);
+      expect(harness.closeAndDrain).toHaveBeenCalledOnce();
+      expect(yield* setups.active(threadId)).toBe(false);
+    }).pipe(Effect.scoped, Effect.provide(layerRestoredSetupTest)),
+);
+
+effectIt.effect("a failed admission check on a worktree thread still identifies the attempt", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      worktreePath: "/tmp/native-account-worktree",
+      admission: RunAdmission.RunAdmission.of({
+        ...ownedStartAdmission().service,
+        check: () =>
+          Effect.fail(new RunAdmission.RunAdmissionError({ operation: "check", cause: "sql" })),
+      }),
+    });
+    const error = yield* Effect.flip(harness.start);
+    expect(error).toMatchObject({
+      _tag: "ProviderTurnStartError",
+      attemptId: harness.attemptId,
+      rootNodeId: harness.projection().runs.at(-1)?.rootNodeId,
+    });
+  }),
+);
+
+effectIt.effect("restored setup registrations follow their terminal", () =>
+  Effect.gen(function* () {
+    const setups = yield* RestoredWorktreeSetups;
+    const threadId = ThreadId.make("thread-restored-registry");
+    const unallocated = yield* setups.track(threadId);
+    yield* setups.drainThread(threadId);
+    expect(yield* setups.active(threadId)).toBe(true);
+    yield* unallocated.release;
+    expect(yield* setups.active(threadId)).toBe(false);
+
+    const failing = yield* setups.track(threadId);
+    yield* failing.attach(
+      Effect.fail(new RestoredWorktreeSetupDrainError({ threadId, cause: "uncertain" })),
+    );
+    yield* failing.release;
+    expect((yield* Effect.exit(setups.drainThread(threadId)))._tag).toBe("Failure");
+    expect(yield* setups.active(threadId)).toBe(true);
+  }).pipe(Effect.provide(layerRestoredWorktreeSetups)),
 );
 
 effectIt.effect("runs setup for a worktree a send recreated before dispatch", () =>

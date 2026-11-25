@@ -21,6 +21,8 @@ import * as Layer from "effect/Layer";
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as TaskFolders from "../workspace/TaskFolders.ts";
+import * as TerminalManager from "../terminal/Manager.ts";
+import { layerRestoredWorktreeSetups } from "../workspace/restoreMissingWorktree.ts";
 
 // No project in these tests tracks a repository, so no thread works in a task folder.
 export const layerNoTaskFolders = Layer.mock(TaskFolders.TaskFolders)({
@@ -32,6 +34,9 @@ export const layer = Layer.mergeAll(
   Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({
     runForThread: () => Effect.succeed({ status: "no-script" }),
   }),
+  // Restored-worktree setup drains its terminal through this; these setups run no script.
+  Layer.mock(TerminalManager.TerminalManager)({}),
+  layerRestoredWorktreeSetups,
   layerNoTaskFolders,
   Layer.mock(GitWorkflow.GitWorkflowService)({
     pruneWorktrees: () => Effect.void,

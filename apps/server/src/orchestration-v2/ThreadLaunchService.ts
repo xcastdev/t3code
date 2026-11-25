@@ -1,6 +1,7 @@
 import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
+import { RestoredWorktreeSetups } from "../workspace/restoreMissingWorktree.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
   CommandId,
@@ -308,6 +309,7 @@ const make = Effect.gen(function* () {
   const setupTracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
   const cloneTracker = yield* ProjectCloneTracker.ProjectCloneTracker;
   const terminals = yield* TerminalManager.TerminalManager;
+  const restoredSetups = yield* RestoredWorktreeSetups;
   const git = yield* GitWorkflow.GitWorkflowService;
   const checkpointStore = yield* CheckpointStore.CheckpointStore;
   const setupScripts = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
@@ -331,6 +333,9 @@ const make = Effect.gen(function* () {
   const stoppingPreparations = yield* Ref.make<ReadonlySet<ThreadId>>(new Set());
   const ownedSetupResources = yield* Ref.make<ReadonlyMap<string, OwnedSetupResource>>(new Map());
   yield* Effect.addFinalizer(() => Scope.close(preparationScope, Exit.void));
+  yield* Stream.runForEach(restoredSetups.changes, (threadId) =>
+    PubSub.publish(preparationChanges, threadId),
+  ).pipe(Effect.forkIn(preparationScope, { startImmediately: true }));
 
   const preparationKey = (input: PreparationInput, threadId: ThreadId, runId: RunId | null) =>
     `${threadId}:${runId ?? input.commandId}`;
@@ -1452,6 +1457,7 @@ const make = Effect.gen(function* () {
     (threadId: ThreadId) =>
       Effect.gen(function* () {
         if ([...(yield* Ref.get(scheduledLaunches)).values()].includes(threadId)) return true;
+        if (yield* restoredSetups.active(threadId)) return true;
         return [...(yield* Ref.get(ownedSetupResources)).values()].some(
           (resource) => resource.threadId === threadId,
         );
@@ -1471,6 +1477,14 @@ const make = Effect.gen(function* () {
       for (const resource of (yield* Ref.get(ownedSetupResources)).values())
         if (resource.threadId === threadId) resource.stopRequested = true;
       yield* setupTracker.cancel(threadId);
+      // A failed drain leaves its setup registered, so Work keeps waiting on it.
+      yield* restoredSetups
+        .drainThread(threadId)
+        .pipe(
+          Effect.catch((error) =>
+            Effect.logError("Restored workspace setup drain failed", { threadId, error }),
+          ),
+        );
       for (const resource of (yield* Ref.get(ownedSetupResources)).values()) {
         if (resource.threadId !== threadId) continue;
         yield* drainOwnedSetup(resource, false);

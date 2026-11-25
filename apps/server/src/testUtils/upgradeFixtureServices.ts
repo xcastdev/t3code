@@ -22,7 +22,11 @@ import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as TaskFolders from "../workspace/TaskFolders.ts";
-import { ThreadWorktreeRestore } from "../workspace/restoreMissingWorktree.ts";
+import * as TerminalManager from "../terminal/Manager.ts";
+import {
+  layerRestoredWorktreeSetups,
+  ThreadWorktreeRestore,
+} from "../workspace/restoreMissingWorktree.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as Option from "effect/Option";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
@@ -140,6 +144,8 @@ export const layerFixtureServicesForMode = (mode: "preservation" | "controlled-f
           plan: () => Effect.succeed(null),
           find: () => Effect.succeed(null),
         }),
+        Layer.mock(TerminalManager.TerminalManager)({}),
+        layerRestoredWorktreeSetups,
         Layer.mock(ThreadWorktreeRestore)({ takeRecreated: () => Effect.undefined }),
         Layer.unwrap(
           Effect.gen(function* () {

@@ -598,7 +598,7 @@ A third round found five more, also fixed:
   prompt, and clears them when a session is replaced, restarted or compacted.
 - **Cursor Stop:** Cursor background commands, new upstream, now stop from Processes.
 
-A final round found five more, also fixed:
+A final round found six more, also fixed:
 
 - **Linked worktree:** the real-path root check resolved the worktree itself, so a worktree
   replaced by a link to another repository passed. Only parent folders are resolved now, and
@@ -613,11 +613,15 @@ A final round found five more, also fixed:
   outcomes no longer acknowledge on that path; the next turn re-sends them.
 - **Root-kind binding:** a project-checkout Work binding on a chosen repository is refused
   once its thread moves into a worktree.
+- **Restored setup drain:** upstream's setup run for a restored worktree during turn start
+  closed its terminal without proof on Stop, and Work's stop did not wait for it. For an
+  owned run, as for a launch's managed preparation, turn start now counts as active
+  preparation from its admission check, before the restore. It retains the setup terminal
+  and keeps it until a drain proves its processes ended. Work's stop or settlement drains
+  it, and a failed drain keeps Work waiting. Other threads keep upstream's behavior.
 
-Known gaps: upstream's setup run for a restored worktree during turn start does not use the
-fork's drain options, so a Stop during it cannot prove its processes ended. The OMP adapter
-does not take upstream's agent-feedback line or multi-folder workspace list, as upstream's
-own Pi and Grok adapters do not.
+Known gaps: the OMP adapter does not take upstream's agent-feedback line or multi-folder
+workspace list, as upstream's own Pi and Grok adapters do not.
 
 Checklist titles, Work section labels and the folded thought count in upstream files are
 now wrapped for translation; like the fork's other new keys, the other locales show English

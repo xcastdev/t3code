@@ -77,6 +77,7 @@ import {
 import * as ThreadLaunch from "./ThreadLaunchService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
+import { layerRestoredWorktreeSetups } from "../workspace/restoreMissingWorktree.ts";
 import * as ThreadTitleRegeneration from "./ThreadTitleRegenerationService.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
@@ -300,6 +301,7 @@ function makeHarness(options: HarnessOptions = {}) {
     Layer.provide(
       Layer.mergeAll(
         RunAdmission.layerOrdinary,
+        layerRestoredWorktreeSetups,
         layerExternalServices,
         layerLaunchThreads,
         layerReceipts,

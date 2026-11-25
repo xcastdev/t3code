@@ -33,7 +33,10 @@ import * as Git from "../vcs/GitVcsDriver.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as TaskFolders from "../workspace/TaskFolders.ts";
 import * as WorkspaceFolders from "../workspace/WorkspaceFolders.ts";
-import { layerThreadWorktreeRestore } from "../workspace/restoreMissingWorktree.ts";
+import {
+  layerRestoredWorktreeSetups,
+  layerThreadWorktreeRestore,
+} from "../workspace/restoreMissingWorktree.ts";
 import * as VcsConfig from "../vcs/VcsProjectConfig.ts";
 import * as VcsRegistry from "../vcs/VcsDriverRegistry.ts";
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
@@ -186,10 +189,11 @@ export function layerControlledBusiness(snapshot: UpgradeSnapshot) {
   const setup = Setup.layer.pipe(Layer.provideMerge(registeredProjects));
   const manager = GitManager.layer.pipe(Layer.provideMerge(setup));
   const workflow = GitWorkflow.layer.pipe(Layer.provideMerge(manager));
-  const taskFolders = Layer.merge(WorkspaceFolders.layer, layerThreadWorktreeRestore).pipe(
-    Layer.provideMerge(TaskFolders.layer),
-    Layer.provideMerge(workflow),
-  );
+  const taskFolders = Layer.mergeAll(
+    WorkspaceFolders.layer,
+    layerThreadWorktreeRestore,
+    layerRestoredWorktreeSetups,
+  ).pipe(Layer.provideMerge(TaskFolders.layer), Layer.provideMerge(workflow));
   const folders = Folders.layer.pipe(Layer.provideMerge(taskFolders));
   const claimedFolders = Layer.effect(
     Folders.ManagedProjectFolders,

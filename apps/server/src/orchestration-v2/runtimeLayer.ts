@@ -82,7 +82,10 @@ import * as ProviderRuntimeRecoveryService from "./ProviderRuntimeRecoveryServic
 import * as ProviderSwitchService from "./ProviderSwitchService.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
-import { layerThreadWorktreeRestore } from "../workspace/restoreMissingWorktree.ts";
+import {
+  layerRestoredWorktreeSetups,
+  layerThreadWorktreeRestore,
+} from "../workspace/restoreMissingWorktree.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ResourceCleanupService from "./ResourceCleanupService.ts";
@@ -261,6 +264,8 @@ const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pip
       TurnItemPositionStore.layer,
       // The same instance as thread management's, which hands over send-time recreations.
       layerThreadWorktreeRestore,
+      // The same instance as thread launch's, which Work's stop consults.
+      layerRestoredWorktreeSetups,
     ),
   ),
 );
@@ -392,6 +397,7 @@ const layerThreadLaunchProvided = ThreadLaunchService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       layerRunAdmission,
+      layerRestoredWorktreeSetups,
       layerProjectSetupScriptRunner,
       layerManagedProjectFoldersProvided,
       layerThreadManagementProvided,
