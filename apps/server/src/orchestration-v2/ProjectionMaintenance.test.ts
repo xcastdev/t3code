@@ -469,7 +469,9 @@ it.effect("a deleted thread keeps only its tombstone", () =>
     assert.equal(yield* searchMatches("secret in thread:purge-deleted"), 1);
 
     yield* deleteThread(deleted, now);
-    assert.isAbove(yield* maintenance.purgeDeletedThread(deleted.id), 0);
+    const purge = yield* maintenance.purgeDeletedThread(deleted.id);
+    assert.isAbove(purge.purgedRowCount, 0);
+    assert.deepEqual(purge.purgedThreadIds, [deleted.id]);
 
     assert.equal(yield* contentRowCount(deleted.id), 0);
     assert.equal(yield* searchMatches("secret in thread:purge-deleted"), 0);
@@ -499,7 +501,7 @@ it.effect("a deleted thread keeps only its tombstone", () =>
     );
     assert.equal(leaked[0]?.count, 0);
     assert.deepEqual(yield* projections.getThreadProjection(live.id), liveProjection);
-    assert.equal(yield* maintenance.purgeDeletedThread(deleted.id), 0);
+    assert.equal((yield* maintenance.purgeDeletedThread(deleted.id)).purgedRowCount, 0);
   }).pipe(Effect.provide(layerTest)),
 );
 
@@ -516,11 +518,15 @@ it.effect("a deleted run-fork source stays until its last live fork is deleted",
     yield* writeThread(fork, now);
 
     yield* deleteThread(source, now);
-    assert.equal(yield* maintenance.purgeDeletedThread(source.id), 0);
+    assert.deepEqual(yield* maintenance.purgeDeletedThread(source.id), {
+      purgedRowCount: 0,
+      purgedThreadIds: [],
+    });
     assert.isAbove(yield* contentRowCount(source.id), 0);
 
     yield* deleteThread(fork, now);
-    yield* maintenance.purgeDeletedThread(fork.id);
+    const { purgedThreadIds } = yield* maintenance.purgeDeletedThread(fork.id);
+    assert.sameMembers([...purgedThreadIds], [fork.id, source.id]);
     assert.equal(yield* contentRowCount(source.id), 0);
     assert.equal(yield* contentRowCount(fork.id), 0);
   }).pipe(Effect.provide(layerTest)),

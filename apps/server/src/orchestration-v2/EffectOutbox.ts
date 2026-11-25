@@ -149,6 +149,8 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("thread-content.purge"),
+    // The deletion's files, freed again once the purge releases the archives that claimed them.
+    attachmentIds: Schema.optional(Schema.Array(Schema.String)),
   }),
   Schema.Struct({
     type: Schema.Literal("thread-title.generate"),

@@ -240,7 +240,10 @@ export const planThreadDeletion = Effect.fn("ThreadDeletion.planThreadDeletion")
     id: `effect:${command.commandId}:thread-content.purge`,
     commandId: command.commandId,
     threadId: command.threadId,
-    request: { type: "thread-content.purge" },
+    request: {
+      type: "thread-content.purge",
+      ...(attachmentIds.length > 0 ? { attachmentIds } : {}),
+    },
   });
   return { events, effects };
 });

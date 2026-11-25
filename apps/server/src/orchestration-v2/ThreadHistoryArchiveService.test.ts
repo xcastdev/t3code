@@ -341,3 +341,67 @@ it.live(
       assert.isTrue(yield* archives.isAttachmentRetained("retained-blob"));
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
 );
+
+it.live("releasing a thread's archives frees its claims and keeps other threads' archives", () =>
+  Effect.gen(function* () {
+    const { sql, cwd } = yield* setup();
+    const archives = yield* Archive.ThreadHistoryArchiveService;
+    const checkpoints = yield* CheckpointStore.CheckpointStore;
+    const fork = ThreadId.make("archive-live-fork");
+    const rows = yield* sql<
+      Record<string, string | number | null>
+    >`SELECT * FROM orchestration_v2_projection_threads WHERE thread_id=${threadId}`;
+    const payload = yield* sql<{
+      payload_json: string;
+    }>`SELECT json_set(payload_json,'$.id',${fork},'$.forkedFrom',json_object('type','run','threadId',${threadId},'runId','archive-run')) AS payload_json FROM orchestration_v2_projection_threads WHERE thread_id=${threadId}`;
+    yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert({ ...rows[0]!, thread_id: fork, payload_json: payload[0]!.payload_json })}`;
+    yield* archives.prepare({ threadId, archiveId: "deleted-first", reason: "rollback" });
+    yield* archives.prepare({ threadId, archiveId: "deleted-executing", reason: "rollback" });
+    yield* archives.prepare({ threadId: fork, archiveId: "live-fork", reason: "rollback" });
+    yield* archives.beginExternal({ threadId, archiveId: "deleted-executing" });
+    const ownRefs = yield* sql<{
+      retained_ref: string;
+    }>`SELECT retained_ref FROM t3_workflow_v2_history_archive_refs r JOIN t3_workflow_v2_history_archives a USING(archive_id) WHERE a.thread_id=${threadId}`;
+    assert.lengthOf(ownRefs, 2);
+
+    // An uncertain restore keeps its archive, so the caller retries once it settles.
+    assert.equal(
+      (yield* archives.releaseThread(threadId).pipe(Effect.flip)).reason,
+      "reconciliation-required",
+    );
+    assert.deepEqual(
+      (yield* archives.list({ threadId })).map((archive) => archive.archive_id),
+      ["deleted-executing"],
+    );
+    yield* archives.reconcileExternal({
+      threadId,
+      archiveId: "deleted-executing",
+      outcome: "not-applied",
+    });
+    yield* archives.releaseThread(threadId);
+    yield* archives.releaseThread(threadId);
+
+    assert.isEmpty(yield* archives.list({ threadId }));
+    for (const table of [
+      "t3_workflow_v2_history_archive_rows",
+      "t3_workflow_v2_history_archive_refs",
+      "t3_workflow_v2_history_archive_attachments",
+    ])
+      assert.isEmpty(
+        yield* sql`SELECT 1 FROM ${sql(table)} WHERE archive_id IN ('deleted-first','deleted-executing')`,
+      );
+    for (const { retained_ref } of ownRefs)
+      assert.isFalse(
+        yield* checkpoints.hasCheckpointRef({
+          cwd,
+          checkpointRef: CheckpointRef.make(retained_ref),
+        }),
+      );
+    assert.deepEqual(
+      (yield* archives.list({ threadId: fork })).map((archive) => archive.archive_id),
+      ["live-fork"],
+    );
+    // The live fork's archive still claims the blob it inherited from the released thread.
+    assert.isTrue(yield* archives.isAttachmentRetained("retained-blob"));
+  }).pipe(Effect.scoped, Effect.provide(testLayer)),
+);

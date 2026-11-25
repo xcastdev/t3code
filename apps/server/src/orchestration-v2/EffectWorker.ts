@@ -696,9 +696,17 @@ export const layerExecutor: Layer.Layer<
               ),
             );
           }
-          case "thread-content.purge":
-            return projectionMaintenance.purgeDeletedThread(effect.threadId).pipe(
-              Effect.asVoid,
+          case "thread-content.purge": {
+            const request = effect.request;
+            return Effect.gen(function* () {
+              const { purgedThreadIds } = yield* projectionMaintenance.purgeDeletedThread(
+                effect.threadId,
+              );
+              if (purgedThreadIds.length === 0) return;
+              yield* resourceCleanup.cleanupHistoryArchives(purgedThreadIds);
+              // The attachment cleanup ran first and skipped the files these archives claimed.
+              yield* resourceCleanup.cleanupAttachments(request.attachmentIds ?? []);
+            }).pipe(
               Effect.mapError(
                 (cause) =>
                   new OrchestrationEffectExecutionError({
@@ -708,6 +716,7 @@ export const layerExecutor: Layer.Layer<
                   }),
               ),
             );
+          }
           case "thread-title.generate":
             return threadTitleRegeneration
               .execute({

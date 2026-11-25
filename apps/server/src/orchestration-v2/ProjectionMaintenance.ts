@@ -39,11 +39,15 @@ export interface ProjectionMaintenanceV2Shape {
   >;
   /**
    * Removes a deleted thread's conversation, and that of deleted run-fork sources it alone kept.
-   * Returns the number of rows removed.
+   * Returns the number of rows removed and every thread it purged.
    */
-  readonly purgeDeletedThread: (
-    threadId: ThreadId,
-  ) => Effect.Effect<number, ProjectionMaintenanceError>;
+  readonly purgeDeletedThread: (threadId: ThreadId) => Effect.Effect<
+    {
+      readonly purgedRowCount: number;
+      readonly purgedThreadIds: ReadonlyArray<ThreadId>;
+    },
+    ProjectionMaintenanceError
+  >;
 }
 
 export class ProjectionMaintenanceV2 extends Context.Service<
@@ -293,7 +297,7 @@ export const layer: Layer.Layer<ProjectionMaintenanceV2, never, SqlClient.SqlCli
     // every live thread that shows it is deleted too.
     const purgeableThreads = (deletedThreadId: ThreadId | undefined) =>
       sql<{
-        readonly thread_id: string;
+        readonly thread_id: ThreadId;
       }>`
       WITH RECURSIVE shown(thread_id) AS (
         SELECT thread_id FROM orchestration_v2_projection_threads WHERE deleted_at IS NULL
@@ -510,7 +514,7 @@ export const layer: Layer.Layer<ProjectionMaintenanceV2, never, SqlClient.SqlCli
           WHERE thread_id = ${threadId}
         `;
       }
-      return purged;
+      return { purgedRowCount: purged, purgedThreadIds: threads.map((row) => row.thread_id) };
     });
 
     const purgeDeletedThread: ProjectionMaintenanceV2Shape["purgeDeletedThread"] = (threadId) =>
@@ -562,7 +566,7 @@ export const layer: Layer.Layer<ProjectionMaintenanceV2, never, SqlClient.SqlCli
 
         // Catches threads deleted before purging existed, and any purge a crash interrupted.
         // It runs first so the legacy prune below takes the v1 events of threads it marks.
-        const purgedRowCount = yield* purgeThreads(undefined, betweenPages);
+        const { purgedRowCount } = yield* purgeThreads(undefined, betweenPages);
 
         const legacy = yield* pruneImportedLegacyHistory(
           head,

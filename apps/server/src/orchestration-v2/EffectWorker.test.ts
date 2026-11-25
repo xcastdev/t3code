@@ -39,6 +39,7 @@ import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
+import * as ResourceCleanupService from "./ResourceCleanupService.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
@@ -95,6 +96,7 @@ function layerExecutorFor(input: {
   readonly interrupt?: ProviderTurnControlService.ProviderTurnControlServiceV2Shape["interrupt"];
   readonly rollback?: CheckpointRollbackService.CheckpointRollbackServiceV2Shape["execute"];
   readonly respond?: RuntimeRequestService.RuntimeRequestServiceV2["Service"]["respond"];
+  readonly maintenance?: Partial<ProjectionMaintenance.ProjectionMaintenanceV2["Service"]>;
 }) {
   const record = (event: string) => Ref.update(input.events, (events) => [...events, event]);
   const layerDependencies = Layer.mergeAll(
@@ -179,7 +181,7 @@ function layerExecutorFor(input: {
         layerDependencies,
         Layer.mock(ThreadManagementService.ThreadManagementService)(input.threads ?? {}),
         Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
-        Layer.mock(ProjectionMaintenance.ProjectionMaintenanceV2)({}),
+        Layer.mock(ProjectionMaintenance.ProjectionMaintenanceV2)(input.maintenance ?? {}),
         ServerSettings.layerTest(
           input.continueAfterRestart === true ? { continueThreadsAfterServerUpdate: true } : {},
         ),
@@ -302,6 +304,47 @@ it.effect.each([
       yield* Effect.flip(executor.execute(rollback, { willRetry: false }));
     }).pipe(Effect.provide(layer));
     assert.deepEqual(yield* Ref.get(failures), [message]);
+  }),
+);
+
+it.effect.each([
+  { name: "releases the archives of every thread it purged", purged: true },
+  { name: "keeps the archives of a thread it could not purge yet", purged: false },
+])("thread purge $name", ({ purged }) =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const record = (event: string) => Ref.update(events, (current) => [...current, event]);
+    const forkSourceId = ThreadId.make("thread:effect-worker-purged-fork-source");
+    const layer = layerExecutorFor({
+      events,
+      maintenance: {
+        purgeDeletedThread: () =>
+          Effect.succeed({
+            purgedRowCount: purged ? 3 : 0,
+            purgedThreadIds: purged ? [threadId, forkSourceId] : [],
+          }),
+      },
+    });
+    const cleanup = ResourceCleanupService.ResourceCleanupService.of({
+      ...ResourceCleanupService.ResourceCleanupService.defaultValue(),
+      cleanupHistoryArchives: (threadIds) => record(`archives:${threadIds.join(",")}`),
+      cleanupAttachments: (attachmentIds) => record(`attachments:${attachmentIds.join(",")}`),
+    });
+    yield* Effect.gen(function* () {
+      const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+      yield* executor.execute({
+        ...restartEffect(now, { type: "detach" }),
+        request: { type: "thread-content.purge", attachmentIds: ["attachment-claimed"] },
+      });
+    }).pipe(
+      Effect.provide(layer),
+      Effect.provideService(ResourceCleanupService.ResourceCleanupService, cleanup),
+    );
+    assert.deepEqual(
+      yield* Ref.get(events),
+      purged ? [`archives:${threadId},${forkSourceId}`, "attachments:attachment-claimed"] : [],
+    );
   }),
 );
 

@@ -99,6 +99,8 @@ export class ThreadHistoryArchiveService extends Context.Service<
       input: Identity & { readonly outcome: "completed" | "not-applied" },
     ) => Effect.Effect<void, HistoryArchiveError>;
     readonly release: (input: Identity) => Effect.Effect<void, HistoryArchiveError>;
+    /** Releases every archive of a purged thread; an uncertain restore fails it for a retry. */
+    readonly releaseThread: (threadId: ThreadId) => Effect.Effect<void, HistoryArchiveError>;
     readonly isCheckpointRetained: (ref: string) => Effect.Effect<boolean, HistoryArchiveError>;
     readonly isAttachmentRetained: (id: string) => Effect.Effect<boolean, HistoryArchiveError>;
   }
@@ -313,6 +315,36 @@ const make = Effect.gen(function* () {
       }),
     );
   });
+  const release = Effect.fn("ThreadHistoryArchive.releaseArchive")(function* (input: Identity) {
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        const archive = yield* read(input);
+        const dependent =
+          yield* sql`SELECT 1 FROM t3_workflow_v2_history_archives WHERE state='executing' AND json_extract(operation_json,'$.type')='file-restore' AND json_extract(operation_json,'$.sourceArchiveId')=${input.archiveId} LIMIT 1`;
+        if (dependent.length)
+          return yield* new HistoryArchiveError({ reason: "reconciliation-required" });
+        if (archive.state === "executing")
+          return yield* new HistoryArchiveError({ reason: "reconciliation-required" });
+        if (archive.state !== "released")
+          yield* sql`UPDATE t3_workflow_v2_history_archives SET state='releasing' WHERE archive_id=${input.archiveId}`;
+      }),
+    );
+    const refs =
+      yield* sql<RetainedRef>`SELECT * FROM t3_workflow_v2_history_archive_refs WHERE archive_id=${input.archiveId}`;
+    for (const ref of refs)
+      yield* checkpoints.deleteCheckpointRefs({
+        cwd: ref.cwd,
+        checkpointRefs: [CheckpointRef.make(ref.retained_ref)],
+      });
+    yield* sql.withTransaction(
+      Effect.gen(function* () {
+        yield* sql`DELETE FROM t3_workflow_v2_history_archive_rows WHERE archive_id=${input.archiveId}`;
+        yield* sql`DELETE FROM t3_workflow_v2_history_archive_refs WHERE archive_id=${input.archiveId}`;
+        yield* sql`DELETE FROM t3_workflow_v2_history_archive_attachments WHERE archive_id=${input.archiveId}`;
+        yield* sql`UPDATE t3_workflow_v2_history_archives SET state='released' WHERE archive_id=${input.archiveId}`;
+      }),
+    );
+  });
   const protect = <A, E>(effect: Effect.Effect<A, E>) =>
     effect.pipe(
       Effect.mapError((cause) =>
@@ -386,37 +418,19 @@ const make = Effect.gen(function* () {
         changeState(input, "executing", input.outcome === "completed" ? "completed" : "ready"),
       ),
     ),
-    release: Effect.fn("ThreadHistoryArchive.release")((input) =>
+    release: Effect.fn("ThreadHistoryArchive.release")((input) => protect(release(input))),
+    releaseThread: Effect.fn("ThreadHistoryArchive.releaseThread")((threadId) =>
       protect(
         Effect.gen(function* () {
-          yield* sql.withTransaction(
-            Effect.gen(function* () {
-              const archive = yield* read(input);
-              const dependent =
-                yield* sql`SELECT 1 FROM t3_workflow_v2_history_archives WHERE state='executing' AND json_extract(operation_json,'$.type')='file-restore' AND json_extract(operation_json,'$.sourceArchiveId')=${input.archiveId} LIMIT 1`;
-              if (dependent.length)
-                return yield* new HistoryArchiveError({ reason: "reconciliation-required" });
-              if (archive.state === "executing")
-                return yield* new HistoryArchiveError({ reason: "reconciliation-required" });
-              if (archive.state !== "released")
-                yield* sql`UPDATE t3_workflow_v2_history_archives SET state='releasing' WHERE archive_id=${input.archiveId}`;
-            }),
+          const pending = yield* sql<{
+            readonly archive_id: string;
+          }>`SELECT archive_id FROM t3_workflow_v2_history_archives WHERE thread_id=${threadId} AND state!='released' ORDER BY archive_id`;
+          const [, failures] = yield* Effect.partition(
+            pending,
+            ({ archive_id }) => release({ archiveId: archive_id, threadId }),
+            { concurrency: 1 },
           );
-          const refs =
-            yield* sql<RetainedRef>`SELECT * FROM t3_workflow_v2_history_archive_refs WHERE archive_id=${input.archiveId}`;
-          for (const ref of refs)
-            yield* checkpoints.deleteCheckpointRefs({
-              cwd: ref.cwd,
-              checkpointRefs: [CheckpointRef.make(ref.retained_ref)],
-            });
-          yield* sql.withTransaction(
-            Effect.gen(function* () {
-              yield* sql`DELETE FROM t3_workflow_v2_history_archive_rows WHERE archive_id=${input.archiveId}`;
-              yield* sql`DELETE FROM t3_workflow_v2_history_archive_refs WHERE archive_id=${input.archiveId}`;
-              yield* sql`DELETE FROM t3_workflow_v2_history_archive_attachments WHERE archive_id=${input.archiveId}`;
-              yield* sql`UPDATE t3_workflow_v2_history_archives SET state='released' WHERE archive_id=${input.archiveId}`;
-            }),
-          );
+          if (failures[0] !== undefined) return yield* failures[0];
         }),
       ),
     ),

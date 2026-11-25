@@ -79,7 +79,7 @@ const compactionLayer = (
     Layer.provide(
       Layer.succeed(ProjectionMaintenance.ProjectionMaintenanceV2, {
         pruneEventStore,
-        purgeDeletedThread: () => Effect.succeed(0),
+        purgeDeletedThread: () => Effect.succeed({ purgedRowCount: 0, purgedThreadIds: [] }),
       }),
     ),
     Layer.provide(Sqlite.layerMemory),
