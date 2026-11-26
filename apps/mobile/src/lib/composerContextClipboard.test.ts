@@ -142,7 +142,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.sequence = 0;
   mocks.local.mockReturnValue(undefined);
-  mocks.execute.mockResolvedValue({ _tag: "Success", value: { relativeUrl: "/assets/source" } });
+  mocks.execute.mockResolvedValue({
+    _tag: "Success",
+    value: { relativeUrl: "https://source.example/assets/source" },
+  });
   mocks.download.mockResolvedValue({ uri: "file:///download.png", dispose: mocks.dispose });
   mocks.persist.mockResolvedValue("file:///owned.png");
   mocks.remove.mockResolvedValue(undefined);

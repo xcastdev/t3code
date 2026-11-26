@@ -5,6 +5,8 @@ import {
   PROJECT_FAVICON_THUMBNAIL_SIZE,
 } from "@t3tools/client-runtime/project-favicon-cache";
 
+import { fetchEnvironmentResource } from "../connection/environmentTransport";
+
 const DATABASE_NAME = "t3code:project-favicons";
 const DATABASE_VERSION = 2;
 const STORE_NAME = "images";
@@ -80,5 +82,9 @@ export const projectFaviconCache = createProjectFaviconCache({
       await withStore("readwrite", (store) => store.delete(key));
     },
   },
-  load: createProjectFaviconImageLoader({ downscale: downscaleProjectFavicon }),
+  load: createProjectFaviconImageLoader({
+    // The asset RPC has already bound the icon grant to its issuing environment.
+    fetch: fetchEnvironmentResource,
+    downscale: downscaleProjectFavicon,
+  }),
 });

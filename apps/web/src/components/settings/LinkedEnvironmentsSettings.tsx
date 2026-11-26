@@ -41,7 +41,11 @@ import { Input } from "../ui/input";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { ITEM_ROW_CLASSNAME, ITEM_ROW_INNER_CLASSNAME } from "./itemRows";
 import { LinkAccessPicker } from "./LinkAccessPicker";
-import { LinkAddressWarning, LinkMachineSelect } from "./LinkMachineSelect";
+import {
+  LinkAddressWarning,
+  LinkMachineAddressSelect,
+  LinkMachineSelect,
+} from "./LinkMachineSelect";
 import { SettingsRow, SettingsSection } from "./settingsLayout";
 import { useLiveRefresh } from "../../hooks/useLiveRefresh";
 import { useNowMinute } from "../../hooks/useNowMinute";
@@ -185,6 +189,10 @@ function LinkEnvironmentAction({ environmentId }: { readonly environmentId: Envi
   const machines = useLinkableMachines(environmentId, open);
   // Null until the user picks; with no other machines known, only an address is left.
   const [choice, setChoice] = useState<string | null>(null);
+  const [addressChoice, setAddressChoice] = useState<{
+    environmentId: EnvironmentId;
+    url: string;
+  } | null>(null);
   const [address, setAddress] = useState("");
   const [pairingCode, setPairingCode] = useState("");
   const [access, setAccess] = useState<AuthMcpClientAccess>("approval-required");
@@ -202,6 +210,12 @@ function LinkEnvironmentAction({ environmentId }: { readonly environmentId: Envi
   const mayMint = useEnvironmentScope(targetId, AuthAccessWriteScope);
   // A picked machine that left the list has no address here either.
   const needsAddress = selected !== null && (machine === null || machine.urls.length === 0);
+  const selectedUrl =
+    machine !== null &&
+    addressChoice?.environmentId === machine.environmentId &&
+    machine.urls.includes(addressChoice.url)
+      ? addressChoice.url
+      : null;
   // This client mints a code there when it is connected with a session that may
   // create pairing links, and only for its own addresses: anything can answer
   // as that machine at one typed in, so that one gets a code the user fetched.
@@ -213,12 +227,13 @@ function LinkEnvironmentAction({ environmentId }: { readonly environmentId: Envi
     !mintFailed.has(targetId);
   const ready =
     selected !== null &&
-    (!needsAddress || address.trim().length > 0) &&
+    (needsAddress ? address.trim().length > 0 : selectedUrl !== null) &&
     (canMint || pairingCode.trim().length > 0);
   const handleOpenChange = (next: boolean) => {
     setOpen(next);
     if (!next) {
       setChoice(null);
+      setAddressChoice(null);
       setAddress("");
       setPairingCode("");
       setAccess("approval-required");
@@ -235,9 +250,8 @@ function LinkEnvironmentAction({ environmentId }: { readonly environmentId: Envi
     return null;
   };
   const submit = async () => {
-    const [url, ...alternateUrls] =
-      machine === null || needsAddress ? [address.trim()] : machine.urls;
-    if (inFlight.current || !ready || url === undefined) return;
+    if (inFlight.current || !ready) return;
+    const namedMachine = selectedUrl === null ? null : machine;
     inFlight.current = true;
     setBusy(true);
     const code = await resolvePairingCode();
@@ -247,12 +261,15 @@ function LinkEnvironmentAction({ environmentId }: { readonly environmentId: Envi
         : await link({
             environmentId,
             input: {
-              url,
-              ...(alternateUrls.length > 0 ? { alternateUrls } : {}),
+              url: selectedUrl ?? address.trim(),
               // A typed address links alone: only this app's own addresses name a machine.
-              ...(machine === null || needsAddress
+              ...(namedMachine === null
                 ? {}
-                : { expectedEnvironmentId: machine.environmentId, expectedLabel: machine.label }),
+                : {
+                    expectedEnvironmentId: namedMachine.environmentId,
+                    expectedLabel: namedMachine.label,
+                    addressConfirmed: true,
+                  }),
               pairingCode: code,
               access,
             },
@@ -306,13 +323,24 @@ function LinkEnvironmentAction({ environmentId }: { readonly environmentId: Envi
                 machines={machines}
                 value={selected}
                 disabled={busy}
-                onChange={setChoice}
+                onChange={(next) => {
+                  setChoice(next);
+                  setAddressChoice(null);
+                }}
               />
             ) : null}
             {machine?.linked ? (
               <p className="text-xs text-muted-foreground">
                 Already linked. Linking again renews it with the access you pick.
               </p>
+            ) : null}
+            {machine !== null && machine.urls.length > 0 ? (
+              <LinkMachineAddressSelect
+                urls={machine.urls}
+                value={selectedUrl}
+                onChange={(url) => setAddressChoice({ environmentId: machine.environmentId, url })}
+                disabled={busy}
+              />
             ) : null}
             {needsAddress ? (
               <label className="block space-y-1.5">

@@ -1,25 +1,40 @@
-import type { ScopedThreadRef } from "@t3tools/contracts";
+import type { EnvironmentId, ScopedThreadRef } from "@t3tools/contracts";
 import {
   HTML_RENDER_COLUMN_WIDTH,
   htmlRenderFrameHeight,
+  htmlRenderFileName,
   type HtmlRenderReference,
 } from "@t3tools/shared/htmlRender";
-import { MinusIcon, PlusIcon, XIcon } from "lucide-react";
+import { DownloadIcon, MinusIcon, PlusIcon, XIcon } from "lucide-react";
 import { useRef, useState } from "react";
 
+import { hostedAdmissionRequired } from "~/connection/hostedRelayAdmission";
+import { readVerifiedPreviewAsset } from "~/browser/readVerifiedPreviewAsset";
+import { saveBlob } from "~/lib/saveBlob";
+import { toastManager } from "~/components/ui/toast";
 import { observeResize } from "~/lib/observeResize";
 
-import { HtmlRenderDocument } from "../files/BrowserDocumentFrame";
+import { HtmlRenderDocument, OfflineHtmlFile } from "../files/BrowserDocumentFrame";
 import { Button } from "../ui/button";
 import { Dialog, DialogPopup, DialogTitle } from "../ui/dialog";
 
+export type HtmlRenderSource =
+  | { readonly src: string; readonly verified?: true }
+  | { readonly file: Blob };
+
 export function HtmlRenderDialog(props: {
-  readonly src: string;
+  readonly source: HtmlRenderSource;
+  readonly environmentId?: EnvironmentId;
   readonly htmlRender: HtmlRenderReference;
   readonly threadRef?: ScopedThreadRef | undefined;
   readonly onClose: () => void;
 }) {
   const { title } = props.htmlRender;
+  const environmentId = props.environmentId ?? props.threadRef?.environmentId;
+  const hostedSource =
+    "src" in props.source && props.source.verified && hostedAdmissionRequired(props.source.src)
+      ? props.source.src
+      : null;
   const [zoom, setZoom] = useState(1);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const [width, setWidth] = useState(HTML_RENDER_COLUMN_WIDTH);
@@ -60,19 +75,43 @@ export function HtmlRenderDialog(props: {
           <div className="max-h-[min(86vh,calc(100vh-160px))] overflow-y-auto overscroll-contain rounded-lg bg-background p-4 shadow-2xl ring-1 ring-border/70">
             <div ref={measureBox}>
               <div style={{ zoom, height }}>
-                <HtmlRenderDocument
-                  src={props.src}
-                  title={title}
-                  threadRef={props.threadRef}
-                  className="block size-full"
-                  onContentHeight={setContentHeight}
-                />
+                {"file" in props.source ? (
+                  <div className="flex size-full flex-col">
+                    <OfflineHtmlFile file={props.source.file} title={title} />
+                  </div>
+                ) : (
+                  <HtmlRenderDocument
+                    src={props.source.src}
+                    verified={props.source.verified}
+                    title={title}
+                    threadRef={props.threadRef}
+                    environmentId={environmentId}
+                    className="block size-full"
+                    onContentHeight={setContentHeight}
+                  />
+                )}
               </div>
             </div>
           </div>
           <div className="mt-2 flex min-w-0 items-center justify-center gap-3 text-xs text-white/80">
             <span className="truncate">{title}</span>
             <div className="flex shrink-0 items-center gap-1">
+              {environmentId && hostedSource ? (
+                <Button
+                  aria-label="Download original"
+                  size="icon-sm"
+                  variant="overlay"
+                  onClick={() => {
+                    void readVerifiedPreviewAsset(environmentId, hostedSource)
+                      .then((blob) => saveBlob(blob, htmlRenderFileName(title)))
+                      .catch(() =>
+                        toastManager.add({ type: "error", title: "Unable to download page" }),
+                      );
+                  }}
+                >
+                  <DownloadIcon />
+                </Button>
+              ) : null}
               <Button
                 aria-label="Zoom out"
                 size="icon-sm"

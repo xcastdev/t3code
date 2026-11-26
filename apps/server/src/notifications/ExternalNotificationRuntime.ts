@@ -1,8 +1,15 @@
-import type { ProjectWorkTaskId } from "@t3tools/contracts";
+import type {
+  OrchestrationV2DomainEvent,
+  OrchestrationV2Notification,
+  ProjectWorkAttentionRead,
+  ProjectWorkTaskId,
+} from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
@@ -47,6 +54,119 @@ export class ExternalNotificationRuntime extends Context.Service<
   { readonly start: Effect.Effect<void, never, Scope.Scope> }
 >()("t3/notifications/ExternalNotificationRuntime") {}
 
+const messageEventType = {
+  completed: "completion",
+  failed: "failure",
+  cancelled: "cancelled",
+  updated: "update",
+  unknown: "unknown",
+} as const satisfies Record<OrchestrationV2Notification["outcome"], string>;
+
+const threadFactSource = ({ threadId, projectId }: OrchestrationV2DomainEvent) => ({
+  threadId,
+  ...(projectId === undefined ? {} : { projectId }),
+});
+
+const messageFact = (
+  event: OrchestrationV2DomainEvent,
+  messageId: string,
+  notification: Pick<OrchestrationV2Notification, "outcome" | "summary">,
+  taskId?: string,
+): ExternalNotificationDispatcher.ExternalNotificationFact => ({
+  eventType: messageEventType[notification.outcome],
+  occurrenceId: JSON.stringify(["message", event.threadId, messageId]),
+  legacyIdentity: JSON.stringify(["notification", event.threadId, messageId]),
+  ...threadFactSource(event),
+  timestamp: DateTime.formatIso(event.occurredAt),
+  title: notification.summary.slice(0, 1024),
+  ...(taskId === undefined ? {} : { taskId }),
+});
+
+const attentionFact = (
+  event: ProjectWorkEvent,
+  attention: ProjectWorkAttentionRead,
+): ExternalNotificationDispatcher.ExternalNotificationFact => {
+  const { taskId, reason, revision } = attention;
+  const identity = JSON.stringify(["work-attention", event.projectId, taskId, reason, revision]);
+  return {
+    eventType: "work-attention",
+    occurrenceId: identity,
+    legacyIdentity: identity,
+    projectId: event.projectId,
+    taskId,
+    timestamp: event.occurredAt,
+    title: reason,
+    reason,
+  };
+};
+
+const domainFact = (
+  event: OrchestrationV2DomainEvent,
+): ExternalNotificationDispatcher.ExternalNotificationFact | undefined => {
+  switch (event.type) {
+    case "message.updated":
+      return event.payload.notification !== undefined && !event.payload.streaming
+        ? messageFact(
+            event,
+            event.payload.id,
+            event.payload.notification,
+            event.payload.scheduledTaskId,
+          )
+        : undefined;
+    case "turn-item.updated": {
+      const item = event.payload;
+      if (item.type !== "notification") return;
+      if (item.sourceMessageId !== undefined) {
+        return { ...messageFact(event, item.sourceMessageId, item), liveOnly: true };
+      }
+      return {
+        eventType: messageEventType[item.outcome],
+        occurrenceId: JSON.stringify(["turn-item", event.threadId, item.id]),
+        liveOnly: true,
+        ...threadFactSource(event),
+        timestamp: DateTime.formatIso(event.occurredAt),
+        title: item.summary.slice(0, 1024),
+      };
+    }
+    case "runtime-request.updated": {
+      const { id, kind, status } = event.payload;
+      if (status !== "pending" || kind === "dynamic_tool_call" || kind === "auth_refresh") return;
+      const needsInput = kind === "user_input" || kind === "mcp-elicitation";
+      return {
+        eventType: needsInput ? "needs-input" : "needs-approval",
+        occurrenceId: JSON.stringify(["runtime-request", event.threadId, id]),
+        legacyIdentity: JSON.stringify(["notification", event.threadId, `runtime-request:${id}`]),
+        ...threadFactSource(event),
+        timestamp: DateTime.formatIso(event.occurredAt),
+        title: needsInput ? "A question needs an answer" : "Approval required",
+      };
+    }
+    case "run.updated": {
+      const run = event.payload;
+      // The parent reports delegated outcomes through its notification.
+      if (run.delegatedTaskId !== undefined || run.startedAt === null || run.completedAt === null)
+        return;
+      const eventType =
+        run.status === "interrupted"
+          ? "cancelled"
+          : run.status === "completed" || run.status === "failed" || run.status === "cancelled"
+            ? messageEventType[run.status]
+            : undefined;
+      if (eventType === undefined) return;
+      return {
+        eventType,
+        occurrenceId: JSON.stringify(["run", event.threadId, run.id]),
+        liveOnly: true,
+        ...threadFactSource(event),
+        timestamp: DateTime.formatIso(run.completedAt),
+        title: `Agent run ${run.status}`,
+      };
+    }
+    default:
+      return;
+  }
+};
+
 const make = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const bus = yield* ProjectWorkEventBus.ProjectWorkEventBus;
@@ -71,11 +191,9 @@ const make = Effect.gen(function* () {
       // This adapts the persisted foundation event, not a Work attention row.
       // Its project-global event revision owns the occurrence, avoiding collisions
       // between distinct gates/questions whose record-local revisions are both zero.
-      yield* dispatcher.notifyCommitted({
-        kind: "work-attention",
-        projectId: event.projectId,
-        attention: { taskId: record.taskId, reason, revision: event.revision },
-      });
+      yield* dispatcher.notifyCommitted(
+        attentionFact(event, { taskId: record.taskId, reason, revision: event.revision }),
+      );
       return;
     }
     const cause = attentionCause(event);
@@ -95,11 +213,7 @@ const make = Effect.gen(function* () {
         fact.seenAt !== undefined
       )
         continue;
-      yield* dispatcher.notifyCommitted({
-        kind: "work-attention",
-        projectId: event.projectId,
-        attention: fact,
-      });
+      yield* dispatcher.notifyCommitted(attentionFact(event, fact));
     }
   }, Effect.ignoreCause());
   const start = Effect.fn("ExternalNotificationRuntime.start")(function* () {
@@ -109,43 +223,11 @@ const make = Effect.gen(function* () {
     yield* Stream.runForEach(work, workCommitted).pipe(Effect.ignoreCause, Effect.forkScoped);
     // Orchestrator owns the live-tail cursor; subscribing does not replay stored events.
     yield* orchestrator.streamDomainEvents.pipe(
-      Stream.buffer({ capacity: 64, strategy: "dropping" }),
-      Stream.runForEach((event) => {
-        if (
-          event.type === "runtime-request.updated" &&
-          event.payload.status === "pending" &&
-          event.payload.kind !== "dynamic_tool_call" &&
-          event.payload.kind !== "auth_refresh"
-        ) {
-          return dispatcher
-            .notifyCommitted({
-              kind: "notification",
-              threadId: event.threadId,
-              messageId: `runtime-request:${event.payload.id}`,
-              notification: {
-                source: { kind: "background_task" },
-                outcome: "updated",
-                summary:
-                  event.payload.kind === "user_input" || event.payload.kind === "mcp-elicitation"
-                    ? "A question needs an answer"
-                    : "Approval required",
-              },
-            })
-            .pipe(Effect.ignoreCause);
-        }
-        return event.type === "message.updated" &&
-          event.payload.notification !== undefined &&
-          !event.payload.streaming
-          ? dispatcher
-              .notifyCommitted({
-                kind: "notification",
-                threadId: event.payload.threadId,
-                messageId: event.payload.id,
-                notification: event.payload.notification,
-              })
-              .pipe(Effect.ignoreCause)
-          : Effect.void;
+      Stream.filterMap((event) => {
+        const fact = domainFact(event);
+        return fact === undefined ? Result.failVoid : Result.succeed(fact);
       }),
+      Stream.runForEach(dispatcher.notifyCommitted),
       Effect.ignoreCause,
       Effect.forkScoped,
     );

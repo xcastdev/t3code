@@ -11,6 +11,7 @@ import { FetchHttpClient, type HttpMethod } from "effect/http";
 
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
 import type { PreparedConnection, PreparedHttpAuthorization } from "../connection/model.ts";
+import { requireRouteAdmission, requireVerifiedRoute } from "../connection/verifiedRoute.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import * as ManagedRelay from "../relay/managedRelay.ts";
 import {
@@ -147,8 +148,14 @@ const executeEnvironmentRequest = Effect.fnUntraced(function* <
 >(input: {
   readonly prepared: Pick<
     PreparedConnection,
-    "environmentId" | "httpBaseUrl" | "httpAuthorization" | "target"
-  >;
+    | "environmentId"
+    | "httpBaseUrl"
+    | "httpAuthorization"
+    | "target"
+    | "learnedRoute"
+    | "verificationRequired"
+  > &
+    Partial<Pick<PreparedConnection, "socketUrl">>;
   readonly signer: Option.Option<ManagedRelay.ManagedRelayDpopSigner["Service"]>;
   readonly remoteAuthorization?: Option.Option<
     RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]
@@ -178,9 +185,21 @@ const executeEnvironmentRequest = Effect.fnUntraced(function* <
   let httpBaseUrl = input.prepared.httpBaseUrl;
   const requestUrlFor = (baseUrl: string) =>
     input.url(makeEnvironmentHttpApiUrlBuilder(baseUrl)[input.group]);
+  const verificationRequired = input.prepared.verificationRequired || input.prepared.learnedRoute;
   return yield* Effect.gen(function* () {
     let rejectedAccessToken: string | undefined;
     for (;;) {
+      if (verificationRequired) {
+        yield* requireVerifiedRoute(input.prepared.environmentId, {
+          httpBaseUrl,
+          wsBaseUrl: input.prepared.socketUrl ?? "",
+        }).pipe(
+          Effect.flatMap(requireRouteAdmission),
+          Effect.mapError(
+            (cause) => new RemoteEnvironmentAuthFetchError({ message: cause.message, cause }),
+          ),
+        );
+      }
       let authorization = input.prepared.httpAuthorization;
       if (authorization?._tag === "Dpop") {
         const remote = input.remoteAuthorization;
@@ -224,7 +243,7 @@ const executeEnvironmentRequest = Effect.fnUntraced(function* <
         input.timeoutMs,
         withEnvironmentRequestInit(
           authorization,
-          input.requestInit,
+          verificationRequired ? { ...input.requestInit, redirect: "error" } : input.requestInit,
           input.request({ client, headers }),
         ),
       ).pipe(Effect.result);

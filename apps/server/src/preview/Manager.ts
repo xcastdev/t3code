@@ -11,6 +11,7 @@ import {
   type PreviewAdjustInput,
   FILL_PREVIEW_VIEWPORT,
   PreviewSessionLookupError,
+  PreviewVerifiedAssetUnavailableError,
   type PreviewSessionSnapshot,
 } from "@t3tools/contracts";
 import {
@@ -29,6 +30,8 @@ import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 import { PreviewControlRequiredError } from "@t3tools/contracts";
 
+import * as VerifiedAssetNavigation from "./VerifiedAssetNavigation.ts";
+
 export class PreviewManager extends Context.Service<
   PreviewManager,
   {
@@ -39,6 +42,9 @@ export class PreviewManager extends Context.Service<
         readonly beforePublish?: (snapshot: PreviewSessionSnapshot) => void;
       },
     ) => Effect.Effect<PreviewSessionSnapshot, PreviewError>;
+    readonly verifiedAssetFor: (
+      input: PreviewCloseInput & { readonly tabId: string },
+    ) => Effect.Effect<VerifiedAssetNavigation.VerifiedAssetNavigation | undefined>;
     readonly reportStatus: (
       input: PreviewReportStatusInput & { readonly serverControlled?: boolean },
     ) => Effect.Effect<void, PreviewError>;
@@ -74,6 +80,7 @@ interface PreviewSessionState {
   readonly threadId: string;
   readonly tabId: string;
   readonly snapshot: PreviewSessionSnapshot;
+  readonly verifiedAsset?: VerifiedAssetNavigation.VerifiedAssetNavigation;
 }
 
 interface ManagerState {
@@ -124,6 +131,8 @@ const normalizeUrl = (rawUrl: string): Effect.Effect<string, PreviewInvalidUrlEr
   });
 
 const currentIsoTimestamp = DateTime.now.pipe(Effect.map(DateTime.formatIso));
+const verifiedAssetEnrollment = () =>
+  VerifiedAssetNavigation.readEnrollment(process.env.T3CODE_SERVER_BROWSER_VERIFIED_ROUTE);
 
 /** @public */
 export const make = Effect.gen(function* PreviewManagerMake() {
@@ -191,19 +200,32 @@ export const make = Effect.gen(function* PreviewManagerMake() {
   const open: PreviewManager["Service"]["open"] = Effect.fn("PreviewManager.open")(
     function* (input) {
       const runtime = input.runtime;
+      const verifiedAsset =
+        input.verifiedAssetUrl === undefined
+          ? undefined
+          : VerifiedAssetNavigation.prepare(input.verifiedAssetUrl, verifiedAssetEnrollment());
+      if (
+        verifiedAsset === null ||
+        (verifiedAsset && (runtime !== "server" || input.url !== undefined))
+      ) {
+        return yield* new PreviewVerifiedAssetUnavailableError();
+      }
       // Persisted client surfaces must not bind to a different tab after a server restart.
       const tabId = `${newPreviewTabId()}${runtime === "server" ? `_${serverEpoch}` : ""}`;
       const updatedAt = yield* currentIsoTimestamp;
       const snapshot: PreviewSessionSnapshot = {
         threadId: input.threadId,
         tabId,
-        navStatus: input.url
-          ? { _tag: "Loading", url: yield* normalizeUrl(input.url), title: "" }
-          : { _tag: "Idle" },
+        navStatus: verifiedAsset
+          ? { _tag: "Loading", url: verifiedAsset.viewUrl.href, title: "" }
+          : input.url
+            ? { _tag: "Loading", url: yield* normalizeUrl(input.url), title: "" }
+            : { _tag: "Idle" },
+        ...(verifiedAsset ? { headless: true, verifiedAsset: true } : {}),
         canGoBack: false,
         canGoForward: false,
         viewport: input.viewport ?? FILL_PREVIEW_VIEWPORT,
-        ...(input.profileId === undefined ? {} : { profileId: input.profileId }),
+        ...(verifiedAsset || input.profileId === undefined ? {} : { profileId: input.profileId }),
         ...(runtime === undefined ? {} : { runtime }),
         ...(input.colorScheme === undefined ? {} : { colorScheme: input.colorScheme }),
         ...(input.zoomFactor === undefined ? {} : { zoomFactor: input.zoomFactor }),
@@ -221,6 +243,7 @@ export const make = Effect.gen(function* PreviewManagerMake() {
             threadId: input.threadId,
             tabId,
             snapshot,
+            ...(verifiedAsset ? { verifiedAsset } : {}),
           });
           input.beforePublish?.(snapshot);
           yield* PubSub.publish(eventsPubSub, {
@@ -451,6 +474,7 @@ export const make = Effect.gen(function* PreviewManagerMake() {
 
   const list: PreviewManager["Service"]["list"] = Effect.fn("PreviewManager.list")(
     function* (input) {
+      const enrollment = verifiedAssetEnrollment();
       return yield* SynchronizedRef.get(stateRef).pipe(
         Effect.map((state): PreviewListResult => ({
           sessions: sessionsForThread(state, input.threadId)
@@ -458,6 +482,7 @@ export const make = Effect.gen(function* PreviewManagerMake() {
             .toSorted((a, b) => a.updatedAt.localeCompare(b.updatedAt)),
           serverEpoch,
           revision: state.revision,
+          ...(enrollment === null ? {} : { verifiedAssetOrigin: enrollment.httpsOrigin }),
         })),
       );
     },
@@ -496,6 +521,13 @@ export const make = Effect.gen(function* PreviewManagerMake() {
 
   return PreviewManager.of({
     open,
+    // An opened event can reach the browser before the state write releases its lock.
+    verifiedAssetFor: Effect.fn("PreviewManager.verifiedAssetFor")(({ threadId, tabId }) =>
+      SynchronizedRef.modify(stateRef, (state) => [
+        state.sessions.get(compositeKey(threadId, tabId))?.verifiedAsset,
+        state,
+      ]),
+    ),
     requestReveal,
     reportStatus,
     markHeadless,

@@ -9,12 +9,14 @@ import {
   makeRevisionedAssetUrlFamily,
 } from "@t3tools/client-runtime/state/assets";
 import { executeAtomQuery, squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
-import type { AssetResource, EnvironmentId } from "@t3tools/contracts";
+import type { AssetCreateUrlResult, AssetResource, EnvironmentId } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { Atom, AsyncResult } from "effect/reactivity";
 
+import { issuedMobileAssetUrl } from "../lib/verifiedAssetUrl";
+import { useVerifiedLocalAsset } from "../lib/useVerifiedLocalAsset";
 import { environmentCatalog } from "../connection/catalog";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { projectFaviconDatabaseCache } from "../lib/projectFaviconDatabaseCache";
@@ -32,7 +34,17 @@ export const assetEnvironment = createAssetEnvironmentAtoms(connectionAtomRuntim
 
 export const projectFaviconUrlAtom = createProjectFaviconUrlAtomFamily({
   imageCache: projectFaviconDatabaseCache,
-  createUrl: assetEnvironment.createUrl,
+  createUrl: (input) =>
+    Atom.make((get) => {
+      const result = get(assetEnvironment.createUrl(input));
+      if (
+        result._tag === "Success" &&
+        issuedMobileAssetUrl(input.environmentId, result.value) === null
+      ) {
+        return AsyncResult.initial();
+      }
+      return result;
+    }),
   preparedConnection: environmentSession.preparedConnectionValueAtom,
   projectClones: environmentProjectCloneListAtom,
 });
@@ -47,6 +59,7 @@ export function useAssetUrlState(
   environmentId: EnvironmentId | null,
   resource: AssetResource | null,
   revision?: string | null,
+  delivery?: "web-document",
 ): AssetUrlState {
   const fileAccessSession = useEnvironmentQuery(
     environmentId === null ? null : environmentSession.sessionStateAtom(environmentId),
@@ -59,24 +72,32 @@ export function useAssetUrlState(
     sessionError: fileAccessSession.error,
   });
   const blocked = blockedAssetUrlState(resource, fileAccess);
-  const preparedConnection = usePreparedConnection(environmentId);
   const connectionPhase = fileEnvironment.presentation?.connection.phase ?? "available";
-  const result = useAtomValue(
+  const result = useAtomValue<AsyncResult.AsyncResult<AssetCreateUrlResult, unknown>>(
     blocked !== null || environmentId === null || resource === null
       ? EMPTY_ASSET_URL_ATOM
       : revision === undefined
         ? assetEnvironment.createUrl({ environmentId, input: { resource } })
         : revisionedAssetUrl({ environmentId, input: { resource }, revision }),
   );
-  const shared =
-    blocked ??
-    assetUrlStateFromResult(
-      result,
-      preparedConnection._tag === "Some" ? preparedConnection.value.httpBaseUrl : null,
-    );
+  const shared = blocked ?? checkedAssetState(result, environmentId);
+  const local = useVerifiedLocalAsset(
+    shared._tag === "Success" && delivery !== "web-document" ? shared.url : null,
+  );
   return deriveAssetUrlState({
     connectionPhase,
-    shared: shared._tag === "Failure" && result.waiting ? { _tag: "Loading" } : shared,
+    shared:
+      local.status === "failed"
+        ? { _tag: "Failure" }
+        : shared._tag === "Success"
+          ? delivery === "web-document"
+            ? shared
+            : local.status === "ready"
+              ? { ...shared, url: local.uri }
+              : { _tag: "Loading" }
+          : shared._tag === "Failure" && result.waiting
+            ? { _tag: "Loading" }
+            : shared,
   });
 }
 
@@ -101,9 +122,9 @@ export function useRefreshAssetUrl(
   });
   return async () => {
     if (environmentId === null || resource === null || httpBaseUrl === null) return null;
-    const state = assetUrlStateFromResult(
+    const state = checkedAssetState(
       await createUrl({ environmentId, input: { resource } }),
-      httpBaseUrl,
+      environmentId,
     );
     return state._tag === "Success" ? state.url : null;
   };
@@ -128,11 +149,21 @@ export async function refreshAssetUrl(
     ...(signal ? { signal } : {}),
   });
   if (result._tag === "Failure") throw squashAtomCommandFailure(result);
-  // A route can change while the query runs; resolve against the connection now current.
-  const connection = appAtomRegistry.get(connectionAtom);
-  if (connection._tag === "None") return null;
-  const state = assetUrlStateFromResult(result, connection.value.httpBaseUrl);
+  const state = checkedAssetState(result, environmentId);
   return state._tag === "Success" ? state.url : null;
+}
+
+function checkedAssetState(
+  result: Parameters<typeof assetUrlStateFromResult>[0],
+  environmentId: EnvironmentId | null,
+) {
+  if (result._tag !== "Success" || environmentId === null) {
+    return assetUrlStateFromResult(result, null);
+  }
+  const url = issuedMobileAssetUrl(environmentId, result.value);
+  if (url === null) return { _tag: "Failure" } as const;
+  const state = assetUrlStateFromResult(result, url);
+  return state._tag === "Success" ? { ...state, url } : state;
 }
 
 export interface AuthorizedAssetUrl {
@@ -143,7 +174,7 @@ export interface AuthorizedAssetUrl {
 interface FreshAssetUrlKey {
   readonly environmentId: EnvironmentId | null;
   readonly resource: AssetResource;
-  /** A reconnect changes the base URL, and any URL minted against the old one is unusable. */
+  /** Reauthorize on a new connection instead of reusing an older signed URL. */
   readonly httpBaseUrl: string | null;
   /** Bumped by Retry so a file replaced on disk is reauthorized. */
   readonly revision: number;

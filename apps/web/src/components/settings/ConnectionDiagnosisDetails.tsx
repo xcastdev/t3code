@@ -1,4 +1,6 @@
 import { useAtomValue } from "@effect/atom-react";
+import { Link } from "@tanstack/react-router";
+import { useGT } from "gt-react";
 import {
   AVAILABLE_CONNECTION_STATE,
   type ConnectionDiagnosis,
@@ -57,7 +59,26 @@ export function ConnectionDiagnosisHeadline({
 }: {
   readonly environment: EnvironmentPresentation;
 }) {
-  return useConnectionDiagnosis(environment).diagnosis?.headline ?? null;
+  const { diagnosis } = useConnectionDiagnosis(environment);
+  return diagnosis?.action === "renew-relay-access" ? (
+    <HostedRelayAdmissionMessage />
+  ) : (
+    (diagnosis?.headline ?? null)
+  );
+}
+
+function HostedRelayAdmissionMessage() {
+  const gt = useGT();
+  return gt("Relay access could not be confirmed. Request a fresh operator ticket.");
+}
+
+export function RenewHostedRelayAccessButton() {
+  const gt = useGT();
+  return (
+    <Button size="xs" variant="ghost" render={<Link to="/pair" />}>
+      {gt("Renew relay access")}
+    </Button>
+  );
 }
 
 const HOP_MARK = { ok: "✓", failed: "✕", unchecked: "–" } as const;
@@ -89,7 +110,16 @@ export function ConnectionDiagnosisSummary({
 }) {
   return (
     <div className="text-xs">
-      <p className="text-destructive">{diagnosis.headline}</p>
+      {diagnosis.action === "renew-relay-access" ? (
+        <div className="flex flex-wrap items-center gap-x-1">
+          <p className="text-destructive">
+            <HostedRelayAdmissionMessage />
+          </p>
+          <RenewHostedRelayAccessButton />
+        </div>
+      ) : (
+        <p className="text-destructive">{diagnosis.headline}</p>
+      )}
       <p className="flex flex-wrap items-center gap-1 text-muted-foreground">
         {retryAt !== null ? <RetryCountdown retryAt={retryAt} /> : null}
         {retryAt !== null && attempt > 0 ? <span aria-hidden>·</span> : null}

@@ -9,6 +9,7 @@ import {
   type McpAppHost,
   type McpAppHostContext,
 } from "@t3tools/client-runtime/mcp-apps";
+import type { PreviewAssetWidgetConnection } from "@t3tools/client-runtime/preview/server-browser-stream";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
   clampMcpAppHeight,
@@ -26,10 +27,12 @@ import { flushSync } from "react-dom";
 import { useLongLivedAssetUrl } from "~/assets/longLivedAssetUrls";
 import { APP_VERSION } from "~/branding";
 import { isConfirmDialogActive, requestConfirmDialog } from "~/confirmDialog";
+import { HostedAssetDocument } from "~/components/files/HostedAssetDocument";
 import { useHtmlRenderTheme } from "~/hooks/useHtmlRenderTheme";
 import { useStableCallback } from "~/hooks/useStableCallback";
 import { Button } from "~/components/ui/button";
 import { isElectron } from "~/env";
+import { environmentRelayAdmissionRequired } from "~/connection/environmentTransport";
 import { cn } from "~/lib/utils";
 import { useEnvironmentQuery } from "~/state/query";
 import { useTurnItemDetail } from "~/state/queries";
@@ -37,6 +40,7 @@ import { mcpAppEnvironment } from "~/state/mcpApps";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { observeResize } from "~/lib/observeResize";
 import { saveBlob } from "~/lib/saveBlob";
+import { listenToWidgetFrame } from "../widgetFrameConnection";
 
 const commandFailure = (result: {
   readonly cause: Parameters<typeof squashAtomCommandFailure>[0]["cause"];
@@ -68,7 +72,7 @@ if (typeof window !== "undefined") {
   }
 }
 
-export function McpAppFrame(props: {
+interface McpAppFrameProps {
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
   readonly conversationThreadId: ThreadId;
@@ -78,10 +82,23 @@ export function McpAppFrame(props: {
   readonly onSendMessage: ((text: string) => Promise<void>) | undefined;
   readonly awaitingUser?: boolean;
   readonly onFullscreenChange?: (fullscreen: boolean) => void;
-}) {
+}
+
+export function McpAppFrame(props: McpAppFrameProps) {
+  const owner = JSON.stringify([
+    props.environmentId,
+    props.threadId,
+    props.itemId,
+    props.conversationThreadId,
+    props.app.attachmentId,
+  ]);
+  return <McpAppFrameView key={owner} {...props} />;
+}
+
+function McpAppFrameView(props: McpAppFrameProps) {
   const { app } = props;
   const theme = useHtmlRenderTheme();
-  const frameRef = useRef<HTMLIFrameElement>(null);
+  const hostedSlotRef = useRef<HTMLDivElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
   const [height, setHeight] = useState(MCP_APP_DEFAULT_HEIGHT);
@@ -115,13 +132,23 @@ export function McpAppFrame(props: {
     renderIntent: "mcp-app" as const,
   };
   // The frame keeps its first URL: a re-minted one would reload the app.
-  const [src, setSrc] = useState<string | null>(null);
-  const asset = useLongLivedAssetUrl(src === null ? props.environmentId : null, resource);
-  if (src === null && asset._tag === "Success") {
-    // The app paints before `ui/initialize`, so it reads the initial scheme from its URL.
-    const url = new URL(asset.url);
-    url.searchParams.set(MCP_APP_COLOR_SCHEME_PARAM, theme.appearance);
-    setSrc(url.toString());
+  const [pinnedDocument, setPinnedDocument] = useState<{
+    readonly src: string;
+    readonly hosted: boolean;
+  } | null>(null);
+  const asset = useLongLivedAssetUrl(
+    pinnedDocument === null ? props.environmentId : null,
+    resource,
+  );
+  if (pinnedDocument === null && asset._tag === "Success") {
+    if (environmentRelayAdmissionRequired(asset.url)) {
+      setPinnedDocument({ src: asset.url, hosted: true });
+    } else {
+      // The app paints before `ui/initialize`, so it reads the initial scheme from its URL.
+      const url = new URL(asset.url);
+      url.searchParams.set(MCP_APP_COLOR_SCHEME_PARAM, theme.appearance);
+      setPinnedDocument({ src: url.toString(), hosted: false });
+    }
   }
 
   const detail = useTurnItemDetail({
@@ -166,8 +193,10 @@ export function McpAppFrame(props: {
     updateModelContext,
     displayMode,
     toolDefinition,
+    toolCall,
   }));
   const hostRef = useRef<McpAppHost | null>(null);
+  const connectionRef = useRef<PreviewAssetWidgetConnection | null>(null);
 
   const [stepAsideFor, setStepAsideFor] = useState(props.awaitingUser);
   if (stepAsideFor !== props.awaitingUser) {
@@ -210,16 +239,29 @@ export function McpAppFrame(props: {
     }
     loads.current.count += 1;
     if (loads.current.count > 1) {
-      hostRef.current?.dispose();
+      connectionRef.current?.dispose();
       setNavigatedAway(true);
     }
   };
 
-  // The host belongs to this frame element, which is replaced when the document is reopened.
-  const attachFrame = (frame: HTMLIFrameElement) => {
-    frameRef.current = frame;
+  const connectHost = (
+    post: (message: unknown) => void,
+    frame?: HTMLIFrameElement,
+  ): PreviewAssetWidgetConnection => {
+    connectionRef.current?.dispose();
+    let rendererActivation = false;
+    const frameActivated = () =>
+      frame !== undefined &&
+      document.activeElement === frame &&
+      navigator.userActivation?.isActive === true;
+    const requireLiveHost = () => {
+      if (hostRef.current !== host) {
+        throw new McpAppHostRefusal({ message: "The app was closed." });
+      }
+    };
     const hostContext = (): McpAppHostContext => {
       const current = readLive();
+      const viewport = frame ?? hostedSlotRef.current;
       return {
         theme: current.theme.appearance,
         styles: { variables: mcpAppStyleVariables(current.theme.variables) },
@@ -228,8 +270,8 @@ export function McpAppFrame(props: {
         containerDimensions:
           current.displayMode === "fullscreen"
             ? {
-                width: frameRef.current?.clientWidth || window.innerWidth,
-                height: frameRef.current?.clientHeight || window.innerHeight,
+                width: viewport?.clientWidth || window.innerWidth,
+                height: viewport?.clientHeight || window.innerHeight,
               }
             : { width: current.width, maxHeight: MCP_APP_MAX_HEIGHT },
         platform: isElectron ? "desktop" : "web",
@@ -248,27 +290,25 @@ export function McpAppFrame(props: {
     };
     // Return inline so approvals stay visible above the app.
     const ask = async (message: string) => {
+      requireLiveHost();
       flushSync(() => setDisplayMode("inline"));
       const approved = await requestConfirmDialog(message);
+      requireLiveHost();
       if (approved === undefined) {
         throw new McpAppHostRefusal({ message: "T3 could not ask for approval here." });
       }
       return approved;
     };
-    const target = () => frameRef.current?.contentWindow ?? null;
-    const scope = () => {
-      const { environmentId, threadId, itemId } = readLive().props;
-      return { environmentId, input: { threadId, itemId } };
-    };
+    const { environmentId, threadId, itemId, conversationThreadId } = readLive().props;
+    const input = { threadId, itemId };
     const host = makeMcpAppHost({
       app,
       hostVersion: APP_VERSION,
-      // Opaque origins require "*"; the window reference scopes delivery to this frame.
-      post: (message) => target()?.postMessage(message, "*"),
+      post,
       hostContext,
       callTool: async ({ name, arguments: args }) => {
-        const { environmentId, input } = scope();
         const info = await readLive().toolInfo({ environmentId, input: { ...input, name } });
+        requireLiveHost();
         if (info._tag !== "Success") throw commandFailure(info);
         if (!info.value.callable)
           throw new McpAppHostRefusal({ message: "This app cannot call that tool." });
@@ -286,7 +326,6 @@ export function McpAppFrame(props: {
         return result.value;
       },
       readResource: async ({ uri }) => {
-        const { environmentId, input } = scope();
         const result = await readLive().readResource({
           environmentId,
           input: { ...input, uri },
@@ -295,7 +334,7 @@ export function McpAppFrame(props: {
         return result.value;
       },
       openLink: async (url) => {
-        if (document.activeElement !== frameRef.current || !navigator.userActivation?.isActive) {
+        if (!(frame === undefined ? rendererActivation : frameActivated())) {
           throw new McpAppHostRefusal({ message: "Links open only from a click in the app." });
         }
         window.open(url, "_blank", "noopener,noreferrer");
@@ -309,13 +348,12 @@ export function McpAppFrame(props: {
         await send(text);
       },
       updateModelContext: async (context) => {
-        const { environmentId, input } = scope();
         const result = await readLive().updateModelContext({
           environmentId,
           input: {
             ...input,
             ...context,
-            conversationThreadId: readLive().props.conversationThreadId,
+            conversationThreadId,
           },
         });
         if (result._tag !== "Success") throw commandFailure(result);
@@ -325,9 +363,9 @@ export function McpAppFrame(props: {
         if (
           mode === "fullscreen" &&
           (!fullscreenSupported ||
-            document.activeElement !== frameRef.current ||
-            !navigator.userActivation?.isActive ||
-            performance.now() - lastPageInputAt < PAGE_ACTIVATION_MS ||
+            !(frame === undefined
+              ? rendererActivation
+              : frameActivated() && performance.now() - lastPageInputAt >= PAGE_ACTIVATION_MS) ||
             readLive().props.awaitingUser === true ||
             isConfirmDialogActive() ||
             (otherFullscreen !== null && otherFullscreen !== boxRef.current))
@@ -347,11 +385,11 @@ export function McpAppFrame(props: {
           if (file._tag === "embedded") {
             bytes = file.bytes;
           } else {
-            const { environmentId, input } = scope();
             const read = await readLive().readResource({
               environmentId,
               input: { ...input, uri: file.uri },
             });
+            requireLiveHost();
             if (read._tag !== "Success") throw commandFailure(read);
             const content = read.value.contents[0];
             bytes = mcpResourceBytes(content);
@@ -383,17 +421,45 @@ export function McpAppFrame(props: {
       },
     });
     hostRef.current = host;
-    const receive = (event: MessageEvent) => {
-      if (event.source !== null && event.source === target()) host.receive(event.data);
+    const latestToolCall = readLive().toolCall;
+    if (latestToolCall !== undefined) host.setToolCall(latestToolCall);
+    const connection: PreviewAssetWidgetConnection = {
+      receive: (data, activated) => {
+        if (hostRef.current !== host) return;
+        rendererActivation = activated;
+        try {
+          host.receive(data);
+        } catch (error) {
+          rendererActivation = false;
+          throw error;
+        }
+        rendererActivation = false;
+      },
+      dispose: () => {
+        host.dispose();
+        if (hostRef.current === host) {
+          hostRef.current = null;
+          connectionRef.current = null;
+        }
+      },
     };
-    window.addEventListener("message", receive);
-    return () => {
-      window.removeEventListener("message", receive);
-      void host.teardown();
-      hostRef.current = null;
-      frameRef.current = null;
-    };
+    connectionRef.current = connection;
+    return connection;
   };
+  const connect = useStableCallback(connectHost);
+
+  const attachFrame = useStableCallback((frame: HTMLIFrameElement) => {
+    const target = frame.contentWindow;
+    // The opaque document has no origin for a narrower postMessage target.
+    const connection = connect((message) => target?.postMessage(message, "*"), frame);
+    const host = hostRef.current;
+    const stopListening = listenToWidgetFrame(frame, connection, () => false);
+    return () => {
+      stopListening();
+      void host?.teardown();
+      connection.dispose();
+    };
+  });
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- pushes theme, width, display mode and tool definition to the MCP app host in the iframe
   useEffect(() => {
@@ -405,7 +471,7 @@ export function McpAppFrame(props: {
   useEffect(() => {
     if (toolCall !== undefined) hostRef.current?.setToolCall(toolCall);
     // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Each new document needs the call.
-  }, [toolCall, src, documentGeneration]);
+  }, [toolCall, pinnedDocument, documentGeneration]);
 
   if (closed) {
     return (
@@ -415,7 +481,7 @@ export function McpAppFrame(props: {
           size="xs"
           variant="ghost"
           onClick={() => {
-            setSrc(null);
+            setPinnedDocument(null);
             setDocumentGeneration((value) => value + 1);
             setClosed(false);
           }}
@@ -465,10 +531,22 @@ export function McpAppFrame(props: {
           <p className="flex size-full items-center justify-center text-muted-foreground text-xs">
             The {app.server} app left its page and was stopped
           </p>
-        ) : src !== null ? (
+        ) : pinnedDocument?.hosted ? (
+          <div
+            ref={hostedSlotRef}
+            className={cn("flex w-full flex-col", fullscreen ? "min-h-0 flex-1" : "h-full")}
+          >
+            <HostedAssetDocument
+              environmentId={props.environmentId}
+              src={pinnedDocument.src}
+              title={`${app.server} app`}
+              widget={{ kind: "mcp-app", connect }}
+            />
+          </div>
+        ) : pinnedDocument !== null ? (
           <iframe
             ref={attachFrame}
-            src={src}
+            src={pinnedDocument.src}
             title={`${app.server} app`}
             // Omitting allow-same-origin isolates the app from the session.
             sandbox="allow-scripts allow-forms"

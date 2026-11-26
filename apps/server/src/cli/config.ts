@@ -26,6 +26,7 @@ import { readBootstrapEnvelope } from "../bootstrap.ts";
 import { resolveServiceLauncherMode } from "../cloud/serviceLauncherClient.ts";
 import * as ServerConfig from "../config.ts";
 import { expandHomePath, resolveBaseDir } from "../os-jank.ts";
+import { RelayListenPort } from "../relay/relayListenPort.ts";
 import { isProcessAlive, readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
 import { resolveHostCliCommand } from "./invocation.ts";
 
@@ -90,6 +91,17 @@ const lanFlag = Flag.Boolean("lan").pipe(
   Flag.withDescription(
     "Accept connections from your local network and tailnet, not only this machine (equivalent to T3CODE_LAN).",
   ),
+  Flag.optional,
+);
+const relayEnabledFlag = Flag.Boolean("relay").pipe(
+  Flag.withDescription(
+    "Enable the self-hosted relay with loopback management (equivalent to T3CODE_RELAY_ENABLED).",
+  ),
+  Flag.optional,
+);
+const relayPortFlag = Flag.Int("relay-port").pipe(
+  Flag.withSchema(RelayListenPort),
+  Flag.withDescription("Self-hosted relay port, or 0 for an OS-selected port."),
   Flag.optional,
 );
 
@@ -175,6 +187,14 @@ const EnvServerConfig = Config.all({
   lan: Config.Boolean("T3CODE_LAN").pipe(Config.option, Config.map(Option.getOrUndefined)),
 });
 
+const RelayEnabledConfig = Config.Boolean("T3CODE_RELAY_ENABLED").pipe(Config.withDefault(false));
+
+const RelayForwardingConfig = Config.option(Config.String("T3CODE_RELAY_FORWARDING_CONFIG"));
+
+const RelayPortConfig = Config.schema(RelayListenPort, "T3CODE_RELAY_PORT").pipe(
+  Config.withDefault(0),
+);
+
 const DevAuthTokenConfig = Config.Redacted("T3CODE_DEV_AUTH_TOKEN").pipe(
   Config.map((token) => Redacted.make(Redacted.value(token).trim())),
   Config.mapEffect((token) =>
@@ -209,6 +229,8 @@ export interface CliServerFlags {
   readonly tailscaleServeEnabled: Option.Option<boolean>;
   readonly tailscaleServePort: Option.Option<number>;
   readonly lan: Option.Option<boolean>;
+  readonly relayEnabled?: Option.Option<boolean>;
+  readonly relayPort?: Option.Option<number>;
 }
 
 export interface CliAuthLocationFlags {
@@ -244,6 +266,8 @@ export const sharedServerCommandFlags = {
   tailscaleServeEnabled: tailscaleServeFlag,
   tailscaleServePort: tailscaleServePortFlag,
   lan: lanFlag,
+  relayEnabled: relayEnabledFlag,
+  relayPort: relayPortFlag,
 } as const;
 
 const resolveOptionPrecedence = <Value>(
@@ -292,6 +316,8 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     tailscaleServeEnabled: flags.tailscaleServeEnabled ?? Option.none(),
     tailscaleServePort: flags.tailscaleServePort ?? Option.none(),
     lan: flags.lan ?? Option.none(),
+    relayEnabled: flags.relayEnabled ?? Option.none(),
+    relayPort: flags.relayPort ?? Option.none(),
   } satisfies CliServerFlags;
   const bootstrapFd = Option.getOrUndefined(normalizedFlags.bootstrapFd) ?? env.bootstrapFd;
   const bootstrapEnvelope =
@@ -340,6 +366,21 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
       resolveOptionPrecedence(explicitBaseDir, Option.fromUndefinedOr(bootstrap?.t3Home)),
     ),
   );
+  const relayEnabled = Option.isSome(normalizedFlags.relayEnabled)
+    ? normalizedFlags.relayEnabled.value
+    : yield* RelayEnabledConfig;
+  const relayForwardingConfig = relayEnabled ? yield* RelayForwardingConfig : Option.none<string>();
+  const selfHostedRelay = relayEnabled
+    ? {
+        homeDirectory: path.join(baseDir, "relay"),
+        port: Option.isSome(normalizedFlags.relayPort)
+          ? normalizedFlags.relayPort.value
+          : yield* RelayPortConfig,
+        ...(Option.isSome(relayForwardingConfig)
+          ? { forwardingConfigPath: relayForwardingConfig.value }
+          : {}),
+      }
+    : undefined;
   const rawCwd = Option.getOrElse(normalizedFlags.cwd, () => process.cwd());
   const cwd = path.resolve(yield* expandHomePath(rawCwd.trim()));
   const derivedPaths = yield* ServerConfig.deriveServerPaths(baseDir, devUrl, {
@@ -531,6 +572,7 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
     logWebSocketEvents,
     tailscaleServeEnabled,
     tailscaleServePort,
+    ...(selfHostedRelay === undefined ? {} : { selfHostedRelay }),
   };
 
   return config;

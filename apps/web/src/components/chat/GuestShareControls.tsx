@@ -251,6 +251,8 @@ export function GuestPendingMessages({
     const preview = buildExpandedImagePreview(
       images.map((image) => ({ ...image, previewUrl: imageUrlById.get(image.id) ?? "" })),
       attachment.id,
+      undefined,
+      threadRef.environmentId,
     );
     if (preview) onImageExpand(preview);
   };

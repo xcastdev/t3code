@@ -24,7 +24,17 @@ import {
 } from "lucide-react";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 
-import { useAssetUrlRefresh } from "~/assets/assetUrls";
+import {
+  createAdmittedMediaSource,
+  readAdmittedStaticAsset,
+  sanitizeStaticPreviewBlob,
+  requiresAdmittedAsset,
+} from "~/assets/admittedAssetSource";
+import { useAssetGrantRefresh } from "~/assets/assetUrls";
+import {
+  prepareVerifiedPreviewSource,
+  readVerifiedPreviewAsset,
+} from "~/browser/readVerifiedPreviewAsset";
 import ChatMarkdown from "~/components/ChatMarkdown";
 import { maskMarkdownFrontmatter } from "@t3tools/shared/markdownFrontmatter";
 import { ScrollArea } from "~/components/ui/scroll-area";
@@ -36,7 +46,7 @@ import { cn } from "~/lib/utils";
 import { BinaryFilePreview } from "./BinaryFilePreview";
 import { PreviewImage } from "./PreviewImage";
 import { AudioPreview } from "./AudioPreview";
-import { BrowserDocumentFrame } from "./BrowserDocumentFrame";
+import { BrowserDocumentFrame, OfflineHtmlFile } from "./BrowserDocumentFrame";
 import { DelimitedTablePreview } from "./DelimitedTablePreview";
 import {
   FILE_SURFACE_SUBHEADER_CLASS,
@@ -63,6 +73,9 @@ const MermaidFilePreview = lazy(() =>
 const SourcePreview = lazy(() => import("./ReadOnlySourcePreview"));
 
 const STALE_URL_MS = 5 * 60_000;
+const SMALL_MEDIA_BYTES = 8 * 1024 * 1024;
+
+type RemoteAttachmentSource = { url: string; verified?: true } | { file: Blob };
 
 const blobKeys = new WeakMap<Blob, string>();
 let nextBlobKey = 0;
@@ -96,13 +109,20 @@ export function AttachmentFilePreview(props: {
   mimeType: string;
   sizeBytes: number;
   file?: Blob | null;
+  verifiedLocal?: boolean;
   asset?:
     | { environmentId: EnvironmentId; attachmentId: string }
     | {
         environmentId: EnvironmentId;
         resource: Extract<
           AssetResource,
-          { _tag: "media-file" | "draft-workspace-file" | "provider-output-artifact" }
+          {
+            _tag:
+              | "workspace-file"
+              | "media-file"
+              | "draft-workspace-file"
+              | "provider-output-artifact";
+          }
         >;
       };
   htmlRender?: boolean;
@@ -127,7 +147,7 @@ export function AttachmentFilePreview(props: {
   const attachmentId =
     props.asset && "attachmentId" in props.asset ? props.asset.attachmentId : undefined;
   const { copyToClipboard, isCopied } = useCopyToClipboard({ target: props.name });
-  // useAssetUrlRefresh keys its callback on these objects, so they must stay cached.
+  // useAssetGrantRefresh keys its callback on these objects, so they must stay cached.
   const resource =
     props.asset && "resource" in props.asset
       ? props.asset.resource
@@ -145,53 +165,100 @@ export function AttachmentFilePreview(props: {
       ? resource
       : { ...resource, disposition: "attachment" as const }
     : null;
-  const refresh = useAssetUrlRefresh(
-    props.file ? null : (props.asset?.environmentId ?? null),
+  const environmentId = props.asset?.environmentId ?? null;
+  const activePreview = kind === "pdf" || kind === "html" || kind === "audio" || kind === "video";
+  const refresh = useAssetGrantRefresh(
+    props.file ? null : environmentId,
     props.file ? null : resource,
   );
-  const prepareDownload = useAssetUrlRefresh(props.asset?.environmentId ?? null, downloadResource);
+  const prepareDownload = useAssetGrantRefresh(environmentId, downloadResource);
   const [saving, setSaving] = useState(false);
-  const [localUrl, setLocalUrl] = useState<string | null>(null);
-  const [remoteUrl, setRemoteUrl] = useState<string | null>(null);
+  const [localSource, setLocalSource] = useState<{ file: Blob; url: string } | null>(null);
+  const [resolvedRemoteSource, setResolvedRemoteSource] = useState<{
+    key: string;
+    source: RemoteAttachmentSource;
+  } | null>(null);
   const [rendered, setRendered] = useState(true);
   const [revision, setRevision] = useState(0);
+  const sourceKey = JSON.stringify([environmentId, resource, kind, props.sizeBytes, revision]);
+  const remoteSource = resolvedRemoteSource?.key === sourceKey ? resolvedRemoteSource.source : null;
   const [content, setContent] = useState<{ text: string; truncated: boolean } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [contentError, setContentError] = useState<string | null>(null);
   const copyContents = useRef<(() => Promise<string>) | null>(null);
   const authorizedAt = useRef(0);
-  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- creates an object URL for the local file and revokes it on cleanup
-  useEffect(() => {
-    if (!props.file) return;
-    const url = URL.createObjectURL(props.file);
-    // oxlint-disable-next-line react/set-state-in-effect -- Publish an object URL only after its cleanup is registered for this Blob.
-    setLocalUrl(url);
-    return () => URL.revokeObjectURL(url);
-  }, [props.file]);
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- authorizes a remote attachment URL from the server and ignores the result after cleanup
   useEffect(() => {
     if (props.file) return;
-    let cancelled = false;
+    const controller = new AbortController();
     // oxlint-disable-next-line react/set-state-in-effect -- A new preview request clears its previous URL and error.
-    setRemoteUrl(null);
     setError(null);
-    void refresh()
-      .then((url) => {
-        if (cancelled) return;
-        if (!url) throw new Error("Reconnect to the environment and try again.");
-        authorizedAt.current = Date.now();
-        setRemoteUrl(url);
-      })
-      .catch((cause: unknown) => {
-        if (!cancelled)
-          setError(cause instanceof Error ? cause.message : "The attachment is unavailable.");
-      });
-    return () => {
-      cancelled = true;
+    const settleSource = (source: RemoteAttachmentSource) => {
+      authorizedAt.current = Date.now();
+      setResolvedRemoteSource({ key: sourceKey, source });
     };
-    // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Retry must reauthorize the remote file.
-  }, [props.file, refresh, revision]);
-  const url = props.file ? localUrl : remoteUrl;
+    void (async () => {
+      const grant = await refresh();
+      if (controller.signal.aborted) return;
+      if (!grant) throw new Error("Reconnect to the environment and try again.");
+      if (environmentId !== null && kind !== "html" && requiresAdmittedAsset(grant.url)) {
+        const source =
+          (kind === "audio" || kind === "video") &&
+          !(props.sizeBytes > 0 && props.sizeBytes <= SMALL_MEDIA_BYTES)
+            ? await createAdmittedMediaSource(
+                environmentId,
+                grant.url,
+                kind,
+                grant.expiresAt ?? 0,
+                controller.signal,
+              )
+            : await sanitizeStaticPreviewBlob(
+                await readAdmittedStaticAsset(environmentId, grant.url, controller.signal),
+                controller.signal,
+              );
+        if (controller.signal.aborted) return;
+        settleSource(typeof source === "string" ? { url: source } : { file: source });
+      } else if (
+        (grant.learnedRoute || requiresAdmittedAsset(grant.url)) &&
+        activePreview &&
+        environmentId !== null
+      ) {
+        const source = await prepareVerifiedPreviewSource(environmentId, grant.url, {
+          html: kind === "html",
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) return;
+        settleSource(
+          typeof source === "string" ? { url: source, verified: true } : { file: source },
+        );
+      } else {
+        settleSource({ url: grant.url });
+      }
+    })().catch((cause: unknown) => {
+      if (!controller.signal.aborted)
+        setError(cause instanceof Error ? cause.message : "The attachment is unavailable.");
+    });
+    return () => controller.abort();
+  }, [props.file, props.sizeBytes, refresh, activePreview, environmentId, kind, sourceKey]);
+  const verifiedFile = remoteSource && "file" in remoteSource ? remoteSource.file : null;
+  const file = props.file ?? verifiedFile;
+  const verifiedLocal = props.verifiedLocal === true || (!props.file && verifiedFile !== null);
+  const verified = file === null && remoteSource !== null && "verified" in remoteSource;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- creates and releases an object URL for local bytes
+  useEffect(() => {
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    // oxlint-disable-next-line react/set-state-in-effect -- publish the URL after registering its lifecycle
+    setLocalSource({ file, url });
+    return () => URL.revokeObjectURL(url);
+  }, [file]);
+  const url = file
+    ? localSource?.file === file
+      ? localSource.url
+      : null
+    : remoteSource && "url" in remoteSource
+      ? remoteSource.url
+      : null;
   const streamsText =
     kind === "text" &&
     (props.sizeBytes > FILE_TEXT_PREVIEW_MAX_BYTES ||
@@ -205,15 +272,34 @@ export function AttachmentFilePreview(props: {
     // oxlint-disable-next-line react/set-state-in-effect -- A new external resource must clear the previous response before loading.
     setContent(null);
     setContentError(null);
-    const file = props.file;
     void (async () => {
       if (!file && Date.now() - authorizedAt.current > STALE_URL_MS) {
-        const target = await refresh();
+        const grant = await refresh();
         if (controller.signal.aborted) return;
-        if (!target) throw new Error("Reconnect to the environment and try again.");
+        if (!grant) throw new Error("Reconnect to the environment and try again.");
+        if (
+          (grant.learnedRoute || requiresAdmittedAsset(grant.url)) &&
+          activePreview &&
+          environmentId !== null
+        ) {
+          const source = await prepareVerifiedPreviewSource(environmentId, grant.url, {
+            html: kind === "html",
+            signal: controller.signal,
+          });
+          if (controller.signal.aborted) return;
+          authorizedAt.current = Date.now();
+          if (typeof source !== "string" || source !== url) {
+            setResolvedRemoteSource({
+              key: sourceKey,
+              source:
+                typeof source === "string" ? { url: source, verified: true } : { file: source },
+            });
+            return;
+          }
+        }
         authorizedAt.current = Date.now();
-        if (target !== url) {
-          setRemoteUrl(target);
+        if (grant.url !== url) {
+          setResolvedRemoteSource({ key: sourceKey, source: { url: grant.url } });
           return;
         }
       }
@@ -224,6 +310,7 @@ export function AttachmentFilePreview(props: {
             ...(props.sizeBytes > 0
               ? { headers: { Range: `bytes=0-${FILE_TEXT_PREVIEW_MAX_BYTES}` } }
               : {}),
+            ...(verified ? { redirect: "error", credentials: "omit" } : {}),
             cache: revision === 0 ? "default" : "reload",
           });
       const result = await readFilePreviewResponse(response, controller.signal);
@@ -233,7 +320,20 @@ export function AttachmentFilePreview(props: {
         setContentError(cause instanceof Error ? cause.message : "Could not load this file.");
     });
     return () => controller.abort();
-  }, [url, needsText, streamsText, revision, props.sizeBytes, props.file, refresh]);
+  }, [
+    url,
+    needsText,
+    streamsText,
+    revision,
+    props.sizeBytes,
+    file,
+    refresh,
+    activePreview,
+    environmentId,
+    verified,
+    kind,
+    sourceKey,
+  ]);
   const failure = error ?? (needsText ? contentError : null);
   const defaultWordWrap = useClientSettings((settings) => settings.wordWrap);
   const [wordWrapOverride, setWordWrapOverride] = useState<boolean | null>(null);
@@ -248,16 +348,26 @@ export function AttachmentFilePreview(props: {
   const save = () => {
     setSaving(true);
     void settlePromise(async () => {
-      let file = props.file;
-      if (!file) {
-        const target = await prepareDownload();
-        if (!target) throw new Error("Reconnect to the environment and try again.");
-        const response = await fetch(target);
-        if (!response.ok) throw new Error("The file could not be loaded. Try again.");
-        file = await response.blob();
+      let download = props.file ?? (file?.type.split(";", 1)[0] === "image/svg+xml" ? null : file);
+      if (!download) {
+        const grant = await prepareDownload();
+        if (!grant) throw new Error("Reconnect to the environment and try again.");
+        if (environmentId !== null && requiresAdmittedAsset(grant.url)) {
+          download = await readAdmittedStaticAsset(
+            environmentId,
+            grant.url,
+            AbortSignal.timeout(60_000),
+          );
+        } else if (grant.learnedRoute && environmentId !== null) {
+          download = await readVerifiedPreviewAsset(environmentId, grant.url);
+        } else {
+          const response = await fetch(grant.url);
+          if (!response.ok) throw new Error("The file could not be loaded. Try again.");
+          download = await response.blob();
+        }
       }
       // Blob downloads keep desktop's custom app scheme from navigating to an external browser.
-      const downloadUrl = URL.createObjectURL(file);
+      const downloadUrl = URL.createObjectURL(download);
       // Scheduled before the click so the URL is revoked even if the click throws.
       setTimeout(() => URL.revokeObjectURL(downloadUrl), 30_000);
       const anchor = document.createElement("a");
@@ -339,11 +449,15 @@ export function AttachmentFilePreview(props: {
         sizeBytes={props.sizeBytes}
       />
     </Suspense>
+  ) : kind === "html" && verifiedLocal && file ? (
+    <OfflineHtmlFile file={file} title={props.name} />
   ) : kind === "pdf" || kind === "html" ? (
     <BrowserDocumentFrame
       src={url}
       title={props.name}
       pdf={kind === "pdf"}
+      local={verifiedLocal}
+      verified={verified}
       htmlRender={props.htmlRender === true}
       threadRef={props.threadRef}
       // Each mount signs or creates a new URL, so the URL cannot identify the file across visits.
@@ -351,8 +465,8 @@ export function AttachmentFilePreview(props: {
       documentKey={
         kind !== "pdf"
           ? undefined
-          : props.file
-            ? blobKey(props.file)
+          : file
+            ? blobKey(file)
             : props.asset && "attachmentId" in props.asset
               ? `${props.asset.environmentId}:${props.asset.attachmentId}`
               : undefined

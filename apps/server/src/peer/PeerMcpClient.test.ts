@@ -18,7 +18,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/ai";
 import * as TestClock from "effect/testing/TestClock";
-import { HttpClient, HttpClientResponse } from "effect/http";
+import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/http";
 
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
@@ -47,8 +47,12 @@ const toolkit = Toolkit.make(
   }),
 );
 
-/** One `probe` call to a linked peer at a remote address, answered by `http`. */
-const probeThrough = Effect.fn(function* (http: HttpClient.HttpClient) {
+/** One tool call to a linked peer at a remote address, answered by `http`. */
+const probeThrough = Effect.fn(function* (
+  http: HttpClient.HttpClient,
+  tool = "probe",
+  readOnly = false,
+) {
   const box = descriptorOf("environment-box", "Box");
   const context = yield* Layer.build(
     PeerMcpClient.layer.pipe(
@@ -79,16 +83,122 @@ const probeThrough = Effect.fn(function* (http: HttpClient.HttpClient) {
   );
   return Context.get(context, PeerMcpClient.PeerMcpClient).call({
     environmentId: box.environmentId,
-    tool: "probe",
+    tool,
+    readOnly,
     arguments: {},
     limits: { runtimeMode: "approval-required", interactionMode: "plan" },
     success: Result,
   });
 });
 
+it.effect(
+  "leaves a mutation with a generic 404 unreplayed and opens a fresh session for the next call",
+  () =>
+    Effect.gen(function* () {
+      const calls: Array<string | undefined> = [];
+      let sessions = 0;
+      const http = HttpClient.make((request) =>
+        Effect.sync(() => {
+          const body = request.body;
+          if (body._tag !== "Uint8Array") throw new Error("Expected a JSON-RPC request");
+          const { method } = JSON.parse(new TextDecoder().decode(body.body));
+          if (method === "initialize") {
+            return HttpClientResponse.fromWeb(
+              request,
+              new Response("", { headers: { "mcp-session-id": String(++sessions) } }),
+            );
+          }
+          if (method === "notifications/initialized") {
+            return HttpClientResponse.fromWeb(request, new Response("", { status: 202 }));
+          }
+          calls.push(request.headers["mcp-session-id"]);
+          return HttpClientResponse.fromWeb(
+            request,
+            calls.length === 1 ? new Response("", { status: 404 }) : new Response(probeResult),
+          );
+        }),
+      );
+      const mutate = yield* probeThrough(http, "mutate");
+
+      const outcome = yield* Effect.result(mutate);
+      expect(outcome).toMatchObject({
+        _tag: "Failure",
+        failure: { code: "orchestration_error", message: expect.stringContaining("unknown") },
+      });
+      expect(calls).toEqual(["1"]);
+      expect(yield* mutate).toEqual({ modes: "approval-required/plan" });
+      expect(calls).toEqual(["1", "2"]);
+    }),
+);
+
 const probeResult = JSON.stringify({
   result: { content: [{ type: "text", text: '{"modes":"approval-required/plan"}' }] },
 });
+
+it.effect("rejects mutation redirects on the fetch transport", () =>
+  Effect.gen(function* () {
+    const requests: string[] = [];
+    const fetchFixture: typeof fetch = async (url, options) => {
+      expect(options?.redirect).toBe("manual");
+      requests.push(String(url));
+      const body = options?.body;
+      if (!(body instanceof Uint8Array)) throw new Error("Expected a JSON-RPC request");
+      switch (JSON.parse(new TextDecoder().decode(body)).method) {
+        case "initialize":
+          return new Response("", { headers: { "mcp-session-id": "fixture-session" } });
+        case "notifications/initialized":
+          return new Response("", { status: 202 });
+        default:
+          return new Response("", {
+            status: 307,
+            headers: { location: "https://wrong-peer.example/mcp" },
+          });
+      }
+    };
+    const http = yield* HttpClient.HttpClient;
+    const mutate = yield* probeThrough(http, "mutate");
+    expect(
+      yield* Effect.flip(mutate).pipe(Effect.provideService(FetchHttpClient.Fetch, fetchFixture)),
+    ).toMatchObject({
+      code: "orchestration_error",
+      message: "The linked environment answered HTTP 307.",
+    });
+    expect(requests).toEqual(Array(3).fill("https://peer.example/mcp"));
+  }).pipe(Effect.provide(FetchHttpClient.layer)),
+);
+
+it.effect("evicts a renewed read session when it also returns 404", () =>
+  Effect.gen(function* () {
+    const calls: Array<string | undefined> = [];
+    let sessions = 0;
+    const http = HttpClient.make((request) =>
+      Effect.sync(() => {
+        const body = request.body;
+        if (body._tag !== "Uint8Array") throw new Error("Expected a JSON-RPC request");
+        const { method } = JSON.parse(new TextDecoder().decode(body.body));
+        if (method === "initialize") {
+          return HttpClientResponse.fromWeb(
+            request,
+            new Response("", { headers: { "mcp-session-id": String(++sessions) } }),
+          );
+        }
+        if (method === "notifications/initialized") {
+          return HttpClientResponse.fromWeb(request, new Response("", { status: 202 }));
+        }
+        calls.push(request.headers["mcp-session-id"]);
+        return HttpClientResponse.fromWeb(
+          request,
+          calls.length <= 2 ? new Response("", { status: 404 }) : new Response(probeResult),
+        );
+      }),
+    );
+    const read = yield* probeThrough(http, "probe", true);
+    expect(yield* Effect.flip(read)).toMatchObject({ code: "orchestration_error" });
+    expect(calls).toEqual(["1", "2"]);
+    expect(yield* read).toEqual({ modes: "approval-required/plan" });
+    expect(calls).toEqual(["1", "2", "3"]);
+  }),
+);
 
 const refusal = new OrchestratorMcpFailure({
   code: "thread_not_found",
@@ -312,6 +422,7 @@ it.effect("renews a missing peer session once and reuses its replacement", () =>
         yield* client.call({
           environmentId: box.environmentId,
           tool: "probe",
+          readOnly: true,
           arguments: {},
           limits: { runtimeMode: "approval-required", interactionMode: "plan" },
           success: Result,

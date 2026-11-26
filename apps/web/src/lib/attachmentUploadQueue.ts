@@ -35,10 +35,17 @@ import { environmentCatalog } from "../connection/catalog";
 import { assetEnvironment } from "../state/assets";
 import { attachmentEnvironment } from "../state/attachments";
 import { readEnvironmentScope, readPreparedConnection } from "../state/session";
-import type { AttachmentUploadState, ReadyAttachmentUpload } from "./attachmentUploadState";
+import type {
+  AttachmentUploadFailure,
+  AttachmentUploadState,
+  ReadyAttachmentUpload,
+} from "./attachmentUploadState";
+import {
+  isAttachmentUploadOutcomeUnknown,
+  uploadAttachmentBytes,
+} from "./attachmentUploadTransport";
 
 const MAX_UPLOADS_PER_ENVIRONMENT = 3;
-const UPLOAD_TIMEOUT_MS = 5 * 60_000;
 
 interface AttachmentUploadStore {
   readonly uploadsByImageId: Readonly<Record<string, AttachmentUploadState>>;
@@ -139,48 +146,22 @@ function deletePendingUpload(environmentId: EnvironmentId, attachmentId: string)
   });
 }
 
-function uploadBytes(input: {
-  readonly url: string;
-  readonly file: File;
-  readonly mimeType: string;
-  readonly signal: AbortSignal;
-  readonly onProgress: (progress: number) => void;
-}): Promise<void> {
-  const xhr = new XMLHttpRequest();
-  return new Promise<void>((resolve, reject) => {
-    xhr.open("POST", input.url, true);
-    xhr.timeout = UPLOAD_TIMEOUT_MS;
-    xhr.setRequestHeader("Content-Type", input.mimeType);
-    xhr.upload.addEventListener("progress", (event) => {
-      if (event.lengthComputable && event.total > 0) {
-        input.onProgress(event.loaded / event.total);
-      }
-    });
-    xhr.addEventListener("load", () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        resolve();
-      } else {
-        reject(new Error(`Upload rejected (${xhr.status})`));
-      }
-    });
-    xhr.addEventListener("error", () => reject(new Error("Upload failed")));
-    xhr.addEventListener("timeout", () => reject(new Error("Upload timed out")));
-    xhr.addEventListener("abort", () => reject(new Error("Upload cancelled")));
-    input.signal.addEventListener("abort", () => xhr.abort(), { once: true });
-    xhr.send(input.file);
-  });
-}
-
 const canOperate = (environmentId: EnvironmentId) =>
   readEnvironmentScope(environmentId, AuthOrchestrationOperateScope);
 
 /** Records the failure the composer shows, then fails the upload with it. */
-const failUpload = (job: UploadJob, reason: string, attachmentId?: string) =>
+const failUpload = (
+  job: UploadJob,
+  reason: string,
+  attachmentId?: string,
+  failure?: AttachmentUploadFailure,
+) =>
   Effect.sync(() =>
     setUploadState(job.image.id, {
       status: "failed",
       environmentId: job.environmentId,
       reason,
+      ...(failure ? { failure } : {}),
       ...(attachmentId ? { attachmentId } : {}),
       ...(job.previous ? { previous: job.previous } : {}),
     }),
@@ -261,15 +242,18 @@ const uploadJob = Effect.fn("WebAttachmentUploads.upload")(function* (job: Uploa
       mimeType,
       sizeBytes: file.size,
     },
-    resolveUploadUrl: (relativeUrl) => {
+    resolveUploadUrl: (issuedUrl, verificationRequired) => {
       if (!canOperate(job.environmentId)) return null;
+      if (verificationRequired) return URL.canParse(issuedUrl) ? issuedUrl : null;
       const connection = readPreparedConnection(job.environmentId);
-      return connection ? resolveAssetUrl(connection.httpBaseUrl, relativeUrl) : null;
+      return connection ? resolveAssetUrl(connection.httpBaseUrl, issuedUrl) : null;
     },
-    transport: (url) =>
+    transport: (url, verificationRequired) =>
       Effect.tryPromise({
         try: (signal) =>
-          uploadBytes({
+          uploadAttachmentBytes({
+            environmentId: job.environmentId,
+            verificationRequired,
             url,
             file,
             mimeType,
@@ -286,7 +270,8 @@ const uploadJob = Effect.fn("WebAttachmentUploads.upload")(function* (job: Uploa
               });
             },
           }),
-        catch: attachmentUploadError,
+        catch: (error) =>
+          isAttachmentUploadOutcomeUnknown(error) ? error : attachmentUploadError(error),
       }),
   });
   if (result.status === "uploaded") {
@@ -313,6 +298,11 @@ const uploadJob = Effect.fn("WebAttachmentUploads.upload")(function* (job: Uploa
           ? result.error.message
           : "Upload failed",
     result.attachmentId ?? undefined,
+    isAttachmentUploadOutcomeUnknown(result.error)
+      ? result.error.retired
+        ? "relay-retired"
+        : "outcome-unknown"
+      : undefined,
   );
 });
 
@@ -419,9 +409,11 @@ export function startAttachmentUpload(input: {
       awaitHeldUpload(input.image.id).pipe(
         Effect.andThen(
           Effect.sync(() => {
+            const upload = readAttachmentUpload(input.image.id);
             if (
               ownsImage() &&
-              readAttachmentUpload(input.image.id)?.status === "failed" &&
+              upload?.status === "failed" &&
+              upload.failure === undefined &&
               isConnected()
             ) {
               retryAttachmentUpload(input);

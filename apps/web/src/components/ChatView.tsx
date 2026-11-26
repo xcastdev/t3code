@@ -1,3 +1,4 @@
+import { readAdmittedStaticAsset, requiresAdmittedAsset } from "~/assets/admittedAssetSource";
 import { ChildThreadApprovals } from "./chat/ChildThreadApprovals";
 import { workspaceAreaProps } from "../lib/workspaceFocus";
 import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
@@ -1634,8 +1635,14 @@ export default function ChatView(props: ChatViewProps) {
         httpBaseUrl: connection.httpBaseUrl,
         createAssetUrl: createAttachmentAssetUrl,
       });
+      const downloadUrl = requiresAdmittedAsset(url)
+        ? URL.createObjectURL(
+            await readAdmittedStaticAsset(environmentId, url, AbortSignal.timeout(60_000)),
+          )
+        : url;
+      if (downloadUrl !== url) setTimeout(() => URL.revokeObjectURL(downloadUrl), 30_000);
       const anchor = document.createElement("a");
-      anchor.href = url;
+      anchor.href = downloadUrl;
       anchor.download = attachment.name;
       anchor.click();
     } catch (error) {

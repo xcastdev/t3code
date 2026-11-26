@@ -8,6 +8,7 @@ export type ConnectionWakeup =
   | "application-active-long"
   | "application-focused"
   | "credentials-changed"
+  | "route-admission-changed"
   | "network-changed";
 
 function isApplicationActiveWakeup(reason: ConnectionWakeup): boolean {

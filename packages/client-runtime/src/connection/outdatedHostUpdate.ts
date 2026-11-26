@@ -33,6 +33,7 @@ import {
   routeHttpBaseUrl,
   usableRoutes,
 } from "./routes.ts";
+import { requireVerifiedRoute } from "./verifiedRoute.ts";
 
 // A v1 host restarting into v2 runs migrations before its descriptor answers again.
 const OUTDATED_HOST_RESTART_TIMEOUT = Duration.minutes(4);
@@ -114,6 +115,12 @@ export const updateOutdatedHost = Effect.fn("clientRuntime.connection.updateOutd
 
     const result = yield* Effect.scoped(
       Effect.gen(function* () {
+        if (prepared.verificationRequired || prepared.learnedRoute) {
+          yield* requireVerifiedRoute(prepared.environmentId, {
+            httpBaseUrl: prepared.httpBaseUrl,
+            wsBaseUrl: prepared.socketUrl,
+          });
+        }
         const protocolContext = yield* Layer.build(
           Layer.effect(
             RpcClient.Protocol,

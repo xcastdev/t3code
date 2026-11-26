@@ -294,6 +294,7 @@ describe("DesktopPreReadyPlatform", () => {
           preReady: {
             linux: null,
             linuxPasswordStoreCommandLine: null,
+            verifiedRoutes: [],
           },
         });
         assert.deepEqual(events, ["pre-ready", "clerk"]);

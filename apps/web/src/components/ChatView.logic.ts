@@ -1,3 +1,4 @@
+import { readAdmittedStaticAsset, requiresAdmittedAsset } from "~/assets/admittedAssetSource";
 import { toServerClock } from "@t3tools/client-runtime/clock";
 import { type OrchestrationV2ProviderTurn, type RunAttemptId } from "@t3tools/contracts";
 import {
@@ -671,9 +672,14 @@ export async function prepareRevertedMessageAttachments(input: {
       if (result._tag === "Failure") throw squashAtomCommandFailure(result);
       const url = resolveAssetUrl(input.httpBaseUrl, result.value.relativeUrl);
       if (url === null) throw new Error("The environment returned an invalid attachment URL.");
-      const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
-      if (!response.ok) throw new Error(`Could not restore attachment: ${attachment.name}`);
-      const file = new File([await response.blob()], attachment.name, {
+      const signal = AbortSignal.timeout(30_000);
+      const blob = requiresAdmittedAsset(url)
+        ? await readAdmittedStaticAsset(input.environmentId, url, signal)
+        : await fetch(url, { signal }).then((response) => {
+            if (!response.ok) throw new Error(`Could not restore attachment: ${attachment.name}`);
+            return response.blob();
+          });
+      const file = new File([blob], attachment.name, {
         type: attachment.mimeType,
       });
       if (attachment.type === "image") await readComposerImageBytes(file);

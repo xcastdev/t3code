@@ -31,6 +31,7 @@ import { Keyboard, Platform, Pressable, View } from "react-native";
 import { composerImageGallery } from "../../lib/composerImageGallery";
 import { filePreviewGallery } from "../../lib/filePreviewGallery";
 import { FilePreviewModal, type FilePreviewSource } from "../../components/ui/FilePreviewModal";
+import { useAttachmentUploadOutcomeUnknownMessage } from "../../components/useAttachmentUploadOutcomeUnknownMessage";
 import {
   composerAttachmentUploadBlockReason,
   composerAttachmentsStillUploading,
@@ -506,12 +507,14 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
   const hasEditingAttachments =
     (queuedEdit !== null && queuedEdit.existingAttachments.length > 0) ||
     stripAttachments.length > 0;
+  const outcomeUnknownMessage = useAttachmentUploadOutcomeUnknownMessage();
   const attachmentBlockReason = composerAttachmentUploadBlockReason({
     environmentId: props.environmentId,
     attachments: draftAttachments,
     connected: props.connectionState === "connected",
     serverConfig: props.serverConfig,
     states: uploadStates,
+    formatUnknownUpload: outcomeUnknownMessage,
   });
   const contextImports = useAtomValue(composerContextImportsAtom);
   const sendBlockedReason =

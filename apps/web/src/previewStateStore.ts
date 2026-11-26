@@ -38,6 +38,7 @@ export interface ThreadPreviewState {
   desktopByTabId: Record<string, DesktopPreviewOverlay>;
   recentlySeenUrls: string[];
   listLoaded: boolean;
+  verifiedAssetOrigin: string | null;
   serverEpoch: string | null;
   serverRevision: number;
 }
@@ -51,6 +52,7 @@ const EMPTY_THREAD_PREVIEW_STATE: ThreadPreviewState = Object.freeze({
   desktopByTabId: {},
   recentlySeenUrls: [] as string[],
   listLoaded: false,
+  verifiedAssetOrigin: null,
   serverEpoch: null,
   serverRevision: 0,
 });
@@ -134,7 +136,7 @@ const rememberSnapshotUrl = (
   recentlySeenUrls: string[],
   snapshot: PreviewSessionSnapshot,
 ): string[] =>
-  snapshot.navStatus._tag === "Idle"
+  snapshot.verifiedAsset || snapshot.navStatus._tag === "Idle"
     ? recentlySeenUrls
     : dedupeRecentUrls(recentlySeenUrls, snapshot.navStatus.url);
 
@@ -191,10 +193,7 @@ export function applyPreviewServerEvent(ref: ScopedThreadRef, event: PreviewEven
         case "resized": {
           const snapshot = event.snapshot;
           if (current.suppressedTabIds.has(snapshot.tabId)) return current;
-          const recentlySeenUrls =
-            snapshot.navStatus._tag === "Idle"
-              ? current.recentlySeenUrls
-              : dedupeRecentUrls(current.recentlySeenUrls, snapshot.navStatus.url);
+          const recentlySeenUrls = rememberSnapshotUrl(current.recentlySeenUrls, snapshot);
           const sessions = { ...current.sessions, [snapshot.tabId]: snapshot };
           const activeTabId = event.type === "opened" ? snapshot.tabId : current.activeTabId;
           const activeSnapshot = sessions[activeTabId ?? snapshot.tabId] ?? snapshot;
@@ -313,6 +312,7 @@ export function reconcilePreviewServerSessions(
       return current;
     }
     const snapshots = result.sessions;
+    const verifiedAssetOrigin = result.verifiedAssetOrigin ?? null;
     const sessions: Record<string, PreviewSessionSnapshot> = {};
     const currentSuppressedTabIds = sameServer ? current.suppressedTabIds : new Set<string>();
     let recentlySeenUrls = current.recentlySeenUrls;
@@ -344,6 +344,7 @@ export function reconcilePreviewServerSessions(
     if (
       sameServer &&
       current.listLoaded &&
+      current.verifiedAssetOrigin === verifiedAssetOrigin &&
       current.serverRevision === result.revision &&
       current.activeTabId === activeTabId &&
       current.snapshot === snapshot &&
@@ -365,6 +366,7 @@ export function reconcilePreviewServerSessions(
       desktopOverlay,
       recentlySeenUrls,
       listLoaded: true,
+      verifiedAssetOrigin,
       serverEpoch: result.serverEpoch,
       serverRevision: result.revision,
     };

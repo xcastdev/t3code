@@ -2,19 +2,22 @@
 import * as NodeFS from "node:fs";
 // @effect-diagnostics-next-line nodeBuiltinImport:off - A peer with a certificate this machine does not trust.
 import * as NodeHttps from "node:https";
-import { NodeHttpServer } from "@effect/platform-node";
+import { NodeHttpServer, NodeServices } from "@effect/platform-node";
 import { type ExecutionEnvironmentDescriptor, OrchestratorMcpFailure } from "@t3tools/contracts";
-import { expect, it } from "@effect/vitest";
+import { expect, it, vi } from "@effect/vitest";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as HttpClientResponse from "effect/http/HttpClientResponse";
 import * as HttpRouter from "effect/http/HttpRouter";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
@@ -40,6 +43,7 @@ import {
   type ServedPeer,
 } from "./PeerLinks.testkit.ts";
 import * as PeerMcpClient from "./PeerMcpClient.ts";
+import * as PeerVerifiedTransport from "./PeerVerifiedTransport.ts";
 
 import { layerReaderDatabase, traceSqlRouting } from "../persistence/testkit/SqliteRouting.ts";
 
@@ -413,68 +417,226 @@ it.effect("lists a peer asleep at every address as unreachable within one probe 
       yield* Ref.set(b.asleep, true);
       const listing = yield* a.links.list.pipe(Effect.forkScoped);
       yield* Queue.take(b.unanswered);
-      yield* TestClock.adjust(Duration.seconds(3));
+      yield* TestClock.adjust(Duration.millis(1999));
+      expect(listing.pollUnsafe()).toBeUndefined();
+      yield* TestClock.adjust(Duration.millis(1));
+      expect(listing.pollUnsafe()).toBeDefined();
       const listed = yield* Fiber.join(listing);
       expect(listed.map((link) => link.status)).toEqual(["unreachable"]);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("lists a peer as reachable at another address while its first one sleeps", () =>
+it.effect("lists a peer through its relay after a noncanonical direct probe stalls", () =>
+  Effect.gen(function* () {
+    const canonicalOrigin = "https://canonical.example";
+    const direct = "https://direct.example";
+    const relay = "https://relay.example";
+    const fs = yield* FileSystem.FileSystem;
+    const directory = yield* fs.makeTempDirectoryScoped({ prefix: "peer-probe-" });
+    const relayCredentialPath = `${directory}/credential`;
+    yield* fs.writeFileString(relayCredentialPath, `t3-session-1.test-relay.1.${"a".repeat(43)}`, {
+      mode: 0o600,
+    });
+    const spkiSha256 = "A".repeat(43);
+    const config = ConfigProvider.fromEnv({
+      env: {
+        T3CODE_PEER_ENROLLMENTS: JSON.stringify([
+          {
+            environmentId: box.environmentId,
+            canonicalOrigin,
+            routes: [
+              { origin: relay, spkiSha256, relayCredentialPath },
+              { origin: direct, spkiSha256 },
+            ],
+          },
+        ]),
+      },
+    });
+    const entered = yield* Deferred.make<void>();
+    const stopped = yield* Deferred.make<void>();
+    const observed: string[] = [];
+    using _transport = vi
+      .spyOn(PeerVerifiedTransport, "make")
+      .mockImplementation(({ aliasOrigin }) =>
+        HttpClient.make((request, url) => {
+          if (aliasOrigin === direct) {
+            return Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Effect.never),
+              Effect.onInterrupt(() => Deferred.succeed(stopped, undefined)),
+            );
+          }
+          observed.push(url.pathname);
+          return Effect.succeed(
+            HttpClientResponse.fromWeb(
+              request,
+              Response.json(
+                url.pathname === "/.well-known/t3/environment"
+                  ? box
+                  : {
+                      resource: `${canonicalOrigin}/mcp`,
+                      authorization_servers: [canonicalOrigin],
+                      scopes_supported: [],
+                      bearer_methods_supported: ["header"],
+                      resource_name: box.label,
+                    },
+              ),
+            ),
+          );
+        }),
+      );
+    const credential = new TextEncoder().encode(
+      JSON.stringify({ canonicalOrigin, token: "peer-token" }),
+    );
+    const secrets = Layer.mock(ServerSecretStore.ServerSecretStore)({
+      get: () => Effect.succeedSome(credential),
+    });
+    const context = yield* layerLinkingEnvironment(laptop, secrets).pipe(
+      Layer.provide(ConfigProvider.layer(config)),
+      Layer.build,
+    );
+    const sql = Context.get(context, SqlClient.SqlClient);
+    yield* sql`
+      INSERT INTO peer_environment_links (
+        environment_id, secret_name, label, urls_json, access, linked_at, expires_at, fenced
+      ) VALUES (
+        ${box.environmentId}, 'test-secret', ${box.label}, ${JSON.stringify([direct])}, 'auto',
+        '1970-01-01T00:00:00.000Z', '2099-01-01T00:00:00.000Z', 1
+      )
+    `;
+    const links = Context.get(context, PeerLinks.PeerLinks);
+    const listing = yield* links.list.pipe(Effect.forkScoped);
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust(Duration.millis(1999));
+    expect(yield* Deferred.isDone(stopped)).toBe(false);
+    expect(observed).toEqual([]);
+    yield* TestClock.adjust(Duration.millis(1));
+    expect(yield* Deferred.isDone(stopped)).toBe(true);
+    yield* TestClock.adjust(Duration.seconds(1));
+    expect((yield* Fiber.join(listing)).map((link) => link.status)).toEqual(["reachable"]);
+    expect(observed).toEqual([
+      "/.well-known/t3/environment",
+      "/.well-known/oauth-protected-resource/mcp",
+    ]);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("uses the approved peer resource until another address is explicitly approved", () =>
   Effect.scoped(
     Effect.gen(function* () {
-      const b = yield* serveB(box);
-      const described = yield* HttpClient.get(`${b.url}/.well-known/t3/environment`).pipe(
-        Effect.flatMap((response) => response.text),
-        Effect.provide(FetchHttpClient.layer),
-      );
-      // Another address of the same machine that answers.
-      const elsewhere = yield* serveRaw(() =>
-        Effect.succeed(HttpServerResponse.text(described, { contentType: "application/json" })),
-      );
+      const primary = yield* serveB(box);
+      const alternate = yield* serveApart(box);
       const a = yield* makeA(laptop);
-      const pairing = yield* b.auth.issuePairingCredential();
+      const pairing = yield* primary.auth.issuePairingCredential();
       yield* a.links.link({
-        url: b.url,
-        alternateUrls: [elsewhere],
+        url: primary.url,
+        alternateUrls: [alternate.url],
         pairingCode: pairing.credential,
         access: "auto",
       });
 
-      yield* Ref.set(b.asleep, true);
-      expect((yield* a.links.list).map((link) => link.status)).toEqual(["reachable"]);
+      yield* probe(a);
+      expect((yield* Ref.get(primary.bearers)).length).toBeGreaterThan(0);
+      expect(yield* Ref.get(alternate.bearers)).toEqual([]);
+
+      yield* Ref.set(primary.asleep, true);
+      const call = yield* probe(a).pipe(Effect.flip, Effect.forkScoped);
+      yield* Queue.take(primary.unanswered);
+      yield* TestClock.adjust(Duration.seconds(3));
+      const result = yield* Fiber.join(call);
+      expect(result.message).toContain("Link it again");
+      expect(yield* Ref.get(alternate.bearers)).toEqual([]);
+
+      const listing = yield* a.links.list.pipe(Effect.forkScoped);
+      yield* Queue.take(primary.unanswered);
+      yield* TestClock.adjust(Duration.seconds(3));
+      expect((yield* Fiber.join(listing)).map((link) => link.status)).toEqual(["unreachable"]);
+
+      const reapproval = yield* alternate.auth.issuePairingCredential();
+      yield* a.links.link({
+        url: alternate.url,
+        alternateUrls: [primary.url],
+        pairingCode: reapproval.credential,
+        access: "auto",
+      });
+      yield* probe(a);
+      expect((yield* Ref.get(alternate.bearers)).length).toBeGreaterThan(0);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("resolves a link at its answering address without waiting out a sleeping first", () =>
+it.effect("shares two probe slots across simultaneous lookups of a peer", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const b = yield* serveB(box);
-      const described = yield* HttpClient.get(`${b.url}/.well-known/t3/environment`).pipe(
-        Effect.flatMap((response) => response.text),
-        Effect.provide(FetchHttpClient.layer),
-      );
-      const elsewhere = yield* serveRaw(() =>
-        Effect.succeed(HttpServerResponse.text(described, { contentType: "application/json" })),
-      );
       const a = yield* makeA(laptop);
       const pairing = yield* b.auth.issuePairingCredential();
-      yield* a.links.link({
-        url: b.url,
-        alternateUrls: [elsewhere],
-        pairingCode: pairing.credential,
-        access: "auto",
-      });
+      yield* a.links.link({ url: b.url, pairingCode: pairing.credential, access: "auto" });
 
-      yield* Ref.set(b.asleep, true);
-      const first = yield* a.links.resolve(box.environmentId).pipe(Effect.forkScoped);
-      yield* Queue.take(b.unanswered);
-      yield* TestClock.adjust(Duration.seconds(3));
-      expect((yield* Fiber.join(first)).url).toBe(elsewhere);
+      const twoStarted = yield* Deferred.make<void>();
+      const release = Promise.withResolvers<void>();
+      let requests = 0;
+      const fetchDescriptor: typeof fetch = async (_url) => {
+        if (++requests === 2) Deferred.doneUnsafe(twoStarted, Effect.void);
+        await release.promise;
+        return Response.json(box);
+      };
+      const resolve = a.links
+        .resolve(box.environmentId)
+        .pipe(
+          Effect.provideService(FetchHttpClient.Fetch, fetchDescriptor),
+          Effect.forkScoped({ startImmediately: true }),
+        );
+      const first = yield* resolve;
+      const second = yield* resolve;
+      yield* Deferred.await(twoStarted);
+      const third = yield* resolve;
+      yield* TestClock.adjust(Duration.zero);
+      expect(requests).toBe(2);
 
-      // The clock no longer moves: a resolve that probes the sleeping address first never returns.
-      expect((yield* a.links.resolve(box.environmentId)).url).toBe(elsewhere);
+      release.resolve();
+      const resolved = yield* Fiber.joinAll([first, second, third]);
+      expect(resolved.map((peer) => peer.url)).toEqual([b.url, b.url, b.url]);
+      expect(requests).toBe(3);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("bounds initial descriptor discovery before the environment identity is known", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const a = yield* makeA(laptop);
+      const twoStarted = yield* Deferred.make<void>();
+      const release = Promise.withResolvers<void>();
+      let requests = 0;
+      const fetchDescriptor: typeof fetch = async (url) => {
+        if (!String(url).includes("/.well-known/t3/environment")) {
+          return Response.json({ error: "invalid_grant" }, { status: 400 });
+        }
+        if (++requests === 2) Deferred.doneUnsafe(twoStarted, Effect.void);
+        await release.promise;
+        return Response.json(box);
+      };
+      const discover = a.links
+        .link({
+          url: "https://unknown.test",
+          pairingCode: "unredeemable",
+          access: "auto",
+        })
+        .pipe(
+          Effect.result,
+          Effect.provideService(FetchHttpClient.Fetch, fetchDescriptor),
+          Effect.forkScoped({ startImmediately: true }),
+        );
+      const first = yield* discover;
+      const second = yield* discover;
+      yield* Deferred.await(twoStarted);
+      const third = yield* discover;
+      yield* TestClock.adjust(Duration.zero);
+      expect(requests).toBe(2);
+      release.resolve();
+      yield* Fiber.joinAll([first, second, third]);
+      expect(requests).toBe(3);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
@@ -739,54 +901,66 @@ it.effect(
     ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect(
-  "linking a picked machine skips an address that answers as another, and never signs in there",
-  () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const impostor = yield* serveApart(descriptorOf("environment-impostor", "Impostor"));
-        const b = yield* serveB(box);
-        const a = yield* makeA(laptop);
-        const pairing = yield* b.auth.issuePairingCredential();
-        const linked = yield* a.links.link({
-          url: impostor.url,
-          alternateUrls: [b.url],
+it.effect("linking a picked machine requires confirmation and never substitutes an alternate", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const impostor = yield* serveApart(descriptorOf("environment-impostor", "Impostor"));
+      const b = yield* serveB(box);
+      const a = yield* makeA(laptop);
+      const pairing = yield* b.auth.issuePairingCredential();
+      const input = {
+        url: impostor.url,
+        alternateUrls: [b.url],
+        pairingCode: pairing.credential,
+        access: "auto" as const,
+        expectedEnvironmentId: box.environmentId,
+      };
+      const unconfirmed = yield* a.links.link(input).pipe(Effect.flip);
+      expect(unconfirmed.reason).toBe("pairing_rejected");
+      const mismatched = yield* a.links
+        .link({ ...input, addressConfirmed: true })
+        .pipe(Effect.flip);
+      expect(mismatched.reason).toBe("unreachable");
+      expect(yield* linkedSessions(b)).toEqual([]);
+      const linked = yield* a.links.link({
+        ...input,
+        url: b.url,
+        alternateUrls: [impostor.url],
+        addressConfirmed: true,
+      });
+      expect(linked).toMatchObject({ environmentId: box.environmentId, urls: [b.url] });
+      // A picked machine is never linked at this machine's own loopback.
+      const own = yield* a.links
+        .link({
+          url: b.url.replace("127.0.0.1", "localhost"),
           pairingCode: pairing.credential,
           access: "auto",
           expectedEnvironmentId: box.environmentId,
-        });
-        expect(linked).toMatchObject({ environmentId: box.environmentId, urls: [b.url] });
-        // A picked machine is never linked at this machine's own loopback.
-        const own = yield* a.links
-          .link({
-            url: b.url.replace("127.0.0.1", "localhost"),
-            pairingCode: pairing.credential,
-            access: "auto",
-            expectedEnvironmentId: box.environmentId,
-          })
-          .pipe(Effect.flip);
-        expect(own.message).toContain("is this machine");
-        yield* probe(a);
-        expect(yield* linkedSessions(impostor)).toEqual([]);
-        expect(yield* Ref.get(impostor.bearers)).toEqual([]);
-        expect((yield* linkedSessions(b)).length).toBe(1);
+          addressConfirmed: true,
+        })
+        .pipe(Effect.flip);
+      expect(own.message).toContain("is this machine");
+      yield* probe(a);
+      expect(yield* linkedSessions(impostor)).toEqual([]);
+      expect(yield* Ref.get(impostor.bearers)).toEqual([]);
+      expect((yield* linkedSessions(b)).length).toBe(1);
 
-        // An address alone that answers as the linked box never takes over its link.
-        yield* Ref.set(impostor.descriptor, box);
-        const second = yield* impostor.auth.issuePairingCredential();
-        const taken = yield* a.links
-          .link({ url: impostor.url, pairingCode: second.credential, access: "auto" })
-          .pipe(Effect.flip);
-        expect(taken.message).toContain("already linked");
-        expect(yield* linkedSessions(impostor)).toEqual([]);
-        expect(Option.getOrUndefined(yield* a.links.get(box.environmentId))?.urls).toEqual([b.url]);
-        // The address the link already has still renews it.
-        const renewal = yield* b.auth.issuePairingCredential();
-        expect(
-          yield* a.links.link({ url: b.url, pairingCode: renewal.credential, access: "auto" }),
-        ).toMatchObject({ urls: [b.url] });
-      }),
-    ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+      // An address alone that answers as the linked box never takes over its link.
+      yield* Ref.set(impostor.descriptor, box);
+      const second = yield* impostor.auth.issuePairingCredential();
+      const taken = yield* a.links
+        .link({ url: impostor.url, pairingCode: second.credential, access: "auto" })
+        .pipe(Effect.flip);
+      expect(taken.message).toContain("already linked");
+      expect(yield* linkedSessions(impostor)).toEqual([]);
+      expect(Option.getOrUndefined(yield* a.links.get(box.environmentId))?.urls).toEqual([b.url]);
+      // The address the link already has still renews it.
+      const renewal = yield* b.auth.issuePairingCredential();
+      expect(
+        yield* a.links.link({ url: b.url, pairingCode: renewal.credential, access: "auto" }),
+      ).toMatchObject({ urls: [b.url] });
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
 it.effect("linking a picked machine that answers nowhere names it and links nothing", () =>
@@ -801,6 +975,7 @@ it.effect("linking a picked machine that answers nowhere names it and links noth
           pairingCode: "unused",
           access: "auto",
           expectedEnvironmentId: box.environmentId,
+          addressConfirmed: true,
           expectedLabel: "Box",
         })
         .pipe(Effect.flip);
@@ -818,6 +993,7 @@ it.effect("linking a picked machine that answers nowhere names it and links noth
           pairingCode: "unused",
           access: "auto",
           expectedEnvironmentId: box.environmentId,
+          addressConfirmed: true,
           expectedLabel: "Box",
         })
         .pipe(Effect.flip);
@@ -883,15 +1059,14 @@ it.effect("names an untrusted certificate instead of calling the peer something 
       expect(failed.message).toContain("DEPTH_ZERO_SELF_SIGNED_CERT");
       expect(yield* a.links.list).toEqual([]);
 
-      // A stored link tries its next address past an untrusted one.
       const b = yield* serveB(box);
       const pairing = yield* b.auth.issuePairingCredential();
-      yield* a.links.link({ url: b.url, pairingCode: pairing.credential, access: "auto" });
-      yield* a.sql`
-        UPDATE peer_environment_links
-        SET urls_json = ${JSON.stringify([untrusted, b.url])}
-        WHERE environment_id = ${box.environmentId}
-      `;
+      yield* a.links.link({
+        url: b.url,
+        alternateUrls: [untrusted],
+        pairingCode: pairing.credential,
+        access: "auto",
+      });
       expect((yield* a.links.resolve(box.environmentId)).url).toBe(b.url);
       expect((yield* a.links.list).map((link) => link.status)).toEqual(["reachable"]);
     }),

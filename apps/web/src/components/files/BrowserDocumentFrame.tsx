@@ -1,5 +1,7 @@
+import DOMPurify from "dompurify";
 import { useAtomValue } from "@effect/atom-react";
 import {
+  type EnvironmentId,
   type KeybindingCommand,
   type KeybindingShortcut,
   MODEL_PICKER_JUMP_KEYBINDING_COMMANDS,
@@ -26,6 +28,7 @@ import {
   matchesKeybindingShortcut,
   normalizeEventKey,
 } from "@t3tools/shared/keybindings";
+import { verifiedDocumentCsp } from "@t3tools/shared/verifiedDocumentCsp";
 import {
   lazy,
   Suspense,
@@ -35,8 +38,11 @@ import {
   useRef,
   useState,
 } from "react";
+import { environmentRelayAdmissionRequired } from "~/connection/environmentTransport";
+import { hostedAdmissionRequired } from "~/connection/hostedRelayAdmission";
+import { HostedAssetDocument } from "./HostedAssetDocument";
 import { isElectron } from "~/env";
-import { FileSurfaceLoading } from "./fileSurfaceChrome";
+import { FileSurfaceFailure, FileSurfaceLoading } from "./fileSurfaceChrome";
 import type { PdfViewState } from "./PdfViewer";
 
 import { useOpenLink } from "~/browser/useOpenLink";
@@ -79,13 +85,21 @@ export const isPdfPreviewFile = (path: string): boolean =>
 const PdfViewer = lazy(() => import("./PdfViewer"));
 
 // The document stays mounted while each revision gets a fresh PDF.js document.
-function PdfDocument(props: { src: string; title: string; documentKey: string }) {
+function PdfDocument(props: {
+  src: string;
+  title: string;
+  documentKey: string;
+  local: boolean;
+  verified: boolean;
+}) {
   const [view, setView] = useState<PdfViewState>({ page: 0, offset: 0, zoom: null, left: 0 });
   return (
     <PdfDocumentRevision
       key={props.documentKey}
       src={props.src}
       title={props.title}
+      local={props.local}
+      verified={props.verified}
       positionKey={props.documentKey}
       initialView={view}
       onViewChange={setView}
@@ -98,6 +112,8 @@ function PdfDocumentRevision(props: {
   src: string;
   title: string;
   positionKey: string;
+  local: boolean;
+  verified: boolean;
   initialView: PdfViewState;
   onViewChange: (view: PdfViewState) => void;
 }) {
@@ -105,6 +121,7 @@ function PdfDocumentRevision(props: {
   // The Electron shell does not enable PDF plugins. WebKit embeds on iOS
   // expose only the first page, even when pdfViewerEnabled reports support.
   const native =
+    !props.local &&
     !isElectron &&
     navigator.pdfViewerEnabled &&
     !/iPad|iPhone|iPod/.test(navigator.userAgent) &&
@@ -114,6 +131,7 @@ function PdfDocumentRevision(props: {
     <iframe
       src={`${src.split("#", 1)[0]}#navpanes=0&view=FitH`}
       title={props.title}
+      referrerPolicy={props.verified ? "no-referrer" : undefined}
       className="block h-full min-h-0 w-full flex-1 border-0 bg-white"
     />
   ) : (
@@ -121,6 +139,7 @@ function PdfDocumentRevision(props: {
       <PdfViewer
         src={src}
         title={props.title}
+        verified={props.verified && !props.local}
         positionKey={props.positionKey}
         initialView={props.initialView}
         onViewChange={props.onViewChange}
@@ -137,7 +156,11 @@ export function BrowserDocumentFrame(props: {
   readonly src: string;
   readonly title: string;
   readonly pdf: boolean;
+  readonly local?: boolean;
+  readonly verified?: boolean;
   readonly htmlRender?: boolean;
+  readonly environmentId?: EnvironmentId | undefined;
+  readonly visible?: boolean | undefined;
   readonly threadRef?: ScopedThreadRef | undefined;
   /** Stable resource identity and revision; defaults to src for callers that reload on URL changes. */
   readonly documentKey?: string | undefined;
@@ -145,10 +168,26 @@ export function BrowserDocumentFrame(props: {
   readonly documentId?: string | undefined;
 }) {
   const key = props.documentKey ?? props.src;
+  const environmentId = props.environmentId ?? props.threadRef?.environmentId;
+  if (!props.pdf && environmentRelayAdmissionRequired(props.src)) {
+    if (!environmentId) return <FileSurfaceFailure message="Unable to load file preview." />;
+    return (
+      <HostedAssetDocument
+        key={key}
+        environmentId={environmentId}
+        src={props.src}
+        title={props.title}
+        htmlRender={props.htmlRender === true}
+        visible={props.visible}
+      />
+    );
+  }
   return props.pdf ? (
     <PdfDocument
       key={props.documentId ?? key}
       documentKey={key}
+      local={props.local === true}
+      verified={props.verified === true}
       src={props.src}
       title={props.title}
     />
@@ -157,6 +196,7 @@ export function BrowserDocumentFrame(props: {
       key={key}
       src={props.src}
       title={props.title}
+      verified={props.verified}
       threadRef={props.threadRef}
       className="min-h-0 flex-1"
     />
@@ -166,6 +206,48 @@ export function BrowserDocumentFrame(props: {
       documentKey={key}
       src={props.src}
       title={props.title}
+      verified={props.verified === true}
+    />
+  );
+}
+
+export function OfflineHtmlFile(props: { readonly file: Blob; readonly title: string }) {
+  const [source, setSource] = useState<{ file: Blob; html: string | null } | null>(null);
+  const { file } = props;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- reads the local Blob and ignores results from an obsolete file
+  useEffect(() => {
+    let disposed = false;
+    void file
+      .text()
+      .then((html) => {
+        if (disposed) return;
+        const safe = DOMPurify.sanitize(html, {
+          WHOLE_DOCUMENT: true,
+          USE_PROFILES: { html: true },
+          FORBID_TAGS: ["base", "embed", "form", "frame", "iframe", "link", "meta", "object"],
+          FORBID_ATTR: ["action", "formaction", "ping", "target"],
+          ALLOWED_URI_REGEXP: /^#/,
+        });
+        setSource({ file, html: safe });
+      })
+      .catch(() => {
+        if (!disposed) setSource({ file, html: null });
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [file]);
+  if (source?.file !== file) return <FileSurfaceLoading />;
+  if (source.html === null) return <FileSurfaceFailure message="Unable to load file preview." />;
+  const policy =
+    "default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; base-uri 'none'; form-action 'none'";
+  return (
+    <iframe
+      srcDoc={`<!doctype html><meta charset="utf-8"><meta name="color-scheme" content="light dark"><meta http-equiv="Content-Security-Policy" content="${policy}">${source.html}`}
+      title={props.title}
+      className="block min-h-0 w-full flex-1 border-0"
+      sandbox=""
+      referrerPolicy="no-referrer"
     />
   );
 }
@@ -196,6 +278,7 @@ function FileDocument(props: {
   readonly documentKey: string;
   readonly src: string;
   readonly title: string;
+  readonly verified: boolean;
 }) {
   const [frames, setFrames] = useState<FileDocumentFrames>(() => ({
     shown: { key: props.documentKey, src: props.src },
@@ -254,6 +337,8 @@ function FileDocument(props: {
             className="absolute inset-0 size-full border-0"
             style={{ backgroundColor: "Canvas" }}
             sandbox="allow-scripts allow-forms allow-popups allow-downloads"
+            referrerPolicy={props.verified ? "no-referrer" : undefined}
+            {...(props.verified ? { csp: verifiedDocumentCsp(revision.src) } : {})}
             inert={revision === next}
             aria-hidden={revision === next ? true : undefined}
             onLoad={
@@ -281,12 +366,31 @@ function FileDocument(props: {
 export function HtmlRenderDocument(props: {
   readonly src: string;
   readonly title: string;
+  readonly verified?: boolean | undefined;
+  readonly environmentId?: EnvironmentId | undefined;
   readonly className?: string;
   readonly threadRef?: ScopedThreadRef | undefined;
   readonly onContentHeight?: (height: number) => void;
   /** Reports fullscreen changes so virtualized rows can stay mounted. */
   readonly onFullscreenChange?: ((fullscreen: boolean) => void) | undefined;
 }) {
+  const environmentId = props.environmentId ?? props.threadRef?.environmentId;
+  if (!hostedAdmissionRequired(props.src)) return <InlineHtmlRenderDocument {...props} />;
+  if (!environmentId) return <FileSurfaceFailure message="Unable to load file preview." />;
+  return (
+    <HostedAssetDocument
+      key={environmentId}
+      environmentId={environmentId}
+      src={props.src}
+      title={props.title}
+      htmlRender
+      className={props.className}
+      onContentHeight={props.onContentHeight}
+    />
+  );
+}
+
+function InlineHtmlRenderDocument(props: Parameters<typeof HtmlRenderDocument>[0]) {
   const theme = useHtmlRenderTheme();
   const frameRef = useRef<HTMLIFrameElement>(null);
   const [src] = useState(() => `${props.src.split("#", 1)[0]}${htmlRenderThemeFragment(theme)}`);
@@ -426,6 +530,8 @@ export function HtmlRenderDocument(props: {
         title={props.title}
         // Never allow-same-origin: the opaque origin keeps the page out of the app's session.
         sandbox="allow-scripts allow-forms"
+        referrerPolicy={props.verified ? "no-referrer" : undefined}
+        {...(props.verified ? { csp: verifiedDocumentCsp(src) } : {})}
         // Lets a page's video or image viewer take the screen.
         allow="fullscreen"
         loading="lazy"

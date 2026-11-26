@@ -1,24 +1,100 @@
-import { useState } from "react";
+import { SecureWebView } from "../../native/secureWebView";
+import { useRef, useState } from "react";
 import { View } from "react-native";
 import { WebView } from "react-native-webview";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { AppActivityIndicator } from "../../components/ui/AppActivityIndicator";
 import { AppText as Text } from "../../components/ui/AppText";
-import { FilePreviewLoading } from "./FilePreviewFeedback";
+import { FilePreviewLoading, FilePreviewNotice } from "./FilePreviewFeedback";
 import { LoadingStrip } from "../../components/ui/LoadingStrip";
 import { PdfPreview } from "../../components/PdfPreview";
 import { ControlPill } from "../../components/ui/ControlPill";
 import { useHardwareBack } from "../../lib/backHandler";
+import {
+  framedWebDocument,
+  readFramedWebMessage,
+  useVerifiedWebDocument,
+} from "../../lib/verifiedWebDocument";
+import { uuidv4 } from "../../lib/uuid";
 import { isPdfPreviewUri } from "../../lib/pdfPreview";
 import { webViewDecelerationRate } from "../../lib/webViewDecelerationRate";
+import {
+  signedDocumentResources,
+  workspaceHtmlResources,
+  useVerifiedWebResources,
+  type VerifiedWebResourceAccess,
+} from "../../lib/verifiedWebResources";
 import { useContentTopInset } from "../../components/ui/useBarInset";
 
-export function WorkspaceFileWebPreview(props: { readonly uri: string | null }) {
-  if (props.uri === null) {
+export function WorkspaceFileWebPreview(props: {
+  readonly uri: string | null;
+  readonly workspaceHtml?: boolean;
+}) {
+  const isPdf = props.uri !== null && isPdfPreviewUri(props.uri);
+  const access = props.workspaceHtml ? workspaceHtmlResources : signedDocumentResources;
+  const document = useVerifiedWebDocument(isPdf ? null : props.uri, access);
+  if (props.uri === null || document.kind === "loading") {
     return <FilePreviewLoading message="Preparing preview..." background="card" />;
   }
+  if (document.kind === "failed") {
+    return <FilePreviewNotice>Rendered preview unavailable.</FilePreviewNotice>;
+  }
+  if (document.kind === "local") {
+    return (
+      <VerifiedWorkspaceDocument
+        key={props.uri}
+        uri={props.uri}
+        html={document.html}
+        sandbox={document.sandbox}
+        access={document.resourceAccess}
+      />
+    );
+  }
   return <DocumentWebPreview key={props.uri} uri={props.uri} />;
+}
+
+function VerifiedWorkspaceDocument(props: {
+  readonly uri: string;
+  readonly html: string;
+  readonly sandbox: string | undefined;
+  readonly access: VerifiedWebResourceAccess | undefined;
+}) {
+  const view = useRef<WebView<object>>(null);
+  const [fenceFailed, setFenceFailed] = useState(false);
+  const [secret] = useState(uuidv4);
+  const html = props.sandbox
+    ? framedWebDocument({ html: props.html, sandbox: props.sandbox }, "", secret)
+    : props.html;
+  const handleResource = useVerifiedWebResources(
+    fenceFailed || !props.access ? null : props.uri,
+    view,
+    0,
+    props.access,
+  );
+  if (fenceFailed) return <FilePreviewNotice>Rendered preview unavailable.</FilePreviewNotice>;
+  return (
+    <SecureWebView
+      verified={true}
+      onFenceError={() => setFenceFailed(true)}
+      ref={view}
+      source={{ html }}
+      onMessage={
+        props.access
+          ? (event) => {
+              const data = event.nativeEvent.data;
+              if (props.sandbox) {
+                const relay = readFramedWebMessage(data, secret);
+                if (relay) handleResource(relay.message);
+              } else {
+                handleResource(data);
+              }
+            }
+          : undefined
+      }
+      style={{ flex: 1, backgroundColor: "transparent" }}
+    />
+  );
 }
 
 function DocumentWebPreview(props: { readonly uri: string }) {

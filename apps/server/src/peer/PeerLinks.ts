@@ -6,6 +6,7 @@ import {
   EnvironmentId,
   type ExecutionEnvironmentCapabilities,
   MCP_PEER_LINK_SOFTWARE_ID,
+  mcpClientScopes,
   type PeerLink,
   type PeerLinkCreateInput,
   PeerLinkError,
@@ -28,6 +29,7 @@ import * as Redacted from "effect/Redacted";
 import * as Result from "effect/Result";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as HttpClient from "effect/http/HttpClient";
@@ -39,6 +41,8 @@ import { isLocalLoopbackHost, isTailnetHost } from "@t3tools/shared/hostClassifi
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as PeerEnrollment from "./PeerEnrollment.ts";
+import * as PeerRelayDirectory from "./PeerRelayDirectory.ts";
 
 const PeerHttpApi = HttpApi.make(EnvironmentHttpApi.identifier)
   .add(EnvironmentHttpApi.groups.metadata)
@@ -48,13 +52,13 @@ const PeerHttpApi = HttpApi.make(EnvironmentHttpApi.identifier)
 /** The redirect registered for a link. Nothing ever listens there: the code comes back in the response. */
 const LINK_REDIRECT_URI = "http://127.0.0.1/t3code-peer-link";
 /**
- * How long a peer's descriptor or MCP handshake may take before a route counts
- * as unreachable. A tailnet or relayed route to a machine that is waking up takes longer.
+ * How long an MCP handshake or relay probe may take before a route counts as unreachable.
  */
 export const probeTimeout = (origin: string) =>
   isLocalLoopbackHost(new URL(origin).hostname) ? Duration.seconds(3) : Duration.seconds(10);
-/** How long a listing waits on a link's addresses; a real call still gives a waking peer `probeTimeout`. */
+/** How long a listing waits on a link's addresses. */
 const LIST_PROBE_TIMEOUT = Duration.seconds(3);
+const DIRECT_PROBE_TIMEOUT = Duration.seconds(2);
 
 /** Node's TLS verification code in a failed request's cause chain, if any. */
 export const certificateErrorCode = (error: unknown) => {
@@ -73,13 +77,33 @@ export const certificateErrorCode = (error: unknown) => {
   return undefined;
 };
 
-/** A usable link: where to reach the peer and the token to send there. */
-export interface ResolvedPeerLink {
-  readonly link: PeerLink;
-  /** The first address that answered as this peer. */
+interface PeerRoute {
   readonly url: string;
+  readonly transport?: {
+    readonly canonicalOrigin: string;
+    readonly relay?: true;
+    readonly httpClient: HttpClient.HttpClient;
+  };
+}
+
+const isRelayRoute = (route: PeerRoute) => route.transport?.relay === true;
+
+const routeProbeTimeout = (route: PeerRoute) =>
+  isRelayRoute(route) ? probeTimeout(route.url) : DIRECT_PROBE_TIMEOUT;
+
+type Enrollment = Effect.Success<typeof PeerEnrollment.load>[number];
+
+/** A usable link: where to reach the peer and the token to send there. */
+export interface ResolvedPeerLink extends PeerRoute {
+  readonly link: PeerLink;
   readonly token: string;
 }
+
+const CanonicalCredential = Schema.fromJsonString(
+  Schema.Struct({ canonicalOrigin: Schema.String, token: Schema.String }),
+);
+const encodeCanonicalCredential = Schema.encodeEffect(CanonicalCredential);
+const decodeCanonicalCredential = Schema.decodeUnknownEffect(CanonicalCredential);
 
 export const LINKED_ENVIRONMENTS_OFF =
   "Linked environments is off on this machine. Turn it on in Settings → Labs.";
@@ -95,6 +119,7 @@ export class PeerLinks extends Context.Service<
   {
     /** Whether the Linked environments beta (Settings → Labs) is on here. */
     readonly enabled: Effect.Effect<boolean>;
+    readonly lookup: typeof PeerRelayDirectory.lookup;
     readonly link: (input: PeerLinkCreateInput) => Effect.Effect<PeerLink, PeerLinkError>;
     readonly list: Effect.Effect<ReadonlyArray<PeerLinkSummary>, PeerLinkError>;
     /** The stored link, without asking the peer whether it answers. */
@@ -220,6 +245,9 @@ const linkLimitsHold = (peer: { readonly capabilities: ExecutionEnvironmentCapab
   peer.capabilities.mcpModeLimitHeader === true && peer.capabilities.linkFence === true;
 
 const make = Effect.gen(function* () {
+  const directory = yield* PeerRelayDirectory.PeerRelayDirectory.pipe(
+    Effect.provide(PeerRelayDirectory.layer),
+  );
   const sql = yield* SqlClient.SqlClient;
   const secrets = yield* ServerSecretStore.ServerSecretStore;
   const random = yield* SecureRandom.SecureRandom;
@@ -228,6 +256,28 @@ const make = Effect.gen(function* () {
   const environment = yield* ServerEnvironment.ServerEnvironment;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const isOwnLoopback = yield* LoopbackHost;
+  const enrollments = yield* PeerEnrollment.load;
+  const probeBudgets = new Map<EnvironmentId, { semaphore: Semaphore.Semaphore; users: number }>();
+  const discoveryProbeBudget = Semaphore.makeUnsafe(2);
+  const withProbePermit = <A, E, R>(environmentId: EnvironmentId, effect: Effect.Effect<A, E, R>) =>
+    Effect.acquireUseRelease(
+      Effect.sync(() => {
+        const budget = probeBudgets.get(environmentId) ?? {
+          semaphore: Semaphore.makeUnsafe(2),
+          users: 0,
+        };
+        probeBudgets.set(environmentId, budget);
+        budget.users++;
+        return budget;
+      }),
+      (budget) => budget.semaphore.withPermit(effect),
+      (budget) =>
+        Effect.sync(() => {
+          budget.users--;
+          if (budget.users === 0) probeBudgets.delete(environmentId);
+        }),
+    );
+
   const enabled = serverSettings.getSettings.pipe(
     Effect.map((settings) => settings.linkedEnvironmentsEnabled),
     Effect.orElseSucceed(() => false),
@@ -245,34 +295,45 @@ const make = Effect.gen(function* () {
     Effect.provideService(response, FetchHttpClient.RequestInit, { redirect: "manual" }),
   );
 
-  const clientFor = (origin: string) =>
-    HttpApiClient.make(PeerHttpApi, { baseUrl: origin }).pipe(
-      Effect.provideService(HttpClient.HttpClient, peerHttpClient),
+  const enrollmentAt = (url: string) =>
+    enrollments.find(
+      (entry) => entry.canonicalOrigin === url || entry.routes.some((route) => route.url === url),
+    );
+
+  const routeAt = (url: string): PeerRoute =>
+    enrollmentAt(url)?.routes.find((route) => route.url === url) ?? { url };
+
+  const clientFor = (route: PeerRoute) =>
+    HttpApiClient.make(PeerHttpApi, {
+      baseUrl: route.transport?.canonicalOrigin ?? route.url,
+    }).pipe(
+      Effect.provideService(HttpClient.HttpClient, route.transport?.httpClient ?? peerHttpClient),
     );
 
   /** The environment answering at `origin`, or why nothing there answers as T3 Code. */
-  const probe = (origin: string) => {
-    const timeout = probeTimeout(origin);
-    return clientFor(origin).pipe(
+  const probe = (route: PeerRoute, retries = 1) => {
+    const timeout = routeProbeTimeout(route);
+    return clientFor(route).pipe(
       Effect.flatMap((client) => client.metadata.descriptor()),
       // A brief network drop must not list a live peer as down; the timeout still bounds both tries.
       Effect.retry({
-        times: 1,
+        times: retries,
         schedule: Schedule.spaced("1 second"),
         while: (error) => certificateErrorCode(error) === undefined,
       }),
       Effect.timeout(timeout),
       // No cause: a decode error can carry the response body to the client.
-      Effect.mapError((error) => probeFailure(origin, error, timeout)),
+      Effect.mapError((error) => probeFailure(route.url, error, timeout)),
     );
   };
 
   /** Whether `url` answers as `environmentId`, counting any failure as no. */
   const answersAs = Effect.fn("PeerLinks.answersAs")(function* (
-    url: string,
+    route: PeerRoute,
     environmentId: EnvironmentId,
+    retries?: number,
   ) {
-    const found = yield* probe(url).pipe(Effect.option);
+    const found = yield* probe(route, retries).pipe(Effect.option);
     return Option.filter(found, (peer) => peer.environmentId === environmentId);
   });
 
@@ -304,10 +365,94 @@ const make = Effect.gen(function* () {
       Effect.map((rows) => Option.fromNullishOr(rows[0])),
     );
 
+  const enrolledRoutes = (
+    enrollment: Enrollment,
+    approved: PeerRoute,
+  ): ReadonlyArray<PeerRoute> => {
+    const candidates = [
+      // Only the approved address may use the ordinary direct transport.
+      ...(enrollment.routes.some((route) => route.url === approved.url) ||
+      (approved.url === enrollment.canonicalOrigin && approved.transport === undefined)
+        ? [approved]
+        : []),
+      ...enrollment.routes.filter((route) => route.url !== approved.url),
+    ];
+    const rank = (route: PeerRoute) =>
+      isRelayRoute(route) ? 2 : route.url === enrollment.canonicalOrigin ? 0 : 1;
+    return candidates.sort((left, right) => rank(left) - rank(right));
+  };
+
+  const matchesResource = Effect.fn("PeerLinks.matchesResource")(function* (
+    client: Effect.Success<ReturnType<typeof clientFor>>,
+    canonicalOrigin: string,
+  ) {
+    const resource = yield* client.mcpOAuth.mcpProtectedResource();
+    return (
+      resource.resource === `${canonicalOrigin}/mcp` &&
+      resource.authorization_servers.length === 1 &&
+      resource.authorization_servers[0] === canonicalOrigin
+    );
+  });
+
+  const findEnrolledRoute = Effect.fn("PeerLinks.findEnrolledRoute")(function* (
+    enrollment: Enrollment,
+    approved: PeerRoute,
+    purpose: "oauth" | "mcp",
+  ) {
+    const { canonicalOrigin, environmentId } = enrollment;
+    return yield* Effect.findFirstFilter(enrolledRoutes(enrollment, approved), (route) =>
+      Effect.gen(function* () {
+        const peer = yield* answersAs(route, environmentId, 0);
+        if (Option.isNone(peer) || !linkLimitsHold(peer.value)) return Result.fail(undefined);
+        const client = yield* clientFor(route);
+        if (!(yield* matchesResource(client, canonicalOrigin))) return Result.fail(undefined);
+        if (purpose === "oauth") {
+          const metadata = yield* client.mcpOAuth.authorizationServer();
+          if (
+            metadata.issuer !== canonicalOrigin ||
+            !metadata.authorization_response_iss_parameter_supported ||
+            metadata.authorization_endpoint !== `${canonicalOrigin}/oauth/mcp/authorize` ||
+            metadata.registration_endpoint !== `${canonicalOrigin}/oauth/mcp/register` ||
+            metadata.token_endpoint !== `${canonicalOrigin}/oauth/mcp/token`
+          ) {
+            return Result.fail(undefined);
+          }
+        }
+        return Result.succeed({ route, peer: peer.value });
+      }).pipe(
+        Effect.timeout(routeProbeTimeout(route)),
+        Effect.orElseSucceed(() => Result.fail(undefined)),
+        (effect) => withProbePermit(environmentId, effect),
+      ),
+    );
+  });
+
   /** Signs in to the peer's `/mcp` with a pairing code: register, decide, exchange. */
   const signIn = Effect.fn("PeerLinks.signIn")(
-    function* (origin: string, input: PeerLinkCreateInput, clientName: string) {
-      const client = yield* clientFor(origin);
+    function* (
+      approved: PeerRoute,
+      input: PeerLinkCreateInput,
+      clientName: string,
+      enrollment: Enrollment | undefined,
+    ) {
+      const origin = enrollment?.canonicalOrigin ?? approved.url;
+      const selectRoute =
+        enrollment === undefined
+          ? Effect.succeed(approved)
+          : findEnrolledRoute(enrollment, approved, "oauth").pipe(
+              Effect.flatMap((selected) =>
+                Option.isSome(selected)
+                  ? Effect.succeed(selected.value.route)
+                  : Effect.fail(
+                      new PeerLinkError({
+                        reason: "unreachable",
+                        message:
+                          "No enrolled route answered for the linked environment's canonical OAuth identity.",
+                      }),
+                    ),
+              ),
+            );
+      const client = yield* clientFor(yield* selectRoute);
       // Only the peer's own refusals are rejections. A dropped connection or
       // an answer this version cannot read is classified below.
       const registered = yield* client.mcpOAuth
@@ -335,7 +480,9 @@ const make = Effect.gen(function* () {
       );
       const state = Base64Url.encode(yield* random.randomBytes(16));
       const resource = `${origin}/mcp`;
-      const decided = yield* client.mcpOAuth
+      const decisionClient =
+        enrollment === undefined ? client : yield* clientFor(yield* selectRoute);
+      const decided = yield* decisionClient.mcpOAuth
         .decision({
           headers: {},
           payload: {
@@ -375,7 +522,19 @@ const make = Effect.gen(function* () {
             "The peer did not approve the link. Check the pairing code and try again.",
         });
       }
-      return yield* client.mcpOAuth
+      if (
+        enrollment !== undefined &&
+        (redirect.origin + redirect.pathname !== LINK_REDIRECT_URI ||
+          redirect.searchParams.get("iss") !== origin)
+      ) {
+        return yield* new PeerLinkError({
+          reason: "pairing_rejected",
+          message: "The peer's approval did not match its enrolled OAuth issuer or redirect.",
+        });
+      }
+      // Select a route before dispatch. A failed credential-bearing request is never replayed.
+      const tokenClient = enrollment === undefined ? client : yield* clientFor(yield* selectRoute);
+      const issued = yield* tokenClient.mcpOAuth
         .token({
           payload: {
             grant_type: "authorization_code",
@@ -396,8 +555,19 @@ const make = Effect.gen(function* () {
             ),
           ),
         );
+      if (enrollment !== undefined) {
+        const scopes = new Set(issued.scope.split(" "));
+        const expected = mcpClientScopes(input.access);
+        if (scopes.size !== expected.length || !expected.every((scope) => scopes.has(scope))) {
+          return yield* new PeerLinkError({
+            reason: "pairing_rejected",
+            message: "The peer issued a credential with unexpected permissions.",
+          });
+        }
+      }
+      return issued;
     },
-    (effect, origin) =>
+    (effect, { url: origin }) =>
       effect.pipe(
         // Endpoint errors are mapped above; what is left is the transport or an
         // answer this version cannot decode.
@@ -423,10 +593,8 @@ const make = Effect.gen(function* () {
   );
 
   /**
-   * The addresses that answer as `environmentId`, in the order given, with
-   * what the first one answered. Addresses this environment would not send
-   * credentials to are skipped; when none answers as it, the failure says why
-   * for each.
+   * The selected address must answer as the named environment. Other matching
+   * addresses can be saved without receiving the pairing code.
    */
   const answeringAs = Effect.fn("PeerLinks.answeringAs")(function* (
     urls: ReadonlyArray<string>,
@@ -445,7 +613,7 @@ const make = Effect.gen(function* () {
               message: `${origin} is this machine, not ${name}.`,
             });
           }
-          const descriptor = yield* probe(origin);
+          const descriptor = yield* withProbePermit(environmentId, probe(routeAt(origin)));
           if (descriptor.environmentId !== environmentId) {
             return yield* new PeerLinkError({
               reason: "unreachable",
@@ -459,8 +627,8 @@ const make = Effect.gen(function* () {
     const matching = checked.flatMap((result) =>
       Result.isSuccess(result) ? [result.success] : [],
     );
-    const first = matching[0];
-    if (first === undefined) {
+    const first = checked[0];
+    if (first === undefined || Result.isFailure(first)) {
       const reasons = checked.flatMap((result) =>
         Result.isFailure(result) ? [result.failure.message] : [],
       );
@@ -471,23 +639,32 @@ const make = Effect.gen(function* () {
     }
     // Each address is kept once, even when two spellings share an origin.
     const origins = [...new Set(matching.map((found) => found.origin))];
-    return { primary: first.origin, peer: first.descriptor, origins };
+    return { primary: first.success.origin, peer: first.success.descriptor, origins };
   });
 
   /** The peer at `url`, with every address checked for credentials first. */
   const answeringAt = Effect.fn("PeerLinks.answeringAt")(function* (urls: ReadonlyArray<string>) {
     const origins = yield* Effect.forEach(urls, peerOrigin);
     const primary = origins[0]!;
-    return { primary, peer: yield* probe(primary), origins };
+    const enrollment = enrollmentAt(primary);
+    const descriptor = probe(routeAt(primary));
+    const peer = yield* enrollment === undefined
+      ? discoveryProbeBudget.withPermit(descriptor)
+      : withProbePermit(enrollment.environmentId, descriptor);
+    return { primary, peer, origins };
   });
 
   const link: PeerLinks["Service"]["link"] = Effect.fn("PeerLinks.link")(function* (input) {
     if (!(yield* enabled)) {
       return yield* new PeerLinkError({ reason: "disabled", message: LINKED_ENVIRONMENTS_OFF });
     }
+    if (input.expectedEnvironmentId !== undefined && input.addressConfirmed !== true) {
+      return yield* new PeerLinkError({
+        reason: "pairing_rejected",
+        message: "Select the address to approve before linking this environment.",
+      });
+    }
     const urls = [input.url, ...(input.alternateUrls ?? [])];
-    // The user picked a machine: link through the addresses that answer as
-    // it, so one that now answers as another never receives the pairing code.
     const { primary, peer, origins } =
       input.expectedEnvironmentId === undefined
         ? yield* answeringAt(urls)
@@ -512,6 +689,13 @@ const make = Effect.gen(function* () {
         });
       }
     }
+    const enrollment = enrollmentAt(primary);
+    if (enrollment !== undefined && enrollment.environmentId !== peer.environmentId) {
+      return yield* new PeerLinkError({
+        reason: "pairing_rejected",
+        message: "The selected address did not answer as its enrolled environment.",
+      });
+    }
     const self = yield* environment.getDescriptor;
     if (peer.environmentId === self.environmentId) {
       return yield* new PeerLinkError({
@@ -525,7 +709,7 @@ const make = Effect.gen(function* () {
         message: `${peer.label} runs a T3 Code version that cannot keep a linked agent's limits. Update it, then link again.`,
       });
     }
-    const issued = yield* signIn(primary, input, `T3 Code · ${self.label}`);
+    const issued = yield* signIn(routeAt(primary), input, `T3 Code · ${self.label}`, enrollment);
     const now = yield* DateTime.now;
     const linked: PeerLink = {
       environmentId: peer.environmentId,
@@ -540,8 +724,15 @@ const make = Effect.gen(function* () {
     // The token goes under a name of its own before the row points at it,
     // so the row and its token are replaced together.
     const secretName = yield* newSecretName;
+    const credential =
+      enrollment === undefined
+        ? issued.access_token
+        : yield* encodeCanonicalCredential({
+            canonicalOrigin: enrollment.canonicalOrigin,
+            token: issued.access_token,
+          }).pipe(Effect.catch(failStorage));
     yield* secrets
-      .set(secretName, new TextEncoder().encode(issued.access_token))
+      .set(secretName, new TextEncoder().encode(credential))
       .pipe(Effect.catch(failStorage));
     // A token no row names could never be removed.
     const previous = yield* Effect.gen(function* () {
@@ -586,28 +777,65 @@ const make = Effect.gen(function* () {
           WHERE environment_id = ${link.environmentId}
         `.pipe(Effect.ignoreCause({ log: true }), Effect.as({ ...link, label }));
 
-  const statusOf = Effect.fn("PeerLinks.statusOf")(function* (
+  const readCredential = Effect.fn("PeerLinks.readCredential")(function* (secretName: string) {
+    const stored = yield* secrets.get(secretName).pipe(Effect.catch(failStorage));
+    if (Option.isNone(stored)) return undefined;
+    const token = new TextDecoder().decode(stored.value);
+    return token.startsWith("{")
+      ? yield* decodeCanonicalCredential(token).pipe(Effect.catch(failStorage))
+      : { token, canonicalOrigin: undefined };
+  });
+
+  const reach = Effect.fn("PeerLinks.reach")(function* (
     link: PeerLink,
-    now: DateTime.Utc,
-  ): Effect.fn.Return<PeerLinkSummary> {
-    if (DateTime.isLessThanOrEqualTo(link.expiresAt, now)) return { ...link, status: "expired" };
-    // A race over no addresses never settles.
-    if (link.urls.length === 0) return { ...link, status: "unreachable" };
-    const answered = yield* Effect.raceAll(
-      link.urls.map((url) =>
-        answersAs(url, link.environmentId).pipe(Effect.flatMap(Effect.fromOption)),
-      ),
-    ).pipe(Effect.timeoutOption(LIST_PROBE_TIMEOUT), Effect.orElseSucceed(Option.none));
-    if (Option.isNone(answered)) return { ...link, status: "unreachable" };
-    return { ...(yield* withLabel(link, answered.value.label)), status: "reachable" };
+    canonicalOrigin: string | undefined,
+  ) {
+    const approvedUrl = link.urls[0];
+    if (approvedUrl === undefined) return Option.none();
+    const approved = routeAt(approvedUrl);
+    const entryAtApproved = enrollmentAt(approvedUrl);
+    const enrollment = enrollments.find(
+      (entry) =>
+        entry.environmentId === link.environmentId && entry.canonicalOrigin === canonicalOrigin,
+    );
+    if (enrollment === undefined) {
+      // Older credentials stay on the address approved for them.
+      if (
+        canonicalOrigin !== undefined ||
+        (entryAtApproved !== undefined &&
+          (entryAtApproved.canonicalOrigin !== approvedUrl ||
+            entryAtApproved.environmentId !== link.environmentId))
+      ) {
+        return Option.none();
+      }
+      const peer = yield* withProbePermit(
+        link.environmentId,
+        answersAs(approved, link.environmentId),
+      );
+      return Option.map(peer, (peer) => ({ route: approved, peer }));
+    }
+    return yield* findEnrolledRoute(enrollment, approved, "mcp");
+  });
+
+  const statusOf = Effect.fn("PeerLinks.statusOf")(function* (row: PeerLinkRow, now: DateTime.Utc) {
+    const link = yield* toLink(row);
+    if (DateTime.isLessThanOrEqualTo(link.expiresAt, now))
+      return { ...link, status: "expired" } as const;
+    const credential = yield* readCredential(row.secret_name).pipe(
+      Effect.orElseSucceed(() => undefined),
+    );
+    if (credential === undefined) return { ...link, status: "unreachable" } as const;
+    const answered = yield* reach(link, credential.canonicalOrigin).pipe(
+      Effect.timeoutOrElse({ duration: LIST_PROBE_TIMEOUT, orElse: () => Effect.succeedNone }),
+    );
+    if (Option.isNone(answered)) return { ...link, status: "unreachable" } as const;
+    return { ...(yield* withLabel(link, answered.value.peer.label)), status: "reachable" } as const;
   });
 
   const list: PeerLinks["Service"]["list"] = Effect.gen(function* () {
-    const links = yield* Effect.forEach(yield* readRows, toLink);
+    const rows = yield* readRows;
     const now = yield* DateTime.now;
-    return yield* Effect.forEach(links, (link) => statusOf(link, now), {
-      concurrency: "unbounded",
-    });
+    return yield* Effect.forEach(rows, (row) => statusOf(row, now), { concurrency: "unbounded" });
   });
 
   const get: PeerLinks["Service"]["get"] = (environmentId) =>
@@ -648,8 +876,8 @@ const make = Effect.gen(function* () {
           message: `The link to ${link.label} expired. Link it again with a new pairing code from ${link.label}.`,
         });
       }
-      const stored = yield* secrets.get(row.value.secret_name).pipe(Effect.catch(failStorage));
-      if (Option.isNone(stored)) {
+      const credential = yield* readCredential(row.value.secret_name);
+      if (credential === undefined) {
         // An unlink between the two reads removes the row before its secret.
         if (Option.isNone(yield* readRow(environmentId))) return yield* notLinked;
         return yield* new PeerLinkError({
@@ -657,27 +885,15 @@ const make = Effect.gen(function* () {
           message: `The link to ${link.label} lost its credential. Link it again.`,
         });
       }
-      // The token goes only to an address that still answers as this peer,
-      // so one that now answers as another machine never receives it. The
-      // addresses race, so a silent one never delays one that answers.
-      const answered =
-        link.urls.length === 0
-          ? Option.none()
-          : yield* Effect.raceAll(
-              link.urls.map((url) =>
-                answersAs(url, environmentId).pipe(
-                  Effect.flatMap(Effect.fromOption),
-                  Effect.map((peer) => ({ url, peer })),
-                ),
-              ),
-            ).pipe(Effect.option);
-      if (Option.isNone(answered)) {
+      const approvedUrl = link.urls[0];
+      const reached = yield* reach(link, credential.canonicalOrigin);
+      if (Option.isNone(reached)) {
         return yield* new PeerLinkError({
           reason: "unreachable",
-          message: `${link.label} did not answer at ${link.urls.join(", ")}.`,
+          message: `${link.label} did not answer${approvedUrl === undefined ? "" : ` at ${approvedUrl}`}.${link.urls.length > 1 ? " Link it again to approve an alternate address." : ""}`,
         });
       }
-      const { url, peer } = answered.value;
+      const { route, peer } = reached.value;
       // A link made before the peer had to fence linked work, or a peer moved
       // back to such a version, would carry work past those limits.
       if (!linkLimitsHold(peer)) {
@@ -688,8 +904,8 @@ const make = Effect.gen(function* () {
       }
       return {
         link: yield* withLabel(link, peer.label),
-        url,
-        token: new TextDecoder().decode(stored.value),
+        ...route,
+        token: credential.token,
       };
     },
   );
@@ -714,6 +930,7 @@ const make = Effect.gen(function* () {
 
   return PeerLinks.of({
     enabled,
+    lookup: directory.lookup,
     link,
     list,
     get,

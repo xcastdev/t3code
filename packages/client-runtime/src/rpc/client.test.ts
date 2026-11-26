@@ -29,7 +29,14 @@ import {
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
-import { runStream, subscribe, subscribeDynamicWithSession, refreshVcsBranch } from "./client.ts";
+import {
+  requestInSession,
+  requestSignedTransferUrl,
+  runStream,
+  subscribe,
+  subscribeDynamicWithSession,
+  refreshVcsBranch,
+} from "./client.ts";
 
 const TARGET = new PrimaryConnectionTarget({
   environmentId: EnvironmentId.make("environment-1"),
@@ -85,6 +92,55 @@ const makeHarness = Effect.fn("TestEnvironmentRpc.makeHarness")(function* () {
 });
 
 describe("environment RPC", () => {
+  it.effect.each([
+    { relativeUrl: "/api/assets/token/report.pdf", allowed: true },
+    { relativeUrl: "//other.example.test/api/assets/token/report.pdf", allowed: false },
+    { relativeUrl: "blob:https://environment.example.test/report", allowed: false },
+  ])(
+    "keeps $relativeUrl on the session that issued it across a reconnect",
+    ({ relativeUrl, allowed }) =>
+      Effect.gen(function* () {
+        const { activeSession, supervisor } = yield* makeHarness();
+        const replacement = {
+          ...session({} as WsRpcProtocolClient),
+          httpBaseUrl: "https://other.example.test",
+        };
+        const issuingClient = {
+          [WS_METHODS.assetsCreateUrl]: () =>
+            SubscriptionRef.set(activeSession, Option.some(replacement)).pipe(
+              Effect.as({ relativeUrl, expiresAt: 1 }),
+            ),
+        } as unknown as WsRpcProtocolClient;
+        yield* SubscriptionRef.set(
+          activeSession,
+          Option.some({
+            ...session(issuingClient),
+            httpBaseUrl: TARGET.httpBaseUrl,
+            verificationRequired: true,
+          }),
+        );
+        const result = yield* requestSignedTransferUrl((issuer) =>
+          requestInSession(issuer, WS_METHODS.assetsCreateUrl, {
+            resource: { _tag: "attachment", attachmentId: "report" },
+          }),
+        ).pipe(
+          Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          Effect.result,
+        );
+        expect(result).toMatchObject(
+          allowed
+            ? {
+                _tag: "Success",
+                success: {
+                  relativeUrl: TARGET.httpBaseUrl + relativeUrl,
+                  verificationRequired: true,
+                },
+              }
+            : { _tag: "Failure", failure: { _tag: "EnvironmentRpcUnavailableError" } },
+        );
+      }),
+  );
+
   it.effect("binds finite streaming commands to one active session", () =>
     Effect.gen(function* () {
       const firstEvents = yield* Queue.unbounded<RelayClientInstallProgressEvent>();

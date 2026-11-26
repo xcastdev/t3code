@@ -1566,9 +1566,12 @@ it.effect("accepts case-insensitive MCP bearer schemes and diagnoses rejected cr
         providerInstanceId: ProviderInstanceId.make("codex"),
       });
       const providerToken = issued.config.authorizationHeader.slice("Bearer ".length);
+      const { address } = yield* HttpServer.HttpServer;
+      if (!NetAddress.isInetAddress(address)) throw new Error("Expected a TCP test server");
       const oauth = yield* auth.issueMcpClientSession({
         label: "MCP header test",
         access: "read-only",
+        resource: `http://127.0.0.1:${address.port}/mcp`,
         peerLink: false,
         client: { deviceType: "bot" },
       });

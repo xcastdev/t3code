@@ -35,7 +35,9 @@ export function buildPairingUrl(host: string, code: string): string {
 
   try {
     const url = new URL(h.includes("://") ? h : `${isIpLiteral(h) ? "http" : "https"}://${h}`);
-    url.hash = new URLSearchParams([["token", c]]).toString();
+    const fragment = new URLSearchParams(url.hash.slice(1));
+    fragment.set("token", c);
+    url.hash = fragment.toString();
     return url.toString();
   } catch {
     return `${h}#token=${c}`;
@@ -48,7 +50,9 @@ export function parsePairingUrl(url: string): { host: string; code: string } {
 
   try {
     const parsed = new URL(trimmed);
-    const hostedPairingRequest = readHostedPairingRequest(parsed);
+    const fragment = new URLSearchParams(parsed.hash.slice(1));
+    const hasVerification = fragment.has("leafSpkiSha256") || fragment.has("environmentId");
+    const hostedPairingRequest = hasVerification ? null : readHostedPairingRequest(parsed);
     if (hostedPairingRequest) {
       return {
         host: hostedPairingRequest.host.replace(/\/$/, ""),
@@ -56,13 +60,17 @@ export function parsePairingUrl(url: string): { host: string; code: string } {
       };
     }
 
-    const hashParams = new URLSearchParams(parsed.hash.slice(1));
+    const hashParams = fragment;
     const hashToken = hashParams.get("token");
     const queryToken = parsed.searchParams.get("token");
     const code = hashToken || queryToken || "";
 
-    parsed.hash = "";
-    parsed.search = "";
+    hashParams.delete("token");
+    parsed.hash =
+      hashParams.has("leafSpkiSha256") || hashParams.has("environmentId")
+        ? hashParams.toString()
+        : "";
+    if (!hasVerification) parsed.search = "";
     parsed.pathname = "/";
     return { host: parsed.toString().replace(/\/$/, ""), code };
   } catch {

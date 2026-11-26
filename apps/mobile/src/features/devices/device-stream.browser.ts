@@ -1,3 +1,5 @@
+import { attachPinnedMjpegImage } from "./verified-mjpeg";
+import { installVerifiedViewerTransport } from "../../lib/verifiedViewer.browser";
 import {
   createDeviceStreamClient,
   type DeviceScreenSize,
@@ -11,9 +13,12 @@ declare global {
   }
 }
 
+let stopMjpeg: (() => void) | undefined;
 let activeClient: ReturnType<typeof createDeviceStreamClient> | null = null;
 
 export function stop() {
+  stopMjpeg?.();
+  stopMjpeg = undefined;
   activeClient?.stop();
   activeClient = null;
 }
@@ -25,6 +30,7 @@ export function command(button: "home" | "back" | "appSwitcher" | "rotate") {
 
 export function start(configuration: DeviceStreamConfiguration) {
   stop();
+  if (configuration.verified) installVerifiedViewerTransport();
   // oxlint-disable-next-line unicorn/require-post-message-target-origin -- The native WebView bridge takes one string.
   const post = (message: object) => window.ReactNativeWebView.postMessage(JSON.stringify(message));
   const { colors, platform } = configuration;
@@ -63,6 +69,7 @@ export function start(configuration: DeviceStreamConfiguration) {
   });
   const canvas = document.createElement("canvas");
   const image = document.createElement("img");
+  if (configuration.verified) stopMjpeg = attachPinnedMjpegImage(image);
   image.alt = "";
   image.draggable = false;
   image.style.display = "none";
@@ -138,6 +145,7 @@ export function start(configuration: DeviceStreamConfiguration) {
       image.style.display = "block";
     },
     onCanvasVideo: () => {
+      stopMjpeg?.();
       image.style.display = "none";
       canvas.style.display = "";
     },

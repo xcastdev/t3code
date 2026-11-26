@@ -522,6 +522,7 @@ const client = new Proxy(handlers, {
 });
 
 const session: EnvironmentConnectionLease["session"] = {
+  httpBaseUrl: window.location.origin,
   client: client as unknown as WsRpcProtocolClient,
   initialConfig: Effect.sync(serverConfig),
   subscribeServerConfig: () =>

@@ -1,15 +1,22 @@
 import { useAtomValue } from "@effect/atom-react";
 import { AuthOrchestrationOperateScope, type EnvironmentId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import {
   attachmentUploadError,
   createAttachmentUploadRegistry,
+  type AttachmentUploadError,
+  type AttachmentUploadStatus,
 } from "@t3tools/client-runtime/state/attachment-uploads";
 import { verifyPersistedAttachmentUpload } from "@t3tools/client-runtime/state/attachments";
 import { Atom } from "effect/reactivity";
+import Storage from "expo-sqlite/kv-store";
 
-import { uploadComposerAttachment } from "../lib/attachmentUpload";
+import {
+  mobileAttachmentUploadOutcomeUnknown,
+  uploadComposerAttachment,
+} from "../lib/attachmentUpload";
 import { retainComposerAttachmentFileForPreview } from "../lib/composerAttachmentPreviewRetention";
 import {
   isFileBackedComposerAttachment,
@@ -26,6 +33,7 @@ import { assetEnvironment } from "./assets";
 import { environmentServerConfigsAtom } from "./server";
 import {
   flattenQueuedThreadMessages,
+  flushThreadOutbox,
   threadOutboxManager,
   modifyThreadOutboxMessage,
   type QueuedThreadMessage,
@@ -34,6 +42,7 @@ import { editingQueuedMessageIdsAtom } from "./use-thread-outbox";
 import {
   ComposerDraftPersistenceError,
   type ComposerDraft,
+  composerCloudDraftsAtom,
   composerDraftsAtom,
   composerDraftUploadSourcesAtom,
   ensureComposerDraftsLoaded,
@@ -44,15 +53,32 @@ import { environmentSession, readEnvironmentScope, sessionHasScope } from "./ses
 import { workspaceConnections } from "./workspace";
 
 const isComposerDraftPersistenceError = Schema.is(ComposerDraftPersistenceError);
+const decodePreparedUpload = Schema.decodeUnknownOption(
+  Schema.fromJsonString(Schema.Struct({ version: Schema.Literal(1), attachmentId: Schema.String })),
+);
 
 export {
   composerAttachmentUploadBlockReason,
   composerAttachmentsStillUploading,
 } from "../lib/composerAttachmentUploadQueue";
 
-export const composerAttachmentUploadsAtom = Atom.make<
-  Readonly<Record<string, ComposerAttachmentUploadState>>
->({}).pipe(Atom.keepAlive);
+const registryStatusesAtom = Atom.make<Readonly<Record<string, AttachmentUploadStatus>>>({}).pipe(
+  Atom.keepAlive,
+);
+type UnknownUpload = {
+  readonly status: "outcome-unknown";
+  readonly reason: string;
+  readonly error: AttachmentUploadError;
+};
+const unknownUploadsAtom = Atom.make<Readonly<Record<string, UnknownUpload>>>({}).pipe(
+  Atom.keepAlive,
+);
+export const composerAttachmentUploadsAtom = Atom.make(
+  (get): Readonly<Record<string, ComposerAttachmentUploadState>> => ({
+    ...get(registryStatusesAtom),
+    ...get(unknownUploadsAtom),
+  }),
+);
 const uploadStateAtom = Atom.family((key: string) =>
   Atom.map(composerAttachmentUploadsAtom, (states) => states[key]),
 );
@@ -67,9 +93,22 @@ export function useComposerAttachmentUploadState(
   );
 }
 
+export function useComposerAttachmentWithUnknownUpload(
+  environmentId: EnvironmentId | undefined,
+  attachments: ReadonlyArray<DraftComposerAttachment>,
+) {
+  const unknownUploads = useAtomValue(unknownUploadsAtom);
+  if (environmentId === undefined) return undefined;
+  for (const attachment of attachments) {
+    const unknown = unknownUploads[composerAttachmentUploadKey(environmentId, attachment.id)];
+    if (unknown) return attachment;
+  }
+}
+
 export function retryComposerAttachmentUpload(environmentId: EnvironmentId, attachmentId: string) {
   if (!readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)) return;
-  uploadQueue?.retry(composerAttachmentUploadKey(environmentId, attachmentId));
+  const key = composerAttachmentUploadKey(environmentId, attachmentId);
+  if (!appAtomRegistry.get(unknownUploadsAtom)[key]) uploadQueue?.retry(key);
 }
 
 type ComposerAttachmentUploadRequest = {
@@ -212,33 +251,167 @@ const recordComposerAttachmentUpload = Effect.fn("ComposerAttachments.recordUplo
     uploadedAttachmentId: uploadedId,
     uploadEnvironmentId: environmentId,
   };
-  const queued = flattenQueuedThreadMessages(
-    appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom),
-  );
+  const queuedMessages = () =>
+    flattenQueuedThreadMessages(
+      appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom),
+    );
   const knownEnvironmentIds = appAtomRegistry
     .get(workspaceConnections.environmentsAtom)
     .map((environment) => environment.environmentId);
-  let draftsChanged = false;
-  for (const [key, draft] of Object.entries(appAtomRegistry.get(composerDraftsAtom))) {
-    if (
-      composerDraftEnvironmentId(key, knownEnvironmentIds, queued, draft) === environmentId &&
-      draft.attachments.some((candidate) => candidate.id === attachment.id)
-    ) {
-      draftsChanged = setComposerDraftAttachmentUpload(key, uploaded) || draftsChanged;
-    }
+  const draftOwners = (queued: ReadonlyArray<QueuedThreadMessage>) =>
+    Object.entries(appAtomRegistry.get(composerDraftsAtom)).filter(
+      ([key, draft]) =>
+        composerDraftEnvironmentId(key, knownEnvironmentIds, queued, draft) === environmentId &&
+        draft.attachments.some((candidate) => candidate.id === attachment.id),
+    );
+  const outboxLoaded = yield* Effect.promise(() => threadOutboxManager.load());
+  for (const [key] of draftOwners(queuedMessages())) {
+    setComposerDraftAttachmentUpload(key, uploaded);
   }
   yield* recordQueuedAttachmentUpload(environmentId, uploaded);
-  if (!draftsChanged) return;
-  // A failed draft save only costs a re-upload after restart; the outbox saves its own references.
-  yield* Effect.tryPromise({ try: () => flushComposerDrafts(), catch: attachmentUploadError }).pipe(
+  // A draft cleared during handoff can still be on disk until this flush.
+  const draftsSaved = yield* Effect.tryPromise({
+    try: () => flushComposerDrafts(),
+    catch: attachmentUploadError,
+  }).pipe(
+    Effect.as(true),
     Effect.catchIf(
       (error) => isComposerDraftPersistenceError(error.cause),
       (error) =>
         Effect.logWarning(
           "[composer-attachments] could not save the uploaded reference",
           error.cause,
-        ),
+        ).pipe(Effect.as(false)),
     ),
+  );
+  if (!draftsSaved || !outboxLoaded) return false;
+  // An enqueue can publish an owner before its write finishes.
+  yield* Effect.promise(() => flushThreadOutbox());
+  const queued = queuedMessages();
+  const references = [
+    ...draftOwners(queued).flatMap(([, draft]) => draft.attachments),
+    ...queued
+      .filter((message) => message.environmentId === environmentId)
+      .flatMap((message) => message.attachments),
+  ].filter((candidate) => candidate.id === attachment.id);
+  if (references.length === 0) return false;
+  const savedReference = (candidate: DraftComposerAttachment) =>
+    candidate.id !== attachment.id ||
+    (candidate.uploadEnvironmentId === environmentId &&
+      candidate.uploadedAttachmentId === uploadedId);
+  const archives = Object.values(appAtomRegistry.get(composerCloudDraftsAtom).signedOut);
+  return (
+    references.every(savedReference) &&
+    archives.every(
+      (archive) =>
+        Object.values(archive.drafts).every((draft) => draft.attachments.every(savedReference)) &&
+        archive.queuedMessages.every((message) => message.attachments.every(savedReference)),
+    )
+  );
+});
+
+const activeUploads = new Map<string, Promise<void>>();
+
+function rememberUnknownUpload(key: string, error: AttachmentUploadError) {
+  appAtomRegistry.update(unknownUploadsAtom, (current) => ({
+    ...current,
+    [key]: { status: "outcome-unknown", reason: error.message, error } as const,
+  }));
+}
+
+const runComposerUpload = Effect.fn("ComposerAttachments.transfer")(function* (
+  { environmentId, attachment }: ComposerAttachmentUploadRequest,
+  reportProgress: (progress: number) => void,
+) {
+  const key = composerAttachmentUploadKey(environmentId, attachment.id);
+  const storageKey = `t3code.attachment-upload.unknown:${key}`;
+  const clearOutcome = async () => {
+    try {
+      await Storage.removeItemAsync(storageKey);
+      appAtomRegistry.update(unknownUploadsAtom, ({ [key]: _, ...others }) => others);
+    } catch (cause) {
+      console.warn("[composer-attachments] could not clear upload outcome", cause);
+    }
+  };
+  return yield* Effect.acquireUseRelease(
+    Effect.gen(function* () {
+      // A new holder can arrive while the last holder's interruption is still reconciling.
+      let previous = activeUploads.get(key);
+      while (previous) {
+        const finished = previous;
+        yield* Effect.interruptible(Effect.promise(() => finished));
+        previous = activeUploads.get(key);
+      }
+      const unknown = appAtomRegistry.get(unknownUploadsAtom)[key]?.error;
+      if (unknown) return yield* unknown;
+      const release = isFileBackedComposerAttachment(attachment)
+        ? retainComposerAttachmentFileForPreview(attachment)
+        : undefined;
+      const finished = Promise.withResolvers<void>();
+      activeUploads.set(key, finished.promise);
+      return { release, finish: finished.resolve };
+    }),
+    () =>
+      Effect.gen(function* () {
+        const outcome = yield* Effect.tryPromise({
+          try: () => Storage.getItemAsync(storageKey),
+          catch: attachmentUploadError,
+        });
+        let uploadedId: string;
+        let recorded = outcome !== null;
+        if (outcome !== null) {
+          const prepared = decodePreparedUpload(outcome);
+          // Only a saved reference can resolve a prepared upload. The POST or its cleanup
+          // may still be finishing, so a lookup alone cannot resolve an unreferenced marker.
+          const verified =
+            Option.isSome(prepared) &&
+            attachment.uploadEnvironmentId === environmentId &&
+            attachment.uploadedAttachmentId === prepared.value.attachmentId &&
+            readEnvironmentScope(environmentId, AuthOrchestrationOperateScope) &&
+            (yield* verifyPersistedAttachmentUpload({
+              registry: appAtomRegistry,
+              createAssetUrl: assetEnvironment.createUrl,
+              environmentId,
+              attachmentId: prepared.value.attachmentId,
+            })).status === "verified";
+          if (!verified) {
+            const unknown = mobileAttachmentUploadOutcomeUnknown(attachment);
+            rememberUnknownUpload(key, unknown);
+            return yield* unknown;
+          }
+          uploadedId = prepared.value.attachmentId;
+        } else {
+          uploadedId = yield* uploadComposerAttachment(
+            environmentId,
+            attachment,
+            reportProgress,
+            (error) => {
+              if (error) rememberUnknownUpload(key, error);
+              else return clearOutcome();
+            },
+            async (attachmentId) => {
+              await Storage.setItemAsync(storageKey, JSON.stringify({ version: 1, attachmentId }));
+              recorded = true;
+            },
+          );
+        }
+        yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const referencesSaved = yield* recordComposerAttachmentUpload(
+              { environmentId, attachment },
+              uploadedId,
+            );
+            if (recorded && referencesSaved) yield* Effect.promise(clearOutcome);
+          }),
+        );
+        return uploadedId;
+      }),
+    ({ release, finish }) =>
+      Effect.sync(() => {
+        activeUploads.delete(key);
+        finish();
+        release?.();
+      }),
   );
 });
 
@@ -247,19 +420,8 @@ const createComposerUploadRegistry = () =>
     key: (request) => composerAttachmentUploadKey(request.environmentId, request.attachment.id),
     environmentId: (request) => request.environmentId,
     concurrencyPerEnvironment: 3,
-    onChange: (states) => appAtomRegistry.set(composerAttachmentUploadsAtom, states),
-    // The file stays on disk while its upload reads it, even if its draft lets go meanwhile.
-    upload: ({ environmentId, attachment }, reportProgress) =>
-      Effect.acquireUseRelease(
-        Effect.sync(() =>
-          isFileBackedComposerAttachment(attachment)
-            ? retainComposerAttachmentFileForPreview(attachment)
-            : undefined,
-        ),
-        () => uploadComposerAttachment(environmentId, attachment, reportProgress),
-        (release) => Effect.sync(() => release?.()),
-      ),
-    onUploaded: recordComposerAttachmentUpload,
+    onChange: (states) => appAtomRegistry.set(registryStatusesAtom, states),
+    upload: runComposerUpload,
   });
 
 function composerAttachmentUploads() {
@@ -273,6 +435,8 @@ export const uploadComposerAttachmentShared = Effect.fn("ComposerAttachments.upl
     const uploads = composerAttachmentUploads();
     const request = { environmentId, attachment };
     const key = composerAttachmentUploadKey(environmentId, attachment.id);
+    const unknown = appAtomRegistry.get(unknownUploadsAtom)[key]?.error;
+    if (unknown) return yield* unknown;
     // An upload that finished earlier can outlive the server's pending-upload sweep.
     const finishedEarlier = uploads.status(key)?.status === "ready";
     const uploadedId = yield* uploads.upload(request);

@@ -108,10 +108,16 @@ Leaving an edited form asks before discarding unsaved changes.
 
 In **Settings → Scheduled tasks**, choose **On webhook**
 as a task's schedule to run it whenever another service calls its URL, such as
-GitHub on a new pull request or a CI job that failed. A public URL needs a
-[T3 Connect](remote-access.md) managed tunnel; after you save the task, copy
-its URL from the editor. Without one, the editor shows only the URL's path.
-**Rotate** replaces the URL and the old one stops working.
+GitHub on a new pull request or a CI job that failed. With a
+[T3 Connect](remote-access.md) managed tunnel, copy the public URL from the editor
+after saving. Otherwise, use the displayed path through an address where the
+environment is reachable. **Rotate** replaces the URL token and the old one stops
+working.
+
+A self-hosted relay can provide a separate public URL. The task must opt in, and
+the relay administrator must enable exposure for that task and provide its URL.
+Enabling a relay does not expose every webhook task. The direct URL remains usable;
+relay access does not replace the task's token or signature check.
 
 The prompt decides what the agent sees. Placeholders pull values out of the
 request: `{{body.path}}` for a JSON or form field, `{{headers.name}}`,
@@ -151,7 +157,9 @@ To suppress repeated deliveries, set a **Duplicate request key** template, such 
 To combine a burst, set a **Coalesce key**, such as `{{body.id}}`, and a window
 of 10–3600 seconds (120 by default). One run uses the latest body, headers,
 and query when the window from the first delivery closes; later requests
-do not extend it. Pending windows survive a server restart. Keys must contain
+do not extend it. A relay request whose filled-in prompt is too long is rejected
+without replacing an existing window; a repeated sender key still returns its
+original duplicate outcome. Pending windows survive a server restart. Keys must contain
 request placeholders; if any placeholder is missing, or the render is empty,
 that key's rule is skipped. Clear the templates to turn dedupe off.
 
@@ -171,6 +179,12 @@ T3 Connect URL for up to 24 hours and delivers them when the environment
 returns. Leave it off if you don't want request bodies stored outside your
 machine. To skip requests that waited too long, set **Skip requests older
 than** on the task.
+
+On a self-hosted relay, the administrator enables offline holds separately for
+each exposed task. A hold response confirms storage at the relay; it does not
+mean the task ran. Disabling exposure or offline holds prevents those held
+requests from being admitted later. Requests already admitted by the environment
+follow the task's execution and cancellation rules.
 
 ## Defaults and inheritance
 

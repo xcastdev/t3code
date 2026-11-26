@@ -34,6 +34,7 @@ vi.mock("react", async (importOriginal) => ({
   useRef: <A,>(current: A) => ({ current }),
   useState: <A,>(initial: A) => [initial, () => {}],
 }));
+vi.mock("gt-react", () => ({ useGT: () => (message: string) => message }));
 vi.mock("../../hooks/useCopyToClipboard", () => ({ writeTextToClipboard: state.copyText }));
 vi.mock("../../localApi", () => ({
   readLocalApi: () => ({ contextMenu: { show: state.showMenu } }),
@@ -160,6 +161,10 @@ it.each(["workspace-file", "media-file"] as const)(
     expect(state.mint).not.toHaveBeenCalled();
     expect(state.download).not.toHaveBeenCalled();
     expect(state.clipboard).not.toHaveBeenCalled();
+    state.sessions.delete(environmentId);
+    await expect(useMediaActions(source).save()).rejects.toThrow("cannot read host files");
+    await expect(useMediaActions(source).copyImage()).rejects.toThrow("cannot read host files");
+    expect(state.mint).not.toHaveBeenCalled();
   },
 );
 

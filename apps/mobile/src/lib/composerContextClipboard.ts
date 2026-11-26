@@ -18,7 +18,7 @@ import {
   threadLinkContextReferences,
 } from "@t3tools/shared/composerContextReferences";
 import { executeAtomQuery, squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
-import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
+import { issuedMobileAssetUrl } from "./verifiedAssetUrl";
 import * as Option from "effect/Option";
 import { appAtomRegistry } from "../state/atom-registry";
 import { assetEnvironment } from "../state/assets";
@@ -213,7 +213,7 @@ async function importAttachment(
   );
   if (result._tag === "Failure") throw squashAtomCommandFailure(result);
   checkAborted(signal);
-  const url = resolveAssetUrl(connection.value.httpBaseUrl, result.value.relativeUrl);
+  const url = issuedMobileAssetUrl(environmentId, result.value);
   if (!url) throw new Error("Attachment URL unavailable");
   const temporary = await downloadAttachmentForPreview({
     attachment: { name: record.name, mimeType: record.mimeType },

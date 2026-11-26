@@ -1,3 +1,6 @@
+import { verificationRequiredFor } from "../connection/verified-route";
+import { downloadVerifiedLocalAsset, useVerifiedLocalAsset } from "../lib/useVerifiedLocalAsset";
+import type { AttachmentPreviewFile } from "../lib/attachmentDownload";
 import { useEvent } from "expo";
 import { useVideoPlayer, VideoView } from "expo-video";
 import { useIsFocused } from "@react-navigation/native";
@@ -31,6 +34,7 @@ function LoadedMediaVideo(props: {
     player.staysActiveInBackground = false;
     player.bufferOptions = { preferredForwardBufferDuration: 5 };
   });
+  const previewFiles = useRef(new Set<AttachmentPreviewFile>());
   const playback = createAudioPlaybackSession(player, true);
   const { active, fullscreen, createPlayRequest, onFullscreenEnter, onFullscreenExit } =
     useMediaVideoPlayback(player, props, playback);
@@ -69,14 +73,44 @@ function LoadedMediaVideo(props: {
   const { status } = useEvent(player, "statusChange", { status: player.status });
   const loadSource = useEffectEvent(async (signal: AbortSignal) => {
     const playIfUninterrupted = createPlayRequest();
-    const uri = props.resolvePlaybackUri ? await props.resolvePlaybackUri() : props.uri;
+    let uri = props.resolvePlaybackUri ? await props.resolvePlaybackUri() : props.uri;
     if (signal.aborted) return;
+    let file: AttachmentPreviewFile | null = null;
+    if (props.resolvePlaybackUri && uri !== null && verificationRequiredFor(uri)) {
+      file = await downloadVerifiedLocalAsset(uri, signal);
+      if (signal.aborted) {
+        file?.dispose();
+        return;
+      }
+      uri = file?.uri ?? null;
+    }
     if (uri === null) throw new Error("Video unavailable");
     playback.pause();
     previousPlaybackRequested.current = false;
-    await player.replaceAsync({ uri, contentType: "progressive" });
-    if (!signal.aborted && props.playRequested) await playIfUninterrupted();
+    const previousFiles = [...previewFiles.current];
+    if (file) previewFiles.current.add(file);
+    try {
+      await player.replaceAsync({ uri, contentType: "progressive" });
+    } catch (error) {
+      // A rejected native load never installs the new item.
+      if (file && previewFiles.current.delete(file)) file.dispose();
+      throw error;
+    }
+    if (signal.aborted) return;
+    for (const previous of previousFiles) {
+      if (previewFiles.current.delete(previous)) previous.dispose();
+    }
+    if (props.playRequested) await playIfUninterrupted();
   });
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- releases cached media after the native player unmounts
+  useEffect(() => {
+    const files = previewFiles.current;
+    return () => {
+      for (const file of files) file.dispose();
+      files.clear();
+    };
+  }, []);
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- loads the video source into the native player and aborts the load on cleanup
   useEffect(() => {
@@ -265,5 +299,14 @@ function MediaVideoPlayerContent(props: MediaVideoPlayerProps) {
 }
 
 export function MediaVideoPlayer(props: MediaVideoPlayerProps) {
-  return <MediaVideoPlayerContent key={props.thumbnailKey} {...props} />;
+  const local = useVerifiedLocalAsset(props.uri);
+  const uri = local.status === "ready" ? local.uri : null;
+  return (
+    <MediaVideoPlayerContent
+      key={props.thumbnailKey}
+      {...props}
+      uri={uri}
+      unavailable={props.unavailable === true || local.status === "failed"}
+    />
+  );
 }

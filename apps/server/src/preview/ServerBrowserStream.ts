@@ -1,9 +1,12 @@
 import * as NodeHttpServerRequest from "@effect/platform-node/NodeHttpServerRequest";
 import {
+  AuthFilesystemReadScope,
   AuthOrchestrationReadScope,
   AuthPreviewOperateScope,
   PREVIEW_STREAM_HOST_SETUP_CLOSE_CODE,
+  PREVIEW_ASSET_WIDGET_MAX_MESSAGE_BYTES,
   PreviewStreamHostSetup,
+  PreviewAssetStreamOpen,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -25,7 +28,9 @@ import * as SessionStore from "../auth/SessionStore.ts";
 import { assetResponseHeaders } from "../http.ts";
 import * as PreviewBrowserHost from "./PreviewBrowserHost.ts";
 import * as ServerBrowser from "./ServerBrowser.ts";
-import { requestUrl } from "../requestUrl.ts";
+import { relayExternalOrigin, requestUrl } from "../requestUrl.ts";
+import { htmlRenderThemeFragment } from "@t3tools/shared/htmlRender";
+import * as LocalAssetNavigation from "./LocalAssetNavigation.ts";
 
 const PREVIEW_STREAM_ROUTE_PREFIX = "/api/preview-stream";
 const TAB_GONE_CODE = 4404;
@@ -41,6 +46,9 @@ const intParam = (params: URLSearchParams, name: string, fallback: number, max: 
 
 type Frame = Extract<ServerBrowser.ServerBrowserViewerOutput, { readonly _tag: "frame" }>;
 
+const decodeAssetOpen = Schema.decodeUnknownOption(PreviewAssetStreamOpen);
+const MAX_ASSET_STREAM_MESSAGE_BYTES = 24 * 1024;
+
 const isAck = (message: unknown) =>
   typeof message === "object" && message !== null && "type" in message && message.type === "ack";
 
@@ -53,7 +61,10 @@ const parseMessage = (chunk: Uint8Array | string): unknown => {
 };
 
 // Request middleware owns tracing, including long-lived WebSocket sessions.
-const makeHandler = Effect.fnUntraced(function* (browser: ServerBrowser.ServerBrowser["Service"]) {
+const makeHandler = Effect.fnUntraced(function* (
+  browser: ServerBrowser.ServerBrowser["Service"],
+  dispatcher: Option.Option<LocalAssetNavigation.LocalAssetDispatcher["Service"]>,
+) {
   const request = yield* HttpServerRequest.HttpServerRequest;
   const url = requestUrl(request);
   if (Option.isNone(url)) return HttpServerResponse.text("Bad Request", { status: 400 });
@@ -71,51 +82,104 @@ const makeHandler = Effect.fnUntraced(function* (browser: ServerBrowser.ServerBr
   ) {
     return HttpServerResponse.text("Not Found", { status: 404 });
   }
-  const session = yield* authenticateMediaRequest(AuthOrchestrationReadScope);
   const params = url.value.searchParams;
-  const canOperate =
-    session.scopes.includes(AuthPreviewOperateScope) && params.get("interactive") !== "false";
-  const threadId = params.get("threadId") ?? "";
-  const tabId = params.get("tabId") ?? "";
-  if (threadId.length === 0 || tabId.length === 0) {
+  const assetMode = params.get("asset") === "1";
+  const issuer = assetMode ? relayExternalOrigin(request) : undefined;
+  if (assetMode && (issuer === undefined || Option.isNone(dispatcher))) {
     return HttpServerResponse.text("Not Found", { status: 404 });
   }
+  const session = yield* authenticateMediaRequest(
+    assetMode ? AuthFilesystemReadScope : AuthOrchestrationReadScope,
+  );
+  const canOperate =
+    assetMode ||
+    (session.scopes.includes(AuthPreviewOperateScope) && params.get("interactive") !== "false");
+  const threadId = params.get("threadId") ?? "";
+  const tabId = params.get("tabId") ?? "";
+  if (!assetMode && (threadId.length === 0 || tabId.length === 0)) {
+    return HttpServerResponse.text("Not Found", { status: 404 });
+  }
+  const viewerSettings = {
+    canOperate,
+    maxWidth: intParam(params, "maxWidth", 1280, assetMode ? 3840 : 7680),
+    maxHeight: intParam(params, "maxHeight", 800, assetMode ? 2160 : 4320),
+    quality: intParam(params, "quality", DEFAULT_QUALITY, 100),
+  };
   const sessions = yield* SessionStore.SessionStore;
+  const incoming = NodeHttpServerRequest.toIncomingMessage(request);
+  const transport = incoming.socket;
+  const disconnected = Effect.callback<HttpServerResponse.HttpServerResponse>((resume) => {
+    const close = () => resume(Effect.succeed(HttpServerResponse.empty()));
+    if (transport.destroyed) {
+      close();
+      return;
+    }
+    transport.once("close", close);
+    return Effect.sync(() => transport.off("close", close));
+  });
   const stream = Effect.scoped(
     Effect.gen(function* () {
-      const attached = yield* browser
-        .attachViewer({
-          threadId,
-          tabId,
-          canOperate,
-          maxWidth: intParam(params, "maxWidth", 1280, 7680),
-          maxHeight: intParam(params, "maxHeight", 800, 4320),
-          quality: intParam(params, "quality", DEFAULT_QUALITY, 100),
-        })
-        .pipe(
+      const attach = (asset?: LocalAssetNavigation.LocalAssetNavigation) =>
+        (asset
+          ? browser.attachAssetViewer({ ...viewerSettings, asset })
+          : browser.attachViewer({ ...viewerSettings, threadId, tabId })
+        ).pipe(
           Effect.map((viewer) => ({ _tag: "attached" as const, viewer })),
           Effect.catchTags({
             ServerBrowserTabNotFoundError: () => Effect.succeed({ _tag: "gone" as const }),
             ServerBrowserLaunchError: (error) => {
               const setup = hostSetup(error.cause);
               return setup === undefined
-                ? Effect.fail(error)
+                ? assetMode
+                  ? Effect.succeed({ _tag: "gone" as const })
+                  : Effect.fail(error)
                 : Effect.succeed({ _tag: "hostSetup" as const, reason: encodeHostSetup(setup) });
             },
           }),
         );
-      const incoming = NodeHttpServerRequest.toIncomingMessage(request);
+      const existing = assetMode ? null : yield* attach();
       // JPEGs are already compressed. Disabling deflate also keeps all
       // pending writes in the socket buffer we bound below, not a zlib queue.
       delete incoming.headers["sec-websocket-extensions"];
-      const transport = incoming.socket;
       const socket = yield* request.upgrade;
       const reader = yield* socket.reader;
       const writer = yield* socket.writer;
       // A refused upgrade reads as an auth failure to ticket clients, so a
       // missing tab is a close code they stop on.
       const gone = writer.write(new Socket.CloseEvent(TAB_GONE_CODE, "tab closed"));
-      if (attached._tag === "gone") {
+      let attached = existing;
+      let widgetMode = false;
+      if (issuer !== undefined && Option.isSome(dispatcher)) {
+        yield* Effect.addFinalizer(() => Effect.sync(() => transport.destroy()));
+        const first = yield* reader.pull.pipe(Effect.timeoutOption("5 seconds"));
+        const chunk = Option.isSome(first) ? first.value[0] : undefined;
+        const open =
+          chunk !== undefined && Buffer.byteLength(chunk) <= MAX_ASSET_STREAM_MESSAGE_BYTES
+            ? decodeAssetOpen(parseMessage(chunk))
+            : Option.none();
+        const asset = Option.isSome(open)
+          ? LocalAssetNavigation.prepare(
+              open.value.verifiedAssetUrl,
+              issuer,
+              open.value.appearance,
+              dispatcher.value.read,
+              open.value.theme === undefined
+                ? ""
+                : htmlRenderThemeFragment({
+                    appearance: open.value.appearance,
+                    variables: open.value.theme,
+                  }),
+              open.value.widget,
+            )
+          : null;
+        if (asset === null) {
+          yield* gone;
+          return HttpServerResponse.empty();
+        }
+        widgetMode = asset.widget !== undefined;
+        attached = yield* attach(asset);
+      }
+      if (attached === null || attached._tag === "gone") {
         yield* gone;
         return HttpServerResponse.empty();
       }
@@ -158,6 +222,9 @@ const makeHandler = Effect.fnUntraced(function* (browser: ServerBrowser.ServerBr
               return superseded ? Effect.forkScoped(superseded.ack) : Effect.void;
             }
             case "viewport":
+            case "assetHeight":
+            case "widgetReady":
+            case "widgetMessage":
             case "control":
             case "clipboard":
             case "download":
@@ -180,13 +247,29 @@ const makeHandler = Effect.fnUntraced(function* (browser: ServerBrowser.ServerBr
       );
       // Incoming messages share the session span; frame acknowledgements are frequent.
       const receive = Effect.fnUntraced(function* (chunk: Uint8Array | string) {
+        const bytes = assetMode ? Buffer.byteLength(chunk) : 0;
+        const maxBytes = widgetMode
+          ? PREVIEW_ASSET_WIDGET_MAX_MESSAGE_BYTES + 128
+          : MAX_ASSET_STREAM_MESSAGE_BYTES;
+        if (bytes > maxBytes) return;
         const message = parseMessage(chunk);
+        if (
+          bytes > MAX_ASSET_STREAM_MESSAGE_BYTES &&
+          !(
+            typeof message === "object" &&
+            message !== null &&
+            "type" in message &&
+            message.type === "widgetMessage"
+          )
+        )
+          return;
         // Ownership serializes actions in the service. Keep reading so dialog
         // replies and takeover can unblock an action already waiting on the page.
-        if (!isAck(message))
-          return yield* canOperate
-            ? viewer.input(message).pipe(Effect.forkScoped, Effect.asVoid)
-            : Effect.void;
+        if (!isAck(message)) {
+          if (!canOperate) return;
+          if (assetMode) return yield* viewer.input(message);
+          return yield* viewer.input(message).pipe(Effect.forkScoped, Effect.asVoid);
+        }
         const ack = inFlight;
         const next = pending;
         inFlight = null;
@@ -214,7 +297,14 @@ const makeHandler = Effect.fnUntraced(function* (browser: ServerBrowser.ServerBr
     Effect.orElseSucceed(() => HttpServerResponse.empty()),
   );
   return yield* Effect.raceFirst(
-    stream,
+    assetMode
+      ? Effect.raceFirst(stream, disconnected).pipe(
+          Effect.timeoutOrElse({
+            duration: "15 minutes",
+            orElse: () => Effect.succeed(HttpServerResponse.empty()),
+          }),
+        )
+      : stream,
     sessions.awaitInvalidation(session.sessionId).pipe(
       Effect.as(HttpServerResponse.empty()),
       Effect.catchTags({
@@ -305,7 +395,8 @@ export const routeLayer = HttpRouter.use((router) =>
     const platform = yield* Effect.context<
       HttpPlatform.HttpPlatform | FileSystem.FileSystem | Path.Path
     >();
-    const handler = makeHandler(browser).pipe(Effect.provideContext(platform));
+    const dispatcher = yield* Effect.serviceOption(LocalAssetNavigation.LocalAssetDispatcher);
+    const handler = makeHandler(browser, dispatcher).pipe(Effect.provideContext(platform));
     yield* router.add("GET", `${PREVIEW_STREAM_ROUTE_PREFIX}/*`, handler);
     yield* router.add("POST", `${PREVIEW_STREAM_ROUTE_PREFIX}/upload`, handler);
   }),

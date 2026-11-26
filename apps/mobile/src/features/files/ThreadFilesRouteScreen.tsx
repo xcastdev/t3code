@@ -30,6 +30,7 @@ import { LoadingScreen } from "../../components/LoadingScreen";
 import { copyTextWithHaptic } from "../../lib/copyTextWithHaptic";
 import { isPdfFile } from "../../lib/filePreview";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
+import { verificationRequiredFor } from "../../connection/verified-route";
 import { useUniwindTheme } from "../../lib/useUniwindTheme";
 import type { MediaVideoPreviewSource } from "../../lib/videoPreviewSource";
 import { useMediaActions } from "../../state/mediaActions";
@@ -66,6 +67,7 @@ import {
   fileRoutePathSegments,
   resolveWorkspaceFilePath,
   resolveWorkspaceRelativeFilePath,
+  isAbsolutePath,
   isAudioPreviewFile,
   isMarkdownPreviewFile,
   isSvgImagePreviewFile,
@@ -239,6 +241,7 @@ function FileContent(props: {
   readonly cwd: string;
   readonly environmentId: EnvironmentId;
   readonly previewUri: string | null;
+  readonly workspaceHtml: boolean;
   readonly previewFailure: AssetUrlFailureReason | null;
   readonly onRetryPreview: () => void;
   readonly videoSource: MediaVideoPreviewSource | null;
@@ -312,7 +315,7 @@ function FileContent(props: {
   }
 
   if (props.activeMode === "preview" && isBrowserFile) {
-    return <WorkspaceFileWebPreview uri={props.previewUri} />;
+    return <WorkspaceFileWebPreview uri={props.previewUri} workspaceHtml={props.workspaceHtml} />;
   }
 
   if (props.fileError && props.fileContents === null) {
@@ -692,6 +695,13 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
     draftCwd: threadId === null ? cwd : null,
   });
   const assetPreviewUri = assetPreview._tag === "Success" ? assetPreview.url : null;
+  const assetResource = assetPreview.resource;
+  const workspaceHtml =
+    (assetResource?._tag === "workspace-file" ||
+      (assetResource?._tag === "draft-workspace-file" &&
+        !isAbsolutePath(assetResource.path) &&
+        !/^(?:\\|~[/\\]|[a-z]:)/i.test(assetResource.path))) &&
+    /\.html?$/i.test(assetResource.path);
   const mediaSource: MediaActionsSource | undefined =
     environmentId !== null &&
     relativePath !== null &&
@@ -897,7 +907,9 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
             onPress: () =>
               setFullScreenPreview({
                 kind: "pdf",
-                uri: previewUri,
+                ...(environmentId !== null && assetPreview.resource !== null
+                  ? { environmentId, resource: assetPreview.resource }
+                  : { uri: previewUri }),
                 name: basename(relativePath),
                 ...(environmentId !== null && assetPreview.resource !== null
                   ? {
@@ -912,7 +924,9 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
               }),
           } as const)
         : null,
-      isBrowserFile && typeof assetPreviewUri === "string"
+      isBrowserFile &&
+      typeof assetPreviewUri === "string" &&
+      !verificationRequiredFor(assetPreviewUri)
         ? ({
             id: "open-browser",
             title: Platform.OS === "ios" ? "Open in Safari" : "Open in browser",
@@ -1051,10 +1065,12 @@ export function ThreadFileScreen(props: ThreadFileRouteScreenProps) {
           cwd={cwd}
           environmentId={environmentId}
           previewUri={previewUri}
+          workspaceHtml={workspaceHtml}
           previewFailure={assetPreview._tag === "Failure" ? assetPreview.reason : null}
           onRetryPreview={handleRetryPreview}
           videoSource={videoSource}
           mediaSource={mediaSource}
+          // Playback localizes the freshly issued URL and holds its own file lease.
           resolveVideoUri={assetPreview.refresh}
           fileContents={fileData?.contents ?? null}
           fileError={fileQuery.error}

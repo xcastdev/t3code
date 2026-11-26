@@ -89,6 +89,7 @@ export const ConnectionFailureCause = Schema.Literals([
   "tunnel_pending",
   "tunnel_not_enabled",
   "approval_pending",
+  "hosted_relay_admission_required",
 ]);
 export type ConnectionFailureCause = typeof ConnectionFailureCause.Type;
 
@@ -158,6 +159,8 @@ export interface PreparedConnection {
   readonly socketUrl: string;
   readonly httpAuthorization: PreparedHttpAuthorization | null;
   readonly target: ConnectionTarget;
+  readonly learnedRoute?: true;
+  readonly verificationRequired?: true;
   /** What the server said about itself while this connection was prepared. */
   readonly descriptor?: ExecutionEnvironmentDescriptor;
 }

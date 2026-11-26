@@ -18,6 +18,26 @@
     "./relay": {
       "types": "./src/relay.ts",
       "import": "./src/relay.ts"
+    },
+    "./selfHostedRelay": {
+      "types": "./src/selfHostedRelay.ts",
+      "import": "./src/selfHostedRelay.ts"
+    },
+    "./selfHostedRelayDirectory": {
+      "types": "./src/selfHostedRelayDirectory.ts",
+      "import": "./src/selfHostedRelayDirectory.ts"
+    },
+    "./selfHostedRelayHosted": {
+      "types": "./src/selfHostedRelayHosted.ts",
+      "import": "./src/selfHostedRelayHosted.ts"
+    },
+    "./selfHostedRelayHooks": {
+      "types": "./src/selfHostedRelayHooks.ts",
+      "import": "./src/selfHostedRelayHooks.ts"
+    },
+    "./selfHostedRelayForwarding": {
+      "types": "./src/selfHostedRelayForwarding.ts",
+      "import": "./src/selfHostedRelayForwarding.ts"
     }
   },
   "scripts": {

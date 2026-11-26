@@ -45,6 +45,7 @@ import {
 } from "~/plugins/pluginInstalls";
 import { pickFileInCommandPalette } from "~/commandPaletteBus";
 import { environmentCatalog } from "~/connection/catalog";
+import { environmentRelayAdmissionRequired } from "~/connection/environmentTransport";
 import { readProjects, readThreadShells } from "~/state/entities";
 import { pluginEnvironment } from "~/state/plugins";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -389,7 +390,11 @@ export function PluginPanelView(props: {
       {(url) => (
         <PluginPanelFrame
           title={panel.title}
-          document={{ kind: "src", url }}
+          document={
+            environmentRelayAdmissionRequired(url)
+              ? { kind: "hosted", url, environmentId: destination.environmentId }
+              : { kind: "src", url }
+          }
           bridge={bridge}
           destination={destination}
           chatTarget={props.chatTarget}
@@ -428,11 +433,12 @@ export function PluginPanelSurface(props: {
     writeState: (panelKey, value, version) =>
       clientPluginStore.writeState(panelKey, value, version),
     backend: ({ environmentId, pluginId, version, manifest }) => ({
-      call: async (operation, input) => {
+      call: async (operation, input, lifetime) => {
         const chat = chatHint();
         const mutates =
           manifest.backend?.operations.find((entry) => entry.name === operation)?.mutates ?? true;
         await waitForEnvironmentConnection(registry, environmentCatalog.stateAtom(environmentId));
+        lifetime.throwIfAborted();
         const result = await runAtomCommand(
           registry,
           mutates ? pluginEnvironment.mutate : pluginEnvironment.query,

@@ -1,7 +1,8 @@
 import type { AssetResource, EnvironmentId } from "@t3tools/contracts";
 import { useEffect, useRef, useState } from "react";
 
-import { useAssetUrlState } from "~/assets/assetUrls";
+import { requiresAdmittedAsset } from "~/assets/admittedAssetSource";
+import { useAssetUrlRefresh, useAssetUrlState } from "~/assets/assetUrls";
 
 import { AudioPreview } from "./AudioPreview";
 
@@ -20,8 +21,12 @@ export function InlineAudioPreview(props: {
   const asset = useAssetUrlState(
     visible ? (props.environmentId ?? null) : null,
     visible ? (props.resource ?? null) : null,
+    undefined,
+    "audio",
   );
-  const src = visible ? (asset._tag === "Success" ? asset.url : props.src) : undefined;
+  const refresh = useAssetUrlRefresh(props.environmentId ?? null, props.resource ?? null);
+  const fallback = props.src && !requiresAdmittedAsset(props.src) ? props.src : undefined;
+  const src = visible ? (asset._tag === "Success" ? asset.url : fallback) : undefined;
   const failed = asset._tag === "Failure" || (src !== undefined && failedSrc === src);
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- IntersectionObserver defers loading the audio until the element scrolls into view
@@ -46,13 +51,18 @@ export function InlineAudioPreview(props: {
         name={props.name}
         src={src ?? ""}
         revision={
-          props.resource
-            ? JSON.stringify([props.environmentId, props.resource])
-            : (props.src ?? null)
+          asset.localSource
+            ? (src ?? null)
+            : props.resource
+              ? JSON.stringify([props.environmentId, props.resource])
+              : (props.src ?? null)
         }
         failed={failed}
         onOpen={props.onOpen}
-        onRetry={() => setFailedSrc(null)}
+        onRetry={() => {
+          setFailedSrc(null);
+          void refresh().catch(() => undefined);
+        }}
         onError={() => setFailedSrc(src ?? null)}
       />
     </span>

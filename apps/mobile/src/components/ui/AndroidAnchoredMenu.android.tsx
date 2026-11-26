@@ -1,7 +1,7 @@
 import type { MenuAction, MenuComponentProps } from "@react-native-menu/menu";
 import type { ReactNode } from "react";
 import { use, useRef, useState } from "react";
-import type { StyleProp, ViewInstance, ViewStyle } from "react-native";
+import type { AccessibilityProps, StyleProp, ViewInstance, ViewStyle } from "react-native";
 import { Pressable, ScrollView, View } from "react-native";
 import { useKeyboardState } from "react-native-keyboard-controller";
 
@@ -34,7 +34,14 @@ type OverlayFrame = {
   readonly height: number;
 };
 
-export type AndroidAnchoredMenuProps = {
+export type AndroidAnchoredMenuProps = Pick<
+  AccessibilityProps,
+  | "accessible"
+  | "accessibilityLabel"
+  | "accessibilityRole"
+  | "accessibilityState"
+  | "accessibilityValue"
+> & {
   readonly actions: readonly MenuAction[];
   readonly title?: string;
   readonly onPressAction?: MenuComponentProps["onPressAction"];
@@ -67,6 +74,7 @@ export function AndroidAnchoredMenu(props: AndroidAnchoredMenuProps) {
   }
 
   const open = () => {
+    if (props.accessibilityState?.disabled) return;
     anchorNode?.measureInWindow((x, y, width, height) => {
       setAnchor({ x, y, width, height, keyboardWasVisible: keyboardVisible });
     });
@@ -133,7 +141,7 @@ export function AndroidAnchoredMenu(props: AndroidAnchoredMenuProps) {
       setPath((current) => [...current, action]);
       return;
     }
-    close();
+    if (!action.attributes?.keepsMenuPresented) close();
     if (action.id !== undefined) {
       props.onPressAction?.({
         nativeEvent: { event: action.id },
@@ -155,13 +163,25 @@ export function AndroidAnchoredMenu(props: AndroidAnchoredMenuProps) {
       ) : (
         <Pressable
           ref={setAnchorNode}
-          accessibilityRole="button"
+          accessible={props.accessible}
+          accessibilityLabel={props.accessibilityLabel}
+          accessibilityRole={props.accessibilityRole ?? "button"}
+          accessibilityState={props.accessibilityState}
+          accessibilityValue={props.accessibilityValue}
+          disabled={props.accessibilityState?.disabled}
           className={props.className}
           collapsable={false}
           style={props.style}
           onPress={open}
         >
-          <View pointerEvents="none">{props.children}</View>
+          <View
+            importantForAccessibility={
+              props.accessibilityLabel === undefined ? "auto" : "no-hide-descendants"
+            }
+            pointerEvents="none"
+          >
+            {props.children}
+          </View>
         </Pressable>
       )}
       {anchor === null ? null : (

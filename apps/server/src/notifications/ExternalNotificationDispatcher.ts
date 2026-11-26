@@ -1,62 +1,33 @@
-import type { OrchestrationV2Notification, ProjectWorkAttentionRead } from "@t3tools/contracts";
+import type { ExternalNotificationEvent, ExternalNotificationTestResult } from "@t3tools/contracts";
+import { makeExternalNotificationDispatcher } from "@t3tools/external-notifications/dispatcher";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
+import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ServerSettings from "../serverSettings.ts";
-import * as HomeAssistantWebhookAdapter from "./HomeAssistantWebhookAdapter.ts";
+import * as Transport from "./ExternalNotificationTransport.ts";
 
-export type ExternalNotificationFact =
-  | {
-      readonly kind: "notification";
-      readonly messageId: string;
-      readonly threadId: string;
-      readonly notification: OrchestrationV2Notification;
+type WithoutEnvironment<Event> = Event extends ExternalNotificationEvent
+  ? Omit<Event, "environmentId" | "environmentName"> & {
+      readonly legacyIdentity?: string;
+      readonly liveOnly?: boolean;
     }
-  | {
-      readonly kind: "work-attention";
-      readonly projectId: string;
-      readonly attention: ProjectWorkAttentionRead;
-    };
-export interface ExternalNotificationTestResult {
-  readonly status: "delivered" | "failed";
-  readonly reason?: HomeAssistantWebhookAdapter.ExternalNotificationError["reason"];
-}
+  : never;
 
-const factIdentity = (fact: ExternalNotificationFact) =>
-  JSON.stringify(
-    fact.kind === "notification"
-      ? [fact.kind, fact.threadId, fact.messageId]
-      : [
-          fact.kind,
-          fact.projectId,
-          fact.attention.taskId,
-          fact.attention.reason,
-          fact.attention.revision,
-        ],
-  );
-const payload = (
-  fact: ExternalNotificationFact,
-): HomeAssistantWebhookAdapter.ExternalNotificationPayload =>
-  fact.kind === "notification"
-    ? {
-        schemaVersion: 1,
-        test: false,
-        kind: fact.kind,
-        threadId: fact.threadId,
-        title: fact.notification.summary.slice(0, 1024),
-      }
-    : {
-        schemaVersion: 1,
-        test: false,
-        kind: fact.kind,
-        projectId: fact.projectId,
-        taskId: fact.attention.taskId,
-        title: fact.attention.reason,
-      };
+export type ExternalNotificationFact = WithoutEnvironment<ExternalNotificationEvent>;
+
+type Pending = {
+  readonly event: ExternalNotificationEvent;
+  readonly liveOnly: boolean;
+  readonly legacyIdentity?: string;
+};
 
 export class ExternalNotificationDispatcher extends Context.Service<
   ExternalNotificationDispatcher,
@@ -70,79 +41,116 @@ export class ExternalNotificationDispatcher extends Context.Service<
 
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const random = yield* SecureRandom.SecureRandom;
   const settings = yield* ServerSettings.ServerSettingsService;
-  const adapter = yield* HomeAssistantWebhookAdapter.HomeAssistantWebhookAdapter;
-  type Pending = {
-    readonly identity: string;
-    readonly payload: HomeAssistantWebhookAdapter.ExternalNotificationPayload;
-  };
-  const queue = yield* Queue.dropping<Pending>(64);
-  const started = yield* Ref.make(false);
-  const dispatch = Effect.fn("ExternalNotificationDispatcher.dispatch")(function* (fact: Pending) {
-    const config = yield* settings.getSettings;
-    for (const destination of config.externalNotifications.destinations) {
-      if (!destination.enabled || !destination.webhookUrl) continue;
-      yield* Effect.gen(function* () {
-        // Claim before I/O. A crash or ambiguous network failure must not replay a webhook.
-        const claimed =
-          yield* sql`INSERT INTO t3_workflow_v2_external_notifications (fact_id,destination_id,status)
-          VALUES (${fact.identity},${destination.id},'uncertain') ON CONFLICT DO NOTHING RETURNING fact_id`;
-        if (claimed.length === 0) return;
-        const sent = yield* Effect.exit(adapter.send(destination.webhookUrl, fact.payload));
-        yield* sql`UPDATE t3_workflow_v2_external_notifications SET status=${sent._tag === "Success" ? "delivered" : "uncertain"}
-          WHERE fact_id=${fact.identity} AND destination_id=${destination.id}`;
-      }).pipe(Effect.ignoreCause);
-    }
-  });
-  const safeDispatch = (fact: Pending) => dispatch(fact).pipe(Effect.ignoreCause);
-  const start = Effect.gen(function* () {
-    if (yield* Ref.getAndSet(started, true)) return;
-    yield* Queue.take(queue).pipe(Effect.flatMap(safeDispatch), Effect.forever, Effect.forkScoped);
-  });
-  const test = Effect.fn("ExternalNotificationDispatcher.test")(
-    function* (destinationId: string) {
-      const config = yield* settings.getSettings;
-      const destination = config.externalNotifications.destinations.find(
-        (candidate) => candidate.id === destinationId,
-      );
-      if (!destination?.webhookUrl) return { status: "failed", reason: "unconfigured" } as const;
-      return yield* adapter
-        .send(destination.webhookUrl, {
-          schemaVersion: 1,
-          test: true,
-          kind: "test",
-          title: "T3 Code test notification",
-        })
-        .pipe(
-          Effect.as({ status: "delivered" } as const),
-          Effect.catch((error) =>
-            Effect.succeed({ status: "failed", reason: error.reason } as const),
-          ),
-        );
-    },
-    Effect.catchCause(() => Effect.succeed({ status: "failed", reason: "transport" } as const)),
+  const environment = yield* ServerEnvironment.ServerEnvironment;
+  const environmentId = yield* environment.getEnvironmentId;
+  const name =
+    environment.getLabel ?? environment.getDescriptor.pipe(Effect.map(({ label }) => label));
+  const source = name.pipe(
+    Effect.map((label) => ({ environmentId, environmentName: label.trim() || environmentId })),
   );
+  const { send } = yield* Transport.ExternalNotificationTransport;
+  const dispatcher = makeExternalNotificationDispatcher({
+    readDestinations: (sourceId) =>
+      sourceId === environmentId
+        ? settings.withSettingsSnapshot((config) =>
+            Effect.succeed(config.externalNotifications.destinations),
+          )
+        : Effect.succeed([]),
+    claim: ({ environmentId, occurrenceId, destinationId, legacyIdentity }) =>
+      // The alias check and insertion share one SQLite write transaction.
+      sql`INSERT INTO t3_workflow_v2_external_notification_occurrences
+          (environment_id,occurrence_id,destination_id,status)
+        SELECT ${environmentId},${occurrenceId},${destinationId},'uncertain'
+        WHERE NOT EXISTS (
+          SELECT 1 FROM t3_workflow_v2_external_notifications
+          WHERE fact_id=${legacyIdentity ?? null} AND destination_id=${destinationId}
+        )
+        ON CONFLICT DO NOTHING RETURNING occurrence_id`.pipe(Effect.map((rows) => rows.length > 0)),
+    record: ({ environmentId, occurrenceId, destinationId }, status) =>
+      sql`UPDATE t3_workflow_v2_external_notification_occurrences SET status=${status}
+        WHERE environment_id=${environmentId} AND occurrence_id=${occurrenceId}
+          AND destination_id=${destinationId}`.pipe(Effect.asVoid),
+    send,
+  });
+  const homeAssistant = yield* Queue.dropping<Pending>(128);
+  const generic = yield* Queue.dropping<Pending>(64);
+  // Keep legacy capacity reserved while all Home Assistant sends share one FIFO.
+  const legacySlots = yield* Semaphore.make(64);
+  const liveSlots = yield* Semaphore.make(64);
+  const queues = [
+    [homeAssistant, "home-assistant"],
+    [generic, "generic-webhook"],
+  ] as const;
+  const started = yield* Ref.make(false);
+  const dispatch = Effect.fn("ExternalNotificationDispatcher.dispatchPending")(function* (
+    { event, ...options }: Pending,
+    destinationKind: (typeof queues)[number][1],
+  ) {
+    if (destinationKind === "home-assistant") {
+      yield* (options.liveOnly ? liveSlots : legacySlots).release(1);
+    }
+    yield* dispatcher.dispatch(event, { ...options, destinationKind }).pipe(Effect.ignoreCause);
+  });
+  const offerHomeAssistant = Effect.fn("ExternalNotificationDispatcher.offerHomeAssistant")(
+    function* (pending: Pending) {
+      const slots = pending.liveOnly ? liveSlots : legacySlots;
+      if (!(yield* slots.takeIfAvailable(1))) return;
+      if (!(yield* Queue.offer(homeAssistant, pending))) yield* slots.release(1);
+    },
+    Effect.uninterruptible,
+  );
+
   return ExternalNotificationDispatcher.of({
-    start,
-    notifyCommitted: Effect.fn("ExternalNotificationDispatcher.notifyCommitted")(
-      (fact: ExternalNotificationFact) => {
-        if (fact.kind === "work-attention" && (fact.attention.resolvedAt || fact.attention.seenAt))
-          return Effect.void;
-        // Retain only the bounded outbound payload, never the persisted detail or source metadata.
-        return Queue.offer(queue, { identity: factIdentity(fact), payload: payload(fact) }).pipe(
-          Effect.asVoid,
+    start: Effect.gen(function* () {
+      if (yield* Ref.getAndSet(started, true)) return;
+      for (const [queue, selection] of queues) {
+        yield* Queue.take(queue).pipe(
+          Effect.flatMap((pending) => dispatch(pending, selection)),
+          Effect.forever,
+          Effect.forkScoped,
         );
+      }
+    }),
+    notifyCommitted: Effect.fn("ExternalNotificationDispatcher.notifyCommitted")(function* ({
+      legacyIdentity,
+      liveOnly,
+      ...fact
+    }: ExternalNotificationFact) {
+      const origin = yield* source;
+      const pending: Pending = {
+        event: { ...fact, ...origin },
+        liveOnly: liveOnly === true,
+        ...(legacyIdentity === undefined ? {} : { legacyIdentity }),
+      };
+      yield* Queue.offer(generic, pending);
+      yield* offerHomeAssistant(pending);
+    }),
+    test: Effect.fn("ExternalNotificationDispatcher.test")(
+      function* (destinationId: string) {
+        return yield* dispatcher.test(destinationId, {
+          ...(yield* source),
+          eventType: "test",
+          occurrenceId: yield* random.uuidV4(),
+          timestamp: DateTime.formatIso(yield* DateTime.now),
+          title: "T3 Code test notification",
+        });
       },
+      Effect.catchCause(() => Effect.succeed({ status: "failed", reason: "transport" } as const)),
     ),
-    test,
-    // Used by deterministic tests before the background consumer starts.
-    drain: Effect.suspend(() =>
-      Queue.sizeUnsafe(queue) === 0
-        ? Effect.void
-        : Queue.takeAll(queue).pipe(
-            Effect.flatMap((facts) => Effect.forEach(facts, safeDispatch, { discard: true })),
+    drain: Effect.forEach(
+      queues,
+      ([queue, selection]) =>
+        Queue.clear(queue).pipe(
+          Effect.flatMap((facts) =>
+            Effect.forEach(facts, (pending) => dispatch(pending, selection), { discard: true }),
           ),
+        ),
+      { discard: true },
     ),
   });
 });
-export const layer = Layer.effect(ExternalNotificationDispatcher, make);
+export const layer = Layer.effect(ExternalNotificationDispatcher, make).pipe(
+  Layer.provide(SecureRandom.layerWebCrypto),
+);

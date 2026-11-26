@@ -21,7 +21,12 @@ const { fromPartition, sessions } = vi.hoisted(() => ({
       readonly setPermissionRequestHandler: ReturnType<typeof vi.fn>;
       readonly setPermissionCheckHandler: ReturnType<typeof vi.fn>;
       readonly setUserAgent: ReturnType<typeof vi.fn>;
-      readonly webRequest: { readonly onBeforeSendHeaders: ReturnType<typeof vi.fn> };
+      readonly setCertificateVerifyProc: ReturnType<typeof vi.fn>;
+      readonly webRequest: {
+        readonly onBeforeSendHeaders: ReturnType<typeof vi.fn>;
+        readonly onBeforeRequest: ReturnType<typeof vi.fn>;
+        readonly onHeadersReceived: ReturnType<typeof vi.fn>;
+      };
     }
   >(),
 }));
@@ -51,6 +56,7 @@ vi.mock("electron", () => ({
   },
 }));
 
+import { DesktopPreReadyElectronOptions } from "../app/DesktopPreReadyPlatform.ts";
 import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as ElectronDialog from "../electron/ElectronDialog.ts";
 import * as BrowserSession from "./BrowserSession.ts";
@@ -74,9 +80,19 @@ const layerDialog = Layer.succeed(ElectronDialog.ElectronDialog, {
     })),
   showErrorBox: (title, content) => Effect.sync(() => showErrorBox(title, content)),
 });
-const layer = BrowserSession.layer.pipe(
+const browserSessionLayer = BrowserSession.layer.pipe(
   Layer.provide(
     Layer.mergeAll(NodeServices.layer, NodeCrypto.layer, layerDialog, ElectronApp.layer),
+  ),
+);
+
+const layer = browserSessionLayer.pipe(
+  Layer.provide(
+    Layer.succeed(DesktopPreReadyElectronOptions, {
+      linux: null,
+      linuxPasswordStoreCommandLine: null,
+      verifiedRoutes: [],
+    }),
   ),
 );
 
@@ -149,7 +165,12 @@ describe("BrowserSession", () => {
         setPermissionRequestHandler: vi.fn(),
         setPermissionCheckHandler: vi.fn(),
         setUserAgent: vi.fn(),
-        webRequest: { onBeforeSendHeaders: vi.fn() },
+        setCertificateVerifyProc: vi.fn(),
+        webRequest: {
+          onBeforeSendHeaders: vi.fn(),
+          onBeforeRequest: vi.fn(),
+          onHeadersReceived: vi.fn(),
+        },
       };
       sessions.set(partition, browserSession);
       return browserSession;
@@ -223,7 +244,12 @@ describe("BrowserSession", () => {
           setUserAgent: vi.fn((next: string) => {
             userAgent = next;
           }),
-          webRequest: { onBeforeSendHeaders: vi.fn() },
+          setCertificateVerifyProc: vi.fn(),
+          webRequest: {
+            onBeforeSendHeaders: vi.fn(),
+            onBeforeRequest: vi.fn(),
+            onHeadersReceived: vi.fn(),
+          },
         };
         sessions.set(partition, browserSession);
         return browserSession;
@@ -420,6 +446,51 @@ describe("BrowserSession", () => {
       });
       assert.strictEqual(vi.mocked(other.clearStorageData).mock.calls.length, 0);
     }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect(
+    "installs the route policy for every preview profile and refuses certificate overrides",
+    () =>
+      Effect.gen(function* () {
+        const browserSessions = yield* BrowserSession.BrowserSession;
+        showMessageBox.mockClear();
+        for (const persistent of [true, false]) {
+          const browserSession = yield* browserSessions.getSession(
+            "scope-a",
+            persistent,
+            "profile",
+          );
+          assert.strictEqual(
+            vi.mocked(browserSession.setCertificateVerifyProc).mock.calls.length,
+            1,
+          );
+          assert.strictEqual(
+            vi.mocked(browserSession.webRequest.onBeforeRequest).mock.calls.length,
+            1,
+          );
+          assert.strictEqual(
+            vi.mocked(browserSession.webRequest.onHeadersReceived).mock.calls.length,
+            1,
+          );
+          const failure = certificateError(browserSession, { url: "https://localhost:18443/" });
+          assert.isFalse(yield* failure.trusted);
+        }
+        assert.strictEqual(showMessageBox.mock.calls.length, 0);
+      }).pipe(
+        Effect.provide(browserSessionLayer),
+        Effect.provideService(DesktopPreReadyElectronOptions, {
+          linux: null,
+          linuxPasswordStoreCommandLine: null,
+          verifiedRoutes: [
+            {
+              environmentId: "environment-a",
+              origin: "https://localhost:18443",
+              hostname: "localhost",
+              spkiSha256: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            },
+          ],
+        }),
+      ),
   );
 
   it.effect("asks before trusting an untrusted certificate and remembers the approval", () =>

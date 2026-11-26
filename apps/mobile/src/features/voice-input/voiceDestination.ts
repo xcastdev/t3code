@@ -24,6 +24,7 @@ import * as Option from "effect/Option";
 import { Atom, AsyncResult, AtomRegistry } from "effect/reactivity";
 import { requireOptionalNativeModule } from "expo";
 import { fetch as expoFetch } from "expo/fetch";
+import { fetchRouteWith } from "../../native/verifiedNetwork";
 
 import { appAtomRegistry } from "../../state/atom-registry";
 import { environmentPresentations } from "../../state/presentation";
@@ -126,7 +127,7 @@ export function runSpeech<A, E>(
                 code: "cancelled",
                 message: "Your transcription choice changed.",
               });
-            return expoFetch(url, { ...options, redirect: "error" });
+            return fetchRouteWith(expoFetch, url, { ...options, redirect: "error" });
           }),
           Effect.provide(context),
         ),

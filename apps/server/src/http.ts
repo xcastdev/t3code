@@ -12,6 +12,11 @@ import {
 } from "@t3tools/shared/mcpApp";
 import { FILE_PREVIEW_SCROLL_SCRIPT } from "@t3tools/shared/htmlRender";
 import { decodeOtlpTraceRecords } from "@t3tools/shared/observability";
+import {
+  RELAY_MEDIA_DOWNLOAD_HEADER,
+  RELAY_MEDIA_DOWNLOAD_VALUE,
+  RELAY_MEDIA_RANGE_BYTES,
+} from "@t3tools/shared/relayMediaDownload";
 import * as ByteSize from "effect/ByteSize";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -38,7 +43,13 @@ import { OtlpTracer, OtlpSerialization } from "effect/observability";
 import * as ServerConfig from "./config.ts";
 import { ASSET_ROUTE_PREFIX, readMcpAppHtml, resolveAsset } from "./assets/AssetAccess.ts";
 import { sourceControlMediaResponse } from "./assets/sourceControlMediaResponse.ts";
-import { statMediaFile, streamMediaFile, type OpenMediaFile } from "./assets/MediaFile.ts";
+import {
+  makeMediaDownloadValidator,
+  openMediaFile,
+  statMediaFile,
+  streamMediaFile,
+  type OpenMediaFile,
+} from "./assets/MediaFile.ts";
 import {
   ATTACHMENT_UPLOAD_ROUTE_PREFIX,
   storeAttachmentUpload,
@@ -434,6 +445,14 @@ export const layerOtlpTracesProxyRoute = HttpRouter.add(
 
 const UNTRACED_REQUEST_PATHS: ReadonlySet<string> = new Set([OTLP_TRACES_PROXY_PATH]);
 
+const isWebhookRequest = (path: string) =>
+  path.startsWith(`${WEBHOOK_ROUTE_PREFIX}/`) || path.startsWith("/api/relay-hooks/");
+
+export const redactWebhookRequestLogs = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.flatMap(HttpServerRequest.HttpServerRequest, (request) =>
+    isWebhookRequest(request.url) ? HttpMiddleware.withLoggerDisabled(effect) : effect,
+  );
+
 // HttpRouter.serve builds routes privately; provide the server-wide TracerDisabledWhen to the served layer.
 const layerUntracedRequests = Layer.succeed(HttpMiddleware.TracerDisabledWhen)((request) => {
   const queryIndex = request.url.indexOf("?");
@@ -441,7 +460,7 @@ const layerUntracedRequests = Layer.succeed(HttpMiddleware.TracerDisabledWhen)((
   // Signed URLs carry bearer tokens in the path, so they never reach a trace.
   return (
     UNTRACED_REQUEST_PATHS.has(path) ||
-    path.startsWith(`${WEBHOOK_ROUTE_PREFIX}/`) ||
+    isWebhookRequest(path) ||
     path.startsWith(`${ASSET_ROUTE_PREFIX}/`) ||
     path.startsWith(`${ATTACHMENT_UPLOAD_ROUTE_PREFIX}/`)
   );
@@ -461,62 +480,148 @@ export const withRootRequestSpans = <A, E, R>(layer: Layer.Layer<A, E, R>) =>
     ),
   );
 
-export const layerAssetRoute = HttpRouter.add(
-  "GET",
-  `${ASSET_ROUTE_PREFIX}/*`,
-  Effect.gen(function* () {
-    const request = yield* HttpServerRequest.HttpServerRequest;
-    const url = requestUrl(request);
-    if (Option.isNone(url)) {
-      return HttpServerResponse.text("Bad Request", { status: 400 });
-    }
+const signedDownloadResponse = Effect.fn("signedDownloadResponse")(function* (
+  validator: ReturnType<typeof makeMediaDownloadValidator>,
+  asset: Parameters<typeof assetFileResponse>[0],
+  request: HttpServerRequest.HttpServerRequest,
+) {
+  const headers: Record<string, string> = {
+    ...assetResponseHeaders(asset.path, asset),
+    "Cache-Control": "private, no-store, no-transform",
+    Vary: RELAY_MEDIA_DOWNLOAD_HEADER,
+    "Accept-Ranges": "bytes",
+  };
+  const rejected = (status: number) => HttpServerResponse.empty({ status, headers });
+  const rangeHeader = request.headers.range;
+  if (request.method !== "GET" || !rangeHeader || asset.renderIntent) return rejected(400);
+  const file = asset.file ?? (yield* openMediaFile(asset.path));
+  if (!file) return rejected(404);
+  const info = file.info;
+  const ifRange = request.headers["if-range"];
+  const empty =
+    info.size === 0n &&
+    ifRange === undefined &&
+    rangeHeader === `bytes=0-${RELAY_MEDIA_RANGE_BYTES - 1}`;
+  const range = assetByteRange(rangeHeader, info.size);
+  if (!empty && (range?._tag !== "Range" || range.bytesToRead > BigInt(RELAY_MEDIA_RANGE_BYTES))) {
+    return HttpServerResponse.empty({
+      status: 416,
+      headers: { ...headers, "Content-Range": `bytes */${info.size}` },
+    });
+  }
+  const validation = yield* validator.validate(asset.path, file, info, ifRange);
+  if ("status" in validation) return rejected(validation.status);
+  headers.ETag = validation.etag;
+  headers["Content-Type"] ??= Option.getOrElse(
+    Mime.getType(asset.path),
+    () => "application/octet-stream",
+  );
+  if (empty || range?._tag !== "Range") {
+    return HttpServerResponse.empty({
+      status: 200,
+      headers: { ...headers, "Content-Length": "0" },
+    });
+  }
+  headers["Content-Range"] = range.contentRange;
+  headers["Content-Length"] = String(range.bytesToRead);
+  return HttpServerResponse.stream(
+    validator.stream(asset.path, file, info, range.offset, range.bytesToRead),
+    {
+      status: 206,
+      headers,
+    },
+  );
+});
 
-    const suffix = url.value.pathname.slice(`${ASSET_ROUTE_PREFIX}/`.length);
-    const separatorIndex = suffix.indexOf("/");
-    if (separatorIndex <= 0) {
-      return HttpServerResponse.text("Not Found", { status: 404 });
-    }
+const assetRoute = (validator: ReturnType<typeof makeMediaDownloadValidator>) =>
+  HttpRouter.add(
+    "GET",
+    `${ASSET_ROUTE_PREFIX}/*`,
+    Effect.gen(function* () {
+      const request = yield* HttpServerRequest.HttpServerRequest;
+      const url = requestUrl(request);
+      if (Option.isNone(url)) {
+        return HttpServerResponse.text("Bad Request", { status: 400 });
+      }
 
-    const asset = yield* resolveAsset(
-      suffix.slice(0, separatorIndex),
-      suffix.slice(separatorIndex + 1),
-    );
-    if (!asset) {
-      return HttpServerResponse.text("Not Found", { status: 404 });
-    }
-    if (asset.kind === "bytes") {
-      return HttpServerResponse.uint8Array(asset.bytes, {
-        contentType: asset.mimeType,
-        headers: { "cache-control": "private, max-age=3600", "x-content-type-options": "nosniff" },
-      });
-    }
-    if (asset.kind === "source-control-media") {
-      return yield* sourceControlMediaResponse(asset, request.headers).pipe(
-        Effect.tapError((cause) =>
-          // The URL can carry a token in its query string, and the error keeps the request it
-          // failed on; the host and the failure kind are enough to diagnose.
-          Effect.logWarning("Failed to fetch source control media.", {
-            host: URL.canParse(asset.url) ? new URL(asset.url).host : undefined,
-            reason: cause.reason._tag,
-          }),
-        ),
+      const suffix = url.value.pathname.slice(`${ASSET_ROUTE_PREFIX}/`.length);
+      const separatorIndex = suffix.indexOf("/");
+      if (separatorIndex <= 0) {
+        return HttpServerResponse.text("Not Found", { status: 404 });
+      }
+
+      const asset = yield* resolveAsset(
+        suffix.slice(0, separatorIndex),
+        suffix.slice(separatorIndex + 1),
+      );
+      if (!asset) {
+        return HttpServerResponse.text("Not Found", { status: 404 });
+      }
+      if (request.headers[RELAY_MEDIA_DOWNLOAD_HEADER] !== undefined) {
+        if (
+          request.headers[RELAY_MEDIA_DOWNLOAD_HEADER] !== RELAY_MEDIA_DOWNLOAD_VALUE ||
+          asset.kind !== "file"
+        ) {
+          return HttpServerResponse.empty({
+            status: 400,
+            headers: { "Cache-Control": "private, no-store" },
+          });
+        }
+        return yield* signedDownloadResponse(validator, asset, request).pipe(
+          Effect.orElseSucceed(() =>
+            HttpServerResponse.empty({
+              status: 500,
+              headers: { "Cache-Control": "private, no-store" },
+            }),
+          ),
+        );
+      }
+      if (asset.kind === "bytes") {
+        return HttpServerResponse.uint8Array(asset.bytes, {
+          contentType: asset.mimeType,
+          headers: {
+            "cache-control": "private, max-age=3600",
+            "x-content-type-options": "nosniff",
+          },
+        });
+      }
+      if (asset.kind === "source-control-media") {
+        return yield* sourceControlMediaResponse(asset, request.headers).pipe(
+          Effect.tapError((cause) =>
+            // The URL can carry a token in its query string, and the error keeps the request it
+            // failed on; the host and the failure kind are enough to diagnose.
+            Effect.logWarning("Failed to fetch source control media.", {
+              host: URL.canParse(asset.url) ? new URL(asset.url).host : undefined,
+              reason: cause.reason._tag,
+            }),
+          ),
+          Effect.orElseSucceed(() =>
+            HttpServerResponse.empty({
+              status: 502,
+              headers: {
+                "cache-control": "private, no-store",
+                "x-content-type-options": "nosniff",
+              },
+            }),
+          ),
+        );
+      }
+      return yield* assetFileResponse(
+        asset,
+        request.method === "GET" ? request.headers.range : undefined,
+        request.headers["if-range"],
+        request.method === "HEAD" ? "HEAD" : "GET",
+      ).pipe(
+        Effect.map(HttpServerResponse.setHeader("vary", RELAY_MEDIA_DOWNLOAD_HEADER)),
         Effect.orElseSucceed(() =>
-          HttpServerResponse.empty({
-            status: 502,
-            headers: { "cache-control": "private, no-store", "x-content-type-options": "nosniff" },
-          }),
+          HttpServerResponse.text("Internal Server Error", { status: 500 }),
         ),
       );
-    }
-    return yield* assetFileResponse(
-      asset,
-      request.method === "GET" ? request.headers.range : undefined,
-      request.headers["if-range"],
-      request.method === "HEAD" ? "HEAD" : "GET",
-    ).pipe(
-      Effect.orElseSucceed(() => HttpServerResponse.text("Internal Server Error", { status: 500 })),
-    );
-  }),
+    }),
+  );
+
+export const layerAssetRoute = Layer.unwrap(
+  Effect.sync(() => assetRoute(makeMediaDownloadValidator())),
 );
 
 export const layerAttachmentUploadRoute = HttpRouter.add(

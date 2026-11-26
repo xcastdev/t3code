@@ -1,4 +1,6 @@
 import {
+  catalogDirectoryRoutes,
+  setLearnedRoutesInCatalog,
   ConnectionCatalogDocument,
   type ConnectionCatalogDocument as ConnectionCatalogDocumentType,
   EMPTY_CONNECTION_CATALOG_DOCUMENT,
@@ -19,6 +21,7 @@ import {
   makeThreadCacheWriteOrder,
 } from "@t3tools/client-runtime/platform";
 import { TokenStore } from "@t3tools/client-runtime/authorization";
+import { SelfHostedRelayAccountStore } from "@t3tools/client-runtime/self-hosted-relay";
 import {
   ConnectionTransientError,
   ConnectionBlockedError,
@@ -42,6 +45,7 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import { projectFaviconCache } from "../assets/projectFaviconCache";
+import * as RelayAccountStore from "./selfHostedRelayAccountStore";
 
 const DATABASE_NAME = "t3code:connection-runtime";
 const DATABASE_VERSION = 5;
@@ -104,6 +108,7 @@ function persistenceError(
   operation:
     | "list-targets"
     | "list-disabled-targets"
+    | "list-directory-routes"
     | "register-connection"
     | "set-connection-routes"
     | "remove-connection"
@@ -482,12 +487,24 @@ export interface CatalogBackend {
   readonly read: Effect.Effect<string | null, ConnectionTransientError>;
   readonly write: (raw: string) => Effect.Effect<void, ConnectionTransientError>;
   readonly quarantine?: (raw: string) => Effect.Effect<void, ConnectionTransientError>;
+  readonly sharedWrite?: <A, E>(
+    effect: Effect.Effect<A, E>,
+  ) => Effect.Effect<A, E | ConnectionTransientError>;
 }
 
 export function makeCatalogBackend(database: DatabaseHandle): CatalogBackend {
   const bridge = window.desktopBridge;
+  const locks = globalThis.navigator?.locks;
+  const coordination = locks
+    ? {
+        sharedWrite: RelayAccountStore.withWebLock(locks, "t3code:connection-catalog", () =>
+          catalogError("lock", "Web Locks request failed."),
+        ),
+      }
+    : {};
   if (bridge !== undefined) {
     return {
+      ...coordination,
       read: Effect.tryPromise({
         try: () => bridge.getConnectionCatalog(),
         catch: (cause) => catalogError("load", cause),
@@ -512,6 +529,7 @@ export function makeCatalogBackend(database: DatabaseHandle): CatalogBackend {
   }
 
   return {
+    ...coordination,
     read: readDatabaseValue(database, CATALOG_STORE_NAME, CATALOG_KEY).pipe(
       Effect.map((value) => (typeof value === "string" ? value : null)),
     ),
@@ -523,6 +541,7 @@ export function makeCatalogBackend(database: DatabaseHandle): CatalogBackend {
 
 interface CatalogStore {
   readonly read: Effect.Effect<ConnectionCatalogDocumentType, ConnectionTransientError>;
+  readonly readFresh: Effect.Effect<ConnectionCatalogDocumentType, ConnectionTransientError>;
   readonly update: (
     transform: (catalog: ConnectionCatalogDocumentType) => ConnectionCatalogDocumentType,
   ) => Effect.Effect<void, ConnectionTransientError>;
@@ -535,10 +554,6 @@ export const makeCatalogStore = Effect.fn("web.connectionStorage.makeCatalogStor
   const lock = yield* Semaphore.make(1);
 
   const loadUnlocked = Effect.fn("web.connectionStorage.loadCatalog")(function* () {
-    const cached = yield* Ref.get(state);
-    if (Option.isSome(cached)) {
-      return cached.value;
-    }
     const raw = yield* backend.read;
     let catalog = EMPTY_CONNECTION_CATALOG_DOCUMENT;
     if (raw !== null && raw.trim() !== "") {
@@ -574,20 +589,29 @@ export const makeCatalogStore = Effect.fn("web.connectionStorage.makeCatalogStor
     return catalog;
   });
 
-  const read = lock.withPermits(1)(loadUnlocked());
+  const shared = backend.sharedWrite ?? ((effect) => effect);
+  const cachedOrLoad = Effect.fn("web.connectionStorage.cachedCatalog")(function* () {
+    const cached = yield* Ref.get(state);
+    return Option.isSome(cached) ? cached.value : yield* shared(loadUnlocked());
+  });
+  const withSharedCatalog = <A, E>(effect: Effect.Effect<A, E>) => lock.withPermit(shared(effect));
+  const read = lock.withPermit(cachedOrLoad());
+  const readFresh = withSharedCatalog(loadUnlocked());
   const update: CatalogStore["update"] = Effect.fn("web.connectionStorage.updateCatalog")(
     function* (transform) {
-      yield* lock.withPermits(1)(
+      yield* withSharedCatalog(
         Effect.gen(function* () {
-          const next = transform(yield* loadUnlocked());
+          // A tab's cached document can contain directory routes withdrawn by another tab.
+          const current = yield* backend.sharedWrite ? loadUnlocked() : cachedOrLoad();
+          const next = transform(current);
           yield* backend.write(yield* encodeCatalog(next));
           yield* Ref.set(state, Option.some(next));
-        }),
+        }).pipe(Effect.uninterruptible),
       );
     },
   );
 
-  return { read, update } satisfies CatalogStore;
+  return { read, readFresh, update } satisfies CatalogStore;
 });
 
 // The stored names predate the rename and stay, so a tab still on an older version and an
@@ -718,6 +742,10 @@ export const layer = Layer.effectContext(
       (owned) => owned.close,
     );
     const catalog = yield* makeCatalogStore(makeCatalogBackend(database));
+    const relayAccount = yield* RelayAccountStore.make({
+      read: (key) => readDatabaseValue(database, CATALOG_STORE_NAME, key),
+      write: (key, raw) => writeDatabaseValue(database, CATALOG_STORE_NAME, key, raw),
+    });
     const pullRequestRoutingPermissions = makeBrowserPullRequestRoutingPermissions();
     // Remembers each thread row's encoding, so a save only encodes rows that changed.
     const encodeStoredShellSnapshot = makeStoredShellSnapshotEncoder({
@@ -741,18 +769,37 @@ export const layer = Layer.effectContext(
     });
     const registrationStore = Persistence.ConnectionRegistrationStore.of({
       register: Effect.fn("Persistence.ConnectionRegistrationStore.register")(
-        function (registration, routes) {
+        function (registration, routes, removedRouteIds) {
           return catalog
-            .update((document) => registerConnectionInCatalog(document, registration, routes))
+            .update((document) =>
+              registerConnectionInCatalog(document, registration, routes, removedRouteIds),
+            )
             .pipe(Effect.mapError((cause) => persistenceError("register-connection", cause)));
         },
       ),
       setRoutes: Effect.fn("Persistence.ConnectionRegistrationStore.setRoutes")(
-        function (environmentId, routes) {
+        function (environmentId, routes, removedRouteIds) {
           return catalog
-            .update((document) => setRoutesInCatalog(document, environmentId, routes))
+            .update((document) =>
+              setRoutesInCatalog(document, environmentId, routes, removedRouteIds),
+            )
             .pipe(Effect.mapError((cause) => persistenceError("set-connection-routes", cause)));
         },
+      ),
+      listDirectoryRoutes: Effect.fn("Persistence.ConnectionRegistrationStore.listDirectoryRoutes")(
+        (source) =>
+          catalog.readFresh.pipe(
+            Effect.map((document) => catalogDirectoryRoutes(document, source)),
+            Effect.mapError((error) => persistenceError("list-directory-routes", error)),
+          ),
+      ),
+      setLearnedRoutes: Effect.fn("Persistence.ConnectionRegistrationStore.setLearnedRoutes")(
+        (environmentId, routes, changes) =>
+          catalog
+            .update((document) =>
+              setLearnedRoutesInCatalog(document, environmentId, routes, changes),
+            )
+            .pipe(Effect.mapError((error) => persistenceError("set-connection-routes", error))),
       ),
       remove: Effect.fn("Persistence.ConnectionRegistrationStore.remove")(function (environmentId) {
         return catalog
@@ -1112,6 +1159,7 @@ export const layer = Layer.effectContext(
       Context.add(ProfileStore.ConnectionProfileStore, profileStore),
       Context.add(CredentialStore.ConnectionCredentialStore, credentialStore),
       Context.add(TokenStore.RemoteDpopAccessTokenStore, remoteTokenStore),
+      Context.add(SelfHostedRelayAccountStore, relayAccount),
       Context.add(Persistence.EnvironmentCacheStore, cacheStore),
       Context.add(EnvironmentQueryStore, queryStore),
     );

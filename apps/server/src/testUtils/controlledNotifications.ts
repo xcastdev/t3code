@@ -1,17 +1,19 @@
+import { DEFAULT_EXTERNAL_NOTIFICATION_EVENTS } from "@t3tools/contracts";
+import { ExternalNotificationError } from "@t3tools/external-notifications/webhook";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as Settings from "../serverSettings.ts";
 import * as Secrets from "../auth/ServerSecretStore.ts";
-import * as Adapter from "../notifications/HomeAssistantWebhookAdapter.ts";
+import * as Transport from "../notifications/ExternalNotificationTransport.ts";
 import * as Dispatcher from "../notifications/ExternalNotificationDispatcher.ts";
 import * as Gateway from "../notifications/ExternalNotificationGateway.ts";
 import * as Runtime from "../notifications/ExternalNotificationRuntime.ts";
 
 export const controlledNotificationDestinationId = "p21-fixture-notification";
 type Receipt = {
-  readonly kind: Adapter.ExternalNotificationPayload["kind"];
+  readonly kind: "notification" | "work-attention" | "test";
   readonly test: boolean;
 };
 export class ControlledNotificationReceipts extends Context.Service<
@@ -30,13 +32,19 @@ export const layerControlledNotificationPorts = Layer.unwrap(
       Effect.gen(function* () {
         const received = yield* Ref.make<ReadonlyArray<Receipt>>([]);
         return Context.make(ControlledNotificationReceipts, { received: Ref.get(received) }).pipe(
-          Context.add(Adapter.HomeAssistantWebhookAdapter, {
-            send: (url, payload) =>
-              url !== webhookUrl
-                ? Effect.fail(new Adapter.ExternalNotificationError({ reason: "unconfigured" }))
-                : Ref.update(received, (current) => [
+          Context.add(Transport.ExternalNotificationTransport, {
+            send: (destination, event) =>
+              destination.webhookUrl !== webhookUrl
+                ? Effect.fail(new ExternalNotificationError({ reason: "unconfigured" }))
+                : Ref.update(received, (current): ReadonlyArray<Receipt> => [
                     ...current.slice(-63),
-                    { kind: payload.kind, test: payload.test },
+                    {
+                      kind:
+                        event.eventType === "test" || event.eventType === "work-attention"
+                          ? event.eventType
+                          : "notification",
+                      test: event.eventType === "test",
+                    },
                   ]),
           }),
         );
@@ -53,6 +61,7 @@ export const layerControlledNotificationPorts = Layer.unwrap(
               name: "Controlled fixture",
               kind: "home-assistant",
               enabled: false,
+              events: DEFAULT_EXTERNAL_NOTIFICATION_EVENTS,
               webhookUrl,
             },
           ],

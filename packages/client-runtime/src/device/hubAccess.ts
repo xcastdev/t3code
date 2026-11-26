@@ -1,4 +1,7 @@
+import type { EnvironmentId } from "@t3tools/contracts";
+
 export interface DeviceHubAccess {
+  readonly environmentId?: EnvironmentId;
   readonly httpBase: string;
   readonly wsBase: string;
   readonly query: Readonly<Record<string, string>>;

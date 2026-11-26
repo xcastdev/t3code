@@ -228,6 +228,7 @@ const withThreadTools = Effect.fn("cli.thread.withThreadTools")(function* <A, E,
       return yield* new ThreadServerNotRunningError({ baseDir: config.baseDir });
     }
     const origin = runtimeState.value.origin;
+    const endpoint = new URL("/mcp", origin).href;
     const environmentAuth = yield* EnvironmentAuth.EnvironmentAuth;
     const issued = yield* Effect.acquireRelease(
       environmentAuth.issueMcpClientSession({
@@ -235,6 +236,7 @@ const withThreadTools = Effect.fn("cli.thread.withThreadTools")(function* <A, E,
         // The CLI runs as the machine's owner. New threads still start at
         // the project's default mode, never at this ceiling by default.
         access: "full-access",
+        resource: endpoint,
         peerLink: false,
         client: { deviceType: "bot" },
       }),
@@ -242,7 +244,7 @@ const withThreadTools = Effect.fn("cli.thread.withThreadTools")(function* <A, E,
         environmentAuth.revokeSession(session.sessionId).pipe(Effect.ignore({ log: true })),
     );
     const session = yield* mcpToolSession({
-      endpoint: new URL("/mcp", origin).href,
+      endpoint,
       authorization: `Bearer ${issued.token}`,
       clientName: "t3-thread-cli",
     }).pipe(Effect.mapError((cause) => new ThreadServerUnreachableError({ origin, cause })));

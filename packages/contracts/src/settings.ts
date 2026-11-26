@@ -27,6 +27,10 @@ import { UsageModelFilter } from "./usage.ts";
 import { SecretProviderId, SecretProviderSlug } from "./secretReference.ts";
 import { containsSecretReference, SettingsSecretValue } from "./settingsSecretValue.ts";
 import { EnvironmentMachineKind, ThreadEnvMode, WorktreeSubmodules } from "./environment.ts";
+import {
+  ExternalNotificationDestinationId,
+  ExternalNotificationEventType,
+} from "./externalNotifications.ts";
 import { KeybindingShortcut } from "./keybindings.ts";
 import {
   CustomModelSetting,
@@ -1371,14 +1375,18 @@ export const StorageCleanupSettings = Schema.Struct({
 export type StorageCleanupSettings = typeof StorageCleanupSettings.Type;
 
 export const ExternalNotificationDestination = Schema.Struct({
-  id: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  id: ExternalNotificationDestinationId,
   name: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
-  kind: Schema.Literal("home-assistant"),
+  kind: Schema.Literals(["home-assistant", "generic-webhook"]),
   enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  events: Schema.optionalKey(Schema.Array(ExternalNotificationEventType)),
   webhookUrl: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
+  signingKey: Schema.optionalKey(Schema.String),
 });
 export type ExternalNotificationDestination = typeof ExternalNotificationDestination.Type;
 export const ExternalNotificationSettings = Schema.Struct({
+  /** A server-provided revision returned with edits to guard the destination list. */
+  revision: Schema.optionalKey(Schema.String),
   destinations: Schema.Array(ExternalNotificationDestination).check(
     Schema.isMaxLength(16),
     Schema.makeFilter(
@@ -1801,6 +1809,7 @@ export const ServerSettingsOperation = Schema.Literals([
   "write-file",
   "prepare-directory",
   "write-managed-setting",
+  "stale-notification-destinations",
   "use-disallowed-provider",
 ]);
 export type ServerSettingsOperation = typeof ServerSettingsOperation.Type;
@@ -1825,6 +1834,9 @@ export class ServerSettingsError extends Schema.TaggedError<ServerSettingsError>
   },
 ) {
   override get message(): string {
+    if (this.operation === "stale-notification-destinations") {
+      return "Notification destinations changed while you were editing.";
+    }
     if (this.operation === "write-managed-setting") {
       return `${this.managedSetting ?? "This setting"} is managed by ${this.managedBy ?? "your organization"} and cannot be changed.`;
     }

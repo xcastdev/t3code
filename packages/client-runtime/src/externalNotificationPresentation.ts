@@ -1,13 +1,12 @@
-import type {
-  ExternalNotificationDestination,
-  ExternalNotificationTestResult,
+import {
+  DEFAULT_EXTERNAL_NOTIFICATION_EVENTS,
+  SECRET_REDACTED,
+  type ExternalNotificationDestination,
+  type ExternalNotificationSettings,
+  type ExternalNotificationTestResult,
 } from "@t3tools/contracts";
 
-/**
- * A saved webhook URL is a secret the server only returns redacted. The form
- * never holds or shows it: it is kept as stored, replaced, or cleared.
- */
-export type WebhookUrlDraft =
+export type CredentialDraft =
   | { readonly kind: "stored" }
   | { readonly kind: "none" }
   | { readonly kind: "replace"; readonly value: string }
@@ -16,11 +15,24 @@ export type WebhookUrlDraft =
 export interface DestinationDraft {
   readonly id: string;
   readonly name: string;
+  readonly kind: ExternalNotificationDestination["kind"];
   readonly enabled: boolean;
-  readonly url: WebhookUrlDraft;
+  readonly events: ExternalNotificationDestination["events"];
+  readonly url: CredentialDraft;
+  readonly signingKey: CredentialDraft;
+}
+
+export interface DestinationEditorDraft {
+  readonly destinations: ReadonlyArray<DestinationDraft>;
+  readonly original: ExternalNotificationSettings | undefined;
 }
 
 export const MAX_DESTINATIONS = 16;
+
+export function credentialDraft(value: string, saved?: string): CredentialDraft {
+  if (value.length > 0) return { kind: "replace", value };
+  return saved ? { kind: "stored" } : { kind: "none" };
+}
 
 export function destinationDrafts(
   saved: ReadonlyArray<ExternalNotificationDestination>,
@@ -28,38 +40,58 @@ export function destinationDrafts(
   return saved.map((destination) => ({
     id: destination.id,
     name: destination.name,
+    kind: destination.kind,
     enabled: destination.enabled,
-    url: destination.webhookUrl.length > 0 ? { kind: "stored" } : { kind: "none" },
+    events: destination.events,
+    url: credentialDraft("", destination.webhookUrl),
+    signingKey: credentialDraft("", destination.signingKey),
   }));
 }
 
-/** New destinations start off, so adding one never sends anything. */
-export function newDestinationDraft(id: string): DestinationDraft {
-  return { id, name: "Home Assistant", enabled: false, url: { kind: "none" } };
+export function newDestinationDraft(id: string, name: string): DestinationDraft {
+  return {
+    id,
+    name,
+    kind: "home-assistant",
+    enabled: false,
+    events: DEFAULT_EXTERNAL_NOTIFICATION_EVENTS,
+    url: { kind: "none" },
+    signingKey: { kind: "none" },
+  };
 }
 
-/**
- * The full replacement array. A kept URL is sent back exactly as the server
- * redacted it, which the server reads as "unchanged"; an empty one clears it.
- */
+function credentialPatch(draft: CredentialDraft, saved?: string): string {
+  if (draft.kind === "stored") return saved ?? "";
+  if (draft.kind === "replace") return draft.value;
+  return "";
+}
+
 export function destinationsPatch(
   drafts: ReadonlyArray<DestinationDraft>,
   saved: ReadonlyArray<ExternalNotificationDestination>,
+  supportsWebhookOptions: boolean,
 ): ReadonlyArray<ExternalNotificationDestination> {
   return drafts.map((draft) => {
     const original = saved.find((destination) => destination.id === draft.id);
-    const webhookUrl =
-      draft.url.kind === "stored"
-        ? (original?.webhookUrl ?? "")
-        : draft.url.kind === "replace"
-          ? draft.url.value.trim()
-          : "";
+    const signingKey =
+      draft.signingKey.kind === "clear"
+        ? ""
+        : draft.kind === "generic-webhook" && draft.signingKey.kind === "replace"
+          ? draft.signingKey.value
+          : undefined;
     return {
       id: draft.id,
       name: draft.name.trim(),
-      kind: "home-assistant",
+      kind: draft.kind,
       enabled: draft.enabled,
-      webhookUrl,
+      ...(draft.events === undefined ? {} : { events: draft.events }),
+      webhookUrl:
+        supportsWebhookOptions &&
+        original &&
+        (draft.url.kind === "none" || draft.url.kind === "stored")
+          ? SECRET_REDACTED
+          : credentialPatch(draft.url, original?.webhookUrl).trim(),
+      ...(signingKey === undefined ? {} : { signingKey }),
     };
   });
 }
@@ -68,7 +100,39 @@ export function destinationDraftsChanged(
   drafts: ReadonlyArray<DestinationDraft>,
   saved: ReadonlyArray<ExternalNotificationDestination>,
 ): boolean {
-  return JSON.stringify(drafts) !== JSON.stringify(destinationDrafts(saved));
+  const original = destinationDrafts(saved);
+  return (
+    drafts.length !== original.length ||
+    drafts.some((draft, index) => {
+      const entry = original[index];
+      return (
+        entry === undefined ||
+        draft.id !== entry.id ||
+        draft.name !== entry.name ||
+        draft.kind !== entry.kind ||
+        draft.enabled !== entry.enabled ||
+        draft.events?.length !== entry.events?.length ||
+        draft.events?.some((event) => !entry.events?.includes(event)) ||
+        draft.url.kind !== entry.url.kind ||
+        draft.signingKey.kind !== entry.signingKey.kind
+      );
+    })
+  );
+}
+
+export function updateDestinationEditorDraft(
+  previous: DestinationEditorDraft | null,
+  saved: ExternalNotificationSettings | undefined,
+  destinations: ReadonlyArray<DestinationDraft> | null,
+): DestinationEditorDraft | null {
+  const original = previous === null ? saved : previous.original;
+  if (
+    destinations === null ||
+    !destinationDraftsChanged(destinations, original?.destinations ?? [])
+  ) {
+    return null;
+  }
+  return { destinations, original };
 }
 
 function isWebhookUrl(value: string): boolean {
@@ -80,53 +144,40 @@ function isWebhookUrl(value: string): boolean {
   }
 }
 
-/** Errors name the destination, never the URL. */
-export function destinationDraftsError(drafts: ReadonlyArray<DestinationDraft>): string | null {
-  if (drafts.length > MAX_DESTINATIONS) return `Keep at most ${MAX_DESTINATIONS} destinations.`;
+export function destinationDraftsError(drafts: ReadonlyArray<DestinationDraft>) {
+  if (drafts.length > MAX_DESTINATIONS) return "too-many";
   for (const draft of drafts) {
     const name = draft.name.trim();
-    if (name.length === 0) return "Give each destination a name.";
-    if (name.length > 128) return `Shorten the name "${name.slice(0, 32)}…".`;
-    if (draft.url.kind === "replace" && !isWebhookUrl(draft.url.value.trim()))
-      return `Enter a full http or https webhook URL for "${name}".`;
+    if (name.length === 0) return "empty-name";
+    if (name.length > 128) return "long-name";
+    if (draft.url.kind === "replace" && !isWebhookUrl(draft.url.value.trim())) return "invalid-url";
   }
   return null;
 }
 
-/**
- * Tests use only the saved destination by ID, so a destination with unsaved
- * edits, or none saved yet, must be saved first.
- */
 export function destinationTestBlocked(input: {
   readonly draft: DestinationDraft;
   readonly saved: ReadonlyArray<ExternalNotificationDestination>;
   readonly dirty: boolean;
-}): string | null {
+}) {
   const original = input.saved.find((destination) => destination.id === input.draft.id);
-  if (original === undefined) return "Save this destination before testing it.";
-  if (input.dirty) return "Save your changes before testing.";
-  if (original.webhookUrl.length === 0) return "Add a webhook URL and save before testing.";
+  if (original === undefined) return "new";
+  if (input.dirty) return "dirty";
+  if (original.webhookUrl.length === 0) return "missing-url";
   return null;
 }
 
-const TEST_FAILURES: Record<NonNullable<ExternalNotificationTestResult["reason"]>, string> = {
-  unconfigured: "No webhook URL is saved for this destination.",
-  "malformed-url": "The saved webhook URL isn't valid. Replace it and save.",
-  transport: "Couldn't reach the webhook from the server.",
-  timeout: "The webhook didn't answer in time.",
-  "http-status": "The webhook answered with an error status.",
-};
-
-export function describeTestResult(result: ExternalNotificationTestResult): {
-  readonly delivered: boolean;
-  readonly message: string;
-} {
-  if (result.status === "delivered")
-    return { delivered: true, message: "Test notification delivered." };
+export function describeTestResult(result: ExternalNotificationTestResult) {
   return {
-    delivered: false,
-    message:
-      (result.reason === undefined ? undefined : TEST_FAILURES[result.reason]) ??
-      "The test notification wasn't delivered.",
-  };
+    delivered: result.status === "delivered",
+    message: result.status === "delivered" ? "delivered" : (result.reason ?? "failed"),
+  } as const;
+}
+
+export function describeExternalNotificationCommandFailure(error: unknown) {
+  if (error !== null && typeof error === "object" && "_tag" in error) {
+    if (error._tag === "EnvironmentAuthorizationError") return "unauthorized";
+    if (error._tag === "EnvironmentRpcUnavailableError") return "offline";
+  }
+  return "command-failed";
 }

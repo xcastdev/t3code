@@ -1,5 +1,6 @@
 import type { SnapShotSource } from "@t3tools/contracts";
 
+import { requiresAdmittedAsset } from "../../assets/admittedAssetSource";
 import type { ComposerFileAttachment } from "../../composerDraftStore";
 import { type ChatFileAttachment, type ChatImageAttachment, isVideoAttachment } from "../../types";
 import type {
@@ -60,7 +61,7 @@ export async function resolveMarkdownMediaPreview(input: {
   const { kind, name, reference } = media;
   const relativePath = reference?.kind === "file" ? reference.relativePath : undefined;
 
-  let src: string;
+  let src: string | null;
   let asset: MediaActionSource["asset"];
   if (media.access === "direct") {
     src = resolveProtocolRelativeMediaUrl(media.uri);
@@ -76,7 +77,7 @@ export async function resolveMarkdownMediaPreview(input: {
     if (result._tag === "Failure") throw squashAtomCommandFailure(result);
     const assetUrl = resolveAssetUrl(input.httpBaseUrl, result.value.relativeUrl);
     if (assetUrl === null) throw new Error("The environment returned an invalid media URL.");
-    src = assetUrl + media.srcFragment;
+    src = requiresAdmittedAsset(assetUrl) ? null : assetUrl + media.srcFragment;
   }
   return {
     images: [
@@ -164,6 +165,7 @@ export function buildExpandedImagePreview(
   images: ReadonlyArray<ChatImageAttachment | ComposerFileAttachment>,
   selectedImageId: string,
   onCopySnapshot?: (id: string) => Promise<void>,
+  environmentId?: EnvironmentId,
 ): ExpandedImagePreview | null {
   const selected = images.find((image) => image.id === selectedImageId);
   if (selected?.type === "file" && selected.file && isVideoAttachment(selected)) {
@@ -188,6 +190,7 @@ export function buildExpandedImagePreview(
             name: image.name,
             mimeType: image.mimeType,
             source: image.source,
+            downloadable: "downloadable" in image ? image.downloadable : undefined,
           },
         ]
       : [],
@@ -204,6 +207,22 @@ export function buildExpandedImagePreview(
       src: image.src,
       name: image.name,
       mimeType: image.mimeType,
+      ...(environmentId && image.downloadable !== false
+        ? {
+            actionsSource: {
+              kind: "image" as const,
+              name: image.name,
+              src: image.src,
+              asset: {
+                environmentId,
+                resource: {
+                  _tag: "attachment" as const,
+                  attachmentId: image.id,
+                },
+              },
+            },
+          }
+        : {}),
       ...(image.source?.kind === "snap-shot"
         ? {
             source: image.source,

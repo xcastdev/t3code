@@ -46,7 +46,7 @@ import * as ServerSecretStore from "./ServerSecretStore.ts";
 import * as SessionStore from "./SessionStore.ts";
 import { REUSABLE_DEV_SESSION_EXPIRES_AT, resolveReusableDevAuth } from "./ReusableDevAuth.ts";
 import { verifyRequestDpopProof } from "./dpop.ts";
-import { DESKTOP_RENDERER_ORIGINS } from "../httpCors.ts";
+import { DESKTOP_RENDERER_ORIGINS, MCP_HTTP_PATH } from "../httpCors.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ManagedLimits from "../policy/managedLimits.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
@@ -54,7 +54,7 @@ import {
   MCP_APPROVAL_SUBJECT_PREFIX,
   PEER_LINK_PAIRING_SUBJECT_PREFIX,
 } from "../persistence/AuthPairingLinks.ts";
-import { requestUrl } from "../requestUrl.ts";
+import { canonicalRequestUrl, relayExternalOrigin, requestUrl } from "../requestUrl.ts";
 
 const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
 export const INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT = "administrative-bootstrap";
@@ -614,6 +614,7 @@ export class EnvironmentAuth extends Context.Service<
     readonly issueMcpClientSession: (input: {
       readonly label: string;
       readonly access: AuthMcpClientAccess;
+      readonly resource: string;
       readonly peerLink: boolean;
       readonly client: AuthClientMetadata;
     }) => Effect.Effect<
@@ -764,6 +765,8 @@ function isBrowserOriginAllowed(
   if (origin === undefined) return true;
   if (request.headers["sec-fetch-site"] === "same-origin") return true;
   if (trustedOrigins.has(origin)) return true;
+  const externalOrigin = relayExternalOrigin(request);
+  if (externalOrigin !== undefined) return origin === externalOrigin;
   let originHost: string;
   try {
     originHost = new URL(origin).host.toLowerCase();
@@ -1531,24 +1534,33 @@ export const make = Effect.gen(function* () {
   const authenticateMcpClient: EnvironmentAuth["Service"]["authenticateMcpClient"] = (request) => {
     const token = parseBearerToken(request);
     if (token === null) return Effect.fail(new ServerAuthMissingCredentialError({}));
+    const url = canonicalRequestUrl(request);
     return sessions.verify(token).pipe(
       mapSessionVerificationErrors,
-      Effect.flatMap((session) =>
-        session.subject === MCP_CLIENT_SUBJECT && session.method === "bearer-access-token"
-          ? Effect.succeed({
-              sessionId: session.sessionId,
-              label: session.client.label ?? "MCP client",
-              access: session.scopes.includes(AuthOrchestrationOperateScope)
-                ? (session.runtimeModeCeiling ?? "approval-required")
-                : "read-only",
-              peerLink: session.peerLink === true,
-            } satisfies McpClientSession)
-          : Effect.fail(
-              new ServerAuthInvalidCredentialError({
-                diagnostic: "Only MCP client sessions are accepted here.",
-              }),
-            ),
-      ),
+      Effect.flatMap((session) => {
+        if (session.subject !== MCP_CLIENT_SUBJECT || session.method !== "bearer-access-token") {
+          return Effect.fail(
+            new ServerAuthInvalidCredentialError({
+              diagnostic: "Only MCP client sessions are accepted here.",
+            }),
+          );
+        }
+        if (Option.isNone(url) || session.mcpResource !== `${url.value.origin}${MCP_HTTP_PATH}`) {
+          return Effect.fail(
+            new ServerAuthInvalidCredentialError({
+              diagnostic: "The MCP client session does not match this resource.",
+            }),
+          );
+        }
+        return Effect.succeed({
+          sessionId: session.sessionId,
+          label: session.client.label ?? "MCP client",
+          access: session.scopes.includes(AuthOrchestrationOperateScope)
+            ? (session.runtimeModeCeiling ?? "approval-required")
+            : "read-only",
+          peerLink: session.peerLink === true,
+        } satisfies McpClientSession);
+      }),
       Effect.withSpan("EnvironmentAuth.authenticateMcpClient"),
     );
   };
@@ -1561,6 +1573,7 @@ export const make = Effect.gen(function* () {
         scopes: mcpClientScopes(input.access),
         ttl: MCP_CLIENT_SESSION_TTL,
         ...(input.access === "read-only" ? {} : { runtimeModeCeiling: input.access }),
+        mcpResource: input.resource,
         peerLink: input.peerLink,
         client: { ...input.client, label: input.label, deviceType: "bot" },
       })

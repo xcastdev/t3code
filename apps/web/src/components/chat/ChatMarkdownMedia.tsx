@@ -13,6 +13,7 @@ import {
   type MouseEvent as ReactMouseEvent,
 } from "react";
 
+import { requiresAdmittedAsset } from "../../assets/admittedAssetSource";
 import { useAssetUrlRefresh, useAssetUrlState } from "../../assets/assetUrls";
 import { cn } from "../../lib/utils";
 import { useRightPanelStore } from "../../rightPanelStore";
@@ -414,9 +415,13 @@ export const ChatMarkdownAssetImage = memo(function ChatMarkdownAssetImage(props
       (resource._tag === "media-file" || resource._tag === "workspace-file")
         ? workspaceMutationId
         : undefined),
+    props.kind === "video" ? "video" : "static",
   );
   const refreshAssetUrl = useAssetUrlRefresh(props.environmentId, resource);
-  const fallbackSrc = assetUrl._tag === "Failure" ? props.fallbackSrc : undefined;
+  const fallbackSrc =
+    assetUrl._tag === "Failure" && props.fallbackSrc && !requiresAdmittedAsset(props.fallbackSrc)
+      ? props.fallbackSrc
+      : undefined;
   const missingFileAccess =
     assetUrl._tag === "Failure" &&
     assetUrl.reason === "missing-file-access" &&
@@ -458,7 +463,11 @@ export const ChatMarkdownAssetImage = memo(function ChatMarkdownAssetImage(props
         copyMarkdown={props.copyMarkdown}
         originalUrl={props.originalUrl}
         style={props.style}
-        mediaIdentity={JSON.stringify([props.environmentId, props.resource, props.srcFragment])}
+        mediaIdentity={
+          assetUrl.localSource
+            ? (src ?? undefined)
+            : JSON.stringify([props.environmentId, props.resource, props.srcFragment])
+        }
         // Re-signing cannot grant the file access this connection lacks.
         onRetry={missingFileAccess ? undefined : refreshAssetUrl}
         actionsSource={actionsSource}

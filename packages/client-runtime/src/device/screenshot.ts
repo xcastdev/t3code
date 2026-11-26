@@ -13,18 +13,25 @@ export class DeviceScreenshotError extends Schema.TaggedError<DeviceScreenshotEr
   }
 }
 
-export async function captureDeviceScreenshot(target: DeviceStreamTarget, signal: AbortSignal) {
+export async function captureDeviceScreenshot(
+  target: DeviceStreamTarget,
+  signal: AbortSignal,
+  send: (url: string, init: RequestInit) => Promise<Response> = globalThis.fetch,
+) {
   const vendor = target.platform === "ios" ? "serve-sim" : "serve-emu";
   const url = withDeviceHubQuery(
     `${target.access.httpBase}/vendor/${vendor}/api/screenshot?device=${encodeURIComponent(target.deviceId)}`,
     target.access,
   );
-  const response = await fetch(url, {
+  const response = await send(url, {
     method: "POST",
     credentials: target.access.credentials ? "include" : "omit",
     signal: AbortSignal.any([signal, AbortSignal.timeout(20_000)]),
   });
-  if (!response.ok) throw new DeviceScreenshotError({ status: response.status });
+  if (!response.ok) {
+    void response.body?.cancel().catch(() => {});
+    throw new DeviceScreenshotError({ status: response.status });
+  }
   const png = extractPng(new Uint8Array(await response.arrayBuffer()));
   if (!png) throw new Error("The device returned an incomplete screenshot. Try again.");
   return new Blob([png], { type: "image/png" });

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 
+import { installVerifiedViewerTransport } from "../../lib/verifiedViewer.browser";
 import { start, stop } from "./device-stream.browser";
 
 const envelope = (tag: number, payload: number[]) => {
@@ -105,4 +106,75 @@ describe("native iOS simulator viewer", () => {
       }
     },
   );
+});
+
+it.each([
+  { format: "raw AVCC", nativeMjpeg: false },
+  { format: "iOS multipart MJPEG", nativeMjpeg: true },
+])("keeps $format and binary control on the verified WebView bridge", async ({ nativeMjpeg }) => {
+  const messages: Array<{ viewerTransport: string; id: number; url?: string; binary?: string }> =
+    [];
+  const emitted = Promise.withResolvers<number>();
+  const pulled = Promise.withResolvers<void>();
+  const cancel = Promise.withResolvers<void>();
+  const fallback = vi.fn();
+  vi.stubGlobal("fetch", fallback);
+  vi.stubGlobal("WebSocket", vi.fn());
+  vi.stubGlobal("T3VerifiedViewer", undefined);
+  vi.stubGlobal("ReactNativeWebView", {
+    postMessage(data: string) {
+      const message = JSON.parse(data);
+      messages.push(message);
+      if (message.viewerTransport === "fetch") emitted.resolve(message.id);
+      if (message.viewerTransport === "pull") pulled.resolve();
+      if (message.viewerTransport === "cancel") cancel.resolve();
+    },
+  });
+  try {
+    installVerifiedViewerTransport();
+    const media = `https://relay.test/api/device-hub/helper/sim/stream.${nativeMjpeg ? "mjpeg" : "avcc"}?wsTicket=signed`;
+    const input = "wss://relay.test/api/device-hub/helper/ws?wsTicket=signed";
+    const request = fetch(media);
+    const id = await emitted.promise;
+    const reply = (type: string, payload?: object) =>
+      window.T3VerifiedViewer!(id, { type, status: 200, headers: {}, bodyBase64: "", ...payload });
+    reply("headers", {
+      headers: {
+        "Content-Type": nativeMjpeg ? 'multipart/x-mixed-replace; boundary="frame"' : "video/h264",
+      },
+    });
+    const reader = (await request).body!.getReader();
+    if (nativeMjpeg) {
+      reply("headers", { headers: { "Content-Type": "image/jpeg", "Content-Length": "3" } });
+    }
+    reply("chunk", { binary: "AQID" });
+    expect(messages.some((message) => message.viewerTransport === "pull")).toBe(false);
+    const read = reader.read();
+    await pulled.promise;
+    const delivered = await Promise.race([read, Promise.resolve(undefined)]);
+    expect(delivered?.done).toBe(false);
+    expect(new TextDecoder().decode(delivered?.value)).toBe(
+      nativeMjpeg
+        ? "\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: 3\r\n\r\n\x01\x02\x03"
+        : "\x01\x02\x03",
+    );
+    await reader.cancel();
+    await cancel.promise;
+    const socket = new WebSocket(input);
+    const socketId = messages.at(-1)!.id;
+    window.T3VerifiedViewer!(socketId, { type: "open", status: 0, headers: {}, bodyBase64: "" });
+    socket.send(Uint8Array.of(3, 4));
+    expect(messages).toContainEqual({
+      viewerTransport: "fetch",
+      id,
+      url: media,
+      method: "GET",
+      headers: [],
+    });
+    expect(messages).toContainEqual({ viewerTransport: "connect", id: socketId, url: input });
+    expect(messages.at(-1)).toEqual({ viewerTransport: "send", id: socketId, binary: "AwQ=" });
+    expect(fallback).not.toHaveBeenCalled();
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });

@@ -5,7 +5,10 @@ import { expect, it, onTestFinished, vi } from "vite-plus/test";
 import type { ServerConfig } from "@t3tools/contracts";
 
 import type { ZipTreeRow } from "./zipTree";
+import * as VerifiedRoutes from "../../connection/verified-route";
+import * as AttachmentDownloads from "../../lib/attachmentDownload";
 
+const secureValues = vi.hoisted(() => new Map<string, string>());
 const files = vi.hoisted(() => new Map<string, Uint8Array>());
 const navigation = vi.hoisted(() => ({ remove: null as (() => void) | null }));
 const server = vi.hoisted(() => ({
@@ -93,6 +96,9 @@ vi.mock("expo-file-system", () => ({
       return Uint8Array.from(bytes).buffer;
     }
   },
+}));
+vi.mock("expo-secure-store", () => ({
+  getItemAsync: async (key: string) => secureValues.get(key) ?? null,
 }));
 vi.mock("expo/fetch", () => ({ fetch: vi.fn() }));
 vi.mock("expo-crypto", () => ({ randomUUID: vi.fn() }));
@@ -209,8 +215,60 @@ function setup() {
   };
 }
 
+it("refuses a bare ZIP URL on cold startup when the policy survives a missing pin", async () => {
+  const screen = setup();
+  const origin = "https://cold-zip.example.test";
+  const url = `${origin}/api/assets/signed/archive.zip?ticket=signed`;
+  secureValues.set("t3code.verified-route-policy.v1", JSON.stringify({ [origin]: "verified" }));
+  onTestFinished(() => secureValues.clear());
+  expect(VerifiedRoutes.verificationRequiredFor(url)).toBe(false);
+  using download = vi
+    .spyOn(AttachmentDownloads, "downloadAttachmentForPreview")
+    .mockRejectedValue(new Error("Required pin unavailable"));
+  const { fetch } = await import("expo/fetch");
+  vi.mocked(fetch).mockClear();
+  await screen.render({ ...screen.props, uri: url, isLocal: false });
+  await screen.settle(() => {
+    expect(screen.container.textContent).toContain("Couldn't download this ZIP");
+    expect(download).toHaveBeenCalledOnce();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+});
+
+it.each(["missing pin", "unreadable enrollment"])(
+  "refuses ordinary ZIP networking with %s",
+  async (failure) => {
+    const screen = setup();
+    using _initialize = vi
+      .spyOn(VerifiedRoutes, "initializeVerifiedRoutes")
+      .mockImplementation(async () => {
+        if (failure === "unreadable enrollment") throw new Error("SecureStore unavailable");
+      });
+    using _binding = vi.spyOn(VerifiedRoutes, "verifiedRouteFor").mockReturnValue(undefined);
+    using _required = vi.spyOn(VerifiedRoutes, "verificationRequiredFor").mockReturnValue(true);
+    using _download = vi
+      .spyOn(AttachmentDownloads, "downloadAttachmentForPreview")
+      .mockRejectedValue(new Error("Required pin unavailable"));
+    const { fetch } = await import("expo/fetch");
+    vi.mocked(fetch).mockClear().mockRejectedValue(new Error("Ordinary networking is forbidden"));
+    await screen.render({
+      ...screen.props,
+      uri: "https://required.example/api/assets/signed/archive.zip",
+      isLocal: false,
+      refresh: async () => null,
+    });
+    await screen.settle(() => {
+      expect(screen.container.textContent).toContain("Couldn't download this ZIP");
+      expect(fetch).not.toHaveBeenCalled();
+    });
+  },
+);
+
 it("opens a ZIP chat attachment as a browsable archive on the attachment file screen", async () => {
   const screen = setup();
+  using _initialize = vi
+    .spyOn(VerifiedRoutes, "initializeVerifiedRoutes")
+    .mockResolvedValue(undefined);
   server.capabilities = {
     repositoryIdentity: false,
     attachmentUploads: true,

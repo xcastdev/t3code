@@ -48,7 +48,7 @@ export interface PluginBridgeOptions {
     readonly set: (value: unknown) => Promise<void>;
   };
   readonly backend?: {
-    readonly call: (operation: string, input: unknown) => Promise<unknown>;
+    readonly call: (operation: string, input: unknown, lifetime: AbortSignal) => Promise<unknown>;
     readonly subscribe: (
       topic: string,
       params: unknown,
@@ -354,6 +354,7 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
   const { manifest } = options;
   let initialized = false;
   let disposed = false;
+  const lifetime = new AbortController();
   let pending = 0;
   let sentContext = "";
   let nextSubscriptionId = 0;
@@ -515,7 +516,7 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
         if (!declared.operations.some((decl) => decl.name === operation)) {
           throw refusal("unknown-operation");
         }
-        answer(id, () => backend.call(operation, input ?? {}));
+        answer(id, () => backend.call(operation, input ?? {}, lifetime.signal));
         return;
       }
       case "t3/backend.subscribe": {
@@ -695,6 +696,7 @@ export function makePluginBridge(options: PluginBridgeOptions): PluginBridge {
     },
     dispose: () => {
       disposed = true;
+      lifetime.abort();
       save = null;
       const live = [...subscriptions.values()];
       subscriptions.clear();

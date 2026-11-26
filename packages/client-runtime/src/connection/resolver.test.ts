@@ -10,10 +10,12 @@ import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 
 import * as ConnectionResolver from "./resolver.ts";
+import { VerifiedRoutePolicy } from "./verifiedRoute.ts";
 import * as ClientCapabilities from "../platform/capabilities.ts";
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
 import {
   BearerConnectionCredential,
+  BearerConnectionProfile,
   type ConnectionCatalogEntry,
   SshConnectionProfile,
   type ConnectionCredential,
@@ -21,6 +23,7 @@ import {
 } from "./catalog.ts";
 import * as ConnectionCredentialStore from "./credentialStore.ts";
 import {
+  BearerConnectionTarget,
   ConnectionBlockedError,
   ConnectionTransientError,
   PrimaryConnectionTarget,
@@ -58,6 +61,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   readonly profiles?: ReadonlyArray<ConnectionProfile>;
   readonly profileStore?: ConnectionProfileStore.ConnectionProfileStore["Service"];
   readonly credentials?: ReadonlyArray<readonly [string, ConnectionCredential]>;
+  readonly onCredentialRead?: (connectionId: string) => void;
   readonly authorizeBearer?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeBearer"];
   readonly authorizeDpop?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeDpop"];
   readonly primaryBearerToken?: string;
@@ -76,7 +80,11 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
     remove: (connectionId) => Effect.sync(() => void profiles.delete(connectionId)),
   });
   const credentialStore = ConnectionCredentialStore.ConnectionCredentialStore.of({
-    get: (connectionId) => Effect.succeed(Option.fromNullishOr(credentials.get(connectionId))),
+    get: (connectionId) =>
+      Effect.sync(() => {
+        options?.onCredentialRead?.(connectionId);
+        return Option.fromNullishOr(credentials.get(connectionId));
+      }),
     put: (connectionId, credential) =>
       Effect.sync(() => void credentials.set(connectionId, credential)),
     remove: (connectionId) => Effect.sync(() => void credentials.delete(connectionId)),
@@ -174,6 +182,147 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
 });
 
 describe("ConnectionResolver", () => {
+  it.effect.each([
+    { route: "bearer", binding: "absent", supported: false, allowed: false },
+    { route: "t3-connect", binding: "absent", supported: false, allowed: false },
+    { route: "bearer", binding: "wrong-environment", supported: true, allowed: false },
+    { route: "bearer", binding: "right", supported: false, allowed: false },
+    { route: "wrong-websocket", binding: "right", supported: true, allowed: false },
+    { route: "bearer", binding: "right", supported: true, allowed: true },
+    { route: "directory", binding: "absent", supported: true, allowed: false },
+    { route: "directory", binding: "wrong-origin", supported: true, allowed: false },
+    { route: "directory", binding: "wrong-environment", supported: true, allowed: false },
+    { route: "directory", binding: "right", supported: true, allowed: true },
+    { route: "t3-connect", binding: "right", supported: true, allowed: true },
+    { route: "explicit", binding: "absent", supported: false, allowed: true },
+    { route: "explicit", binding: "right", supported: true, allowed: true },
+    { route: "explicit", binding: "right", supported: false, allowed: false },
+    { route: "explicit", binding: "wrong-environment", supported: true, allowed: false },
+    { route: "explicit-http", binding: "absent", supported: false, allowed: true },
+    { route: "explicit-verified", binding: "absent", supported: true, allowed: false },
+    { route: "explicit-verified", binding: "invalid", supported: true, allowed: false },
+    { route: "explicit-verified", binding: "right", supported: false, allowed: false },
+    { route: "explicit-verified", binding: "right", supported: true, allowed: true },
+  ])("gates $route with $binding enrollment and support=$supported", (scenario) =>
+    Effect.gen(function* () {
+      const explicit = scenario.route.startsWith("explicit");
+      const connectionId = explicit
+        ? "paired"
+        : `learned:${ENVIRONMENT_ID}:${ENDPOINT.httpBaseUrl}@paired`;
+      const target = new BearerConnectionTarget({
+        connectionId,
+        environmentId: ENVIRONMENT_ID,
+        label: "Test",
+      });
+      const entry = catalogEntry(
+        target,
+        Option.some(
+          new BearerConnectionProfile({
+            connectionId,
+            environmentId: ENVIRONMENT_ID,
+            label: target.label,
+            ...ENDPOINT,
+            ...(scenario.route === "explicit-http"
+              ? { httpBaseUrl: "http://192.168.1.5:3773", wsBaseUrl: "ws://192.168.1.5:3773" }
+              : {}),
+            ...(scenario.route === "explicit-verified"
+              ? { verificationRequired: true as const }
+              : {}),
+            ...(scenario.route === "wrong-websocket"
+              ? { wsBaseUrl: "wss://other.example.test" }
+              : {}),
+            ...(scenario.route === "t3-connect"
+              ? { authorization: "t3-connect", learned: true }
+              : {}),
+            ...(scenario.route === "directory"
+              ? { directorySource: "saved-relay", learned: true, verificationRequired: true }
+              : {}),
+          }),
+        ),
+      );
+      const calls: string[] = [];
+      const credentialReads: string[] = [];
+      const layer = yield* makeDependencies({
+        credentials: [["paired", new BearerConnectionCredential({ token: "saved" })]],
+        onCredentialRead: (connectionId) => void credentialReads.push(connectionId),
+        authorizeBearer: (input) =>
+          Effect.sync(() => {
+            calls.push(input.bearerToken);
+            return {
+              ...target,
+              httpBaseUrl: input.httpBaseUrl,
+              socketUrl: input.wsBaseUrl,
+              httpAuthorization: { _tag: "Bearer" as const, token: input.bearerToken },
+            };
+          }),
+        authorizeDpop: (input) =>
+          Effect.sync(() => {
+            calls.push("dpop");
+            return {
+              ...target,
+              httpBaseUrl: input.directEndpoint!.httpBaseUrl,
+              socketUrl: input.directEndpoint!.wsBaseUrl,
+              httpAuthorization: {
+                _tag: "Dpop" as const,
+                accessToken: "cached",
+                expiresAtEpochMs: Number.MAX_SAFE_INTEGER,
+              },
+            };
+          }),
+      });
+      const enforcement: string[] = [];
+      const policy = Layer.succeed(VerifiedRoutePolicy, {
+        readEnrollment: () =>
+          Effect.succeed(
+            scenario.binding === "absent"
+              ? null
+              : {
+                  environmentId:
+                    scenario.binding === "right" || scenario.binding === "wrong-origin"
+                      ? ENVIRONMENT_ID
+                      : "different-environment",
+                  httpsOrigin:
+                    scenario.binding === "wrong-origin"
+                      ? "https://different.example.test"
+                      : ENDPOINT.httpBaseUrl,
+                  leafSpkiSha256: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                },
+          ),
+        enforce: (binding) =>
+          Effect.sync(() => {
+            enforcement.push(binding.environmentId);
+            return scenario.supported;
+          }),
+      });
+      yield* Effect.gen(function* () {
+        const resolver = yield* ConnectionResolver.ConnectionResolver;
+        // The same entry drives initial connection, cached reconnect, and update preflight.
+        const first = yield* resolver.prepare(entry).pipe(Effect.result);
+        const reconnect = yield* resolver.prepare(entry).pipe(Effect.result);
+        const update = yield* resolver.prepareForUpdate(entry).pipe(Effect.result);
+        for (const result of [first, reconnect, update]) {
+          expect(result._tag).toBe(scenario.allowed ? "Success" : "Failure");
+          if (result._tag === "Failure") {
+            expect(result.failure).toMatchObject({
+              _tag: "ConnectionBlockedError",
+              reason: "configuration",
+            });
+          }
+        }
+      }).pipe(Effect.provide(layer.pipe(Layer.provide(policy))));
+      const credential = scenario.route === "t3-connect" ? "dpop" : "saved";
+      expect(calls).toEqual(scenario.allowed ? [credential, credential, credential] : []);
+      expect(credentialReads).toEqual(
+        scenario.allowed && scenario.route !== "t3-connect" ? ["paired", "paired", "paired"] : [],
+      );
+      expect(enforcement).toEqual(
+        scenario.binding === "right" && scenario.route !== "wrong-websocket"
+          ? [ENVIRONMENT_ID, ENVIRONMENT_ID, ENVIRONMENT_ID]
+          : [],
+      );
+    }),
+  );
+
   it.effect(
     "pins primary credentials to the requested socket when the registered endpoint changes",
     () =>
@@ -299,7 +448,7 @@ describe("ConnectionResolver", () => {
         label: "Primary",
         httpBaseUrl: "http://127.0.0.1:3777",
         socketUrl:
-          "ws://127.0.0.1:3777/ws?clientSurface=web&clientDeviceType=desktop&connectionMethod=direct&orchestrationProtocol=2&clientCapabilities=settingsSecretReferences",
+          "ws://127.0.0.1:3777/ws?clientSurface=web&clientDeviceType=desktop&connectionMethod=direct&orchestrationProtocol=2&clientCapabilities=settingsSecretReferences%2CgenericWebhookDestinations",
         httpAuthorization: null,
         target,
         // The shell reads the server's build and shell flags here before the socket opens.

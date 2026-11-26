@@ -1,7 +1,10 @@
+import { sendExternalNotification } from "@t3tools/external-notifications/webhook";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import { deriveProviderInstanceConfigMap } from "./provider/ProviderInstanceRegistryHydration.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
+  DEFAULT_EXTERNAL_NOTIFICATION_EVENTS,
   DEFAULT_SERVER_SETTINGS,
   globalIdleCompaction,
   type ManagedPolicyDocument,
@@ -1410,6 +1413,215 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("server settings"
           expected,
         );
       }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect(
+    "preserves old webhook URLs and stores signing keys independently as write-only settings",
+    () =>
+      Effect.gen(function* () {
+        const service = yield* ServerSettingsModule.ServerSettingsService;
+        const config = yield* ServerConfig.ServerConfig;
+        const store = yield* ServerSecretStore.ServerSecretStore;
+        const fs = yield* FileSystem.FileSystem;
+        const url = "http://home.lan/hooks/old-token";
+        const urlSlot = "notification-webhook-aG9tZQ";
+        const keySlot = "notification-signing-key-aG9tZQ";
+        yield* store.set(urlSlot, new TextEncoder().encode(url));
+        yield* fs.writeFileString(
+          config.settingsPath,
+          '{"externalNotifications":{"destinations":[{"id":"home","name":"Home","kind":"home-assistant","enabled":true,"webhookUrl":"••••••"}]}}',
+        );
+
+        const read = service.getSettings.pipe(
+          Effect.flatMap((settings) =>
+            Effect.fromNullishOr(settings.externalNotifications.destinations[0]),
+          ),
+        );
+        const original = yield* read;
+        assert.equal(original.webhookUrl, url);
+        const save = (fields: { webhookUrl: string; signingKey?: string }) =>
+          service.updateSettings({
+            externalNotifications: {
+              destinations: [{ ...original, ...fields, kind: "generic-webhook" }],
+            },
+          });
+
+        yield* save({ webhookUrl: SECRET_REDACTED, signingKey: "signing-secret" });
+        const settings = yield* service.getSettings;
+        const redacted = ServerSettingsModule.redactServerSettingsForClient(settings, {
+          secretReferences: true,
+        }).externalNotifications.destinations[0];
+        assert.equal(redacted?.webhookUrl, SECRET_REDACTED);
+        assert.equal(redacted?.signingKey, SECRET_REDACTED);
+        const persisted = yield* fs.readFileString(config.settingsPath);
+        assert.notInclude(persisted, url);
+        assert.notInclude(persisted, "signing-secret");
+
+        yield* save({ webhookUrl: "https://new.example/webhook", signingKey: SECRET_REDACTED });
+        const replaced = yield* read;
+        assert.equal(replaced.webhookUrl, "https://new.example/webhook");
+        assert.equal(replaced.signingKey, "signing-secret");
+
+        yield* save({ webhookUrl: SECRET_REDACTED, signingKey: "rotated-secret" });
+        assert.equal((yield* read).signingKey, "rotated-secret");
+        assert.equal((yield* read).webhookUrl, "https://new.example/webhook");
+
+        yield* save({ webhookUrl: SECRET_REDACTED });
+        assert.equal((yield* read).signingKey, "rotated-secret");
+
+        yield* store.remove(keySlot);
+        const fresh = yield* Effect.gen(function* () {
+          const reloaded = yield* ServerSettingsModule.ServerSettingsService;
+          return yield* reloaded.getSettings;
+        }).pipe(
+          Effect.provide(
+            Layer.fresh(ServerSettingsModule.layer).pipe(
+              Layer.provide(Layer.merge(ServerSecretStore.layer, ManagedPolicy.layerTest())),
+            ),
+          ),
+        );
+        const [missingKey] = fresh.externalNotifications.destinations;
+        if (!missingKey) throw new Error("Expected saved webhook destination");
+        const signatures: Array<string | null> = [];
+        const deliver = (destination: typeof missingKey) =>
+          sendExternalNotification(destination, {
+            environmentId: "env",
+            environmentName: "Test",
+            eventType: "test",
+            occurrenceId: "test-key",
+            timestamp: "2026-11-18T12:00:00.000Z",
+            title: "Test",
+          }).pipe(
+            Effect.provide(FetchHttpClient.layer),
+            Effect.provideService(FetchHttpClient.Fetch, (url, init) => {
+              signatures.push(new Request(url, init).headers.get("X-T3-Signature"));
+              return Promise.resolve(new Response(null, { status: 204 }));
+            }),
+          );
+        assert.equal((yield* Effect.flip(deliver(missingKey))).reason, "unconfigured");
+        assert.deepEqual(signatures, []);
+
+        yield* save({ webhookUrl: SECRET_REDACTED, signingKey: "" });
+        yield* deliver(yield* read);
+        assert.deepEqual(signatures, [null]);
+        assert.isTrue(Option.isNone(yield* store.get(keySlot)));
+        assert.isTrue(Option.isSome(yield* store.get(urlSlot)));
+
+        yield* save({ webhookUrl: "", signingKey: "" });
+        assert.isTrue(Option.isNone(yield* store.get(urlSlot)));
+      }).pipe(Effect.provide(layerServerSettingsWithSecrets())),
+  );
+
+  it.effect(
+    "keeps generic webhooks out of legacy settings and preserves them on legacy saves",
+    () =>
+      Effect.gen(function* () {
+        const service = yield* ServerSettingsModule.ServerSettingsService;
+        const generic = {
+          id: "generic",
+          name: "Generic",
+          kind: "generic-webhook" as const,
+          enabled: true,
+          events: ["failure"] as const,
+          webhookUrl: "https://example.com/hooks/secret",
+          signingKey: "saved-secret",
+        };
+        const home = {
+          ...generic,
+          id: "home",
+          name: "Home",
+          kind: "home-assistant" as const,
+        };
+        const modern = yield* service.updateSettings({
+          externalNotifications: { destinations: [home, generic] },
+        });
+        const legacy = { secretReferences: true, genericWebhookDestinations: false };
+        const projected = ServerSettingsModule.redactServerSettingsForClient(modern, legacy);
+        assert.deepEqual(
+          projected.externalNotifications.destinations.map(({ id }) => id),
+          ["home"],
+        );
+
+        const saved = yield* service.updateSettings(
+          {
+            externalNotifications: {
+              destinations: [
+                {
+                  id: "home",
+                  kind: "home-assistant",
+                  name: "Renamed",
+                  enabled: true,
+                  webhookUrl: SECRET_REDACTED,
+                  events: DEFAULT_EXTERNAL_NOTIFICATION_EVENTS,
+                },
+              ],
+            },
+          },
+          legacy,
+        );
+        assert.deepEqual(saved.externalNotifications.destinations, [
+          { ...home, name: "Renamed" },
+          generic,
+        ]);
+        const removed = yield* service.updateSettings(
+          { externalNotifications: { destinations: [] } },
+          legacy,
+        );
+        assert.deepEqual(removed.externalNotifications.destinations, [generic]);
+      }).pipe(Effect.provide(layerServerSettingsWithSecrets())),
+  );
+
+  it.effect.each(["added destination", "rotated credentials"] as const)(
+    "rejects a stale destination list after concurrent %s",
+    (change) =>
+      Effect.gen(function* () {
+        const service = yield* ServerSettingsModule.ServerSettingsService;
+        const client = { secretReferences: true, genericWebhookDestinations: true };
+        const initial = {
+          id: "original",
+          name: "Original",
+          kind: "generic-webhook" as const,
+          enabled: true,
+          events: ["failure"] as const,
+          webhookUrl: "https://example.com/hooks/original",
+          signingKey: "original-key",
+        };
+        const save = (...destinations: ReadonlyArray<typeof initial>) =>
+          service.updateSettings({ externalNotifications: { destinations } });
+        const readClient = service.getSettings.pipe(
+          Effect.map((settings) =>
+            ServerSettingsModule.redactServerSettingsForClient(settings, client),
+          ),
+          Effect.map((settings) => settings.externalNotifications),
+        );
+        yield* save(initial);
+        const snapshot = yield* readClient;
+        assert.isString(snapshot.revision);
+        const concurrent =
+          change === "added destination"
+            ? [initial, { ...initial, id: "added", name: "Added", signingKey: "added-key" }]
+            : [{ ...initial, signingKey: "rotated-key" }];
+        yield* save(...concurrent);
+        const stale = yield* Effect.flip(
+          service.updateSettings(
+            { externalNotifications: { ...snapshot, destinations: [] } },
+            client,
+          ),
+        );
+        assert.equal(stale.operation, "stale-notification-destinations");
+        assert.deepEqual(
+          (yield* service.getSettings).externalNotifications.destinations,
+          concurrent,
+        );
+
+        const latest = yield* readClient;
+        const removed = yield* service.updateSettings(
+          { externalNotifications: { ...latest, destinations: [] } },
+          client,
+        );
+        assert.deepEqual(removed.externalNotifications.destinations, []);
+        assert.isUndefined(removed.externalNotifications.revision);
+      }).pipe(Effect.provide(layerServerSettingsWithSecrets())),
   );
 
   it.effect("removes a kept secret once every row with its name is deleted", () =>

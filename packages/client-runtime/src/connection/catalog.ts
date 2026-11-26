@@ -22,7 +22,10 @@ export class BearerConnectionProfile extends Schema.TaggedClass<BearerConnection
     ...ConnectionProfileBase,
     httpBaseUrl: Schema.String,
     wsBaseUrl: Schema.String,
+    // Mobile uses false for an explicitly approved direct route and absence for old profiles.
+    verificationRequired: Schema.optionalKey(Schema.Boolean),
     learned: Schema.optionalKey(Schema.Literal(true)),
+    directorySource: Schema.optionalKey(Schema.String),
     authorization: Schema.optionalKey(Schema.Literal("t3-connect")),
     /**
      * "tailscale" on a learned route the server found on its Tailscale

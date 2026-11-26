@@ -1,9 +1,18 @@
+import { assertHostedStreamTarget } from "~/connection/hostedRelayAdmission";
+import {
+  environmentRelayAdmissionRequired,
+  fetchEnvironmentResource,
+  openEnvironmentSocket,
+} from "~/connection/environmentTransport";
+import { saveBlob } from "~/lib/saveBlob";
 import {
   createPreviewFramePainter,
   createPreviewStreamClient,
+  PREVIEW_STREAM_BASE_PATH,
   previewStreamControlLabel,
   previewStreamModifiers,
   type PreviewStreamClient,
+  type PreviewAssetWidgetConnection,
   type PreviewStreamControl,
   type PreviewStreamDownload,
   type PreviewStreamFileChooser,
@@ -16,6 +25,8 @@ import {
 } from "@t3tools/client-runtime/preview/server-browser-stream";
 import type {
   EnvironmentId,
+  PreviewAssetStreamOpen,
+  PreviewAssetStreamPresentation,
   PreviewStreamHostSetup,
   PreviewViewportSetting,
 } from "@t3tools/contracts";
@@ -123,7 +134,31 @@ async function copyPageText(text: string) {
   }
 }
 
-function offerDownload(download: PreviewStreamDownload) {
+async function savePreviewDownload(download: PreviewStreamDownload, environmentId: EnvironmentId) {
+  assertHostedStreamTarget(download.url, environmentId, `${PREVIEW_STREAM_BASE_PATH}/download`);
+  const response = await fetchEnvironmentResource(download.url);
+  if (!response.ok || response.body === null) {
+    await response.body?.cancel();
+    throw new Error("The browser download is unavailable.");
+  }
+  const maxBytes = 1024 * 1024 * 1024;
+  let bytes = 0;
+  const body = response.body.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        bytes += chunk.byteLength;
+        if (bytes > maxBytes) throw new Error("The browser download exceeds the size limit.");
+        controller.enqueue(chunk);
+      },
+    }),
+  );
+  const blob = await new Response(body, {
+    headers: { "Content-Type": response.headers.get("Content-Type") ?? "application/octet-stream" },
+  }).blob();
+  saveBlob(blob, download.fileName);
+}
+
+function offerDownload(download: PreviewStreamDownload, environmentId: EnvironmentId) {
   const id = toastManager.add({
     type: "info",
     title: `Downloaded ${download.fileName}`,
@@ -131,6 +166,16 @@ function offerDownload(download: PreviewStreamDownload) {
       children: "Save",
       onClick: () => {
         toastManager.close(id);
+        if (environmentRelayAdmissionRequired(download.url)) {
+          void savePreviewDownload(download, environmentId).catch((cause: unknown) =>
+            toastManager.add({
+              type: "error",
+              title: "Could not save the browser download",
+              description: cause instanceof Error ? cause.message : undefined,
+            }),
+          );
+          return;
+        }
         const anchor = document.createElement("a");
         anchor.href = download.url;
         anchor.download = download.fileName;
@@ -140,11 +185,25 @@ function offerDownload(download: PreviewStreamDownload) {
   });
 }
 
+const focusedWidgetHasActivation = (
+  canvas: HTMLCanvasElement | null,
+  input: HTMLTextAreaElement | null,
+) =>
+  navigator.userActivation?.isActive === true &&
+  document.hasFocus() &&
+  (document.activeElement === canvas || document.activeElement === input);
+
 export function ServerBrowserSurface(props: {
   readonly environmentId: EnvironmentId;
   readonly threadId: string;
   readonly tabId: string;
   readonly visible: boolean;
+  readonly asset?: PreviewAssetStreamOpen;
+  readonly assetTitle?: string;
+  readonly assetPresentation?: PreviewAssetStreamPresentation;
+  readonly onAssetHeight?: (height: number) => void;
+  readonly connectWidget?: (post: (data: unknown) => void) => PreviewAssetWidgetConnection;
+  readonly onGone?: () => void;
   readonly followSize?: boolean;
   readonly controlPosition?: "top" | "bottom";
   readonly onFirstFrame?: () => void;
@@ -160,6 +219,12 @@ export function ServerBrowserSurface(props: {
     threadId,
     tabId,
     visible,
+    asset,
+    assetTitle,
+    assetPresentation,
+    onAssetHeight,
+    connectWidget,
+    onGone,
     followSize = true,
     controlPosition = "top",
     onFirstFrame,
@@ -187,7 +252,14 @@ export function ServerBrowserSurface(props: {
     const chooser = fileChooser;
     if (!chooser) return;
     setFileChooser(null);
-    void uploadPreviewStreamFiles(chooser, files).catch((cause: unknown) =>
+    void uploadPreviewStreamFiles(chooser, files, async (input, init) => {
+      assertHostedStreamTarget(
+        chooser.uploadUrl,
+        environmentId,
+        `${PREVIEW_STREAM_BASE_PATH}/upload`,
+      );
+      return fetchEnvironmentResource(input, init);
+    }).catch((cause: unknown) =>
       toastManager.add({
         type: "error",
         title: "Could not send the files to the page",
@@ -215,16 +287,35 @@ export function ServerBrowserSurface(props: {
   const probeRef = useRef<TouchProbe | null>(null);
   const lastProbeRef = useRef<{ x: number; y: number; editable: boolean; at: number } | null>(null);
   const firstFrame = useEffectEvent(() => onFirstFrame?.());
+  const viewGone = useEffectEvent(() => onGone?.());
+  const attachWidget = useEffectEvent((post: (data: unknown) => void) => {
+    if (!connectWidget) throw new Error("The widget host is unavailable.");
+    return connectWidget(post);
+  });
+  const assetHeightChanged = useEffectEvent((height: number) => onAssetHeight?.(height));
+  const presentAsset = useEffectEvent((client: PreviewStreamClient) => {
+    if (assetPresentation) client.send(assetPresentation);
+  });
   const viewportChanged = useEffectEvent((viewport: PreviewStreamViewport) =>
     onViewport?.(viewport),
   );
   const controlChanged = useEffectEvent((next: PreviewStreamControl | null) => onControl?.(next));
   const popupOpened = useEffectEvent((popupTabId: string) => onPopup?.(popupTabId));
+  const assetView = asset !== undefined;
   const [cap, setCap] = useState<{ width: number; height: number } | null>(null);
 
   // Keep clearInput stable: a new identity reconnects the stream.
   const send = (input: PreviewStreamInput) => {
     clientRef.current?.send(input);
+  };
+
+  const sendWidgetInput = (input: PreviewStreamInput, event: Event) => {
+    clientRef.current?.send(
+      input,
+      asset?.widget !== undefined &&
+        event.isTrusted &&
+        focusedWidgetHasActivation(canvasRef.current, inputRef.current),
+    );
   };
 
   const clearInput = () => {
@@ -329,6 +420,10 @@ export function ServerBrowserSurface(props: {
       capTimer = null;
       const size = sizeRef.current;
       if (!size) return;
+      if (assetView) {
+        setCap((current) => current ?? { width: 3840, height: 2160 });
+        return;
+      }
       const ratio = window.devicePixelRatio || 1;
       const width = Math.round(size.width * ratio);
       const height = Math.round(size.height * ratio);
@@ -363,7 +458,7 @@ export function ServerBrowserSurface(props: {
       if (timer !== null) clearTimeout(timer);
       if (capTimer !== null) clearTimeout(capTimer);
     };
-  }, [followSize]);
+  }, [assetView, followSize]);
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- opens the preview stream client and paints its frames onto the canvas while visible
   useEffect(() => {
@@ -376,7 +471,14 @@ export function ServerBrowserSurface(props: {
       firstFrame();
     });
     const client = createPreviewStreamClient(
-      { access, threadId, tabId, maxWidth: cap.width, maxHeight: cap.height },
+      {
+        access,
+        threadId,
+        tabId,
+        maxWidth: cap.width,
+        maxHeight: cap.height,
+        ...(asset === undefined ? {} : { asset }),
+      },
       {
         onFrame: (jpeg) => {
           unauthorizedRef.current = 0;
@@ -399,7 +501,7 @@ export function ServerBrowserSurface(props: {
           if (placed) setAgentCursor(placed);
         },
         onClipboard: (text) => void copyPageText(text),
-        onDownload: offerDownload,
+        onDownload: (download) => offerDownload(download, environmentId),
         onPopup: popupOpened,
         onFileChooser: setFileChooser,
         onViewport: (viewport) => {
@@ -421,6 +523,7 @@ export function ServerBrowserSurface(props: {
           } else if (previous?.controller !== "you") {
             const size = sizeRef.current;
             if (followSize && size) client.send({ type: "resize", ...size });
+            presentAsset(client);
           }
         },
         onConnectedChange: (connected) => {
@@ -431,6 +534,14 @@ export function ServerBrowserSurface(props: {
           controlChanged(null);
           clearInput();
         },
+        onAssetHeight: assetHeightChanged,
+        ...(asset?.widget
+          ? {
+              connectWidget: attachWidget,
+              widgetHasActivation: () => focusedWidgetHasActivation(canvas, inputRef.current),
+            }
+          : {}),
+        onGone: viewGone,
         onHostSetup: setHostSetup,
         onUnauthorized: () => {
           const refusals = ++unauthorizedRef.current;
@@ -444,6 +555,24 @@ export function ServerBrowserSurface(props: {
             refusals === 1 ? 0 : 1_000 * 2 ** (refusals - 1),
           );
         },
+      },
+      (url) => {
+        if (asset) {
+          const endpoint = new URL(url);
+          const issuer = new URL(asset.verifiedAssetUrl);
+          if (
+            !environmentRelayAdmissionRequired(url) ||
+            issuer.protocol !== "https:" ||
+            endpoint.protocol !== "wss:" ||
+            endpoint.host !== issuer.host ||
+            endpoint.pathname !== `${PREVIEW_STREAM_BASE_PATH}/ws` ||
+            access.environmentId !== environmentId
+          ) {
+            throw new Error("The document stream does not match its issuer.");
+          }
+        }
+        assertHostedStreamTarget(url, environmentId, `${PREVIEW_STREAM_BASE_PATH}/ws`);
+        return openEnvironmentSocket(url);
       },
     );
     clientRef.current = client;
@@ -460,6 +589,7 @@ export function ServerBrowserSurface(props: {
   }, [
     access,
     accessDenied,
+    asset,
     cap,
     clearInput,
     environmentId,
@@ -469,6 +599,11 @@ export function ServerBrowserSurface(props: {
     threadId,
     visible,
   ]);
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- forwards theme and visibility to the destination document
+  useEffect(() => {
+    if (assetPresentation) clientRef.current?.send(assetPresentation);
+  }, [assetPresentation]);
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- registers a non-passive wheel listener on the canvas so it can stop the panel scrolling
   useEffect(() => {
@@ -568,6 +703,7 @@ export function ServerBrowserSurface(props: {
       if (!point) return;
       // iOS requires focus during the tap; late probe replies only raise Android's keyboard.
       if (probe?.editable === true) focusInput();
+      else if (asset?.widget) event.currentTarget.focus({ preventScroll: true });
       else if (probe?.editable === false) inputRef.current?.blur();
       if (probe && !probe.answered) probe.tapped = true;
       else probeRef.current = null;
@@ -576,7 +712,10 @@ export function ServerBrowserSurface(props: {
       const at = { x: point.x, y: point.y, modifiers: 0 };
       send({ type: "mouse", action: "move", ...at, button: "none", buttons: 0, clickCount: 0 });
       send({ type: "mouse", action: "down", ...at, button: "left", buttons: 1, clickCount });
-      send({ type: "mouse", action: "up", ...at, button: "left", buttons: 0, clickCount });
+      sendWidgetInput(
+        { type: "mouse", action: "up", ...at, button: "left", buttons: 0, clickCount },
+        event.nativeEvent,
+      );
       return;
     }
     const previous = mouseButtonsRef.current;
@@ -594,14 +733,16 @@ export function ServerBrowserSurface(props: {
     const mouse = (action: "down" | "up", button: PreviewStreamMouseButton, buttons: number) => {
       if (action === "down")
         mouseClicksRef.current[button] = countClick(button, clientX, clientY, event.timeStamp);
-      send({
-        type: "mouse",
+      const input = {
+        type: "mouse" as const,
         action,
         ...at,
         button,
         buttons,
         clickCount: mouseClicksRef.current[button],
-      });
+      };
+      if (type === "pointerup" && button === "left") sendWidgetInput(input, event.nativeEvent);
+      else send(input);
     };
     if (type === "pointerdown") {
       focusInput();
@@ -699,15 +840,17 @@ export function ServerBrowserSurface(props: {
         : event.key === "Enter"
           ? "\r"
           : undefined;
-    send({
-      type: "key",
+    const input = {
+      type: "key" as const,
       action,
       key: event.key,
       code: event.code,
       keyCode: event.keyCode,
       ...(action === "down" && text !== undefined ? { text } : {}),
       modifiers: previewStreamModifiers(event),
-    });
+    };
+    if (action === "down") sendWidgetInput(input, event.nativeEvent);
+    else send(input);
     // Some Android keyboards edit the textarea even when keydown is prevented.
     keySentRef.current =
       action === "down" &&
@@ -748,28 +891,30 @@ export function ServerBrowserSurface(props: {
       data-server-browser-surface={tabId}
       onMouseUp={handleMouseUp}
     >
-      <div
-        className={cn(
-          "visible relative z-20 flex shrink-0 items-center justify-between gap-2 border-border bg-background px-2 py-1",
-          controlPosition === "bottom" ? "order-last border-t" : "border-b",
-        )}
-      >
-        <span role="status" className="text-xs text-muted-foreground">
-          {previewStreamControlLabel(control)}
-        </span>
-        {control?.canOperate ? (
-          <Button
-            variant="outline"
-            size="xs"
-            disabled={control.controller === "another-viewer"}
-            onClick={() =>
-              send({ type: control.controller === "you" ? "releaseControl" : "takeControl" })
-            }
-          >
-            {control.controller === "you" ? "Release control" : "Take control"}
-          </Button>
-        ) : null}
-      </div>
+      {!assetView ? (
+        <div
+          className={cn(
+            "visible relative z-20 flex shrink-0 items-center justify-between gap-2 border-border bg-background px-2 py-1",
+            controlPosition === "bottom" ? "order-last border-t" : "border-b",
+          )}
+        >
+          <span role="status" className="text-xs text-muted-foreground">
+            {previewStreamControlLabel(control)}
+          </span>
+          {control?.canOperate ? (
+            <Button
+              variant="outline"
+              size="xs"
+              disabled={control.controller === "another-viewer"}
+              onClick={() =>
+                send({ type: control.controller === "you" ? "releaseControl" : "takeControl" })
+              }
+            >
+              {control.controller === "you" ? "Release control" : "Take control"}
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
       <div className="relative min-h-0 flex-1">
         {pdfUrl ? (
           <embed
@@ -781,6 +926,8 @@ export function ServerBrowserSurface(props: {
         ) : null}
         <canvas
           ref={canvasRef}
+          aria-label={assetTitle}
+          tabIndex={asset?.widget ? -1 : undefined}
           className="block size-full touch-none object-contain"
           onPointerDown={handlePointer}
           onPointerMove={handlePointer}
@@ -798,7 +945,7 @@ export function ServerBrowserSurface(props: {
         {/* Pin top-left to avoid focus scrolling; 16px prevents iOS focus zoom. */}
         <textarea
           ref={inputRef}
-          aria-label="Browser page"
+          aria-label={assetTitle ?? "Browser page"}
           aria-description="Press Shift+Escape to leave the browser page."
           autoCapitalize="off"
           autoComplete="off"

@@ -1,3 +1,4 @@
+import { SecureWebView } from "../../native/secureWebView";
 import { Button } from "../../components/ui/Button";
 import { AppActivityIndicator } from "../../components/ui/AppActivityIndicator";
 import * as Dialog from "../../components/ui/Dialog";
@@ -20,11 +21,17 @@ import {
   type Ref,
 } from "react";
 import { Platform, Pressable, TextInput, View } from "react-native";
-import { WebView } from "react-native-webview";
+import type { WebView } from "react-native-webview";
 import * as Clipboard from "expo-clipboard";
 
 import { AppText } from "../../components/ui/AppText";
 import { PdfPreview } from "../../components/PdfPreview";
+import {
+  createVerifiedViewerBridge,
+  verifiedViewerEndpoint,
+  viewerUsesVerifiedRoute,
+} from "../../lib/verifiedViewerBridge";
+import { sendVerifiedChooserFiles } from "./verifiedFileChooser";
 import { downloadAndShareAttachment } from "../../lib/attachmentDownload";
 import { beginForegroundHandoff } from "../../lib/foreground-handoff";
 import { usePreviewStreamAccess } from "../../state/preview";
@@ -62,28 +69,58 @@ type NativeStreamBridge = {
   readonly pdfUri?: string | null;
 };
 
-async function sendFilesToPage(chooser: PreviewStreamFileChooser, pick: boolean) {
+type AnswerFileChooser = (chooser: PreviewStreamFileChooser, pick: boolean) => void;
+type FileChooserListener = (chooser: PreviewStreamFileChooser | null) => void;
+type FileChooserOffer = {
+  readonly chooser: PreviewStreamFileChooser;
+  readonly access: PreviewStreamConfiguration["access"];
+};
+
+function resolveChooserEndpoint({ chooser, access }: FileChooserOffer) {
+  const verified = viewerUsesVerifiedRoute(access);
+  const endpoint = verified ? verifiedViewerEndpoint(access, chooser.uploadUrl, "http") : null;
+  if (verified && !endpoint) {
+    throw new Error("The browser's file picker URL was refused.");
+  }
+  return endpoint;
+}
+
+async function pickChooserFiles(chooser: PreviewStreamFileChooser, signal: AbortSignal) {
+  const { getDocumentAsync } = await import("expo-document-picker");
+  signal.throwIfAborted();
+  const endHandoff = beginForegroundHandoff();
+  try {
+    const result = await getDocumentAsync({
+      multiple: chooser.multiple,
+      copyToCacheDirectory: true,
+    });
+    return result.canceled ? [] : result.assets;
+  } finally {
+    endHandoff();
+  }
+}
+
+async function sendFilesToPage(
+  offer: FileChooserOffer,
+  files: readonly import("expo-document-picker").DocumentPickerAsset[],
+  signal: AbortSignal,
+) {
+  signal.throwIfAborted();
+  const endpoint = resolveChooserEndpoint(offer);
+  if (endpoint) return sendVerifiedChooserFiles(endpoint.href, files, signal);
+  const { chooser } = offer;
   const body = new FormData();
-  if (pick) {
-    const { getDocumentAsync } = await import("expo-document-picker");
-    const endHandoff = beginForegroundHandoff();
-    let result: Awaited<ReturnType<typeof getDocumentAsync>>;
-    try {
-      result = await getDocumentAsync({ multiple: chooser.multiple, copyToCacheDirectory: true });
-    } finally {
-      endHandoff();
-    }
-    for (const asset of result.canceled ? [] : result.assets) {
-      body.append("file", {
-        uri: asset.uri,
-        name: asset.name,
-        type: asset.mimeType ?? "application/octet-stream",
-      } as unknown as Blob);
-    }
+  for (const asset of files) {
+    body.append("file", {
+      uri: asset.uri,
+      name: asset.name,
+      type: asset.mimeType ?? "application/octet-stream",
+    } as unknown as Blob);
   }
   const response = await fetch(chooser.uploadUrl, {
     method: "POST",
     body,
+    signal,
     credentials: chooser.credentials ? "include" : "omit",
   });
   if (!response.ok) throw new Error((await response.text()) || "The upload was refused.");
@@ -111,19 +148,112 @@ function offerDownload(download: PreviewStreamDownload) {
 
 const MAX_REFUSALS = 3;
 
-export function PreviewStreamWebView(
-  props: Omit<PreviewStreamConfiguration, "access"> &
-    Omit<NativeStreamBridge, "onUnauthorized" | "onRefused"> & {
-      readonly environmentId: EnvironmentId;
-      readonly paused?: boolean;
-    },
-) {
-  const { access, error, refresh, retryAfter } = usePreviewStreamAccess(props.environmentId);
+export function PreviewStreamWebView({
+  beginFileChooserHandoff,
+  fileChooserEnabled = true,
+  ...props
+}: Omit<PreviewStreamConfiguration, "access"> &
+  Omit<NativeStreamBridge, "onUnauthorized" | "onRefused"> & {
+    readonly environmentId: EnvironmentId;
+    readonly paused?: boolean;
+    readonly fileChooserEnabled?: boolean;
+    readonly beginFileChooserHandoff?: (signal: AbortSignal) => () => void;
+  }) {
+  const streamAccess = usePreviewStreamAccess(props.environmentId);
+  const chooserRequest = useRef<AbortController | null>(null);
+  const latestOffer = useRef<FileChooserOffer | null>(null);
+  const receiveOffer = useRef<((offer: FileChooserOffer) => void) | null>(null);
+  const [chooserAttempt, setChooserAttempt] = useState<{
+    readonly access: PreviewStreamConfiguration["access"] | null;
+  } | null>(null);
+  const canAnswerFileChooser = fileChooserEnabled && !props.compact && !props.paused;
+  const access = (canAnswerFileChooser ? chooserAttempt?.access : null) ?? streamAccess.access;
+  const { error, refresh, retryAfter } = streamAccess;
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- aborts the upload on unmount or blur, including while picture-in-picture keeps the preview mounted
+  useLayoutEffect(() => {
+    if (canAnswerFileChooser) return () => chooserRequest.current?.abort();
+  }, [canAnswerFileChooser]);
+
+  const waitForOffer = (signal: AbortSignal) => {
+    const { promise, resolve, reject } = Promise.withResolvers<FileChooserOffer>();
+    const abort = () => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    const timeout = setTimeout(
+      () => reject(new Error("The page's file picker is no longer open.")),
+      20_000,
+    );
+    receiveOffer.current = resolve;
+    // Android can close the issuing socket while DocumentsUI is foregrounded.
+    setChooserAttempt({ access: null });
+    refresh();
+    return promise.finally(() => {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", abort);
+      if (receiveOffer.current === resolve) receiveOffer.current = null;
+    });
+  };
+
   if (access && !props.paused) {
+    const answerFileChooser: AnswerFileChooser = (chooser, pick) => {
+      if (chooserRequest.current) return;
+      const request = new AbortController();
+      chooserRequest.current = request;
+      setChooserAttempt({ access });
+      const endHandoff =
+        pick && Platform.OS === "android" ? beginFileChooserHandoff?.(request.signal) : undefined;
+      const finish = () => {
+        if (chooserRequest.current !== request) return;
+        request.signal.removeEventListener("abort", finish);
+        chooserRequest.current = null;
+        setChooserAttempt(null);
+        endHandoff?.();
+      };
+      request.signal.addEventListener("abort", finish, { once: true });
+      const answer = async () => {
+        const { signal } = request;
+        let offer = { chooser, access };
+        resolveChooserEndpoint(offer);
+        const files = pick ? await pickChooserFiles(chooser, signal) : [];
+        signal.throwIfAborted();
+        if (pick && Platform.OS === "android") {
+          const current = latestOffer.current;
+          if (current?.chooser !== chooser) {
+            if (chooser.requestId === undefined)
+              throw new Error("The page's file picker is no longer open.");
+            offer = current ?? (await waitForOffer(signal));
+            if (latestOffer.current !== offer || offer.chooser.requestId !== chooser.requestId)
+              throw new Error("The page's file picker is no longer open.");
+            setChooserAttempt({ access: offer.access });
+          }
+        }
+        await sendFilesToPage(offer, files, signal);
+      };
+      void answer()
+        .catch((cause: unknown) => {
+          if (!request.signal.aborted)
+            Dialog.alert(
+              "Could not send the files to the page",
+              cause instanceof Error ? cause.message : undefined,
+            );
+        })
+        .finally(finish);
+    };
     return (
       <AuthorizedPreviewStream
         {...props}
         access={access}
+        onAnswerFileChooser={
+          canAnswerFileChooser && chooserAttempt === null ? answerFileChooser : undefined
+        }
+        onFileChooser={(chooser) => {
+          const offer = chooser === null ? null : { chooser, access };
+          latestOffer.current = offer;
+          if (offer) receiveOffer.current?.(offer);
+        }}
+        onGone={() => {
+          chooserRequest.current?.abort();
+          props.onGone?.();
+        }}
         onUnauthorized={refresh}
         onRefused={retryAfter}
       />
@@ -162,7 +292,11 @@ export function PreviewStreamWebView(
 function AuthorizedPreviewStream({
   ref,
   ...props
-}: PreviewStreamConfiguration & NativeStreamBridge) {
+}: PreviewStreamConfiguration &
+  NativeStreamBridge & {
+    readonly onAnswerFileChooser: AnswerFileChooser | undefined;
+    readonly onFileChooser: FileChooserListener;
+  }) {
   const [attempt, setAttempt] = useState(0);
   const [previousAccess, setPreviousAccess] = useState(props.access);
   // Wait for refreshed access, including cookie credentials with unchanged JSON.
@@ -172,8 +306,10 @@ function AuthorizedPreviewStream({
   }
   const processRetried = useRef(false);
   const unauthorized = useRef(0);
+  const verified = viewerUsesVerifiedRoute(props.access);
   const configuration = JSON.stringify({
     access: props.access,
+    verified,
     threadId: props.threadId,
     tabId: props.tabId,
     interactive: props.interactive,
@@ -185,6 +321,7 @@ function AuthorizedPreviewStream({
       {...props}
       ref={ref}
       configuration={configuration}
+      verified={verified}
       onUnauthorized={() => {
         const refusals = ++unauthorized.current;
         if (refusals >= MAX_REFUSALS) return false;
@@ -213,6 +350,8 @@ function AuthorizedPreviewStream({
 function PreviewStreamDocumentView({
   ref,
   configuration,
+  access,
+  verified,
   background,
   compact,
   pdfUri,
@@ -221,12 +360,18 @@ function PreviewStreamDocumentView({
   onViewport,
   onControl,
   onPictureInPicture,
+  onAnswerFileChooser,
+  onFileChooser,
   onStreamingChange,
   onRetry,
   onStreaming,
   onRecoverProcess,
 }: Omit<NativeStreamBridge, "onUnauthorized" | "onRefused"> & {
+  readonly onAnswerFileChooser: AnswerFileChooser | undefined;
+  readonly onFileChooser: FileChooserListener;
   readonly configuration: string;
+  readonly access: PreviewStreamConfiguration["access"];
+  readonly verified: boolean;
   readonly background: string;
   readonly onUnauthorized: () => boolean;
   readonly onRetry: () => void;
@@ -234,6 +379,7 @@ function PreviewStreamDocumentView({
   readonly onRecoverProcess: () => boolean;
 }) {
   const webView = useRef<WebView<object>>(null);
+  const bridge = useRef<ReturnType<typeof createVerifiedViewerBridge> | null>(null);
   const active = useRef(false);
   const failed = useRef(false);
   const bootstrapTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -247,14 +393,9 @@ function PreviewStreamDocumentView({
   const [fileChooser, setFileChooser] = useState<PreviewStreamFileChooser | null>(null);
   const answerFileChooser = (pick: boolean) => {
     const chooser = fileChooser;
-    if (!chooser) return;
+    if (!chooser || !onAnswerFileChooser) return;
     setFileChooser(null);
-    void sendFilesToPage(chooser, pick).catch((cause: unknown) =>
-      Dialog.alert(
-        "Could not send the files to the page",
-        cause instanceof Error ? cause.message : undefined,
-      ),
-    );
+    onAnswerFileChooser(chooser, pick);
   };
   const command = (input: PreviewStreamInput) =>
     webView.current?.injectJavaScript(
@@ -277,11 +418,13 @@ function PreviewStreamDocumentView({
   const fail = (message: string) => {
     if (!active.current || failed.current) return;
     failed.current = true;
+    bridge.current?.stop();
     clearBootstrapTimer();
     webView.current?.injectJavaScript("window.T3PreviewStream?.stop(); true;");
     onStreamingChange?.(false);
     setControl(null);
     setFileChooser(null);
+    onFileChooser(null);
     onControl?.(null);
     setError(message);
     setStatus("error");
@@ -291,6 +434,7 @@ function PreviewStreamDocumentView({
   );
   const streamEnded = useEffectEvent(() => {
     onStreamingChange?.(false);
+    onFileChooser(null);
     onControl?.(null);
   });
   // The stream lives exactly as long as this view.
@@ -298,17 +442,23 @@ function PreviewStreamDocumentView({
   useLayoutEffect(() => {
     active.current = true;
     const view = webView.current;
+    if (verified)
+      bridge.current = createVerifiedViewerBridge(access, (script) =>
+        view?.injectJavaScript(script),
+      );
     bootstrapTimer.current = setTimeout(bootstrapTimedOut, 15_000);
     return () => {
       if (bootstrapTimer.current !== null) clearTimeout(bootstrapTimer.current);
       bootstrapTimer.current = null;
       active.current = false;
+      bridge.current?.stop();
+      bridge.current = null;
       view?.injectJavaScript("window.T3PreviewStream?.stop(); true;");
       streamEnded();
     };
-  }, []);
+  }, [access, verified]);
   const source = {
-    html: previewStreamDocument(configuration, previewStreamScript),
+    html: previewStreamDocument(configuration, previewStreamScript, verified),
     baseUrl: Platform.OS === "android" ? "https://localhost/" : "file:///",
   };
   useImperativeHandle(ref, () => ({
@@ -341,14 +491,16 @@ function PreviewStreamDocumentView({
         </View>
       ) : null}
       <View className="relative flex-1">
-        <WebView<object>
+        <SecureWebView
+          verified={verified}
+          onFenceError={() => fail("Browser viewer could not load. Reconnect to try again.")}
           ref={webView}
           source={source}
           originWhitelist={["*"]}
           scrollEnabled={false}
           bounces={false}
-          mixedContentMode="always"
-          allowUniversalAccessFromFileURLs
+          mixedContentMode={verified ? "never" : "always"}
+          allowUniversalAccessFromFileURLs={!verified}
           contentInsetAdjustmentBehavior="never"
           setSupportMultipleWindows={false}
           allowsInlineMediaPlayback
@@ -364,10 +516,12 @@ function PreviewStreamDocumentView({
           }
           onMessage={(event) => {
             if (!active.current || failed.current) return;
+            if (bridge.current?.onMessage(event.nativeEvent.data)) return;
             const message = previewStreamMessage(event.nativeEvent.data);
             if (message === null) return;
             switch (message.type) {
               case "control": {
+                if (message.controller !== "you") onFileChooser(null);
                 setControl(message);
                 const previousDialog = dialogRef.current;
                 dialogRef.current = message.dialog;
@@ -396,9 +550,11 @@ function PreviewStreamDocumentView({
                 void Clipboard.setStringAsync(message.text).catch(() => undefined);
                 return;
               case "download":
-                offerDownload(message);
+                if (!verified || verifiedViewerEndpoint(access, message.url, "http"))
+                  offerDownload(message);
                 return;
               case "fileChooser":
+                onFileChooser(message.chooser);
                 setFileChooser(message.chooser);
                 return;
               case "pictureInPicture":
@@ -428,7 +584,7 @@ function PreviewStreamDocumentView({
           </View>
         ) : null}
       </View>
-      {!compact && fileChooser && control?.controller === "you" ? (
+      {onAnswerFileChooser && fileChooser && control?.controller === "you" ? (
         <View className="absolute inset-x-3 top-16 gap-3 rounded-xl border border-secondary-border bg-secondary p-4">
           <AppText className="text-sm text-secondary-foreground">
             The page asks for {fileChooser.multiple ? "files" : "a file"}.

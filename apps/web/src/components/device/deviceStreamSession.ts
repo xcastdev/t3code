@@ -10,6 +10,12 @@ import type { DeviceHubAccess } from "@t3tools/client-runtime/state/deviceHubAcc
 import type { DevicePlatform, EnvironmentId } from "@t3tools/contracts";
 import { Atom } from "effect/reactivity";
 
+import { assertHostedStreamTarget } from "~/connection/hostedRelayAdmission";
+import {
+  environmentRelayAdmissionRequired,
+  openEnvironmentSocket,
+} from "~/connection/environmentTransport";
+import { fetchDeviceHubResource } from "./deviceHubApi";
 import { refreshDeviceHubAccess } from "~/state/device";
 
 export interface DeviceStreamState {
@@ -96,6 +102,18 @@ export const deviceStreamSessionAtom = Atom.family((key: DeviceStreamKey) =>
         deviceId: key.deviceId,
         access: key.access,
         serveSimOnly: key.serveSimOnly,
+        transport: {
+          fetchResource: (url, init) => fetchDeviceHubResource(key.access, String(url), init),
+          createSocket: (url) => {
+            assertHostedStreamTarget(
+              url,
+              key.environmentId,
+              /^\/api\/device-hub\/vendor\/(serve-emu|serve-sim)\/(helper\/)?ws$/u,
+            );
+            return openEnvironmentSocket(url);
+          },
+          fetchMjpeg: environmentRelayAdmissionRequired(key.access.httpBase),
+        },
       },
       createCanvasFrameSink(canvas, () => frameListener?.()),
       {

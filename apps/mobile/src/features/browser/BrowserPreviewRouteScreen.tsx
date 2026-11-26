@@ -41,6 +41,7 @@ export function BrowserPreviewRouteScreen({ route }: BrowserPreviewRouteScreenPr
   }
   return (
     <BrowserPreviewScreen
+      key={JSON.stringify([environmentId, threadId])}
       environmentId={EnvironmentId.make(environmentId)}
       threadId={ThreadId.make(threadId)}
       initialTabId={route.params.tabId ?? null}
@@ -81,6 +82,7 @@ function BrowserPreviewScreen({
   const focused = useIsFocused();
   const foreground = useAppForeground();
   const [selectedTabId, setSelectedTabId] = useState(initialTabId);
+  const [chooserHandoff, setChooserHandoff] = useState<{ readonly tabId: string } | null>(null);
   const [pictureInPicture, setPictureInPicture] = useState(NO_PICTURE_IN_PICTURE);
   const [streaming, setStreaming] = useState(false);
   const [canControl, setCanControl] = useState(false);
@@ -106,7 +108,22 @@ function BrowserPreviewScreen({
     setPictureInPicture(NO_PICTURE_IN_PICTURE);
     setSelectedTabId(next);
   };
-  const live = (focused && foreground) || pictureInPicture.active;
+  const live =
+    (focused && (foreground || chooserHandoff?.tabId === tabId)) || pictureInPicture.active;
+  const beginFileChooserHandoff = (tabId: string, signal: AbortSignal) => {
+    const handoff = { tabId };
+    let ended = false;
+    const end = () => {
+      if (ended) return;
+      ended = true;
+      signal.removeEventListener("abort", end);
+      setChooserHandoff((current) => (current === handoff ? null : current));
+    };
+    // Keep the issuing viewer mounted until the picker response settles.
+    signal.addEventListener("abort", end, { once: true });
+    setChooserHandoff(handoff);
+    return end;
+  };
 
   return (
     <View
@@ -175,10 +192,12 @@ function BrowserPreviewScreen({
               pdfUri={pdfUri}
               ref={streamRef}
               interactive
+              fileChooserEnabled={focused}
               background={themeVariables["--color-sheet-solid"]}
               onPictureInPicture={onPictureInPicture}
               onStreamingChange={setStreaming}
               onControl={(control) => setCanControl(control?.controller === "you")}
+              beginFileChooserHandoff={(signal) => beginFileChooserHandoff(tab.tabId, signal)}
             />
           ) : (
             <View className="flex-1" />

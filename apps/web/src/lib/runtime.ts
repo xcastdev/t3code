@@ -16,12 +16,22 @@ import {
   resolveRelayTracingConfig,
 } from "../cloud/publicConfig";
 import * as ClientTracer from "../observability/clientTracer";
+import {
+  fetchEnvironmentResource,
+  openEnvironmentSocket,
+} from "../connection/environmentTransport";
 
 function configuredRelayUrl(): string {
   return resolveCloudPublicConfig().relayUrl ?? "http://relay.invalid";
 }
 
-const layerHttpClient = layerRemoteHttpClient((input, init) => globalThis.fetch(input, init));
+const layerHttpClient = layerRemoteHttpClient(fetchEnvironmentResource);
+const layerWebSocketConstructor = Layer.succeed(Socket.WebSocketConstructor, (url, options) => {
+  if (options !== undefined && typeof options !== "string" && !Array.isArray(options)) {
+    throw new TypeError("WebSocket client options are not supported by the browser");
+  }
+  return openEnvironmentSocket(url, options);
+});
 const layerRelayTracing = RelayTracing.layer(
   resolveRelayTracingConfig(),
   {
@@ -37,7 +47,7 @@ const layerRelayTracing = RelayTracing.layer(
 type RuntimeLayerSource =
   | typeof layerHttpClient
   | typeof Dpop.layer
-  | typeof Socket.layerWebSocketConstructorGlobal
+  | typeof layerWebSocketConstructor
   | typeof layerRelayTracing
   | typeof ClientTracer.layer
   | ReturnType<typeof ManagedRelayLayer.layer>;
@@ -66,7 +76,7 @@ export function __setPrimaryHttpRunnerForTests(runner?: PrimaryHttpEffectRunner)
 const layerRuntime = Layer.mergeAll(
   layerHttpClient,
   Dpop.layer,
-  Socket.layerWebSocketConstructorGlobal,
+  layerWebSocketConstructor,
   ClientTracer.layer,
   layerRelayTracing,
   ManagedRelayLayer.layer(configuredRelayUrl()).pipe(

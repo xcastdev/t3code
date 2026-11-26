@@ -1,3 +1,4 @@
+import { resolveComposerDraftDispatchSnapshot } from "./composerDraftDispatch";
 import { PrimaryConnectionTarget } from "@t3tools/client-runtime/connection";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -2236,6 +2237,37 @@ describe("mobile composer drafts", () => {
         attachments: [],
       },
     });
+  });
+
+  it("keeps upload identity completed while approval decline was pending", () => {
+    const key = "environment-1:approval-upload";
+    const attachment: DraftComposerAttachment = {
+      id: "approval-image",
+      type: "image",
+      name: "screen.png",
+      mimeType: "image/png",
+      sizeBytes: 1,
+      previewUri: "file:///drafts/screen.png",
+      fileUri: "file:///drafts/screen.png",
+    };
+    const before = { ...DRAFT, attachments: [attachment] };
+    appAtomRegistry.set(composerDraftsAtom, { [key]: before });
+    const snapshot = getComposerDraftSnapshot(key);
+    const completed = {
+      ...attachment,
+      uploadedAttachmentId: "committed-once",
+      uploadEnvironmentId: EnvironmentId.make("environment-1"),
+    };
+    appAtomRegistry.set(composerDraftsAtom, { [key]: { ...before, attachments: [completed] } });
+    expect(
+      resolveComposerDraftDispatchSnapshot(getComposerDraftSnapshot(key), snapshot)?.attachments,
+    ).toEqual([completed]);
+    appAtomRegistry.set(composerDraftsAtom, {
+      [key]: { ...before, text: "edited during approval" },
+    });
+    expect(
+      resolveComposerDraftDispatchSnapshot(getComposerDraftSnapshot(key), snapshot),
+    ).toBeNull();
   });
 
   it("drops another environment's upload stamp when a draft moves across machines", () => {

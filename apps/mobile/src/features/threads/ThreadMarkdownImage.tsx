@@ -19,6 +19,7 @@ import { PresentationSource } from "../../components/ui/NativePresentation";
 import { useMediaActions } from "../../state/mediaActions";
 import type { MediaActionsSource } from "../../lib/mediaActionsSource";
 import { useAssetUrlState, useFreshAssetUrl } from "../../state/assets";
+import { useVerifiedLocalAsset } from "../../lib/useVerifiedLocalAsset";
 import { WorkspaceMutationIdContext } from "./workspaceMutationIdContext";
 import { ZoomableImagePressable } from "./ZoomableImagePressable";
 import { assetImageCacheKey } from "../../lib/assetImageSource";
@@ -89,8 +90,23 @@ const svgDocumentAtom = Atom.family((uri: string) =>
 
 const noSvgDocumentAtom = Atom.make(AsyncResult.initial<SvgDocument, SvgLoadError>());
 
-export function ThreadMarkdownImageView(props: {
+export function ThreadMarkdownImageView(
+  props: Parameters<typeof PreparedThreadMarkdownImageView>[0],
+) {
+  const local = useVerifiedLocalAsset(props.uri);
+  return (
+    <PreparedThreadMarkdownImageView
+      {...props}
+      uri={local.status === "ready" ? local.uri : null}
+      previewUri={props.uri}
+      unavailable={props.unavailable || local.status === "failed"}
+    />
+  );
+}
+
+function PreparedThreadMarkdownImageView(props: {
   readonly uri: string | null;
+  readonly previewUri?: string | null;
   readonly sourceKey: string;
   readonly sourceIdentifier?: string;
   readonly cacheKey?: string | undefined;
@@ -182,7 +198,7 @@ export function ThreadMarkdownImageView(props: {
                 props.onPressPreview(
                   withGallery({
                     kind: "image",
-                    uri: props.uri!,
+                    uri: props.previewUri ?? props.uri!,
                     name: props.actionsSource?.name ?? props.alt ?? "Image",
                     sourceIdentifier,
                     actionsSource: props.actionsSource,

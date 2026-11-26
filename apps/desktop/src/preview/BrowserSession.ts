@@ -15,8 +15,10 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
+import { DesktopPreReadyElectronOptions } from "../app/DesktopPreReadyPlatform.ts";
 import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as ElectronDialog from "../electron/ElectronDialog.ts";
+import { installVerifiedRoute, isVerifiedRouteHost } from "../electron/VerifiedRoute.ts";
 
 const PREVIEW_PARTITION_PREFIX = "persist:t3code-preview-";
 /** Ephemeral partitions omit persist: but retain a product prefix so the webview gate recognizes them. */
@@ -258,6 +260,7 @@ const previewHostWindow = (guest: WebContents | null): BrowserWindow | undefined
 
 /** @public */
 export const make = Effect.gen(function* BrowserSessionMake() {
+  const { verifiedRoutes } = yield* DesktopPreReadyElectronOptions;
   const crypto = yield* Digest.Digest;
   const electronApp = yield* ElectronApp.ElectronApp;
   const electronDialog = yield* ElectronDialog.ElectronDialog;
@@ -512,9 +515,19 @@ export const make = Effect.gen(function* BrowserSessionMake() {
       if (contents.isDestroyed()) return;
       // Sessions this service did not create keep Electron's denial.
       const trust = certificateTrust.get(contents.session);
+      if (trust === undefined) return;
+      const request = URL.parse(url);
+      if (
+        request !== null &&
+        verifiedRoutes.some((binding) => isVerifiedRouteHost(request, binding))
+      ) {
+        event.preventDefault();
+        callback(false);
+        return;
+      }
       const origin = certificateOrigin(url);
       const reason = OVERRIDABLE_CERTIFICATE_ERRORS.get(error);
-      if (trust === undefined || origin === null || reason === undefined) return;
+      if (origin === null || reason === undefined) return;
       const approval = { origin, fingerprint: certificate.fingerprint, error };
       event.preventDefault();
       if (trust.approvals.has(certificateApprovalKey(approval))) {
@@ -585,6 +598,7 @@ export const make = Effect.gen(function* BrowserSessionMake() {
       return Effect.try({
         try: () => {
           const browserSession = session.fromPartition(partition);
+          if (verifiedRoutes.length > 0) installVerifiedRoute(browserSession, verifiedRoutes);
           // Like Chrome, clipboard reads ask once per origin; both answers last for the session.
           const clipboardReadDecisions = new Map<string, boolean>();
           const confirmClipboardRead = (

@@ -38,6 +38,7 @@ export const projectTerminalNoticeItem = (input: {
     completedAt: now,
     updatedAt: now,
     type: "notification",
+    ...(command.sourceMessageId === undefined ? {} : { sourceMessageId: command.sourceMessageId }),
     ...command.notification,
   };
 };

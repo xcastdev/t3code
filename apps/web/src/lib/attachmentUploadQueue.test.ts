@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   runAtomCommand: vi.fn(),
   readEnvironmentScope: vi.fn(),
   readPreparedConnection: vi.fn(),
+  isOperatorBoundBrowserRoute: vi.fn(() => false),
 }));
 
 vi.mock("@t3tools/client-runtime/state/runtime", () => ({
@@ -47,6 +48,15 @@ vi.mock("../state/attachments", () => ({
     remove: mocks.removeUpload,
   },
 }));
+
+vi.mock("../connection/verifiedRoute", async () => {
+  const Effect = await import("effect/Effect");
+  return {
+    isOperatorBoundBrowserRoute: mocks.isOperatorBoundBrowserRoute,
+    readOperatorBrowserBinding: () => null,
+    verifiedRoutePolicy: { readEnrollment: () => Effect.succeed(null) },
+  };
+});
 
 vi.mock("../state/session", () => ({
   readEnvironmentScope: mocks.readEnvironmentScope,
@@ -77,6 +87,7 @@ class TestXmlHttpRequest {
   static requests: TestXmlHttpRequest[] = [];
 
   status = 0;
+  aborted = false;
   timeout = 0;
   method: string | null = null;
   url: string | null = null;
@@ -110,6 +121,7 @@ class TestXmlHttpRequest {
   send(): void {}
 
   abort(): void {
+    this.aborted = true;
     this.listeners.get("abort")?.();
   }
 
@@ -120,6 +132,10 @@ class TestXmlHttpRequest {
   complete(status = 204): void {
     this.status = status;
     this.listeners.get("load")?.();
+  }
+
+  disconnect(): void {
+    this.listeners.get("error")?.();
   }
 }
 
@@ -202,6 +218,10 @@ describe("attachmentUploadQueue", () => {
       },
     );
     vi.stubGlobal("XMLHttpRequest", TestXmlHttpRequest);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 404 })),
+    );
   });
 
   afterEach(() => {
@@ -209,6 +229,221 @@ describe("attachmentUploadQueue", () => {
       releaseAttachmentUpload(imageId);
     }
     vi.unstubAllGlobals();
+  });
+
+  it("aborts a pending HTTPS upload on explicit retirement with no connected socket", async () => {
+    vi.useFakeTimers();
+    const admission = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+      .mockResolvedValueOnce(
+        new Response(null, { status: 204, headers: { "T3-Relay-Admission": "active" } }),
+      )
+      .mockResolvedValueOnce(
+        new Response(null, { status: 410, headers: { "T3-Relay-Admission": "retired" } }),
+      );
+    vi.stubGlobal("fetch", admission);
+    try {
+      setConnected(firstEnvironment, false);
+      mocks.runAtomCommand.mockResolvedValueOnce({
+        _tag: "Success",
+        value: {
+          attachmentId: "pending-retired-upload",
+          relativeUrl: "/api/attachments/upload/pending-retired-upload?sig=upload-only",
+          expiresAt: 1,
+        },
+      });
+      const image = makeImage("relay-retired-upload");
+      startAttachmentUpload({ environmentId: firstEnvironment, image });
+      await vi.advanceTimersByTimeAsync(0);
+      const request = TestXmlHttpRequest.requests[0]!;
+      expect(request.url).toBe(
+        "https://environment.test/api/attachments/upload/pending-retired-upload?sig=upload-only",
+      );
+      request.progress(1, 3);
+      expect(admission).toHaveBeenCalledWith(
+        "https://environment.test/.well-known/t3/relay-admission",
+        {
+          method: "HEAD",
+          credentials: "omit",
+          redirect: "error",
+          cache: "no-store",
+          referrerPolicy: "no-referrer",
+          signal: expect.any(AbortSignal),
+        },
+      );
+      expect(readAttachmentUpload(image.id)).toMatchObject({ status: "uploading" });
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(admission).toHaveBeenCalledTimes(3);
+      await awaitAttachmentUploads([image.id]);
+      expect(request.aborted).toBe(true);
+      expect(readAttachmentUpload(image.id)).toMatchObject({
+        status: "failed",
+        failure: "relay-retired",
+        reason: "Upload outcome unknown because the relay route was retired.",
+      });
+
+      setConnected(firstEnvironment, true);
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(TestXmlHttpRequest.requests).toEqual([request]);
+      expect(admission).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uploads to the issuing origin with redirect refusal after a route change", async () => {
+    mocks.isOperatorBoundBrowserRoute.mockReturnValueOnce(true);
+    const request = vi.fn<typeof fetch>(async () => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", request);
+    const issuedUrl = "https://issuing.example.test/api/attachments/upload/pending-proof";
+    mocks.runAtomCommand.mockResolvedValueOnce({
+      _tag: "Success",
+      value: { attachmentId: "pending-proof", relativeUrl: issuedUrl, expiresAt: 1 },
+    });
+    mocks.readPreparedConnection.mockReturnValue({ httpBaseUrl: "https://replacement.test/" });
+
+    const image = makeImage("relay-proof-upload");
+    startAttachmentUpload({ environmentId: firstEnvironment, image });
+    await awaitAttachmentUploads([image.id]);
+
+    expect(TestXmlHttpRequest.requests).toEqual([]);
+    expect(request).toHaveBeenCalledWith(
+      issuedUrl,
+      expect.objectContaining({
+        method: "POST",
+        credentials: "omit",
+        redirect: "error",
+      }),
+    );
+    expect(readAttachmentUpload(image.id)).toMatchObject({
+      status: "ready",
+      attachmentId: "pending-proof",
+    });
+  });
+
+  it("refuses an unbound issuer for a verified upload before any transfer", async () => {
+    using _xhr = vi.spyOn(TestXmlHttpRequest.prototype, "send").mockImplementation(function (
+      this: TestXmlHttpRequest,
+    ) {
+      this.complete();
+    });
+    const response = vi.fn<typeof fetch>(async () => new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", response);
+    mocks.runAtomCommand.mockResolvedValueOnce({
+      _tag: "Success",
+      value: {
+        attachmentId: "pending-verified",
+        relativeUrl: "https://unbound.test/api/attachments/upload/proof",
+        expiresAt: 1,
+        verificationRequired: true,
+      },
+    });
+
+    const image = makeImage("verified-upload");
+    startAttachmentUpload({ environmentId: firstEnvironment, image });
+    await awaitAttachmentUploads([image.id]);
+
+    expect(TestXmlHttpRequest.requests).toEqual([]);
+    expect(response).not.toHaveBeenCalled();
+    expect(readAttachmentUpload(image.id)).toMatchObject({ status: "failed" });
+  });
+
+  it.each([
+    ["http", true, true],
+    ["network", true, true],
+    ["network", false, true],
+    ["network", false, false],
+  ] as const)(
+    "does not retry after a %s failure (retired: %s, previously confirmed: %s)",
+    async (failure, retired, confirmed) => {
+      vi.useFakeTimers();
+      const admission = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(
+          confirmed
+            ? new Response(null, { status: 204, headers: { "T3-Relay-Admission": "active" } })
+            : new Response(null, { status: 503 }),
+        )
+        .mockResolvedValueOnce(
+          retired
+            ? new Response(null, { status: 410, headers: { "T3-Relay-Admission": "retired" } })
+            : new Response(null, { status: 503 }),
+        );
+      vi.stubGlobal("fetch", admission);
+      try {
+        const image = makeImage("interrupted-relay-upload");
+        startAttachmentUpload({ environmentId: firstEnvironment, image });
+        await vi.advanceTimersByTimeAsync(0);
+        const request = TestXmlHttpRequest.requests[0]!;
+        setConnected(firstEnvironment, false);
+        if (failure === "http") request.complete(410);
+        else request.disconnect();
+        setConnected(firstEnvironment, true);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(readAttachmentUpload(image.id)).toMatchObject({
+          status: "failed",
+          failure: retired ? "relay-retired" : "outcome-unknown",
+        });
+        expect(TestXmlHttpRequest.requests).toEqual([request]);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("leaves an HTTPS upload alone if the origin does not advertise relay admission", async () => {
+    vi.useFakeTimers();
+    const admission = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 410 }));
+    vi.stubGlobal("fetch", admission);
+    try {
+      const image = makeImage("direct-upload");
+      startAttachmentUpload({ environmentId: firstEnvironment, image });
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(admission).toHaveBeenCalledTimes(1);
+      expect(readAttachmentUpload(image.id)).toMatchObject({ status: "uploading" });
+      const settled = awaitAttachmentUploads([image.id]);
+      TestXmlHttpRequest.requests[0]!.complete();
+      await settled;
+      expect(readAttachmentUpload(image.id)).toMatchObject({ status: "ready" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("continues the upload through inconclusive admission responses and stops checking on completion", async () => {
+    vi.useFakeTimers();
+    const admission = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(null, { status: 204, headers: { "T3-Relay-Admission": "active" } }),
+      )
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce(new Response(null, { status: 410 }))
+      .mockImplementationOnce(() => new Promise(() => {}));
+    vi.stubGlobal("fetch", admission);
+    try {
+      const image = makeImage("relay-active-upload");
+      startAttachmentUpload({ environmentId: firstEnvironment, image });
+      await vi.advanceTimersByTimeAsync(0);
+      const request = TestXmlHttpRequest.requests[0]!;
+      setConnected(firstEnvironment, false);
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(admission).toHaveBeenCalledTimes(4);
+      expect(request.aborted).toBe(false);
+      expect(readAttachmentUpload(image.id)).toMatchObject({ status: "uploading" });
+
+      const probeSignal = admission.mock.calls[3]![1]?.signal;
+      const settled = awaitAttachmentUploads([image.id]);
+      request.complete();
+      await settled;
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(probeSignal?.aborted).toBe(true);
+      expect(admission).toHaveBeenCalledTimes(4);
+      expect(readAttachmentUpload(image.id)).toMatchObject({ status: "ready" });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("reuploads an expired image while retaining other ready images", async () => {

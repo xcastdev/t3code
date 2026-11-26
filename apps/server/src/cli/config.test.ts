@@ -807,6 +807,62 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
     lan: Option.none<boolean>(),
   });
 
+  it.effect("enables the embedded relay only on opt-in and honors CLI precedence", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-cli-relay-" });
+      const flags = minimalDesktopFlags(baseDir);
+      const resolve = (
+        overrides: Partial<typeof flags> & {
+          readonly relayEnabled?: Option.Option<boolean>;
+          readonly relayPort?: Option.Option<number>;
+        },
+        env: Record<string, string>,
+      ) =>
+        resolveServerConfig({ ...flags, ...overrides }, Option.none()).pipe(
+          Effect.provide(
+            Layer.merge(NetService.layer, ConfigProvider.layer(ConfigProvider.fromEnv({ env }))),
+          ),
+        );
+
+      expect((yield* resolve({}, { T3CODE_RELAY_PORT: "4132" })).selfHostedRelay).toBeUndefined();
+      expect(
+        (yield* resolve({}, { T3CODE_RELAY_PORT: "invalid" })).selfHostedRelay,
+      ).toBeUndefined();
+      expect(
+        (yield* resolve({}, { T3CODE_RELAY_ENABLED: "true", T3CODE_RELAY_PORT: "4132" }))
+          .selfHostedRelay,
+      ).toEqual({ homeDirectory: path.join(baseDir, "relay"), port: 4132 });
+      const forwardingConfigPath = path.join(baseDir, "forwarding.json");
+      const forwarding = { T3CODE_RELAY_FORWARDING_CONFIG: forwardingConfigPath };
+      expect((yield* resolve({}, forwarding)).selfHostedRelay).toBeUndefined();
+      expect(
+        (yield* resolve({ relayEnabled: Option.some(true) }, forwarding)).selfHostedRelay,
+      ).toEqual({ homeDirectory: path.join(baseDir, "relay"), port: 0, forwardingConfigPath });
+      expect(
+        (yield* resolve({ relayEnabled: Option.some(true) }, { T3CODE_RELAY_ENABLED: "invalid" }))
+          .selfHostedRelay,
+      ).toEqual({
+        homeDirectory: path.join(baseDir, "relay"),
+        port: 0,
+      });
+      expect(
+        (yield* resolve({ relayEnabled: Option.some(false) }, { T3CODE_RELAY_ENABLED: "invalid" }))
+          .selfHostedRelay,
+      ).toBeUndefined();
+      expect(
+        (yield* resolve(
+          { relayPort: Option.some(5200) },
+          {
+            T3CODE_RELAY_ENABLED: "true",
+            T3CODE_RELAY_PORT: "invalid",
+          },
+        )).selfHostedRelay?.port,
+      ).toBe(5200);
+    }),
+  );
+
   it.effect("uses the automatic port selector only when no port is configured", () =>
     Effect.gen(function* () {
       const baseDir = yield* FileSystem.FileSystem.pipe(

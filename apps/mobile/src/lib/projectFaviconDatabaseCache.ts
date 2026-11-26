@@ -1,3 +1,4 @@
+import * as Base64 from "effect/encoding/Base64";
 import {
   createProjectFaviconCache as createSharedProjectFaviconCache,
   createProjectFaviconImageLoader,
@@ -7,6 +8,12 @@ import {
 } from "@t3tools/client-runtime/project-favicon-cache";
 import * as Effect from "effect/Effect";
 
+import {
+  readVerifiedRouteForDispatch,
+  routeOrigin,
+  verificationRequiredFor,
+} from "../connection/verified-route";
+import { fetchRoute } from "../native/verifiedNetwork";
 import * as MobileDatabase from "../persistence/mobile-database";
 
 const CACHE_KIND = "project-favicon";
@@ -27,7 +34,7 @@ const runDatabase = <A, E>(
 
 /** expo-image encodes only through disk cache; remove the temporary frame after reading bytes. */
 export async function downscaleProjectFavicon(
-  image: { readonly url: string },
+  image: { readonly url: string; readonly mimeType: string; readonly bytes: Uint8Array },
   signal: AbortSignal,
 ) {
   const [{ Image }, { File }] = await Promise.all([
@@ -36,7 +43,10 @@ export async function downscaleProjectFavicon(
   ]);
   for (const size of [PROJECT_FAVICON_THUMBNAIL_SIZE, PROJECT_FAVICON_THUMBNAIL_SIZE / 2]) {
     signal.throwIfAborted();
-    const decoded = await Image.loadAsync(image.url, { maxWidth: size, maxHeight: size });
+    const decoded = await Image.loadAsync(
+      `data:${image.mimeType};base64,${Base64.encode(image.bytes)}`,
+      { maxWidth: size, maxHeight: size },
+    );
     const cacheKey = `t3-favicon-thumbnail:${size}:${image.url}`;
     try {
       signal.throwIfAborted();
@@ -69,7 +79,7 @@ export async function downscaleProjectFavicon(
   throw new Error("Project icon thumbnail exceeds the cache limit.");
 }
 
-export const projectFaviconDatabaseCache = createSharedProjectFaviconCache({
+const cache = createSharedProjectFaviconCache({
   storage: {
     list: () =>
       runDatabase((database) =>
@@ -98,5 +108,18 @@ export const projectFaviconDatabaseCache = createSharedProjectFaviconCache({
     remove: (key, entry) =>
       runDatabase((database) => database.removeCache(entry.environmentId, CACHE_KIND, key)),
   },
-  load: createProjectFaviconImageLoader({ downscale: downscaleProjectFavicon }),
+  load: createProjectFaviconImageLoader({ fetch: fetchRoute, downscale: downscaleProjectFavicon }),
 });
+
+export const projectFaviconDatabaseCache = {
+  ...cache,
+  resolve: async (...args: Parameters<typeof cache.resolve>) => {
+    const url = await cache.resolve(...args);
+    if (url === null || verificationRequiredFor(url)) return null;
+    if (!routeOrigin(url)?.startsWith("https:")) return url;
+    return readVerifiedRouteForDispatch(url).then(
+      (binding) => (binding === null ? url : null),
+      () => null,
+    );
+  },
+};

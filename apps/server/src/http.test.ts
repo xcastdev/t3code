@@ -13,11 +13,12 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
+import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
 import { HttpClient, HttpClientRequest, HttpRouter, HttpServerResponse } from "effect/http";
 import { ASSET_ROUTE_PREFIX } from "./assets/AssetAccess.ts";
 import { ATTACHMENT_UPLOAD_ROUTE_PREFIX } from "./assets/AttachmentUpload.ts";
-import { openMediaFile } from "./assets/MediaFile.ts";
+import { makeMediaDownloadValidator, openMediaFile } from "./assets/MediaFile.ts";
 
 import {
   injectMcpAppCsp,
@@ -601,6 +602,34 @@ it.layer(
 });
 
 describe("video asset byte ranges", () => {
+  it.effect("stops an already dispatched Save range when its file changes", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-save-read-revision-" });
+      const filePath = path.join(directory, "clip.mp4");
+      yield* fs.writeFile(filePath, new Uint8Array(1024 ** 2));
+      const canonicalPath = yield* fs.realPath(filePath);
+      const file = yield* openMediaFile(canonicalPath);
+      if (!file) throw new Error("Expected an opened media file");
+      const validator = makeMediaDownloadValidator();
+      const validation = yield* validator.validate(canonicalPath, file, file.info, undefined);
+      expect(validation).toHaveProperty("etag");
+      let chunks = 0;
+      const failure = yield* validator
+        .stream(canonicalPath, file, file.info, 0n, file.info.size)
+        .pipe(
+          Stream.runForEach(() => {
+            chunks += 1;
+            return fs.utimes(canonicalPath, 1, 1);
+          }),
+          Effect.flip,
+        );
+      expect(failure._tag).toBe("MediaFileReadError");
+      expect(chunks).toBe(1);
+    }).pipe(Effect.provide(layerFileResponse)),
+  );
+
   it.effect("uses current descriptor metadata after an in-place truncate or extension", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

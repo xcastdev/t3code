@@ -993,7 +993,7 @@ it.live(
         expect(card.url).toBeUndefined();
         expect(card.environmentId).toBeUndefined();
 
-        // The user picks the box; their client knows a stale address for it first.
+        // The user picks the box and confirms the address to use.
         const pairing = yield* b.auth.issuePairingCredential();
         yield* a.requests.answer({
           threadId,
@@ -1002,7 +1002,8 @@ it.live(
             type: "link",
             environmentId: box.environmentId,
             label: "Box",
-            urls: ["http://127.0.0.1:9", b.url],
+            urls: [b.url, "http://127.0.0.1:9"],
+            addressConfirmed: true,
             access: "auto",
             pairingCode: pairing.credential,
           },

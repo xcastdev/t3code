@@ -59,18 +59,25 @@ describe("linkRequestAnswerInput", () => {
     urls: ["https://vps.ts.net", "http://10.0.0.2:3773"],
   };
 
-  it("answers with the machine picked and every address known for it", () => {
+  it("sends only the explicitly selected machine address", () => {
     expect(
       linkRequestAnswerInput(item, {
         type: "link",
-        target: vps,
+        target: { ...vps, selectedUrl: "http://10.0.0.2:3773" },
         access: "auto",
         pairingCode: "  abc  ",
       }),
     ).toEqual({
       threadId: item.threadId,
       turnItemId: item.id,
-      answer: { type: "link", ...vps, access: "auto", pairingCode: "abc" },
+      answer: {
+        type: "link",
+        ...vps,
+        urls: ["http://10.0.0.2:3773"],
+        addressConfirmed: true,
+        access: "auto",
+        pairingCode: "abc",
+      },
     });
     expect(
       linkRequestAnswerInput(item, {
@@ -91,6 +98,15 @@ describe("linkRequestAnswerInput", () => {
     ).toBeNull();
     expect(
       blank({ type: "link", target: { ...vps, urls: [] }, access: "auto", pairingCode: "abc" }),
+    ).toBeNull();
+    expect(blank({ type: "link", target: vps, access: "auto", pairingCode: "abc" })).toBeNull();
+    expect(
+      blank({
+        type: "link",
+        target: { ...vps, selectedUrl: "https://elsewhere.example" },
+        access: "auto",
+        pairingCode: "abc",
+      }),
     ).toBeNull();
   });
 });

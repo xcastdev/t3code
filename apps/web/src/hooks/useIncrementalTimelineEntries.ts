@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { shallow } from "zustand/vanilla/shallow";
 import {
   deriveTimelineEntriesFromVisibleTurnItemsWithState,
   type TimelineEntriesInput,
@@ -10,7 +11,8 @@ function sameInput(left: TimelineEntriesInput, right: TimelineEntriesInput): boo
     left.visibleTurnItems === right.visibleTurnItems &&
     left.optimisticMessages === right.optimisticMessages &&
     left.anchoredMessages === right.anchoredMessages &&
-    left.attachmentUrlById === right.attachmentUrlById &&
+    // Asset admission can rebuild the map while its URLs stay the same.
+    shallow(left.attachmentUrlById, right.attachmentUrlById) &&
     left.attempts === right.attempts &&
     left.nodes === right.nodes &&
     left.plans === right.plans

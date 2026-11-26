@@ -12,17 +12,22 @@ import {
   type ConnectionAttemptError,
   ConnectionTransientError,
   Connectivity,
+  hostedRelayAdmissionBlockedError,
   mapRemoteEnvironmentError,
   type PlatformConnectionRegistration,
   PrimaryConnectionRegistration,
   PrimaryConnectionTarget,
   sshTargetKey,
   Wakeups,
+  VerifiedRoutePolicy,
 } from "@t3tools/client-runtime/connection";
 import { bootstrapRemoteBearerSession } from "@t3tools/client-runtime/authorization";
 import { fetchRemoteEnvironmentDescriptor } from "@t3tools/client-runtime/environment";
 import { managedRelayAccountChanges, managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
-import { EnvironmentRpcRequestObserver } from "@t3tools/client-runtime/rpc";
+import {
+  EnvironmentRpcRequestObserver,
+  isHostedRelayAdmissionRequiredError,
+} from "@t3tools/client-runtime/rpc";
 import {
   AuthStandardClientScopes,
   type DesktopBridge,
@@ -68,6 +73,13 @@ import {
 } from "./desktopLocal";
 import * as ConnectionStorage from "./storage";
 import { clientPresentationMetadata } from "./clientMetadata";
+import {
+  assertHostedRelayAdmission,
+  clearHostedRelayAdmission,
+  subscribeHostedRelayAdmission,
+} from "./hostedRelayAdmission";
+import { fetchEnvironmentResource, requiresDesktopRelayTransport } from "./environmentTransport";
+import { verifiedRoutePolicy } from "./verifiedRoute";
 
 let nextObservedRpcRequestId = 0;
 
@@ -167,7 +179,22 @@ const layerWakeups = Wakeups.layer({
         ).pipe(Effect.asVoid),
       ),
       managedRelayAccountChanges(appAtomRegistry).pipe(
+        Stream.tap((accountId) =>
+          Effect.sync(() => {
+            if (accountId === null) clearHostedRelayAdmission();
+          }),
+        ),
         Stream.map(() => "credentials-changed" as const),
+      ),
+      Stream.callback<"route-admission-changed">((queue) =>
+        Effect.acquireRelease(
+          Effect.sync(() => {
+            return subscribeHostedRelayAdmission(() =>
+              Queue.offerUnsafe(queue, "route-admission-changed"),
+            );
+          }),
+          (unsubscribe) => Effect.sync(unsubscribe),
+        ).pipe(Effect.asVoid),
       ),
       networkPathChanges,
     ],
@@ -475,6 +502,36 @@ const layerCapabilities = Layer.effectContext(
       Context.add(ClientCapabilities.RelayDeviceIdentity, identity),
       Context.add(ClientCapabilities.ClientPresentation, presentation),
       Context.add(ClientCapabilities.SshEnvironmentGateway, ssh),
+      Context.add(VerifiedRoutePolicy, {
+        ...verifiedRoutePolicy,
+        requireAdmission: (enrollment) => {
+          if (window.desktopBridge !== undefined) {
+            return requiresDesktopRelayTransport(enrollment.httpsOrigin)
+              ? Effect.void
+              : Effect.fail(
+                  new ConnectionBlockedError({
+                    reason: "configuration",
+                    hop: "relay",
+                    detail: "The desktop main process has no transport for this relay.",
+                  }),
+                );
+          }
+          return Effect.try({
+            try: () => assertHostedRelayAdmission(enrollment),
+            catch: (cause) =>
+              isHostedRelayAdmissionRequiredError(cause)
+                ? hostedRelayAdmissionBlockedError(cause)
+                : new ConnectionBlockedError({
+                    reason: "configuration",
+                    hop: "relay",
+                    detail:
+                      cause instanceof Error
+                        ? cause.message
+                        : "Hosted relay admission is unavailable.",
+                  }),
+          });
+        },
+      }),
     );
   }),
 );
@@ -923,7 +980,13 @@ const layerPlatformConnectionSource = Layer.effect(
 
       yield* Ref.set(cacheRef, next);
       return registrations as ReadonlyArray<PlatformConnectionRegistration>;
-    }).pipe(Effect.provide(FetchHttpClient.layer));
+    }).pipe(
+      Effect.provide(
+        FetchHttpClient.layer.pipe(
+          Layer.provide(Layer.succeed(FetchHttpClient.Fetch, fetchEnvironmentResource)),
+        ),
+      ),
+    );
 
     return PlatformConnectionSource.PlatformConnectionSource.of({
       registrations: Stream.tick(PLATFORM_POLL_INTERVAL).pipe(
@@ -936,8 +999,13 @@ const layerPlatformConnectionSource = Layer.effect(
 const layerEnvironmentOwnedDataCleanup = Layer.succeed(
   Persistence.EnvironmentOwnedDataCleanup,
   Persistence.EnvironmentOwnedDataCleanup.of({
+    clearRoute: Effect.fn("Persistence.EnvironmentOwnedDataCleanup.clearRoute")(
+      (environmentId, origin) =>
+        Effect.sync(() => clearHostedRelayAdmission(environmentId, origin)),
+    ),
     clear: Effect.fn("Persistence.EnvironmentOwnedDataCleanup.clear")(function (environmentId) {
       return Effect.sync(() => {
+        clearHostedRelayAdmission(environmentId);
         clearComposerDraftsEnvironment(environmentId);
       });
     }),

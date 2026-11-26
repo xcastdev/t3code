@@ -88,6 +88,7 @@ const makeAssetUrlHarness = Effect.fn("TestAssetUrl.makeHarness")(function* (
   >();
   const makeSession = (environmentId: EnvironmentId) =>
     ({
+      httpBaseUrl: "https://environment.test",
       client: {
         [WS_METHODS.assetsCreateUrl]: () =>
           Effect.gen(function* () {
@@ -244,6 +245,7 @@ describe("desktop-local media fallback", () => {
     const supervisor = (environmentId: EnvironmentId) =>
       Effect.gen(function* () {
         const session = {
+          httpBaseUrl: environmentId === local ? "https://media-local.test" : "https://remote.test",
           client: {
             [WS_METHODS.assetsCreateUrl]: ({ resource }: { resource: AssetResource }) =>
               Effect.suspend(() => {

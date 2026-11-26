@@ -1,3 +1,5 @@
+import { SecureWebView } from "../../native/secureWebView";
+import { createVerifiedWebResourceScope } from "../../lib/verifiedWebResources";
 import { Button } from "../../components/ui/Button";
 import { AppActivityIndicator } from "../../components/ui/AppActivityIndicator";
 import * as Dialog from "../../components/ui/Dialog";
@@ -27,13 +29,18 @@ import { useNavigation } from "@react-navigation/native";
 import { useEffect, useEffectEvent, useRef, useState } from "react";
 import { Platform, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { WebView, type WebViewMessageEvent } from "react-native-webview";
+import { type WebView, type WebViewMessageEvent } from "react-native-webview";
 
 import { AppText as Text } from "../../components/ui/AppText";
 import { shareGeneratedAttachment } from "../../lib/attachmentDownload";
 import { mobileHtmlRenderTheme } from "../../lib/htmlRenderTheme";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
 import { uuidv4 } from "../../lib/uuid";
+import {
+  framedWebDocument,
+  readFramedWebMessage,
+  useVerifiedWebDocument,
+} from "../../lib/verifiedWebDocument";
 import { webViewDecelerationRate } from "../../lib/webViewDecelerationRate";
 import { useAssetUrlState } from "../../state/assets";
 import { appAtomRegistry } from "../../state/atom-registry";
@@ -46,25 +53,13 @@ import { useAtomCommand } from "../../state/use-atom-command";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
 import { MCP_APP_INLINE_MAX_HEIGHT, mcpAppInlineHeight } from "./mcpAppSizing";
 
-const ROW_BOTTOM_MARGIN = 8;
-
-// Android exposes `ReactNativeWebView` to every frame, so a frame nested in the
-// app could post to React Native directly. The outer page therefore wraps what
-// it relays with a secret only it holds, and React Native drops anything else.
-// The relay also attests activation; the sandboxed app cannot set that flag.
-function outerDocument(src: string, allow: string, secret: string) {
-  const attribute = (value: string) =>
-    value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
-  return `<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
-<style>html,body{margin:0;height:100%;background:transparent}iframe{border:0;display:block;width:100%;height:100%}</style></head>
-<body><iframe id="app" sandbox="allow-scripts allow-forms" allow="${attribute(allow)}"></iframe>
-<script>(function(){var frame=document.getElementById("app"),secret=${JSON.stringify(secret)},loads=0,live=true;
-var send=function(m){var u=navigator.userActivation;window.ReactNativeWebView.postMessage(JSON.stringify({secret:secret,active:!!(u&&u.isActive)&&document.activeElement===frame,message:m}));};
-frame.addEventListener("load",function(){loads+=1;if(loads>1&&live){live=false;send({t3:"navigated"});}});
-window.addEventListener("message",function(e){if(live&&e.source===frame.contentWindow)send(e.data);});
-window.__t3McpAppReceive=function(m){live&&frame.contentWindow&&frame.contentWindow.postMessage(m,"*");};
-frame.src=${JSON.stringify(src).replace(/</g, "\\u003c")};})();</script></body></html>`;
+function declaresIssuer(domains: readonly string[] | undefined, issuer: string | null) {
+  if (issuer === null) return false;
+  const origin = new URL(issuer).origin;
+  return domains?.some((domain) => domain === origin || domain === `${origin}/`) === true;
 }
+
+const ROW_BOTTOM_MARGIN = 8;
 
 const commandFailure = (result: {
   readonly cause: Parameters<typeof squashAtomCommandFailure>[0]["cause"];
@@ -158,7 +153,7 @@ export function ThreadMcpApp(props: {
     disposition: "inline" as const,
     renderIntent: "mcp-app" as const,
   };
-  const asset = useAssetUrlState(props.environmentId, resource);
+  const asset = useAssetUrlState(props.environmentId, resource, undefined, "web-document");
   if (uri === null && asset._tag === "Success") setUri(asset.url);
   const [generation, setGeneration] = useState(0);
   const [crashed, setCrashed] = useState(false);
@@ -263,6 +258,15 @@ export function ThreadMcpApp(props: {
       { immediate: true },
     );
   }, [host, detailAtom]);
+  const assetsAllowed = declaresIssuer(app.csp?.resourceDomains, uri);
+  const fetchAllowed = declaresIssuer(app.csp?.connectDomains, uri);
+  const access =
+    assetsAllowed || fetchAllowed
+      ? { assets: assetsAllowed, fetch: fetchAllowed, framed: true }
+      : undefined;
+  const document = useVerifiedWebDocument(uri, access);
+  const resourceAccess = document.kind === "local" ? document.resourceAccess : undefined;
+  const resourceScope = useRef<ReturnType<typeof createVerifiedWebResourceScope> | null>(null);
   const userActive = useRef(false);
   // Teardown completions check this so a replaced document's late callback is ignored.
   const currentHost = useRef<McpAppHost | null>(null);
@@ -273,6 +277,15 @@ export function ThreadMcpApp(props: {
   // are read through `latest`, never captured.
   const attachWebView = (view: WebView<object> | null) => {
     if (view === null) return;
+    const resources =
+      uri && resourceAccess
+        ? createVerifiedWebResourceScope(
+            uri,
+            (script) => view.injectJavaScript(script),
+            resourceAccess,
+          )
+        : null;
+    resourceScope.current = resources;
     const reloadInline = () => {
       setLoaded(false);
       setHeight(MCP_APP_INLINE_MAX_HEIGHT);
@@ -479,6 +492,8 @@ export function ThreadMcpApp(props: {
     setHost(documentHost);
     currentHost.current = documentHost;
     return () => {
+      resources?.stop();
+      if (resourceScope.current === resources) resourceScope.current = null;
       if (currentHost.current === documentHost) currentHost.current = null;
       // An unmount cannot wait: the request goes out before the view does.
       void documentHost.teardown();
@@ -486,10 +501,16 @@ export function ThreadMcpApp(props: {
     };
   };
 
+  const isolated = document.kind === "local";
+  const inner = isolated
+    ? { html: document.html }
+    : document.kind === "direct" && uri !== null
+      ? { uri }
+      : null;
   const source =
-    uri === null
+    inner === null
       ? null
-      : { html: outerDocument(uri, mcpAppAllowAttribute(app.permissions), secret) };
+      : { html: framedWebDocument(inner, mcpAppAllowAttribute(app.permissions), secret) };
 
   if (presentedFullscreen) {
     return (
@@ -533,13 +554,15 @@ export function ThreadMcpApp(props: {
             The {app.server} app left its page and was stopped
           </Text>
         </View>
-      ) : uri !== null && !crashed ? (
-        <WebView<object>
+      ) : source !== null && !crashed ? (
+        <SecureWebView
+          verified={isolated}
+          onFenceError={() => setCrashed(true)}
           key={`${documentKey}:${generation}:${uri}`}
           ref={attachWebView}
           onContentProcessDidTerminate={restart}
           onRenderProcessGone={restart}
-          source={source!}
+          source={source}
           accessibilityLabel={`${app.server} app`}
           style={{ flex: 1, backgroundColor: "transparent" }}
           nestedScrollEnabled
@@ -556,30 +579,26 @@ export function ThreadMcpApp(props: {
           onError={() => setCrashed(true)}
           onHttpError={() => setCrashed(true)}
           onMessage={(event: WebViewMessageEvent) => {
-            let envelope: unknown;
-            try {
-              envelope = JSON.parse(event.nativeEvent.data);
-            } catch {
-              return;
-            }
-            if (!Predicate.isObject(envelope) || envelope.secret !== secret) return;
-            const message = envelope.message;
+            const envelope = readFramedWebMessage(event.nativeEvent.data, secret);
+            if (envelope === null) return;
+            const { message, active } = envelope;
+            if (resourceScope.current?.receive(message)) return;
             if (Predicate.isObject(message) && message.t3 === "navigated") {
               host?.dispose();
               setNavigatedAway(true);
               return;
             }
-            userActive.current = envelope.active === true;
+            userActive.current = active;
             host?.receive(message);
             userActive.current = false;
           }}
         />
-      ) : asset._tag === "Failure" || crashed ? (
+      ) : asset._tag === "Failure" || document.kind === "failed" || crashed ? (
         <View className="flex-1 items-center justify-center">
           <Text className="text-sm text-foreground-muted">Unable to load the {app.server} app</Text>
         </View>
       ) : null}
-      {uri !== null && !loaded && !crashed && !navigatedAway ? (
+      {uri !== null && !loaded && !crashed && !navigatedAway && document.kind !== "failed" ? (
         <View pointerEvents="none" className="absolute inset-0 items-center justify-center">
           <AppActivityIndicator />
         </View>

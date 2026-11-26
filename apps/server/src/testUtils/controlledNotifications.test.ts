@@ -8,6 +8,7 @@ import * as Sqlite from "../persistence/Sqlite.ts";
 import * as Settings from "../serverSettings.ts";
 import * as Gateway from "../notifications/ExternalNotificationGateway.ts";
 import * as Dispatcher from "../notifications/ExternalNotificationDispatcher.ts";
+import { notificationEnvironment } from "../notifications/externalNotificationTestFixtures.ts";
 import { layerControlledFreshSecrets } from "./controlledUpgradeApp.ts";
 import {
   controlledNotificationDestinationId,
@@ -67,14 +68,11 @@ it.effect(
       );
       const dispatcher = yield* Dispatcher.ExternalNotificationDispatcher;
       const fact: Dispatcher.ExternalNotificationFact = {
-        kind: "notification",
-        messageId: "fixture-fact",
+        eventType: "update",
+        occurrenceId: "fixture-fact",
         threadId: "fixture-thread",
-        notification: {
-          source: { kind: "background_task" },
-          outcome: "updated",
-          summary: "Private fixture detail",
-        },
+        timestamp: DateTime.formatIso(now),
+        title: "Private fixture detail",
       };
       yield* dispatcher.notifyCommitted(fact);
       yield* dispatcher.drain;
@@ -108,6 +106,7 @@ it.effect(
             layerControlledNotificationPorts.pipe(Layer.provide(layerControlledFreshSecrets)),
           ),
           Layer.provideMerge(Sessions.layer),
+          Layer.provide(notificationEnvironment()),
           Layer.provide(Sqlite.layerMemory),
         ),
       ),

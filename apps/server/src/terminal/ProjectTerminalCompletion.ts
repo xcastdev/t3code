@@ -123,6 +123,7 @@ export const deliverProjectTerminalCompletion = Effect.fn("ProjectTerminalComple
         recipientThreadId: subscription.recipient_thread_id,
       });
       const digest = NodeCrypto.createHash("sha256").update(identity).digest("hex");
+      const wakeMessageId = MessageId.make(`project-terminal:${digest}`);
       const authority = yield* decodeCompletionAuthority(subscription.authority_json).pipe(
         Effect.result,
       );
@@ -177,6 +178,7 @@ export const deliverProjectTerminalCompletion = Effect.fn("ProjectTerminalComple
           projectId: terminal.projectId,
           threadId: ThreadId.make(subscription.recipient_thread_id),
           turnItemId: TurnItemId.make(`project-terminal:${digest}`),
+          ...(subscription.mode === "noticeAndWake" ? { sourceMessageId: wakeMessageId } : {}),
           notification: {
             source: { kind: "background_task" },
             outcome: terminal.exitCode === 0 ? "completed" : "failed",
@@ -205,7 +207,7 @@ export const deliverProjectTerminalCompletion = Effect.fn("ProjectTerminalComple
                   : { retainedOwner: null }),
                 commandId: CommandId.make(`project-terminal:${digest}`),
                 threadId: ThreadId.make(subscription.recipient_thread_id),
-                messageId: MessageId.make(`project-terminal:${digest}`),
+                messageId: wakeMessageId,
                 text: `Project terminal ${terminal.label} exited with code ${terminal.exitCode ?? "unknown"}.`,
                 notification: {
                   source: { kind: "background_task" },

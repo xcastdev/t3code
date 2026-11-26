@@ -6,7 +6,7 @@ import { videoMimeType } from "@t3tools/shared/video";
 import { useAtomValue } from "@effect/atom-react";
 import { AsyncResult, Atom } from "effect/reactivity";
 import { Paths } from "expo-file-system";
-import { Image, Pressable, ScrollView, View } from "react-native";
+import { Alert, Image, Pressable, ScrollView, View } from "react-native";
 
 import { AppText as Text } from "./ui/AppText";
 import { MaterializedPreviewKey, materializedPreviewAtom } from "../lib/composerImagePreview";
@@ -28,7 +28,9 @@ import type { EnvironmentId } from "@t3tools/contracts";
 import {
   retryComposerAttachmentUpload,
   useComposerAttachmentUploadState,
+  useComposerAttachmentWithUnknownUpload,
 } from "../state/composer-attachment-uploads";
+import { useAttachmentUploadOutcomeUnknownMessage } from "./useAttachmentUploadOutcomeUnknownMessage";
 
 export interface ComposerAttachmentStripProps {
   readonly environmentId?: EnvironmentId;
@@ -61,32 +63,46 @@ type ComposerAttachmentThumbnailProps = {
 
 export function ComposerAttachmentThumbnail(props: ComposerAttachmentThumbnailProps) {
   const upload = useComposerAttachmentUploadState(props.environmentId, props.attachment.id);
+  const outcomeUnknownMessage = useAttachmentUploadOutcomeUnknownMessage();
+  const uploadWarning =
+    upload?.status === "outcome-unknown" ? outcomeUnknownMessage(props.attachment.name) : undefined;
   return (
     <View style={{ width: props.size, height: props.size }}>
       <ComposerAttachmentContent {...props} />
       {upload && upload.status !== "ready" ? (
         <Pressable
-          accessibilityRole={upload.status === "failed" ? "button" : "text"}
+          accessibilityRole={upload.status === "uploading" ? "text" : "button"}
           accessibilityLabel={
             upload.status === "failed"
               ? `Retry uploading ${props.attachment.name}`
-              : `Uploading ${props.attachment.name}, ${Math.floor(upload.progress * 100)}%`
+              : upload.status === "outcome-unknown"
+                ? uploadWarning
+                : `Uploading ${props.attachment.name}, ${Math.floor(upload.progress * 100)}%`
           }
           accessibilityHint={upload.status === "failed" ? upload.reason : undefined}
-          disabled={upload.status !== "failed"}
-          onPress={() =>
-            props.environmentId &&
-            retryComposerAttachmentUpload(props.environmentId, props.attachment.id)
-          }
+          disabled={upload.status === "uploading"}
+          onPress={() => {
+            if (upload.status === "outcome-unknown") {
+              Alert.alert(props.attachment.name, uploadWarning);
+            } else if (props.environmentId) {
+              retryComposerAttachmentUpload(props.environmentId, props.attachment.id);
+            }
+          }}
           className="absolute bottom-0.5 left-0.5 flex-row items-center gap-0.5 rounded-full bg-black/70 px-1 py-0.5"
         >
           <SymbolView
-            name={upload.status === "failed" ? "arrow.clockwise" : "arrow.up"}
+            name={
+              upload.status === "failed"
+                ? "arrow.clockwise"
+                : upload.status === "outcome-unknown"
+                  ? "exclamationmark.triangle"
+                  : "arrow.up"
+            }
             size={props.compact ? 8 : 10}
             tintColor="#ffffff"
             type="monochrome"
           />
-          {!props.compact ? (
+          {!props.compact && upload.status !== "outcome-unknown" ? (
             <Text className="text-2xs text-white">
               {upload.status === "failed" ? "Retry" : `${Math.floor(upload.progress * 100)}%`}
             </Text>
@@ -278,6 +294,11 @@ function ComposerVideoAttachment(props: {
 }
 
 export function ComposerAttachmentStrip(props: ComposerAttachmentStripProps) {
+  const unknownUpload = useComposerAttachmentWithUnknownUpload(
+    props.environmentId,
+    props.attachments,
+  );
+  const outcomeUnknownMessage = useAttachmentUploadOutcomeUnknownMessage();
   const gallery = composerImageGallery(props.attachments);
   const size = props.imageSize ?? 72;
   const radius = props.imageBorderRadius ?? 16;
@@ -338,6 +359,11 @@ export function ComposerAttachmentStrip(props: ComposerAttachmentStripProps) {
           ))}
         </View>
       </ScrollView>
+      {unknownUpload ? (
+        <Text className="text-xs text-foreground-muted">
+          {outcomeUnknownMessage(unknownUpload.name)}
+        </Text>
+      ) : null}
     </FilePreviewGallery>
   );
 }

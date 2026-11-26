@@ -206,6 +206,8 @@ it.layer(NodeServices.layer)("t3 install", (it) => {
       yield* offer(false, { foreground: false });
       yield* offer(false, { args: ["connect", "--help"] });
       yield* offer(false, { args: ["--log-level", "debug", "install"] });
+      yield* offer(false, { args: ["environment", "lookup", "Peer"] });
+      yield* offer(false, { args: ["--log-level", "debug", "environment", "lookup", "Peer"] });
       yield* offer(false, { args: ["status", "--json"] });
       yield* offer(false, { args: ["up", "--yes"] });
       yield* offer(false, { args: ["status", "--json=true"] });

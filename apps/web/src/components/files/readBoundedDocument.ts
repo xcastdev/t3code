@@ -3,8 +3,13 @@ export async function readBoundedDocument(
   signal: AbortSignal,
   limit: number,
   cache: RequestCache = "default",
+  verified = false,
 ) {
-  const response = await fetch(src, { signal, cache });
+  const response = await fetch(src, {
+    signal,
+    cache,
+    ...(verified ? { redirect: "error", credentials: "omit", referrerPolicy: "no-referrer" } : {}),
+  });
   if (!response.ok || Number(response.headers.get("content-length")) > limit)
     throw new Error("This file is unavailable or too large to preview.");
   const reader = response.body?.getReader();

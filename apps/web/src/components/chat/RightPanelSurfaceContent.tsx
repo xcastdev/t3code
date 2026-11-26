@@ -34,6 +34,17 @@ const DiffPanel = lazy(() => import("../DiffPanel"));
 const DevicePanel = lazy(() =>
   import("../device/DevicePanel").then((module) => ({ default: module.DevicePanel })),
 );
+const BrowserDocumentFrame = lazy(() =>
+  import("../files/BrowserDocumentFrame").then((module) => ({
+    default: module.BrowserDocumentFrame,
+  })),
+);
+
+const AttachmentFilePreview = lazy(() =>
+  import("../files/AttachmentFilePreview").then((module) => ({
+    default: module.AttachmentFilePreview,
+  })),
+);
 const FilePreviewPanel = lazy(() => import("../files/FilePreviewPanel"));
 import type { SourceControlPanelProps } from "../sourceControl/SourceControlPanel";
 
@@ -278,6 +289,37 @@ export function RightPanelSurfaceContent(props: {
       );
     case "files":
     case "file": {
+      if (surface.kind === "file" && surface.localPreview !== undefined) {
+        const name = surface.relativePath.split(/[\\/]/).at(-1) ?? surface.relativePath;
+        const file = surface.localPreview;
+        if (typeof file === "string") {
+          return (
+            <Suspense fallback={null}>
+              <BrowserDocumentFrame
+                key={surface.id}
+                src={file}
+                title={name}
+                pdf={/\.pdf$/i.test(name)}
+                environmentId={threadRef.environmentId}
+                visible={visible}
+                verified
+              />
+            </Suspense>
+          );
+        }
+        return (
+          <Suspense fallback={null}>
+            <AttachmentFilePreview
+              key={surface.id}
+              name={name}
+              origin="File preview"
+              {...(file instanceof Blob
+                ? { mimeType: file.type, sizeBytes: file.size, file, verifiedLocal: true }
+                : { mimeType: "application/octet-stream", sizeBytes: 0, asset: file })}
+            />
+          </Suspense>
+        );
+      }
       const files = props.files;
       const attachment = surface.kind === "file" ? surface.attachment : undefined;
       if (!attachment && (files.projectName === null || !files.workspaceRoot)) return null;

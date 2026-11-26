@@ -32,6 +32,7 @@ export const config: VercelConfig = {
   installCommand:
     "npm install -g vite-plus && vp install --ignore-scripts --filter '@t3tools/scripts...' --filter '@t3tools/web...'",
   routes: [
+    { src: "/__t3code/media/(.*)", headers: { "Cache-Control": "no-store" }, status: 404 },
     {
       src: "/__t3code/channel",
       has: [matchers.query("channel", "nightly")],

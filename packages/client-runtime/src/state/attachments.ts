@@ -9,6 +9,7 @@ import {
 import * as Effect from "effect/Effect";
 import type { AsyncResult, Atom, AtomRegistry } from "effect/reactivity";
 
+import { requestInSession, requestSignedTransferUrl } from "../rpc/client.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import {
   createEnvironmentRpcCommand,
@@ -25,6 +26,10 @@ export function createAttachmentEnvironmentAtoms<R, E>(
     createUploadUrl: createEnvironmentRpcCommand(runtime, {
       label: "environment-command:attachments:create-upload-url",
       tag: WS_METHODS.attachmentsCreateUploadUrl,
+      execute: (input) =>
+        requestSignedTransferUrl((session) =>
+          requestInSession(session, WS_METHODS.attachmentsCreateUploadUrl, input),
+        ),
     }),
     remove: createEnvironmentRpcCommand(runtime, {
       label: "environment-command:attachments:delete",
@@ -89,7 +94,7 @@ export function verifyPersistedAttachmentUpload<A, E>(input: {
 
 type AttachmentCreateUploadUrlCommand<E> = AtomCommand<
   { readonly environmentId: EnvironmentId; readonly input: AttachmentCreateUploadUrlInput },
-  AttachmentCreateUploadUrlResult,
+  AttachmentCreateUploadUrlResult & { readonly verificationRequired?: true },
   E
 >;
 
@@ -99,18 +104,24 @@ type AttachmentRemoveCommand<E> = AtomCommand<
   E
 >;
 
-export function deletePendingAttachmentUpload<E>(input: {
+type PendingAttachmentRemoval<E> = {
   readonly registry: AtomRegistry.AtomRegistry;
   readonly remove: AttachmentRemoveCommand<E>;
   readonly environmentId: EnvironmentId;
   readonly attachmentId: string;
-}): void {
-  void runAtomCommand(
+};
+
+function requestPendingAttachmentRemoval<E>(input: PendingAttachmentRemoval<E>) {
+  return runAtomCommand(
     input.registry,
     input.remove,
     { environmentId: input.environmentId, input: { attachmentId: input.attachmentId } },
     { reportFailure: false, reportDefect: false },
   );
+}
+
+export function deletePendingAttachmentUpload<E>(input: PendingAttachmentRemoval<E>): void {
+  void requestPendingAttachmentRemoval(input);
 }
 
 export type AttachmentUploadCycleResult =
@@ -124,8 +135,8 @@ export type AttachmentUploadCycleResult =
 
 /**
  * Mints an upload slot and sends the bytes. A failure keeps the minted id in the result so the
- * caller decides between retry and release. Interrupting the cycle aborts the transfer and
- * deletes the fresh mint, including when the interruption arrives while minting.
+ * caller decides between retry and release. Interruption aborts the transfer and waits for
+ * its cleanup, including when the interruption arrives while minting.
  */
 export function runAttachmentUploadCycle<E, RE, TE>(input: {
   readonly registry: AtomRegistry.AtomRegistry;
@@ -133,9 +144,15 @@ export function runAttachmentUploadCycle<E, RE, TE>(input: {
   readonly remove: AttachmentRemoveCommand<RE>;
   readonly environmentId: EnvironmentId;
   readonly upload: AttachmentCreateUploadUrlInput;
-  readonly resolveUploadUrl: (relativeUrl: string) => string | null;
+  readonly resolveUploadUrl: (issuedUrl: string, verificationRequired?: true) => string | null;
   /** Sends the bytes; interrupting it aborts the transfer. */
-  readonly transport: (url: string) => Effect.Effect<void, TE>;
+  readonly transport: (
+    url: string,
+    verificationRequired: true | undefined,
+    attachmentId: string,
+  ) => Effect.Effect<void, TE>;
+  /** Reconciles an interrupted transfer. An absent effect uses ordinary pending deletion. */
+  readonly onInterrupted?: (attachmentId: string) => Effect.Effect<void> | undefined;
 }): Effect.Effect<AttachmentUploadCycleResult> {
   return Effect.uninterruptibleMask((restore) =>
     Effect.gen(function* () {
@@ -158,7 +175,8 @@ export function runAttachmentUploadCycle<E, RE, TE>(input: {
       const attachmentId = minted.value.attachmentId;
       return yield* restore(
         Effect.suspend(() => {
-          const url = input.resolveUploadUrl(minted.value.relativeUrl);
+          const { relativeUrl, verificationRequired } = minted.value;
+          const url = input.resolveUploadUrl(relativeUrl, verificationRequired);
           if (!url) {
             return Effect.succeed<AttachmentUploadCycleResult>({
               status: "failed",
@@ -167,7 +185,7 @@ export function runAttachmentUploadCycle<E, RE, TE>(input: {
               error: new Error("The environment is not connected."),
             });
           }
-          return input.transport(url).pipe(
+          return input.transport(url, verificationRequired, attachmentId).pipe(
             Effect.as<AttachmentUploadCycleResult>({ status: "uploaded", attachmentId }),
             Effect.catch((error) =>
               Effect.succeed<AttachmentUploadCycleResult>({
@@ -180,15 +198,12 @@ export function runAttachmentUploadCycle<E, RE, TE>(input: {
           );
         }),
       ).pipe(
-        Effect.onInterrupt(() =>
-          Effect.sync(() =>
-            deletePendingAttachmentUpload({
-              registry: input.registry,
-              remove: input.remove,
-              environmentId: input.environmentId,
-              attachmentId,
-            }),
-          ),
+        Effect.onInterrupt(
+          () =>
+            input.onInterrupted?.(attachmentId) ??
+            Effect.promise(() => requestPendingAttachmentRemoval({ ...input, attachmentId })).pipe(
+              Effect.asVoid,
+            ),
         ),
       );
     }),

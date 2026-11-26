@@ -9,6 +9,7 @@ import * as ManagedRelayLayer from "../features/cloud/managedRelayLayer";
 import { resolveCloudPublicConfig } from "../features/cloud/publicConfig";
 import * as Tracing from "../features/observability/tracing";
 import * as NativeWebSocket from "../native/nativeWebSocket";
+import { fetchRoute } from "../native/verifiedNetwork";
 import * as Persistence from "../persistence/layer";
 import { disposeOnFoundationReplace, type FoundationHotModule } from "./foundation-fast-refresh";
 import { whenProtectedDataAvailable } from "./protectedData";
@@ -19,7 +20,7 @@ function configuredRelayUrl(): string {
   return resolveCloudPublicConfig().relay.url ?? "http://relay.invalid";
 }
 
-const layerHttpClient = layerRemoteHttpClient(fetch);
+const layerHttpClient = layerRemoteHttpClient(fetchRoute);
 
 type RuntimeLayerSource =
   | ReturnType<typeof ManagedRelayLayer.layer>

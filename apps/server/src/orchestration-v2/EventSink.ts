@@ -43,6 +43,8 @@ import * as ProjectStore from "./ProjectStore.ts";
 import * as RunAdmission from "./RunAdmission.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 
+const encodeThreadIds = Schema.encodeSync(Schema.fromJsonString(Schema.Array(ThreadId)));
+
 export class EventSinkWriteError extends Schema.TaggedError<EventSinkWriteError>()(
   "EventSinkWriteError",
   {
@@ -468,6 +470,63 @@ const layerBase: Layer.Layer<
       },
     );
 
+    const captureNotificationProjects = Effect.fn("EventSink.captureNotificationProjects")(
+      function* (
+        events: ReadonlyArray<OrchestrationV2DomainEvent>,
+        createdThreads: ReadonlySet<ThreadId>,
+      ) {
+        const notifications = new Set(
+          events.filter((event) => {
+            switch (event.type) {
+              case "message.updated":
+                return event.payload.notification !== undefined && !event.payload.streaming;
+              case "turn-item.updated":
+                return event.payload.type === "notification";
+              case "runtime-request.updated":
+                return (
+                  event.payload.status === "pending" &&
+                  event.payload.kind !== "dynamic_tool_call" &&
+                  event.payload.kind !== "auth_refresh"
+                );
+              case "run.updated":
+                return (
+                  event.payload.startedAt !== null &&
+                  event.payload.completedAt !== null &&
+                  event.payload.delegatedTaskId === undefined &&
+                  (event.payload.status === "completed" ||
+                    event.payload.status === "interrupted" ||
+                    event.payload.status === "failed" ||
+                    event.payload.status === "cancelled")
+                );
+              default:
+                return false;
+            }
+          }),
+        );
+        if (notifications.size === 0) return events;
+        const existingThreads = Array.from(
+          new Set([...notifications].map(({ threadId }) => threadId)),
+        ).filter((threadId) => !createdThreads.has(threadId));
+        const rows =
+          existingThreads.length === 0
+            ? []
+            : yield* sql<{ readonly thread_id: ThreadId; readonly project_id: ProjectId }>`
+              SELECT thread_id, project_id FROM orchestration_v2_projection_threads
+              WHERE thread_id IN (SELECT value FROM json_each(${encodeThreadIds(existingThreads)}))
+            `;
+        const projectByThread = new Map(rows.map((row) => [row.thread_id, row.project_id]));
+        return events.map((event) => {
+          // Project adoption can be part of the same batch as a notification.
+          if (event.type === "thread.created" || event.type === "thread.metadata-updated") {
+            projectByThread.set(event.threadId, event.payload.projectId);
+          }
+          if (!notifications.has(event)) return event;
+          const projectId = projectByThread.get(event.threadId);
+          return projectId === undefined ? event : { ...event, projectId };
+        });
+      },
+    );
+
     const normalizeEvents = (events: ReadonlyArray<OrchestrationV2DomainEvent>) => {
       const createdThreads = new Set(
         events.flatMap((event) => (event.type === "thread.created" ? [event.threadId] : [])),
@@ -541,6 +600,8 @@ const layerBase: Layer.Layer<
                   )
                 : Effect.succeed(event),
         { concurrency: 1 },
+      ).pipe(
+        Effect.flatMap((normalized) => captureNotificationProjects(normalized, createdThreads)),
       );
     };
 

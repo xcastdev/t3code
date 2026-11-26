@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import { ipcMain, session } from "electron";
 
 import * as NetService from "@t3tools/shared/Net";
 import * as SecureRandom from "effect/crypto/SecureRandom";
@@ -11,6 +12,13 @@ import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as ElectronDialog from "../electron/ElectronDialog.ts";
 import * as ElectronProtocol from "../electron/ElectronProtocol.ts";
 import * as ElectronSafeStorage from "../electron/ElectronSafeStorage.ts";
+import { installVerifiedRoute, type VerifiedRouteEnrollment } from "../electron/VerifiedRoute.ts";
+import * as ElectronWindow from "../electron/ElectronWindow.ts";
+import { installDesktopRelayIpc } from "../electron/DesktopRelayIpc.ts";
+import {
+  makeDesktopRelayTransport,
+  type DesktopRelayTransport,
+} from "../electron/DesktopRelayTransport.ts";
 import { installDesktopIpcHandlers } from "../ipc/DesktopIpcHandlers.ts";
 import * as DesktopAppActivation from "./DesktopAppActivation.ts";
 import * as DesktopAppIdentity from "./DesktopAppIdentity.ts";
@@ -172,7 +180,10 @@ const stopAllPoolInstances = Effect.fn("desktop.app.stopAllPoolInstances")(
 );
 
 // Spawns the local backend as soon as the protocol, IPC, and legacy storage that every window needs exist.
-const startLocalBackend = Effect.gen(function* () {
+const startLocalBackend = Effect.fn("desktop.startLocalBackend")(function* (
+  verifiedRoutes: ReadonlyArray<VerifiedRouteEnrollment>,
+  relayTransport: DesktopRelayTransport,
+) {
   const state = yield* DesktopState.DesktopState;
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const desktopSettings = yield* DesktopAppSettings.DesktopAppSettings;
@@ -188,7 +199,28 @@ const startLocalBackend = Effect.gen(function* () {
       : { assetDirectory: environment.clientAssetsDir }),
     clerkFrontendApiHostname: DesktopClerk.desktopClerkFrontendApiHostname,
   });
-  yield* installDesktopIpcHandlers();
+  if (relayTransport.origins.length === 0) {
+    yield* installDesktopIpcHandlers(verifiedRoutes);
+  } else {
+    const windows = yield* ElectronWindow.ElectronWindow;
+    const runSync = Effect.runSyncWith(yield* Effect.context());
+    const relayIpc = yield* Effect.acquireRelease(
+      Effect.sync(() =>
+        installDesktopRelayIpc(
+          ipcMain,
+          session.defaultSession,
+          ElectronProtocol.getDesktopUrl(environment.isDevelopment),
+          () => Option.getOrUndefined(runSync(windows.main)),
+          relayTransport,
+        ),
+      ),
+      (registration) => Effect.sync(registration.close),
+    );
+    yield* installDesktopIpcHandlers(verifiedRoutes, {
+      transport: relayTransport,
+      ownerFor: relayIpc.ownerFor,
+    });
+  }
   yield* logBootstrapInfo("bootstrap ipc handlers registered");
   // Before any window: the preload merges these items before the app reads storage.
   yield* (yield* DesktopLegacyLocalStorage.DesktopLegacyLocalStorage).load(
@@ -278,7 +310,7 @@ const startLocalBackend = Effect.gen(function* () {
     ),
   );
   return true;
-}).pipe(Effect.withSpan("desktop.startLocalBackend"));
+});
 
 const bootstrap = Effect.fn("desktop.bootstrap")(function* (backendStarted: boolean) {
   const state = yield* DesktopState.DesktopState;
@@ -399,6 +431,12 @@ const startup = Effect.gen(function* () {
     Effect.withSpan("desktop.electron.whenReady"),
     Effect.catchCause((cause) => fatalStartupCause("whenReady", cause)),
   );
+  const { verifiedRoutes } = preReadyElectronOptions;
+  if (verifiedRoutes.length > 0) {
+    yield* Effect.sync(() => installVerifiedRoute(session.defaultSession, verifiedRoutes)).pipe(
+      Effect.catchCause((cause) => fatalStartupCause("verified route", cause)),
+    );
+  }
   yield* logStartupInfo("app ready");
   if (environment.platform === "linux") {
     const selectedBackend = yield* safeStorage.selectedStorageBackend;
@@ -411,7 +449,11 @@ const startup = Effect.gen(function* () {
   yield* updates.configure;
   yield* DesktopRemoteUpdates.listen;
   yield* DesktopStartupRecovery.listen;
-  const backendStarted = yield* startLocalBackend.pipe(
+  const relayTransport = makeDesktopRelayTransport(
+    verifiedRoutes,
+    preReadyElectronOptions.relayCredentials ?? new Map(),
+  );
+  const backendStarted = yield* startLocalBackend(verifiedRoutes, relayTransport).pipe(
     Effect.catchCause((cause) => fatalStartupCause("bootstrap", cause)),
   );
   yield* previewPasskeys.configure;

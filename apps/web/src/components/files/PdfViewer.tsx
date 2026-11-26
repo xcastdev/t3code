@@ -132,6 +132,7 @@ function PdfPage(props: {
 export default function PdfViewer(props: {
   src: string;
   title: string;
+  verified?: boolean;
   positionKey?: string;
   initialView?: PdfViewState;
   onViewChange?: (view: PdfViewState) => void;
@@ -174,6 +175,7 @@ export default function PdfViewer(props: {
       controller.signal,
       50 * 1024 * 1024,
       revision > 0 ? "reload" : "default",
+      props.verified,
     )
       .then(async (bytes) => {
         controller.signal.throwIfAborted();
@@ -211,7 +213,7 @@ export default function PdfViewer(props: {
       clearTimeout(timeout);
       void task?.destroy();
     };
-  }, [props.src, revision, initialPage, savedPosition]);
+  }, [props.src, props.verified, revision, initialPage, savedPosition]);
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- Measure the PDF viewport before paint and observe resizes for fit-width sizing and visible-page selection.
   useLayoutEffect(() => {
     const node = scroll.current;

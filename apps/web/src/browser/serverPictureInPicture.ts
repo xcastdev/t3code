@@ -1,6 +1,7 @@
 import {
   createPreviewFramePainter,
   createPreviewStreamClient,
+  PREVIEW_STREAM_BASE_PATH,
   type PreviewStreamClient,
 } from "@t3tools/client-runtime/preview/server-browser-stream";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
@@ -8,6 +9,8 @@ import { scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { previewPdfAssetUrl } from "@t3tools/shared/preview";
 import { useSyncExternalStore } from "react";
 
+import { assertHostedStreamTarget } from "~/connection/hostedRelayAdmission";
+import { openEnvironmentSocket } from "~/connection/environmentTransport";
 import { readPreviewStreamAccess } from "~/state/previewStream";
 import { previewStateAtom, type ThreadPreviewState } from "~/previewStateStore";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
@@ -130,6 +133,10 @@ export async function openServerPictureInPicture(input: {
           retryTimer = setTimeout(() => void connect(true), 1_000 * 2 ** refusals++);
         },
         onGone: onLeave,
+      },
+      (url) => {
+        assertHostedStreamTarget(url, input.environmentId, `${PREVIEW_STREAM_BASE_PATH}/ws`);
+        return openEnvironmentSocket(url);
       },
     );
   };

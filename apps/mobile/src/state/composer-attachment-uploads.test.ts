@@ -12,15 +12,37 @@ type DraftFault = "decode" | "read" | "write" | null;
 const native = vi.hoisted(() => ({
   files: new Map<string, Uint8Array>(),
   server: new Map<string, Uint8Array | null>(),
+  uploadOutcomes: new Map<string, string>(),
   deleted: [] as string[],
   fault: null as DraftFault,
   canOperate: true,
+  failDelete: false,
+  failOutcomeWrite: false,
+  failOutboxWrite: false,
+  beforeOutcomeWrite: undefined as (() => Promise<void>) | undefined,
+  beforeMint: undefined as (() => Promise<void>) | undefined,
+  beforeDelete: undefined as (() => Promise<void>) | undefined,
   nextId: 0,
   nextUuid: 0,
   mint: Symbol("mint"),
   remove: Symbol("remove"),
   transfer:
     vi.fn<(uri: string, url: string, options: UploadOptions) => Promise<{ status: number }>>(),
+}));
+
+vi.mock("expo-secure-store", () => ({ getItemAsync: async () => null }));
+vi.mock("expo-sqlite/kv-store", () => ({
+  default: {
+    getItemAsync: async (key: string) => native.uploadOutcomes.get(key) ?? null,
+    setItemAsync: async (key: string, value: string) => {
+      await native.beforeOutcomeWrite?.();
+      if (native.failOutcomeWrite) throw new Error("Could not save upload outcome");
+      native.uploadOutcomes.set(key, value);
+    },
+    removeItemAsync: async (key: string) => {
+      native.uploadOutcomes.delete(key);
+    },
+  },
 }));
 
 vi.mock("react-native", () => ({ Alert: { alert: vi.fn() } }));
@@ -65,6 +87,9 @@ vi.mock("expo-file-system", () => {
     }
     write(value: string, options?: { encoding?: string }) {
       if (native.fault === "write" && this.uri.includes("/composer-drafts/")) {
+        throw new Error("ENOSPC");
+      }
+      if (native.failOutboxWrite && this.uri.includes("/thread-outbox/")) {
         throw new Error("ENOSPC");
       }
       native.files.set(
@@ -152,14 +177,25 @@ vi.mock("@t3tools/client-runtime/state/runtime", async (importOriginal) => ({
     target: { input: { attachmentId?: string } },
   ) => {
     if (command === native.mint) {
+      await native.beforeMint?.();
       const id = `pending-${++native.nextId}`;
       native.server.set(id, null);
       return {
         _tag: "Success",
-        value: { attachmentId: id, relativeUrl: `/upload/${id}`, expiresAt: 1 },
+        value: {
+          attachmentId: id,
+          relativeUrl: `https://environment.example/upload/${id}`,
+          expiresAt: 1,
+        },
       };
     }
     if (command === native.remove && target.input.attachmentId) {
+      await native.beforeDelete?.();
+      if (native.failDelete) {
+        return (await import("effect/reactivity")).AsyncResult.failure(
+          (await import("effect/Cause")).fail(new Error("cleanup disconnected")),
+        );
+      }
       native.deleted.push(target.input.attachmentId);
       native.server.delete(target.input.attachmentId);
       return { _tag: "Success", value: undefined };
@@ -261,9 +297,16 @@ beforeEach(async () => {
   vi.spyOn(console, "warn").mockImplementation(() => {});
   native.files.clear();
   native.server.clear();
+  native.uploadOutcomes.clear();
   native.deleted.length = 0;
   native.fault = null;
   native.canOperate = true;
+  native.failDelete = false;
+  native.failOutcomeWrite = false;
+  native.failOutboxWrite = false;
+  native.beforeOutcomeWrite = undefined;
+  native.beforeMint = undefined;
+  native.beforeDelete = undefined;
   native.nextId = 0;
   native.nextUuid = 0;
   native.files.set(draftsUri, Buffer.from('{"schemaVersion":1,"drafts":{}}'));
@@ -294,11 +337,206 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-function uploadState() {
+function uploadState(attachment: DraftComposerAttachment = image) {
   return appAtomRegistry.get(composerAttachmentUploadsAtom)[
-    composerAttachmentUploadKey(environmentId, image.id)
+    composerAttachmentUploadKey(environmentId, attachment.id)
   ];
 }
+
+const outcomeKey = "t3code.attachment-upload.unknown:environment-1:image-1";
+
+it("blocks a fresh worker from replaying a POST that committed before the draft was saved", async () => {
+  const fileUri = "file:///documents/t3-composer-attachments/photo.png";
+  native.files.set(fileUri, Buffer.from("abc"));
+  drafts.replaceComposerDraftAttachments(draftKey, [{ ...image, fileUri }]);
+  await drafts.flushComposerDrafts();
+  const interrupted = Promise.withResolvers<{
+    readonly files: typeof native.files;
+    readonly outcomes: typeof native.uploadOutcomes;
+  }>();
+  const finishTransfer = Promise.withResolvers<{ status: number }>();
+  native.transfer.mockImplementationOnce((uri, url) => {
+    native.server.set(url.split("/").at(-1)!, native.files.get(uri)!);
+    interrupted.resolve({
+      files: new Map(native.files),
+      outcomes: new Map(native.uploadOutcomes),
+    });
+    return finishTransfer.promise;
+  });
+  const queue = worker();
+  const diskAtCrash = await interrupted.promise;
+
+  // Let the test's first worker exit, then restore only the durable client state at the crash.
+  finishTransfer.resolve({ status: 204 });
+  await queue.settled();
+  disposeWorker?.();
+  native.files.clear();
+  for (const entry of diskAtCrash.files) native.files.set(...entry);
+  native.uploadOutcomes.clear();
+  for (const entry of diskAtCrash.outcomes) native.uploadOutcomes.set(...entry);
+
+  vi.resetModules();
+  const restored = await import("./composer-attachment-uploads");
+  const restoredDrafts = await import("./use-composer-drafts");
+  const { appAtomRegistry: restoredRegistry } = await import("./atom-registry");
+  await restoredDrafts.waitForComposerDraftsLoaded();
+  const attachment = restoredDrafts.getComposerDraftSnapshot(draftKey).attachments[0]!;
+  expect(attachment.uploadedAttachmentId).toBeUndefined();
+  const restarted = restored.createComposerAttachmentUploadWorker(
+    Atom.make([{ environmentId, attachment }]),
+  );
+  disposeWorker = restarted.dispose;
+  await restarted.queue.settled();
+
+  expect(native.transfer).toHaveBeenCalledOnce();
+  expect([...native.server.keys()]).toEqual(["pending-1"]);
+  expect(
+    restoredRegistry.get(restored.composerAttachmentUploadsAtom)["environment-1:image-1"],
+  ).toMatchObject({ status: "outcome-unknown" });
+  expect(JSON.parse(native.uploadOutcomes.get(outcomeKey)!)).toMatchObject({
+    version: 1,
+    attachmentId: "pending-1",
+  });
+});
+
+it("blocks the POST if the minted id could not be saved", async () => {
+  native.failOutcomeWrite = true;
+  const queue = worker();
+  await queue.settled();
+
+  expect(native.transfer).not.toHaveBeenCalled();
+  expect(native.server.size).toBe(0);
+  expect(uploadState()?.status).toBe("failed");
+});
+
+it("cancels before dispatch while the minted id is being saved", async () => {
+  const saving = Promise.withResolvers<void>();
+  const finishSave = Promise.withResolvers<void>();
+  native.beforeOutcomeWrite = () => {
+    saving.resolve();
+    return finishSave.promise;
+  };
+  const deleting = Promise.withResolvers<void>();
+  const finishDelete = Promise.withResolvers<void>();
+  native.beforeDelete = () => {
+    deleting.resolve();
+    return finishDelete.promise;
+  };
+
+  const queue = worker();
+  await saving.promise;
+  queue.sync([]);
+  finishSave.resolve();
+  await deleting.promise;
+  const recordedWhileDeleting = native.uploadOutcomes.has(outcomeKey);
+  finishDelete.resolve();
+  await queue.settled();
+
+  expect(recordedWhileDeleting).toBe(true);
+  expect(native.transfer).not.toHaveBeenCalled();
+  expect(native.deleted).toEqual(["pending-1"]);
+  expect(native.uploadOutcomes.has(outcomeKey)).toBe(false);
+  expect(uploadState()).toBeUndefined();
+});
+
+it("keeps cancellation before mint ordinary", async () => {
+  const minting = Promise.withResolvers<void>();
+  const finishMint = Promise.withResolvers<void>();
+  native.beforeMint = () => {
+    minting.resolve();
+    return finishMint.promise;
+  };
+  const queue = worker();
+  await minting.promise;
+  queue.sync([]);
+  finishMint.resolve();
+  await queue.settled();
+
+  expect(native.deleted).toEqual(["pending-1"]);
+  expect(native.transfer).not.toHaveBeenCalled();
+  expect(native.uploadOutcomes.has(outcomeKey)).toBe(false);
+  expect(uploadState()).toBeUndefined();
+});
+
+it.effect("keeps an ambiguous cancellation visible on reconnect without replaying the POST", () =>
+  Effect.gen(function* () {
+    const attachment = { ...image, id: "cancelled-after-publish" };
+    appAtomRegistry.set(drafts.composerDraftsAtom, {
+      [draftKey]: { text: "Look at this", attachments: [attachment] },
+    });
+    yield* Effect.promise(() => drafts.flushComposerDrafts());
+    const started = Promise.withResolvers<void>();
+    const deleteStarted = Promise.withResolvers<void>();
+    const finishDelete = Promise.withResolvers<void>();
+    native.failDelete = true;
+    native.beforeDelete = () => {
+      deleteStarted.resolve();
+      return finishDelete.promise;
+    };
+    native.transfer.mockImplementationOnce((uri, url, { signal }) => {
+      native.server.set(url.split("/").at(-1)!, native.files.get(uri)!);
+      return new Promise((_, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        started.resolve();
+      });
+    });
+    const queue = worker();
+    yield* Effect.promise(() => started.promise);
+    queue.sync([]);
+    yield* Effect.promise(() => deleteStarted.promise);
+    expect(native.uploadOutcomes.size).toBe(1);
+    queue.sync([{ environmentId, attachment }]);
+    finishDelete.resolve();
+    yield* Effect.promise(() => queue.settled());
+    expect(uploadState(attachment)).toMatchObject({
+      status: "outcome-unknown",
+      reason: expect.stringContaining("Upload outcome unknown"),
+    });
+    expect(composerAttachmentUploadBlockReason(sendInput())).toContain("Upload outcome unknown");
+    const message = queuedMessage();
+    yield* Effect.promise(() => enqueueThreadOutboxMessage(message));
+    const failure = yield* Effect.flip(prepareQueuedMessageAttachments(message));
+    expect(failure.message).toContain("Upload outcome unknown");
+    expect(native.transfer).toHaveBeenCalledOnce();
+    expect([...native.server.keys()]).toEqual(["pending-1"]);
+    expect(native.uploadOutcomes.size).toBe(1);
+  }),
+);
+
+it("blocks a restored draft whose previous upload outcome is unknown", async () => {
+  const attachment = { ...image, id: "restored-unknown" };
+  appAtomRegistry.set(drafts.composerDraftsAtom, {
+    [draftKey]: { text: "Look at this", attachments: [attachment] },
+  });
+  await drafts.flushComposerDrafts();
+  native.uploadOutcomes.set("t3code.attachment-upload.unknown:environment-1:restored-unknown", "1");
+  const queue = worker();
+  await queue.settled();
+  expect(uploadState(attachment)?.status).toBe("outcome-unknown");
+  expect(native.nextId).toBe(0);
+  expect(native.transfer).not.toHaveBeenCalled();
+  expect(
+    native.uploadOutcomes.get("t3code.attachment-upload.unknown:environment-1:restored-unknown"),
+  ).toBe("1");
+});
+
+it("reuses a saved reference when restart left its prepared marker behind", async () => {
+  drafts.setComposerDraftAttachmentUpload(draftKey, {
+    ...image,
+    uploadedAttachmentId: "pending-1",
+    uploadEnvironmentId: environmentId,
+  });
+  await drafts.flushComposerDrafts();
+  native.server.set("pending-1", Buffer.from("abc"));
+  native.uploadOutcomes.set(outcomeKey, '{"version":1,"attachmentId":"pending-1"}');
+  const queue = worker();
+  await queue.settled();
+
+  expect(uploadState()).toEqual({ status: "ready" });
+  expect(native.nextId).toBe(0);
+  expect(native.transfer).not.toHaveBeenCalled();
+  expect(native.uploadOutcomes.has(outcomeKey)).toBe(false);
+});
 
 it.effect.each(["decode", "write"] as const)(
   "keeps an accepted upload ready when the draft %s fails",
@@ -311,6 +549,7 @@ it.effect.each(["decode", "write"] as const)(
       const queue = worker();
       yield* Effect.promise(() => queue.settled());
       expect(uploadState()).toEqual({ status: "ready" });
+      expect(native.uploadOutcomes.has(outcomeKey)).toBe(true);
       expect(native.deleted).toEqual([]);
       expect(composerAttachmentUploadBlockReason(sendInput())).toBeNull();
       expect(composerAttachmentsStillUploading(sendInput())).toBe(false);
@@ -367,12 +606,38 @@ it("keeps an upload running when its message is sent mid-upload and records it o
     appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom),
   );
   expect(queued?.attachments[0]?.uploadedAttachmentId).toBe("pending-1");
+  const persistedMessage = native.files.get("file:///documents/thread-outbox/message-1.json");
+  expect(persistedMessage && Buffer.from(persistedMessage).toString()).toContain(
+    '"uploadedAttachmentId":"pending-1"',
+  );
+  expect(native.uploadOutcomes.has(outcomeKey)).toBe(false);
+});
+
+it("retains the minted id when saving the outbox reference fails", async () => {
+  const started = Promise.withResolvers<void>();
+  const finishTransfer = Promise.withResolvers<{ status: number }>();
+  native.transfer.mockImplementationOnce((uri, url) => {
+    native.server.set(url.split("/").at(-1)!, native.files.get(uri)!);
+    started.resolve();
+    return finishTransfer.promise;
+  });
+  const queue = worker();
+  await started.promise;
+  await enqueueThreadOutboxMessage(queuedMessage());
+  drafts.clearComposerDraftContent(draftKey, { deferAttachmentCleanup: true });
+  native.failOutboxWrite = true;
+  finishTransfer.resolve({ status: 204 });
+  await queue.settled();
+
+  expect(uploadState()?.status).toBe("failed");
+  expect(native.uploadOutcomes.has(outcomeKey)).toBe(true);
+  expect(native.deleted).toEqual([]);
 });
 
 it.each(["http", "permission"] as const)(
   "keeps a real %s upload failure blocking Send",
   async (failure) => {
-    if (failure === "http") native.transfer.mockResolvedValueOnce({ status: 503 });
+    if (failure === "http") native.transfer.mockResolvedValueOnce({ status: 400 });
     if (failure === "permission") native.canOperate = false;
     const queue = worker();
     await queue.settled();
@@ -383,6 +648,21 @@ it.each(["http", "permission"] as const)(
   },
 );
 
+it("keeps a transport error with unconfirmed cleanup from replaying the upload", async () => {
+  const attachment = { ...image, id: "unconfirmed-cleanup" };
+  drafts.replaceComposerDraftAttachments(draftKey, [attachment]);
+  await drafts.flushComposerDrafts();
+  native.transfer.mockResolvedValueOnce({ status: 503 });
+  const queue = worker();
+  await queue.settled();
+
+  expect(uploadState(attachment)?.status).toBe("outcome-unknown");
+  expect(
+    native.uploadOutcomes.has("t3code.attachment-upload.unknown:environment-1:unconfirmed-cleanup"),
+  ).toBe(true);
+  expect(native.transfer).toHaveBeenCalledOnce();
+});
+
 it("keeps an unexpected draft flush error blocking Send", async () => {
   vi.spyOn(drafts, "flushComposerDrafts").mockRejectedValueOnce(
     new Error("Unexpected flush defect"),
@@ -392,8 +672,8 @@ it("keeps an unexpected draft flush error blocking Send", async () => {
   expect(composerAttachmentUploadBlockReason(sendInput())).toBe(
     "Retry or remove the failed attachment",
   );
-  // The server sweeps pending uploads nothing claims; a retry uploads again.
   expect(native.deleted).toEqual([]);
+  expect(native.uploadOutcomes.has(outcomeKey)).toBe(true);
 });
 
 it("uploads draft attachments for threads whose ids contain colons", () => {

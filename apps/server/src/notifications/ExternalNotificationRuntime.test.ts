@@ -18,6 +18,9 @@ import {
   ProjectWorkCommentId,
   ProjectWorkTaskId,
   ThreadId,
+  TurnItemId,
+  ScheduledTaskId,
+  type OrchestrationV2Notification,
   type OrchestrationV2DomainEvent,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -177,21 +180,30 @@ const fixture = Effect.gen(function* () {
   yield* Deferred.await(subscribed);
   return { facts, domain, starts, workProcessed, domainProcessed };
 });
+const workFact = (reason: string, revision: number) => {
+  const identity = JSON.stringify(["work-attention", projectId, taskId, reason, revision]);
+  return {
+    eventType: "work-attention",
+    occurrenceId: identity,
+    legacyIdentity: identity,
+    projectId,
+    taskId,
+    reason,
+    timestamp: at,
+    title: reason,
+  };
+};
+
 it.effect("real committed Work mutations publish the exact current attention occurrence", () =>
   Effect.gen(function* () {
     yield* seed;
     const { facts, starts } = yield* fixture;
     const result = yield* block;
-    const fact = yield* Queue.take(facts);
-    expect(fact.kind).toBe("work-attention");
-    if (fact.kind !== "work-attention") throw new Error("Expected Work attention");
-    expect(fact.attention.reason).toBe("blocked");
-    expect(fact.attention.taskId).toBe(taskId);
     const query = yield* Query.ProjectWorkQuery;
     expect(yield* query.getProjectRevision(projectId)).toBe(result.revision);
-    expect(yield* query.listAttention({ projectId, taskId, limit: 8 })).toContainEqual(
-      fact.attention,
-    );
+    const [attention] = yield* query.listAttention({ projectId, taskId, limit: 8 });
+    expect(attention?.reason).toBe("blocked");
+    expect(yield* Queue.take(facts)).toEqual(workFact("blocked", attention!.revision));
     expect(starts).toEqual([1]);
   }).pipe(Effect.scoped, Effect.provide(infrastructure)),
 );
@@ -224,14 +236,15 @@ it.effect(
     }).pipe(Effect.scoped, Effect.provide(infrastructure)),
 );
 
-it.effect("live committed notification messages preserve their persisted message identity", () =>
+it.effect("live notifications preserve their persisted occurrence identity and attribution", () =>
   Effect.gen(function* () {
-    const { facts, domain } = yield* fixture;
+    const { facts, domain, domainProcessed } = yield* fixture;
     const now = DateTime.makeUnsafe(at);
     const event = {
       type: "message.updated",
       id: EventId.make("notice-event"),
       threadId: ThreadId.make("thread"),
+      projectId,
       occurredAt: now,
       payload: {
         id: MessageId.make("persisted-message"),
@@ -253,13 +266,91 @@ it.effect("live committed notification messages preserve their persisted message
         },
       },
     } satisfies OrchestrationV2DomainEvent;
-    yield* PubSub.publish(domain, event);
-    expect(yield* Queue.take(facts)).toEqual({
-      kind: "notification",
-      messageId: "persisted-message",
-      threadId: "thread",
-      notification: event.payload.notification,
-    });
+    const outcomes = [
+      ["completed", "completion"],
+      ["failed", "failure"],
+      ["cancelled", "cancelled"],
+      ["updated", "update"],
+      ["unknown", "unknown"],
+    ] as const satisfies ReadonlyArray<readonly [OrchestrationV2Notification["outcome"], string]>;
+    yield* PubSub.publish(domain, { ...event, payload: { ...event.payload, streaming: true } });
+    yield* Queue.take(domainProcessed);
+    for (const [outcome, eventType] of outcomes) {
+      const messageId = MessageId.make(`persisted-message-${outcome}`);
+      const notification = { ...event.payload.notification, outcome };
+      yield* PubSub.publish(domain, {
+        ...event,
+        payload: {
+          ...event.payload,
+          id: messageId,
+          scheduledTaskId: ScheduledTaskId.make("scheduled"),
+          notification,
+        },
+      });
+      yield* Queue.take(domainProcessed);
+      expect(yield* Queue.clear(facts)).toEqual([
+        {
+          eventType,
+          occurrenceId: JSON.stringify(["message", "thread", messageId]),
+          legacyIdentity: JSON.stringify(["notification", "thread", messageId]),
+          threadId: "thread",
+          projectId,
+          taskId: "scheduled",
+          timestamp: at,
+          title: "Done",
+        },
+      ]);
+      const item = {
+        type: "turn-item.updated",
+        id: EventId.make(`live-${outcome}`),
+        threadId: event.threadId,
+        projectId,
+        occurredAt: now,
+        payload: {
+          type: "notification",
+          ...notification,
+          id: TurnItemId.make("turn-item"),
+          threadId: event.threadId,
+          runId: null,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 0,
+          status: "completed",
+          title: null,
+          startedAt: null,
+          completedAt: now,
+          updatedAt: now,
+        },
+      } satisfies OrchestrationV2DomainEvent;
+      const linked = { ...item, payload: { ...item.payload, sourceMessageId: messageId } };
+      yield* PubSub.publish(domain, linked);
+      yield* Queue.take(domainProcessed);
+      expect(yield* Queue.clear(facts)).toMatchObject([
+        {
+          eventType,
+          occurrenceId: JSON.stringify(["message", "thread", messageId]),
+          legacyIdentity: JSON.stringify(["notification", "thread", messageId]),
+          projectId,
+          liveOnly: true,
+        },
+      ]);
+      yield* PubSub.publish(domain, item);
+      yield* Queue.take(domainProcessed);
+      expect(yield* Queue.clear(facts)).toEqual([
+        {
+          eventType,
+          occurrenceId: JSON.stringify(["turn-item", "thread", "turn-item"]),
+          projectId,
+          threadId: "thread",
+          timestamp: at,
+          title: "Done",
+          liveOnly: true,
+        },
+      ]);
+    }
   }).pipe(Effect.scoped, Effect.provide(infrastructure)),
 );
 
@@ -306,11 +397,7 @@ it.effect("actual pending gates and guided questions each publish their committe
       evidenceIds: [],
     });
     const gateFact = yield* Queue.take(facts);
-    expect(gateFact).toEqual({
-      kind: "work-attention",
-      projectId,
-      attention: { taskId, reason: "approval-required", revision: gate.revision },
-    });
+    expect(gateFact).toEqual(workFact("approval-required", gate.revision));
     yield* Queue.take(workProcessed);
     const question = yield* commitRecord({
       ...fields,
@@ -324,11 +411,7 @@ it.effect("actual pending gates and guided questions each publish their committe
       body: "Which option?",
       choices: [],
     });
-    expect(yield* Queue.take(facts)).toEqual({
-      kind: "work-attention",
-      projectId,
-      attention: { taskId, reason: "approval-required", revision: question.revision },
-    });
+    expect(yield* Queue.take(facts)).toEqual(workFact("approval-required", question.revision));
     yield* Queue.take(workProcessed);
     const [oldGate] = gate.events;
     if (oldGate === undefined) throw new Error("Expected gate event");
@@ -345,7 +428,13 @@ it.effect(
     Effect.gen(function* () {
       const { facts, domain, domainProcessed } = yield* fixture;
       const now = DateTime.makeUnsafe(at);
-      for (const kind of ["command", "user_input", "mcp-elicitation"] as const) {
+      for (const kind of [
+        "dynamic_tool_call",
+        "auth_refresh",
+        "command",
+        "user_input",
+        "mcp-elicitation",
+      ] as const) {
         const event = {
           type: "runtime-request.updated",
           id: EventId.make(`event-${kind}`),
@@ -364,14 +453,21 @@ it.effect(
           },
         } satisfies OrchestrationV2DomainEvent;
         yield* PubSub.publish(domain, event);
-        const fact = yield* Queue.take(facts);
-        expect(fact.kind).toBe("notification");
-        if (fact.kind !== "notification") throw new Error("Expected provider notification");
-        expect(fact.messageId).toBe(`runtime-request:request-${kind}`);
-        expect(fact.threadId).toBe("thread");
-        expect(fact.notification.summary).toBe(
-          kind === "command" ? "Approval required" : "A question needs an answer",
-        );
+        if (kind !== "dynamic_tool_call" && kind !== "auth_refresh") {
+          const needsInput = kind !== "command";
+          expect(yield* Queue.take(facts)).toEqual({
+            eventType: needsInput ? "needs-input" : "needs-approval",
+            occurrenceId: JSON.stringify(["runtime-request", "thread", `request-${kind}`]),
+            legacyIdentity: JSON.stringify([
+              "notification",
+              "thread",
+              `runtime-request:request-${kind}`,
+            ]),
+            threadId: "thread",
+            title: needsInput ? "A question needs an answer" : "Approval required",
+            timestamp: at,
+          });
+        }
         yield* Queue.take(domainProcessed);
         yield* PubSub.publish(domain, {
           ...event,
@@ -446,11 +542,7 @@ it.effect(
           },
         },
       ]);
-      expect(yield* Queue.take(facts)).toEqual({
-        kind: "work-attention",
-        projectId,
-        attention: { taskId, reason: "needs-review", revision },
-      });
+      expect(yield* Queue.take(facts)).toEqual(workFact("needs-review", revision));
       yield* Queue.take(workProcessed);
       yield* bus.publish([
         {
@@ -523,14 +615,10 @@ it.effect(
         specRevision: 0,
         protectedAt: at,
       });
-      const fact = yield* Queue.take(facts);
-      expect(fact.kind).toBe("work-attention");
-      if (fact.kind !== "work-attention") throw new Error("Expected approval attention");
-      expect(fact.attention.reason).toBe("approval-required");
       const query = yield* Query.ProjectWorkQuery;
-      expect(yield* query.listAttention({ projectId, taskId, limit: 8 })).toContainEqual(
-        fact.attention,
-      );
+      const [attention] = yield* query.listAttention({ projectId, taskId, limit: 8 });
+      expect(attention?.reason).toBe("approval-required");
+      expect(yield* Queue.take(facts)).toEqual(workFact("approval-required", attention!.revision));
     }).pipe(Effect.scoped, Effect.provide(infrastructure)),
 );
 
@@ -583,10 +671,6 @@ it.effect(
       );
       const bus = yield* Bus.ProjectWorkEventBus;
       yield* bus.publish(events.map((event, cursor) => ({ event, cursor })));
-      expect(yield* Queue.take(facts)).toEqual({
-        kind: "work-attention",
-        projectId,
-        attention: next.attention[0],
-      });
+      expect(yield* Queue.take(facts)).toEqual(workFact("stale", next.attention[0]!.revision));
     }).pipe(Effect.scoped, Effect.provide(infrastructure)),
 );

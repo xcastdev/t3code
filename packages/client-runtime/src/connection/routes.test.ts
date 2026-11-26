@@ -320,6 +320,29 @@ describe("learned routes", () => {
     const learned = routes.find((route) => connectionRouteKind(route) === "tailnet")!;
     expect(profileOf(learned)).not.toHaveProperty("authorization");
     expect(credentialConnectionId(connectionRouteId(learned.target))).toBe("lan");
+    const directorySource = "relay-directory:fixture";
+    const both = entryWithRoutes(entry, [LAN, PUBLIC]);
+    const initial = mergeLearnedRoutes({
+      entry: both,
+      activeRoute: LAN,
+      reported: [{ httpBaseUrl: "https://cached.example/" }],
+      allowInsecure: true,
+      directorySource,
+    })!;
+    const refreshed = mergeLearnedRoutes({
+      entry: entryWithRoutes(both, initial),
+      activeRoute: PUBLIC,
+      reported: [{ httpBaseUrl: "https://cached.example/" }],
+      allowInsecure: true,
+      directorySource,
+    })!;
+    const directoryRoute = refreshed.find((route) => {
+      const profile = profileOf(route);
+      return (
+        profile._tag === "BearerConnectionProfile" && profile.directorySource === directorySource
+      );
+    })!;
+    expect(credentialConnectionId(connectionRouteId(directoryRoute.target))).toBe("public");
   });
 
   it("keeps a token paired over HTTPS off plain HTTP addresses outside the tailnet", () => {

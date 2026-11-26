@@ -1,3 +1,4 @@
+import { resolveComposerDraftDispatchSnapshot } from "./composerDraftDispatch";
 import { useComposerAttachmentActions } from "./use-composer-attachment-actions";
 import * as Effect from "effect/Effect";
 import * as Dialog from "../components/ui/Dialog";
@@ -639,7 +640,7 @@ export function useThreadComposerState(input: {
     if (appAtomRegistry.get(composerContextImportsAtom)[threadKey]) return null;
     const thread = selectedThreadShell;
     const text = draft.text.trim();
-    const attachments = draft.attachments;
+    let attachments = draft.attachments;
     if (
       composerAttachmentUploadBlockReason({
         environmentId: selectedThreadShell.environmentId,
@@ -805,17 +806,12 @@ export function useThreadComposerState(input: {
       // A context paste still landing, or any draft or settings change while approvals were
       // declined, means this snapshot is no longer what the user sent.
       if (appAtomRegistry.get(composerContextImportsAtom)[threadKey]) return null;
-      const current = getComposerDraftSnapshot(threadKey);
-      if (
-        current.text !== draft.text ||
-        JSON.stringify(current.context) !== JSON.stringify(draft.context) ||
-        JSON.stringify(current.modelSelection) !== JSON.stringify(draft.modelSelection) ||
-        current.runtimeMode !== draft.runtimeMode ||
-        current.interactionMode !== draft.interactionMode ||
-        current.attachments.length !== attachments.length ||
-        current.attachments.some((attachment, index) => attachment.id !== attachments[index]?.id)
-      )
-        return null;
+      const current = resolveComposerDraftDispatchSnapshot(
+        getComposerDraftSnapshot(threadKey),
+        draft,
+      );
+      if (current === null) return null;
+      attachments = current.attachments;
       if (response === "responded") {
         clearComposerDraftContent(threadKey);
         return null;

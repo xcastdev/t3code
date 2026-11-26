@@ -46,7 +46,7 @@ import {
   deriveAuthClientMetadata,
   timingSafeEqualBase64Url,
 } from "./utils.ts";
-import { requestUrl } from "../requestUrl.ts";
+import { canonicalRequestUrl } from "../requestUrl.ts";
 
 // Request-derived origins support loopback, Tailscale and tunnels.
 // Signed client metadata keeps unauthenticated registration stateless.
@@ -73,7 +73,7 @@ export interface McpOAuthUrls {
 }
 
 export const requestUrls = (request: HttpServerRequest.HttpServerRequest): McpOAuthUrls => {
-  const origin = Option.match(requestUrl(request), {
+  const origin = Option.match(canonicalRequestUrl(request), {
     onNone: () => "http://localhost",
     onSome: (url) => url.origin,
   });
@@ -564,6 +564,7 @@ const make = Effect.gen(function* () {
         .issueMcpClientSession({
           label: pending.clientName,
           access: pending.access,
+          resource: pending.resource,
           peerLink: pending.peerLink,
           client: deriveAuthClientMetadata({ request }),
         })

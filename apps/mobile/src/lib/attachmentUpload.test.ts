@@ -14,9 +14,15 @@ const mocks = vi.hoisted(() => ({
   runAtomCommand: vi.fn(),
   readAtom: vi.fn(),
   upload: vi.fn(),
+  verifiedUpload: vi.fn(),
   writeFile: vi.fn(),
   deleteFile: vi.fn(),
   readBase64: vi.fn(),
+}));
+
+vi.mock("expo-secure-store", () => ({ getItemAsync: async () => null }));
+vi.mock("../native/verifiedNetwork", () => ({
+  requestVerifiedRoute: mocks.verifiedUpload,
 }));
 
 vi.mock("@t3tools/client-runtime/state/runtime", () => ({
@@ -67,7 +73,7 @@ vi.mock("expo-file-system", () => ({
     }
     create() {}
     write(bytes: string, options: unknown) {
-      mocks.writeFile(this.uri, bytes, options);
+      return mocks.writeFile(this.uri, bytes, options);
     }
     delete() {
       mocks.deleteFile(this.uri);
@@ -180,6 +186,7 @@ describe("prepareTurnAttachments", () => {
     mocks.runAtomCommand.mockReset();
     mocks.readAtom.mockReset();
     mocks.upload.mockReset();
+    mocks.verifiedUpload.mockReset().mockResolvedValue(null);
     mocks.writeFile.mockReset();
     mocks.deleteFile.mockReset();
     mocks.readBase64.mockReset();
@@ -191,7 +198,7 @@ describe("prepareTurnAttachments", () => {
             _tag: "Success",
             value: {
               attachmentId: MINTED_ID,
-              relativeUrl: "/api/attachments/upload/signed",
+              relativeUrl: "https://environment.example/api/attachments/upload/signed",
               expiresAt: 1,
             },
           }
@@ -225,7 +232,7 @@ describe("prepareTurnAttachments", () => {
           _tag: "Success",
           value: {
             attachmentId: MINTED_ID,
-            relativeUrl: "/api/attachments/upload/signed",
+            relativeUrl: "https://environment.example/api/attachments/upload/signed",
             expiresAt: 1,
           },
         };
@@ -506,17 +513,28 @@ describe("prepareTurnAttachments", () => {
     }),
   );
 
-  it.effect("uses the current connection when an environment reconnects during URL creation", () =>
+  it.effect("keeps the issuer when an environment reconnects during URL creation", () =>
     Effect.gen(function* () {
-      mocks.readAtom
-        .mockReturnValueOnce(Option.some({ httpBaseUrl: "https://old-environment.example/" }))
-        .mockReturnValueOnce(Option.some({ httpBaseUrl: "https://new-environment.example/" }));
-
+      mocks.readAtom.mockReturnValue(
+        Option.some({ httpBaseUrl: "https://old-environment.example/" }),
+      );
+      mocks.runAtomCommand.mockImplementationOnce(async () => {
+        mocks.readAtom.mockReturnValue(
+          Option.some({ httpBaseUrl: "https://new-environment.example/" }),
+        );
+        return {
+          _tag: "Success",
+          value: {
+            attachmentId: MINTED_ID,
+            relativeUrl: "https://old-environment.example/api/attachments/upload/signed",
+            expiresAt: 1,
+          },
+        };
+      });
       yield* prepare({ environmentId, attachments: [file] });
-
       expect(mocks.upload).toHaveBeenCalledWith(
         file.fileUri,
-        "https://new-environment.example/api/attachments/upload/signed",
+        "https://old-environment.example/api/attachments/upload/signed",
         expect.anything(),
       );
     }),
@@ -771,13 +789,161 @@ describe("prepareTurnAttachments", () => {
 
   it.effect("removes pending uploads when the native HTTP request fails", () =>
     Effect.gen(function* () {
-      mocks.upload.mockResolvedValue({ status: 500, body: "failed", headers: {} });
+      mocks.upload.mockResolvedValue({ status: 400, body: "failed", headers: {} });
 
       expect(
         (yield* Effect.flip(prepare({ environmentId, attachments: [file] }))).message,
-      ).toContain("Upload failed for 'report.pdf' (500).");
+      ).toContain("Upload failed for 'report.pdf' (400).");
       expect(removeCallsFor(MINTED_ID)).toBe(1);
     }),
+  );
+
+  it.effect("cancels staging before calling either upload transport", () =>
+    Effect.gen(function* () {
+      const staging = Promise.withResolvers<void>();
+      const staged = Promise.withResolvers<void>();
+      const stagingFileDeleted = Promise.withResolvers<void>();
+      mocks.writeFile.mockImplementation(() => {
+        staging.resolve();
+        return staged.promise;
+      });
+      mocks.deleteFile.mockImplementationOnce(() => stagingFileDeleted.resolve());
+      const report = vi.fn();
+      const upload = yield* Effect.forkChild(
+        uploadComposerAttachment(environmentId, image, undefined, report),
+      );
+      yield* Effect.promise(() => staging.promise);
+      yield* Fiber.interrupt(upload);
+      staged.resolve();
+      yield* Effect.promise(() => stagingFileDeleted.promise);
+      expect(Exit.hasInterrupts(yield* Fiber.await(upload))).toBe(true);
+      expect(report).not.toHaveBeenCalled();
+      expect(removeCallsFor(MINTED_ID)).toBe(1);
+      expect(mocks.verifiedUpload).not.toHaveBeenCalled();
+      expect(mocks.upload).not.toHaveBeenCalled();
+    }),
+  );
+
+  it.effect("requires verified transport even when the issued origin has no cached pin", () =>
+    Effect.gen(function* () {
+      mocks.runAtomCommand.mockImplementationOnce(async () => ({
+        _tag: "Success",
+        value: {
+          attachmentId: MINTED_ID,
+          relativeUrl: "https://environment.example/api/attachments/upload/signed",
+          expiresAt: 1,
+          verificationRequired: true,
+        },
+      }));
+
+      expect((yield* Effect.flip(uploadComposerAttachment(environmentId, file))).message).toContain(
+        "could not be verified",
+      );
+      expect(mocks.verifiedUpload).toHaveBeenCalledExactlyOnceWith(
+        "https://environment.example/api/attachments/upload/signed",
+        expect.objectContaining({ requireVerified: true }),
+      );
+      expect(mocks.upload).not.toHaveBeenCalled();
+    }),
+  );
+
+  it.effect("reports unknown when a committed upload loses its response and cleanup fails", () =>
+    Effect.gen(function* () {
+      let published = false;
+      mocks.verifiedUpload.mockImplementation(async () => {
+        published = true;
+        throw new Error("Response was lost.");
+      });
+      mocks.executeAtomQuery.mockImplementation(async () => {
+        expect(published).toBe(true);
+        return { _tag: "Success", value: {} };
+      });
+      const normalCommand = mocks.runAtomCommand.getMockImplementation()!;
+      mocks.runAtomCommand.mockImplementation((...args) =>
+        args[1] === mocks.removeUpload
+          ? Promise.resolve({ _tag: "Failure", error: new Error("cleanup disconnected") })
+          : normalCommand(...args),
+      );
+
+      const error = yield* Effect.flip(uploadComposerAttachment(environmentId, file));
+      expect(error.message).toContain("Upload outcome unknown");
+      expect(removeCallsFor(MINTED_ID)).toBeGreaterThan(0);
+      expect(mocks.verifiedUpload).toHaveBeenCalledOnce();
+      expect(mocks.upload).not.toHaveBeenCalled();
+    }),
+  );
+
+  it.effect.each(["delete-failed", "delete-no-op", "published-after-delete", "removed"] as const)(
+    "settles a cancelled verified upload with server state %s",
+    (outcome) =>
+      Effect.gen(function* () {
+        const started = Promise.withResolvers<void>();
+        const deleting = Promise.withResolvers<void>();
+        const finishDelete = Promise.withResolvers<void>();
+        let published = outcome !== "published-after-delete";
+        let cancelled = false;
+        const report = vi.fn();
+        mocks.verifiedUpload.mockImplementation(
+          (_url, { signal }: { signal: AbortSignal }) =>
+            new Promise((_, reject) => {
+              signal.addEventListener(
+                "abort",
+                () => {
+                  cancelled = true;
+                  reject(signal.reason);
+                },
+                { once: true },
+              );
+              started.resolve();
+            }),
+        );
+        mocks.executeAtomQuery.mockImplementation(async () =>
+          published
+            ? { _tag: "Success", value: {} }
+            : { _tag: "Failure", error: { _tag: "AssetAttachmentNotFoundError" } },
+        );
+        mocks.runAtomCommand.mockImplementationOnce(async () => ({
+          _tag: "Success",
+          value: {
+            attachmentId: MINTED_ID,
+            relativeUrl: "https://environment.example/api/attachments/upload/signed",
+            expiresAt: 1,
+          },
+        }));
+        const deleteUpload = async () => {
+          deleting.resolve();
+          await finishDelete.promise;
+          if (outcome === "delete-failed") {
+            return { _tag: "Failure", error: new Error("cleanup disconnected") };
+          }
+          if (outcome !== "delete-no-op") published = false;
+          return { _tag: "Success", value: undefined };
+        };
+        mocks.runAtomCommand
+          .mockImplementationOnce(deleteUpload)
+          .mockImplementationOnce(deleteUpload);
+
+        const upload = yield* Effect.forkChild(
+          uploadComposerAttachment(environmentId, file, undefined, report),
+        );
+        yield* Effect.promise(() => started.promise);
+        const interrupt = yield* Effect.forkChild(Fiber.interrupt(upload));
+        yield* Effect.promise(() => deleting.promise);
+        const exitWhileDeleting = upload.pollUnsafe();
+        finishDelete.resolve();
+        yield* Fiber.join(interrupt);
+        if (outcome === "published-after-delete") published = true;
+        expect(exitWhileDeleting).toBeUndefined();
+        expect(cancelled).toBe(true);
+        expect(Exit.hasInterrupts(yield* Fiber.await(upload))).toBe(true);
+        expect(report.mock.calls[0]?.[0]).toMatchObject({
+          message: expect.stringContaining("Upload outcome unknown"),
+        });
+        expect(report.mock.lastCall?.[0] === null).toBe(outcome === "removed");
+        expect(published).toBe(outcome !== "removed");
+        expect(mocks.verifiedUpload).toHaveBeenCalledOnce();
+        expect(mocks.upload).not.toHaveBeenCalled();
+      }),
   );
 
   it.effect("keeps a previously persisted upload when a later attachment fails", () =>
@@ -788,12 +954,12 @@ describe("prepareTurnAttachments", () => {
         uploadedAttachmentId: "pending-existing-pdf",
         uploadEnvironmentId: environmentId,
       };
-      mocks.upload.mockResolvedValue({ status: 500, body: "failed", headers: {} });
+      mocks.upload.mockResolvedValue({ status: 400, body: "failed", headers: {} });
 
       expect(
         (yield* Effect.flip(prepare({ environmentId, attachments: [previouslyUploaded, file] })))
           .message,
-      ).toContain("Upload failed for 'report.pdf' (500).");
+      ).toContain("Upload failed for 'report.pdf' (400).");
 
       expect(removeCallsFor("pending-existing-pdf")).toBe(0);
     }),

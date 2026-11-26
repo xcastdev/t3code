@@ -6,6 +6,8 @@ export type ReadyAttachmentUpload = {
   readonly attachmentId: string;
 };
 
+export type AttachmentUploadFailure = "relay-retired" | "outcome-unknown";
+
 export type AttachmentUploadState =
   | {
       readonly status: "uploading";
@@ -18,6 +20,7 @@ export type AttachmentUploadState =
       readonly status: "failed";
       readonly environmentId: EnvironmentId;
       readonly reason: string;
+      readonly failure?: AttachmentUploadFailure;
       /** Retry/release deletes this id; never use a persisted draft attachment id. */
       readonly attachmentId?: string;
       readonly previous?: ReadyAttachmentUpload;

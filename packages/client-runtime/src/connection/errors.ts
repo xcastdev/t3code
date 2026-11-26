@@ -3,6 +3,7 @@ import type { RelayProtectedError } from "@t3tools/contracts/relay";
 import type { ManagedRelayClientError } from "../relay/managedRelay.ts";
 import { dpopFailureMessage, relayProtectedErrorMessage } from "../relay/errorPresentation.ts";
 import type { RemoteEnvironmentAuthError } from "../authorization/remote.ts";
+import type { HostedRelayAdmissionRequiredError } from "../rpc/http.ts";
 import { NETWORK_BLOCKING_HINT } from "../errors/network.ts";
 import {
   ConnectionBlockedError,
@@ -188,6 +189,16 @@ export function mapManagedRelayError(error: ManagedRelayClientError): Connection
   }
 }
 
+export function hostedRelayAdmissionBlockedError(error: HostedRelayAdmissionRequiredError) {
+  return new ConnectionBlockedError({
+    reason: "authentication",
+    detail: error.message,
+    hop: "relay",
+    via: "relay",
+    failureCause: "hosted_relay_admission_required",
+  });
+}
+
 export function mapRemoteEnvironmentError(
   error: RemoteEnvironmentAuthError,
   connectionMethod: ClientConnectionMethod = "direct",
@@ -198,6 +209,8 @@ export function mapRemoteEnvironmentError(
   const unreachableHop = connectionMethod === "relay" ? "tunnel" : "server";
   const via = connectionMethod === "relay" ? "relay" : "direct";
   switch (error._tag) {
+    case "HostedRelayAdmissionRequiredError":
+      return hostedRelayAdmissionBlockedError(error);
     case "EnvironmentAuthInvalidError":
       return new ConnectionBlockedError({
         reason: "authentication",

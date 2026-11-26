@@ -1,5 +1,5 @@
 import * as Dialog from "../../components/ui/Dialog";
-import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
+import { issuedMobileAssetUrl } from "../../lib/verifiedAssetUrl";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import { useEffect, useRef } from "react";
@@ -35,7 +35,7 @@ export function useFileChipShare(
       const result = await createUrl({ environmentId, input: { resource: source.resource } });
       if (request.signal.aborted) return;
       const url =
-        result._tag === "Success" ? resolveAssetUrl(httpBaseUrl, result.value.relativeUrl) : null;
+        result._tag === "Success" ? issuedMobileAssetUrl(environmentId, result.value) : null;
       if (url === null) throw new Error("The file could not be loaded. Reconnect and try again.");
       await downloadAndShareAttachment({
         url,

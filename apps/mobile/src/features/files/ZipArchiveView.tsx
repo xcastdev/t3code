@@ -14,6 +14,12 @@ import {
 import { LegendList } from "@legendapp/list/react-native";
 import * as Schema from "effect/Schema";
 import { fetch } from "expo/fetch";
+import {
+  initializeVerifiedRoutes,
+  verifiedRouteFor,
+  verificationRequiredFor,
+} from "../../connection/verified-route";
+import { downloadAttachmentForPreview } from "../../lib/attachmentDownload";
 import { File } from "expo-file-system";
 import { useNavigation, usePreventRemove } from "@react-navigation/native";
 import { useEffect, useEffectEvent, useRef, useState } from "react";
@@ -199,6 +205,23 @@ function useZipArchive(input: {
         return openArchive(await file.arrayBuffer());
       }
       const url = (await refresh()) ?? uri;
+      await initializeVerifiedRoutes();
+      if (verifiedRouteFor(url) || verificationRequiredFor(url)) {
+        const cached = await downloadAttachmentForPreview({
+          url,
+          attachment: { name: "archive.zip", mimeType: "application/zip" },
+          signal: abort.signal,
+        });
+        if (cached === null) throw new ZipFailureError({ failure: NETWORK });
+        return Promise.resolve()
+          .then(async () => {
+            const file = new File(cached.uri);
+            if ((file.size ?? 0) > ARCHIVE_MAX_BYTES)
+              throw new ZipFailureError({ failure: TOO_LARGE });
+            return openArchive(await file.arrayBuffer());
+          })
+          .finally(() => cached.dispose());
+      }
       const response = await fetch(url, { signal: abort.signal });
       if (!response.ok || !response.body) throw new ZipFailureError({ failure: NETWORK });
       const bytes = await readArchiveBody(response.body, (receivedBytes) =>

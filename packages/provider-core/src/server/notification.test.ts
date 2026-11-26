@@ -152,6 +152,7 @@ describe("notificationTurnItem", () => {
     const item = notificationTurnItem(userMessage, delivery(["a"]), tasks);
     assert.deepInclude(item, {
       type: "notification",
+      sourceMessageId: userMessage.messageId,
       summary: 'Delegated task "Review src/math.ts" finished',
       source: {
         kind: "delegated_task",

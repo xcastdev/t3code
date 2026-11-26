@@ -3,11 +3,14 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import {
+  BearerConnectionProfile,
   type ConnectionRegistration,
   ConnectionCredential,
   ConnectionProfile,
 } from "../connection/catalog.ts";
 import { type ConnectionTarget, PersistedConnectionTarget } from "../connection/model.ts";
+import { borrowedCredentialRouteId, connectionRouteId } from "../connection/routes.ts";
+import type { LearnedRouteChanges, StoredDirectoryRoute } from "./persistence.ts";
 import * as TokenStore from "../authorization/tokenStore.ts";
 import { StoredPullRequestRoutingPermission } from "../connection/pullRequestRoutingPermissions.ts";
 
@@ -69,10 +72,6 @@ function connectionIdOf(target: ConnectionTarget): string | null {
   }
 }
 
-function routeKey(target: ConnectionTarget): string {
-  return connectionIdOf(target) ?? target._tag;
-}
-
 function removeRouteMetadata(
   document: ConnectionCatalogDocument,
   removed: ReadonlyArray<ConnectionTarget>,
@@ -102,14 +101,14 @@ export function catalogRoutes(
  * position in the catalog. An empty list leaves the environment's other records
  * in place; use `removeConnectionFromCatalog` to forget the environment.
  */
-export function setRoutesInCatalog(
+function replaceCatalogRoutes(
   document: ConnectionCatalogDocument,
   environmentId: EnvironmentId,
   routes: ReadonlyArray<PersistedConnectionTarget>,
 ): ConnectionCatalogDocument {
-  const kept = new Set(routes.map(routeKey));
+  const kept = new Set(routes.map(connectionRouteId));
   const dropped = catalogRoutes(document, environmentId).filter(
-    (target) => !kept.has(routeKey(target)),
+    (target) => !kept.has(connectionRouteId(target)),
   );
   const firstIndex = document.targets.findIndex((target) => target.environmentId === environmentId);
   const others = document.targets.filter((target) => target.environmentId !== environmentId);
@@ -124,12 +123,135 @@ export function setRoutesInCatalog(
   };
 }
 
+export function setRoutesInCatalog(
+  document: ConnectionCatalogDocument,
+  environmentId: EnvironmentId,
+  routes: ReadonlyArray<PersistedConnectionTarget>,
+  removedRouteIds: ReadonlySet<string> = new Set(),
+): ConnectionCatalogDocument {
+  const ordered = new Set(routes.map(connectionRouteId));
+  const stored = catalogRoutes(document, environmentId);
+  const profiles = new Map(
+    document.profiles
+      .filter((profile) => profile.environmentId === environmentId)
+      .map((profile) => [profile.connectionId, profile]),
+  );
+  const learned = (id: string) => {
+    const profile = profiles.get(id);
+    return (
+      id.startsWith("learned:") ||
+      (profile?._tag === "BearerConnectionProfile" && profile.learned === true)
+    );
+  };
+  const removed = new Set(removedRouteIds);
+  for (const target of stored) {
+    const id = connectionRouteId(target);
+    if (!ordered.has(id) && !learned(id)) removed.add(id);
+  }
+  const isRemoved = (id: string) => {
+    const donor = borrowedCredentialRouteId(id, profiles.get(id));
+    return removed.has(id) || (learned(id) && donor !== undefined && removed.has(donor));
+  };
+  const hidden = stored.filter((target) => {
+    const id = connectionRouteId(target);
+    return !ordered.has(id) && !isRemoved(id);
+  });
+  const next = replaceCatalogRoutes(document, environmentId, [...routes, ...hidden]);
+  return {
+    ...next,
+    profiles: next.profiles.filter(
+      (profile) => profile.environmentId !== environmentId || !isRemoved(profile.connectionId),
+    ),
+  };
+}
+
+export function catalogDirectoryRoutes(
+  document: ConnectionCatalogDocument,
+  source: string,
+): ReadonlyArray<StoredDirectoryRoute> {
+  return document.profiles.flatMap((profile) =>
+    profile._tag === "BearerConnectionProfile" &&
+    profile.learned &&
+    profile.directorySource === source
+      ? [{ environmentId: profile.environmentId, connectionId: profile.connectionId }]
+      : [],
+  );
+}
+
+export function putConnectionProfileInCatalog(
+  document: ConnectionCatalogDocument,
+  profile: ConnectionProfile,
+): ConnectionCatalogDocument {
+  const previous = document.profiles.find((value) => value.connectionId === profile.connectionId);
+  // Discovery can update metadata after storage has classified a profile's verification policy.
+  const next =
+    profile._tag === "BearerConnectionProfile" &&
+    profile.verificationRequired === undefined &&
+    previous?._tag === "BearerConnectionProfile" &&
+    previous.verificationRequired !== undefined &&
+    previous.environmentId === profile.environmentId &&
+    previous.httpBaseUrl === profile.httpBaseUrl &&
+    previous.wsBaseUrl === profile.wsBaseUrl
+      ? new BearerConnectionProfile({
+          ...profile,
+          verificationRequired: previous.verificationRequired,
+        })
+      : profile;
+  return {
+    ...document,
+    profiles: replaceCatalogValue(document.profiles, (value) => value.connectionId, next),
+  };
+}
+
+export function setLearnedRoutesInCatalog(
+  document: ConnectionCatalogDocument,
+  environmentId: EnvironmentId,
+  addedTargets: ReadonlyArray<PersistedConnectionTarget>,
+  { profiles, removedConnectionIds, routeOrder }: LearnedRouteChanges,
+): ConnectionCatalogDocument {
+  const routes = catalogRoutes(document, environmentId).filter(
+    (target) => !removedConnectionIds.has(connectionRouteId(target)),
+  );
+  const kept = new Set(routes.map(connectionRouteId));
+  const profileIds = new Set(profiles.map((profile) => profile.connectionId));
+  const positions = new Map(routeOrder?.map((id, index) => [id, index]));
+  for (const target of addedTargets) {
+    const id = connectionRouteId(target);
+    // An order from another runtime can still name a withdrawn directory route.
+    if (kept.has(id) || !profileIds.has(id) || removedConnectionIds.has(id)) continue;
+    const position = positions.get(id) ?? Infinity;
+    const insertAt = routes.findIndex(
+      (route) => (positions.get(connectionRouteId(route)) ?? -1) > position,
+    );
+    routes.splice(insertAt === -1 ? routes.length : insertAt, 0, target);
+    kept.add(id);
+  }
+  const next = replaceCatalogRoutes(document, environmentId, routes);
+  return profiles
+    .filter((profile) => kept.has(profile.connectionId))
+    .reduce(putConnectionProfileInCatalog, {
+      ...next,
+      // Older writes could leave a staged profile without a corresponding target.
+      profiles: next.profiles.filter(
+        (profile) =>
+          profile.environmentId !== environmentId ||
+          !removedConnectionIds.has(profile.connectionId),
+      ),
+    });
+}
+
 export function registerConnectionInCatalog(
   document: ConnectionCatalogDocument,
   registration: ConnectionRegistration,
   routes: ReadonlyArray<PersistedConnectionTarget> = [registration.target],
+  removedRouteIds?: ReadonlySet<string>,
 ): ConnectionCatalogDocument {
-  const next = setRoutesInCatalog(document, registration.target.environmentId, routes);
+  const next = setRoutesInCatalog(
+    document,
+    registration.target.environmentId,
+    routes,
+    removedRouteIds,
+  );
 
   switch (registration._tag) {
     case "RelayConnectionRegistration":
@@ -155,9 +277,15 @@ export function removeConnectionFromCatalog(
   document: ConnectionCatalogDocument,
   environmentId: EnvironmentId,
 ): ConnectionCatalogDocument {
-  const next = setRoutesInCatalog(document, environmentId, []);
+  const next = replaceCatalogRoutes(document, environmentId, []);
   return {
     ...next,
+    profiles: next.profiles.filter(
+      (profile) =>
+        profile.environmentId !== environmentId ||
+        profile._tag !== "BearerConnectionProfile" ||
+        !profile.learned,
+    ),
     remoteDpopTokens: removeCatalogValue(
       next.remoteDpopTokens,
       (value) => value.environmentId,

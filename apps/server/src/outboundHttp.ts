@@ -5,6 +5,7 @@ import type * as Undici from "undici";
 
 // undici is external to the CLI bundle; Node single-executables can load it from disk only with require.
 const requireUndici = NodeModule.createRequire(import.meta.url);
+export const loadUndici = () => requireUndici("undici") as typeof Undici;
 
 /** Node 26 bundles h2-capable undici 8; Node 22/24 and Electron stay on HTTP/1.1 with 6/7. */
 export const builtinFetchUsesHttp2 = (bundledUndiciVersion: string | undefined) =>
@@ -12,7 +13,7 @@ export const builtinFetchUsesHttp2 = (bundledUndiciVersion: string | undefined) 
 
 /** Preserves the EnvHttpProxyAgent installed by --use-env-proxy / NODE_USE_ENV_PROXY. */
 export function installHttp1FetchDispatcher(): void {
-  const undici = requireUndici("undici") as typeof Undici;
+  const undici = loadUndici();
   // Node's agent comes from its internal undici copy, so `instanceof` against the npm class is false.
   const usesEnvProxy = undici.getGlobalDispatcher().constructor.name === "EnvHttpProxyAgent";
   undici.setGlobalDispatcher(

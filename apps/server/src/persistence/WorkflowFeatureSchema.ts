@@ -1,6 +1,9 @@
 import { assistantRoutineMigration } from "./AssistantRoutineMigration.ts";
 import { threadHistoryArchiveMigration } from "./ThreadHistoryArchiveMigration.ts";
-import { externalNotificationMigration } from "./ExternalNotificationMigration.ts";
+import {
+  externalNotificationMigration,
+  externalNotificationOccurrenceMigration,
+} from "./ExternalNotificationMigration.ts";
 import { assistantMemoryMigration } from "./AssistantMemoryMigration.ts";
 import { projectWorkDeliveryRecoveryMigration } from "./ProjectWorkDeliveryRecoveryMigration.ts";
 import { assistantMigration } from "./AssistantMigration.ts";
@@ -63,6 +66,7 @@ export const workflowFeatureMigrations: ReadonlyArray<WorkflowFeatureMigration> 
   externalNotificationMigration,
   assistantRoutineMigration,
   mcpCatalogAliasMigration,
+  externalNotificationOccurrenceMigration,
 ];
 
 export const isWorkflowFeatureName = (name: string) =>

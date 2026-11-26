@@ -235,9 +235,17 @@ describe("ConnectionCatalogDocument", () => {
       }),
     );
 
-    expect(removeConnectionFromCatalog(registered, ENVIRONMENT_ID)).toEqual(
-      EMPTY_CONNECTION_CATALOG_DOCUMENT,
-    );
+    const orphaned = new BearerConnectionProfile({
+      ...BEARER_PROFILE,
+      connectionId: "learned:orphaned",
+      learned: true,
+    });
+    expect(
+      removeConnectionFromCatalog(
+        { ...registered, profiles: [...registered.profiles, orphaned] },
+        ENVIRONMENT_ID,
+      ),
+    ).toEqual(EMPTY_CONNECTION_CATALOG_DOCUMENT);
   });
 
   it("stores a DPoP token for a registered relay environment", () => {
@@ -392,6 +400,54 @@ describe("ConnectionCatalogDocument", () => {
     const bearerOnly = setRoutesInCatalog(withRelay, ENVIRONMENT_ID, [BEARER_TARGET]);
     expect(bearerOnly.credentials).toHaveLength(1);
     expect(bearerOnly.remoteDpopTokens).toEqual([]);
+  });
+
+  it("retains omitted learned routes through visible edits until their donor is removed", () => {
+    const learned = new BearerConnectionTarget({
+      ...BEARER_TARGET,
+      connectionId: `learned:${ENVIRONMENT_ID}:https://hint.example.test@${BEARER_TARGET.connectionId}`,
+    });
+    const profile = new BearerConnectionProfile({
+      ...BEARER_PROFILE,
+      connectionId: learned.connectionId,
+      httpBaseUrl: "https://hint.example.test",
+      wsBaseUrl: "wss://hint.example.test",
+      learned: true,
+      directorySource: "relay-account",
+    });
+    const document = {
+      ...EMPTY_CONNECTION_CATALOG_DOCUMENT,
+      targets: [learned, BEARER_TARGET, RELAY_TARGET],
+      profiles: [profile, BEARER_PROFILE],
+    };
+    const edited = registerConnectionInCatalog(
+      document,
+      new BearerConnectionRegistration({
+        target: BEARER_TARGET,
+        profile: new BearerConnectionProfile({ ...BEARER_PROFILE, label: "Renamed" }),
+        credential: BEARER_CREDENTIAL,
+      }),
+      [BEARER_TARGET, RELAY_TARGET],
+    );
+    expect(edited.targets).toEqual([BEARER_TARGET, RELAY_TARGET, learned]);
+    expect(edited.profiles).toContainEqual(profile);
+
+    const reordered = setRoutesInCatalog(document, ENVIRONMENT_ID, [RELAY_TARGET, BEARER_TARGET]);
+    expect(reordered.targets).toEqual([RELAY_TARGET, BEARER_TARGET, learned]);
+    expect(reordered.profiles).toContainEqual(profile);
+
+    const withoutHint = setRoutesInCatalog(
+      reordered,
+      ENVIRONMENT_ID,
+      [RELAY_TARGET, BEARER_TARGET],
+      new Set([learned.connectionId]),
+    );
+    expect(withoutHint.targets).toEqual([RELAY_TARGET, BEARER_TARGET]);
+    expect(withoutHint.profiles).toEqual([BEARER_PROFILE]);
+
+    const withoutDonor = setRoutesInCatalog(reordered, ENVIRONMENT_ID, [RELAY_TARGET]);
+    expect(withoutDonor.targets).toEqual([RELAY_TARGET]);
+    expect(withoutDonor.profiles).toEqual([]);
   });
 
   it("keeps an environment's position in the catalog when its routes change", () => {

@@ -16,6 +16,11 @@ import {
 } from "./baseSchemas.ts";
 import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 
+export const RELAY_ADMISSION_PATH = "/.well-known/t3/relay-admission";
+export const RELAY_ADMISSION_HEADER = "T3-Relay-Admission";
+export const RELAY_ADMISSION_ACTIVE = { status: 204, marker: "active" } as const;
+export const RELAY_ADMISSION_RETIRED = { status: 410, marker: "retired" } as const;
+
 export const RelayAgentAwarenessPlatform = Schema.Literals(["ios", "android"]);
 export type RelayAgentAwarenessPlatform = typeof RelayAgentAwarenessPlatform.Type;
 

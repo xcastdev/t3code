@@ -40,7 +40,14 @@ export function useWorkspaceFileAssetUrlState(props: {
     if (draftCwd === null) return null;
     return { _tag: "draft-workspace-file", cwd: draftCwd, path: relativePath };
   }, [absolutePath, relativePath, props.threadId, draftCwd]);
-  const state = useAssetUrlState(props.environmentId, resource);
+  const state = useAssetUrlState(
+    props.environmentId,
+    resource,
+    undefined,
+    relativePath !== null && /\.(?:html?|svg|xhtml)$/i.test(relativePath)
+      ? "web-document"
+      : undefined,
+  );
   const refresh = useRefreshAssetUrl(props.environmentId, resource);
   return { ...state, resource, refresh };
 }

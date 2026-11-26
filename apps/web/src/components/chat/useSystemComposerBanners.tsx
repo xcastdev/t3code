@@ -11,7 +11,10 @@ import {
 import { WifiOffIcon } from "lucide-react";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { environmentCatalog } from "../../connection/catalog";
-import { ConnectionDiagnosisHeadline } from "../settings/ConnectionDiagnosisDetails";
+import {
+  ConnectionDiagnosisHeadline,
+  RenewHostedRelayAccessButton,
+} from "../settings/ConnectionDiagnosisDetails";
 import { isDesktopLocalConnectionTarget } from "../../connection/desktopLocal";
 import {
   useEnvironmentDisconnectDelay,
@@ -202,7 +205,9 @@ export function useSystemComposerBanners(input: SystemComposerBannersInput) {
         ) : undefined,
         actions: (
           <>
-            {unavailableConnection.phase !== "connecting" ? (
+            {unavailableConnection.hostedRelayAdmissionRequired ? (
+              <RenewHostedRelayAccessButton />
+            ) : unavailableConnection.phase !== "connecting" ? (
               <Button
                 size="xs"
                 variant="ghost"

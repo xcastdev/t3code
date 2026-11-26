@@ -2,6 +2,7 @@ import { Linking } from "react-native";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { tryOpenExternalUrl } from "./openExternalUrl";
+import { markVerificationRequired } from "../connection/verified-route";
 
 vi.mock("react-native", () => ({
   Linking: { openURL: vi.fn() },
@@ -18,6 +19,13 @@ afterEach(() => {
 });
 
 describe("tryOpenExternalUrl", () => {
+  it("withholds a signed URL from the external browser when its issuer requires verification", async () => {
+    const url = "https://external-preview.example.test/api/assets/signed/document.html";
+    markVerificationRequired(url);
+    await expect(tryOpenExternalUrl(url, "file-preview")).resolves.toBe(false);
+    expect(openURL).not.toHaveBeenCalled();
+  });
+
   it("keeps provider sign-in URLs unchanged and out of failure logs", async () => {
     const url =
       "https://accounts.google.com/o/oauth2/v2/auth?state=private-state&code_challenge=private-challenge&redirect_uri=http%3A%2F%2F127.0.0.1%3A43123%2F";

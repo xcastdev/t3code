@@ -186,6 +186,7 @@ const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 function metadataForV2Event(event: OrchestrationV2DomainEvent): Record<string, unknown> {
   return {
+    ...(event.projectId === undefined ? {} : { projectId: event.projectId }),
     ...(event.runId === undefined ? {} : { runId: event.runId }),
     ...(event.nodeId === undefined ? {} : { nodeId: event.nodeId }),
     ...(event.driver === undefined ? {} : { driver: event.driver }),
@@ -209,6 +210,7 @@ const rowToV2StoredEvent = Effect.fn("OrchestrationEventStore.rowToV2StoredEvent
     type: row.event_type,
     occurredAt: row.occurred_at,
     payload,
+    ...(values.projectId === undefined ? {} : { projectId: values.projectId }),
     ...(values.runId === undefined ? {} : { runId: values.runId }),
     ...(values.nodeId === undefined ? {} : { nodeId: values.nodeId }),
     ...(values.driver === undefined ? {} : { driver: values.driver }),

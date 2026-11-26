@@ -20,6 +20,7 @@ import {
   BearerConnectionCredential,
   BearerConnectionProfile,
   BearerConnectionRegistration,
+  type ConnectionCatalogEntry,
   PrimaryConnectionRegistration,
 } from "./catalog.ts";
 import * as Connectivity from "./connectivity.ts";
@@ -38,8 +39,14 @@ import {
 } from "./onboarding.ts";
 import * as EnvironmentRegistry from "./registry.ts";
 import * as ConnectionProfileStore from "./profileStore.ts";
-import { connectionRoutes, routeHttpBaseUrl } from "./routes.ts";
+import {
+  connectionRoutes,
+  entryWithRoutes,
+  mergeLearnedRoutes,
+  routeHttpBaseUrl,
+} from "./routes.ts";
 import * as ConnectionWakeups from "./wakeups.ts";
+import { VerifiedRoutePolicy } from "./verifiedRoute.ts";
 
 const layerClientPresentation = Layer.succeed(
   ClientCapabilities.ClientPresentation,
@@ -236,6 +243,74 @@ const registerSwitchedOffEnvironment = Effect.gen(function* () {
 });
 
 describe("connection onboarding", () => {
+  it.effect.each([false, true])(
+    "requires verified enrollment before pairing (present=%s)",
+    (enrolled) =>
+      Effect.gen(function* () {
+        const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+        const result = yield* preparePairingRegistration({
+          ...PAIRING_INPUT,
+          expectedEnvironmentId: PAIRED_ENVIRONMENT_ID,
+          verificationRequired: true,
+        }).pipe(
+          Effect.provide(layerPairingOnboarding(undefined, calls)),
+          Effect.provideService(VerifiedRoutePolicy, {
+            readEnrollment: (httpsOrigin) =>
+              Effect.succeed(
+                enrolled ? { httpsOrigin, environmentId: PAIRED_ENVIRONMENT_ID } : null,
+              ),
+            enforce: () => Effect.succeed(true),
+          }),
+          Effect.result,
+        );
+        if (enrolled) {
+          expect(result).toMatchObject({
+            _tag: "Success",
+            success: {
+              profile: { verificationRequired: true },
+              credential: { token: "bearer-token" },
+            },
+          });
+          expect(calls).toHaveLength(2);
+        } else {
+          expect(result).toMatchObject({
+            _tag: "Failure",
+            failure: { _tag: "ConnectionBlockedError", reason: "configuration" },
+          });
+          expect(calls).toEqual([]);
+        }
+      }),
+  );
+
+  it.effect(
+    "blocks explicit relay pairing before reading even its descriptor without admission",
+    () =>
+      Effect.gen(function* () {
+        const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+        const blocked = new ConnectionBlockedError({
+          reason: "authentication",
+          hop: "relay",
+          detail: "Hosted relay admission is required.",
+        });
+        const result = yield* preparePairingRegistration(PAIRING_INPUT).pipe(
+          Effect.provide(layerPairingOnboarding(undefined, calls)),
+          Effect.provideService(VerifiedRoutePolicy, {
+            readEnrollment: () =>
+              Effect.succeed({
+                httpsOrigin: new URL(PAIRED_PROFILE.httpBaseUrl).origin,
+                environmentId: PAIRED_ENVIRONMENT_ID,
+                transportRole: "relay",
+              }),
+            enforce: () => Effect.succeed(true),
+            requireAdmission: () => Effect.fail(blocked),
+          }),
+          Effect.result,
+        );
+        expect(result).toMatchObject({ _tag: "Failure", failure: blocked });
+        expect(calls).toEqual([]);
+      }),
+  );
+
   it.effect("prepares a persisted bearer registration from pairing details", () =>
     Effect.gen(function* () {
       const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
@@ -611,6 +686,71 @@ describe("connection onboarding", () => {
         "https://remote.example.test/.well-known/t3/environment",
       ]);
     }),
+  );
+
+  it.effect("edits the paired bearer when a learned LAN route comes first", () =>
+    Effect.gen(function* () {
+      const target = new BearerConnectionTarget({
+        environmentId: PAIRED_ENVIRONMENT_ID,
+        connectionId: PAIRED_PROFILE.connectionId,
+        label: PAIRED_PROFILE.label,
+      });
+      const paired = { target, profile: Option.some(PAIRED_PROFILE) };
+      const entry = { ...paired, enabled: true };
+      const routes = mergeLearnedRoutes({
+        entry,
+        activeRoute: paired,
+        reported: [{ httpBaseUrl: "https://192.168.1.10:3773" }],
+        allowInsecure: false,
+      })!;
+      expect(routes[0]?.target).not.toBe(target);
+      const entries = yield* SubscriptionRef.make<
+        ReadonlyMap<EnvironmentId, ConnectionCatalogEntry>
+      >(new Map([[PAIRED_ENVIRONMENT_ID, entryWithRoutes(entry, routes)]]));
+      const registrations: Array<BearerConnectionRegistration> = [];
+      const lookups: Array<string> = [];
+      const onboarding = yield* Onboarding.make.pipe(
+        Effect.provideService(
+          EnvironmentRegistry.EnvironmentRegistry,
+          EnvironmentRegistry.EnvironmentRegistry.of({
+            ...(yield* EnvironmentRegistry.EnvironmentRegistry),
+            entries,
+            register: (registration) =>
+              Effect.sync(() => {
+                expect(registration._tag).toBe("BearerConnectionRegistration");
+                if (registration._tag === "BearerConnectionRegistration") {
+                  registrations.push(registration);
+                }
+                return true;
+              }),
+          }),
+        ),
+        Effect.provideService(ConnectionCredentialStore.ConnectionCredentialStore, {
+          ...(yield* ConnectionCredentialStore.ConnectionCredentialStore),
+          get: (connectionId) =>
+            Effect.sync(() => {
+              lookups.push(connectionId);
+              return connectionId === target.connectionId
+                ? Option.some(new BearerConnectionCredential({ token: "paired-token" }))
+                : Option.none();
+            }),
+        }),
+      );
+
+      yield* onboarding.updateBearer({
+        environmentId: PAIRED_ENVIRONMENT_ID,
+        label: "Renamed",
+        httpBaseUrl: PAIRED_PROFILE.httpBaseUrl,
+      });
+
+      expect(lookups).toEqual([target.connectionId]);
+      expect(registrations).toMatchObject([
+        {
+          target: { connectionId: target.connectionId, label: "Renamed" },
+          credential: { token: "paired-token" },
+        },
+      ]);
+    }).pipe(Effect.provide(layerPairingOnboarding())),
   );
 
   it.effect("updates bearer metadata while preserving the credential and identity", () =>

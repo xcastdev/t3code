@@ -1,3 +1,5 @@
+import { useVerifiedWebDocument } from "../../lib/verifiedWebDocument";
+import type { PluginPanelDocument } from "./pluginRelay";
 import { RegistryContext } from "@effect/atom-react";
 import { StackActions, useNavigation, type StaticScreenProps } from "@react-navigation/native";
 import {
@@ -184,19 +186,27 @@ function ServerPanelDocument(props: {
   readonly panelId: string;
   readonly version: string;
   readonly title: string;
-  readonly children: (url: string) => React.ReactNode;
+  readonly children: (document: PluginPanelDocument) => React.ReactNode;
 }) {
   // The view keeps its first URL: a re-minted one would reload the panel.
   const [url, setUrl] = useState<string | null>(null);
-  const asset = useAssetUrlState(url === null ? props.environmentId : null, {
-    _tag: "plugin-panel",
-    pluginId: props.pluginId,
-    panelId: props.panelId,
-    version: props.version,
-  });
+  const asset = useAssetUrlState(
+    url === null ? props.environmentId : null,
+    {
+      _tag: "plugin-panel",
+      pluginId: props.pluginId,
+      panelId: props.panelId,
+      version: props.version,
+    },
+    undefined,
+    "web-document",
+  );
   if (url === null && asset._tag === "Success") setUrl(asset.url);
-  if (url !== null) return props.children(url);
-  return asset._tag === "Failure" ? (
+  const document = useVerifiedWebDocument(url);
+  if (document.kind === "direct" && document.url !== null)
+    return props.children({ kind: "src", url: document.url });
+  if (document.kind === "local") return props.children({ kind: "srcdoc", html: document.html });
+  return asset._tag === "Failure" || document.kind === "failed" ? (
     <PanelState
       title={`Unable to load ${props.title}`}
       detail="Check the connection and reopen it."
@@ -320,12 +330,13 @@ function PluginPanelSurface(props: {
         }
       : { kind: "client" as const };
   const backend = (environmentId: EnvironmentId, manifestValue: PluginManifest): PluginBackend => ({
-    call: async (operation, input) => {
+    call: async (operation, input, lifetime) => {
       const mutates =
         manifestValue.backend?.operations.find((entry) => entry.name === operation)?.mutates ??
         true;
       // A system picker or share sheet backgrounds the app, which reconnects on return.
       await waitForEnvironmentConnection(registry, environmentCatalog.stateAtom(environmentId));
+      lifetime.throwIfAborted();
       const result = await runAtomCommand(
         registry,
         mutates ? pluginEnvironment.mutate : pluginEnvironment.query,
@@ -425,10 +436,10 @@ function PluginPanelSurface(props: {
       version={version}
       title={panel.title}
     >
-      {(url) => (
+      {(document) => (
         <PluginWebView
           title={panel.title}
-          document={{ kind: "src", url }}
+          document={document}
           bridge={bridge}
           destination={destination}
           chatTarget={chatTarget}

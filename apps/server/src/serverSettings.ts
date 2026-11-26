@@ -1,3 +1,5 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Client settings projection stays synchronous.
+import * as NodeCrypto from "node:crypto";
 import {
   DEFAULT_SERVER_SETTINGS,
   ModelSelection,
@@ -65,6 +67,7 @@ import {
 import {
   mapSettingsSecrets,
   mapSettingsSecretValues,
+  NOTIFICATION_SIGNING_KEY_PREFIX,
   withoutRemovedSecretProviderReferences,
   withoutRedirectedSimlockTokens,
   SECRET_REDACTED,
@@ -140,9 +143,43 @@ const normalizeServerSettings = (
     ),
   );
 
+export interface SettingsClientCapabilities {
+  readonly secretReferences: boolean;
+  readonly genericWebhookDestinations?: boolean;
+}
+
+// Key the revision so it changes with credential rotation without exposing a guessable hash.
+const notificationRevisionKey = NodeCrypto.randomBytes(32);
+function notificationRevision(settings: ServerSettings): string {
+  const destinations = settings.externalNotifications.destinations.map((entry) => [
+    entry.id,
+    entry.name,
+    entry.kind,
+    entry.enabled,
+    entry.events,
+    entry.webhookUrl,
+    entry.signingKey,
+  ]);
+  return NodeCrypto.createHmac("sha256", notificationRevisionKey)
+    .update(JSON.stringify(destinations))
+    .digest("base64url");
+}
+
+function checkNotificationRevision(
+  settings: ServerSettings,
+  expected: string,
+  settingsPath: string,
+) {
+  return notificationRevision(settings) === expected
+    ? Effect.void
+    : Effect.fail(
+        new ServerSettingsError({ settingsPath, operation: "stale-notification-destinations" }),
+      );
+}
+
 export function redactServerSettingsForClient(
   settings: ServerSettings,
-  client: { readonly secretReferences: boolean },
+  client: SettingsClientCapabilities,
 ): ServerSettings {
   const redacted = mapSettingsSecrets(settings, (secret) =>
     secret.sensitive
@@ -155,7 +192,59 @@ export function redactServerSettingsForClient(
     : mapSettingsSecretValues(redacted, (value) =>
         isSecretReference(value) ? SECRET_REDACTED : value,
       );
-  return { ...shaped, secretProviders: withoutUnknownSecretProviderConfigs(shaped) };
+  return {
+    ...shaped,
+    secretProviders: withoutUnknownSecretProviderConfigs(shaped),
+    externalNotifications:
+      client.genericWebhookDestinations === false
+        ? {
+            destinations: shaped.externalNotifications.destinations.filter(
+              (destination) => destination.kind === "home-assistant",
+            ),
+          }
+        : client.genericWebhookDestinations === true
+          ? { ...shaped.externalNotifications, revision: notificationRevision(settings) }
+          : shaped.externalNotifications,
+  };
+}
+
+function applySettingsPatchForClient(
+  current: ServerSettings,
+  patch: ServerSettingsPatch,
+  client?: SettingsClientCapabilities,
+): ServerSettings {
+  const updated = applyServerSettingsPatch(current, patch);
+  if (patch.externalNotifications?.destinations === undefined) return updated;
+
+  const previous = current.externalNotifications.destinations;
+  const previousById = new Map(previous.map((entry) => [entry.id, entry]));
+  const legacy = client?.genericWebhookDestinations === false;
+  const destinations = updated.externalNotifications.destinations
+    .filter(({ kind }) => !legacy || kind === "home-assistant")
+    .map((entry) => {
+      const saved = previousById.get(entry.id);
+      const matching = !legacy || saved?.kind === "home-assistant" ? saved : undefined;
+      const signingKey = (legacy ? undefined : entry.signingKey) ?? matching?.signingKey;
+      const events = legacy ? matching?.events : entry.events;
+      const { signingKey: _signingKey, events: _events, ...destination } = entry;
+      return {
+        ...destination,
+        webhookUrl:
+          !legacy && entry.webhookUrl === SECRET_REDACTED
+            ? (matching?.webhookUrl ?? "")
+            : entry.webhookUrl,
+        ...(events === undefined ? {} : { events }),
+        ...(signingKey === undefined ? {} : { signingKey }),
+      };
+    });
+  return {
+    ...updated,
+    externalNotifications: {
+      destinations: legacy
+        ? [...destinations, ...previous.filter(({ kind }) => kind === "generic-webhook")]
+        : destinations,
+    },
+  };
 }
 
 /** A client shown a reference as a saved secret sends that marker back; it keeps the reference. */
@@ -265,11 +354,13 @@ export class ServerSettingsService extends Context.Service<
 
     readonly updateSettings: (
       patch: ServerSettingsPatch,
+      client?: SettingsClientCapabilities,
     ) => Effect.Effect<ServerSettings, ServerSettingsError>;
 
     readonly updateProviderInstance: (
       mutation: ProviderInstanceMutation,
       patch?: ServerSettingsPatch,
+      client?: SettingsClientCapabilities,
     ) => Effect.Effect<ServerSettings, ServerSettingsError>;
 
     readonly withSettingsSnapshot: <A, E, R>(
@@ -309,10 +400,17 @@ const makeTest = Effect.fn("serverSettings.makeTest")(function* (
   const getSettings = Ref.get(currentSettingsRef).pipe(Effect.map(resolveTextGenerationProvider));
 
   const updateTestSettings = (
+    patch: ServerSettingsPatch,
     update: (current: ServerSettings) => Effect.Effect<ServerSettings, ServerSettingsError>,
   ): Effect.Effect<ServerSettings, ServerSettingsError> =>
     writeSemaphore.withPermits(1)(
       Ref.get(currentSettingsRef).pipe(
+        Effect.tap((current) => {
+          const expected = patch.externalNotifications?.revision;
+          return expected === undefined
+            ? Effect.void
+            : checkNotificationRevision(current, expected, "test settings");
+        }),
         Effect.flatMap(update),
         Effect.flatMap(normalizeServerSettings),
         Effect.tap((nextSettings) => Ref.set(currentSettingsRef, nextSettings)),
@@ -325,15 +423,15 @@ const makeTest = Effect.fn("serverSettings.makeTest")(function* (
     start: Effect.void,
     ready: Effect.void,
     getSettings,
-    updateSettings: (patch) =>
-      updateTestSettings((currentSettings) =>
-        Effect.succeed(applyServerSettingsPatch(currentSettings, patch)),
+    updateSettings: (patch, client) =>
+      updateTestSettings(patch, (currentSettings) =>
+        Effect.succeed(applySettingsPatchForClient(currentSettings, patch, client)),
       ),
-    updateProviderInstance: (mutation, patch = {}) =>
-      updateTestSettings((currentSettings) =>
+    updateProviderInstance: (mutation, patch = {}, client) =>
+      updateTestSettings(patch, (currentSettings) =>
         Effect.gen(function* () {
           yield* ensureProviderInstanceMutationAllowed(currentSettings, mutation, "test settings");
-          const patched = applyServerSettingsPatch(currentSettings, patch);
+          const patched = applySettingsPatchForClient(currentSettings, patch, client);
           return applyProviderInstanceMutation(patched, mutation);
         }),
       ),
@@ -971,13 +1069,17 @@ const make = Effect.gen(function* () {
           Option.isSome(value) ? textDecoder.decode(value.value) : "",
         );
       }
-      return mapSettingsSecrets(settings, (secret) => ({
-        value:
-          secret.sensitive && secret.redacted
-            ? (storedSecrets.get(secret.secretName) ?? "")
-            : secret.value,
-        redacted: secret.sensitive && secret.kind === "environment" && secret.redacted,
-      }));
+      return mapSettingsSecrets(settings, (secret) => {
+        const stored = storedSecrets.get(secret.secretName) ?? "";
+        return {
+          value: secret.sensitive && secret.redacted ? stored : secret.value,
+          redacted:
+            secret.sensitive &&
+            secret.redacted &&
+            (secret.kind === "environment" ||
+              (!stored && secret.secretName.startsWith(NOTIFICATION_SIGNING_KEY_PREFIX))),
+        };
+      });
     },
   );
 
@@ -1204,6 +1306,14 @@ const make = Effect.gen(function* () {
             cause: parseFailure.value,
           });
         }
+        const expected = patch.externalNotifications?.revision;
+        if (expected !== undefined) {
+          const snapshot = yield* materializeSettingsSecrets({
+            ...DEFAULT_SERVER_SETTINGS,
+            externalNotifications: current.externalNotifications,
+          });
+          yield* checkNotificationRevision(managed.applyLocks(snapshot), expected, settingsPath);
+        }
         // An older client echoes a reference as the redacted marker; restore it before vetting so
         // a removed provider's reference is cleared below rather than restored by persistence.
         const updated = withoutRedirectedSimlockTokens(
@@ -1377,18 +1487,18 @@ const make = Effect.gen(function* () {
     start,
     ready: Deferred.await(startedDeferred),
     getSettings: getMaterializedSettings,
-    updateSettings: (patch) =>
+    updateSettings: (patch, client) =>
       updateAndPersistSettings(patch, (current) =>
         ensureSecretProviderWritesAllowed(patch, settingsPath).pipe(
-          Effect.as(applyServerSettingsPatch(current, patch)),
+          Effect.as(applySettingsPatchForClient(current, patch, client)),
         ),
       ),
-    updateProviderInstance: (mutation, patch = {}) =>
+    updateProviderInstance: (mutation, patch = {}, client) =>
       updateAndPersistSettings(patch, (current) =>
         Effect.gen(function* () {
           yield* ensureSecretProviderWritesAllowed(patch, settingsPath);
           yield* ensureProviderInstanceMutationAllowed(current, mutation, settingsPath);
-          const patched = applyServerSettingsPatch(current, patch);
+          const patched = applySettingsPatchForClient(current, patch, client);
           return applyProviderInstanceMutation(patched, mutation);
         }),
       ),

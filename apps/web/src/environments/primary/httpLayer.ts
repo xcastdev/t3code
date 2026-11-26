@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 
+import { fetchEnvironmentResource } from "../../connection/environmentTransport";
 import { attachedTargetForRequestUrl, readDesktopPrimaryBearerToken } from "./desktopAuth";
 import { resolvePrimaryEnvironmentHttpUrl } from "./target";
 
@@ -42,7 +43,7 @@ function withPrimaryBearerToken(client: HttpClient.HttpClient): HttpClient.HttpC
 export function layerForCurrentOrigin() {
   return Layer.unwrap(
     Effect.sync(() => {
-      const layerBase = layerRemoteHttpClient(globalThis.fetch);
+      const layerBase = layerRemoteHttpClient(fetchEnvironmentResource);
       if (isSameOriginBrowserPrimary()) {
         return Layer.merge(
           layerBase,

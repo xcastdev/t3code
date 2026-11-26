@@ -17,6 +17,7 @@ import type { ComposerFileAttachment, ComposerImageAttachment } from "~/composer
 import { composerFileNeedsReattach } from "~/composerDraftStore";
 import { useTheme } from "~/hooks/useTheme";
 import type { AttachmentUploadState } from "~/lib/attachmentUploadState";
+import { useAttachmentUploadFailureReason } from "~/hooks/useAttachmentUploadFailureReason";
 import { useAttachmentUploadProgress } from "~/hooks/useAttachmentUploadProgress";
 import { PullRequestGlyph } from "~/components/pullRequest/pullRequestIcons";
 import {
@@ -181,12 +182,13 @@ function useUploadStatusSuffix(
   return progress;
 }
 
-function attachmentTooltip(
+function useAttachmentTooltip(
   attachment: ComposerImageAttachment | ComposerFileAttachment,
   upload: AttachmentUploadState | undefined,
 ): string {
+  const failureReason = useAttachmentUploadFailureReason();
   const lines = [attachment.name, formatAttachmentSize(attachment.sizeBytes)];
-  if (upload?.status === "failed") lines.push("", upload.reason);
+  if (upload?.status === "failed") lines.push("", failureReason(upload));
   return lines.join("\n");
 }
 
@@ -196,6 +198,7 @@ function ImageContextChip(props: {
 }) {
   const actions = use(ComposerContextActionsContext);
   const suffix = useUploadStatusSuffix(props.record.id, props.upload);
+  const tooltip = useAttachmentTooltip(props.record, props.upload);
   return (
     <Tooltip>
       <TooltipTrigger
@@ -210,7 +213,7 @@ function ImageContextChip(props: {
         }
       />
       <TooltipPopup side="top" className="whitespace-pre-wrap">
-        {attachmentTooltip(props.record, props.upload)}
+        {tooltip}
       </TooltipPopup>
     </Tooltip>
   );
@@ -224,6 +227,7 @@ function FileContextChip(props: {
   const { resolvedTheme } = useTheme();
   const needsReattach = composerFileNeedsReattach(props.record);
   const uploadSuffix = useUploadStatusSuffix(props.record.id, props.upload);
+  const tooltip = useAttachmentTooltip(props.record, props.upload);
   const suffix = needsReattach ? "attach again" : uploadSuffix;
   const size = formatAttachmentSize(props.record.sizeBytes);
   const isVideo = videoMimeType(props.record) !== null;
@@ -255,7 +259,7 @@ function FileContextChip(props: {
       tooltip={
         needsReattach
           ? `${props.record.name} was not saved with this draft. Attach it again to send it.`
-          : attachmentTooltip(props.record, props.upload)
+          : tooltip
       }
     />
   );

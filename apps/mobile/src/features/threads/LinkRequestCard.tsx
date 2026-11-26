@@ -26,6 +26,7 @@ import {
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
+import { useGT } from "gt-react-native";
 import { useMemo, useRef, useState } from "react";
 import { Pressable, ScrollView, View, type ColorValue } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -33,6 +34,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { SymbolView, type AppSymbolName } from "../../components/ui/AppSymbol";
 import { AppText as Text, AppTextInput as TextInput } from "../../components/ui/AppText";
 import { EnvironmentMachineSymbol } from "../../components/EnvironmentMachineSymbol";
+import { I18nProvider } from "../../i18n/I18nProvider";
 import { peerLinkEnvironment, useLinkableMachines } from "../../state/peerLinks";
 import { mintPairingCodeOn } from "../../state/peerPairingCode";
 import { useEnvironmentScope, usePreparedConnection } from "../../state/session";
@@ -179,11 +181,13 @@ function PendingLinkRequest(props: {
         </Text>
       )}
       {open ? (
-        <LinkRequestSheet
-          environmentId={props.environmentId}
-          item={item}
-          onClose={() => setOpen(false)}
-        />
+        <I18nProvider>
+          <LinkRequestSheet
+            environmentId={props.environmentId}
+            item={item}
+            onClose={() => setOpen(false)}
+          />
+        </I18nProvider>
       ) : null}
     </View>
   );
@@ -194,12 +198,17 @@ function LinkRequestSheet(props: {
   readonly item: LinkRequestItem;
   readonly onClose: () => void;
 }) {
+  const gt = useGT();
   const { item } = props;
   const insets = useSafeAreaInsets();
   const pickMachine = picksMachine(item);
   const listed = useLinkableMachines(props.environmentId, true);
   const machines = useMemo(() => rankMachinesByHint(listed, item.hint), [listed, item.hint]);
   const [choice, setChoice] = useState<string | null>(null);
+  const [addressChoice, setAddressChoice] = useState<{
+    environmentId: EnvironmentId;
+    url: string;
+  } | null>(null);
   const [address, setAddress] = useState(item.url ?? "");
   const [access, setAccess] = useState<AuthMcpClientAccess>(() => linkRequestDefaultAccess(item));
   const [pairingCode, setPairingCode] = useState("");
@@ -222,6 +231,12 @@ function LinkRequestSheet(props: {
   const mayMint = useEnvironmentScope(targetId, AuthAccessWriteScope);
   const needsAddress =
     target.kind === "address" || (target.kind === "machine" && target.urls.length === 0);
+  const selectedUrl =
+    target.kind === "machine" &&
+    addressChoice?.environmentId === target.environmentId &&
+    target.urls.includes(addressChoice.url)
+      ? addressChoice.url
+      : null;
   // This phone mints a code there when it is connected with a session that may
   // create pairing links, and only for its own addresses: anything can answer
   // as that machine at one typed in, so that one gets a code the user fetched.
@@ -235,7 +250,14 @@ function LinkRequestSheet(props: {
   const ready =
     target.kind !== "none" &&
     (useExisting ||
-      ((!needsAddress || address.trim().length > 0) && (canMint || pairingCode.trim().length > 0)));
+      ((needsAddress ? address.trim().length > 0 : selectedUrl !== null) &&
+        (canMint || pairingCode.trim().length > 0)));
+
+  const chooseMachine = (next: string) => {
+    setChoice(next);
+    if (next !== selected) setAddressChoice(null);
+    setError(null);
+  };
 
   const prepareAnswer = async () => {
     if (target.kind === "none") return null;
@@ -257,14 +279,17 @@ function LinkRequestSheet(props: {
     }
     return linkRequestAnswerInput(item, {
       type: "link",
-      target: target.kind === "machine" && target.urls.length > 0 ? target : { url: address },
+      target:
+        target.kind === "machine" && selectedUrl !== null
+          ? { ...target, selectedUrl }
+          : { url: address },
       access,
       pairingCode: code,
     });
   };
 
   const submit = async () => {
-    if (inFlight.current || target.kind === "none") return;
+    if (inFlight.current || !ready) return;
     inFlight.current = true;
     setBusy(true);
     setError(null);
@@ -302,7 +327,7 @@ function LinkRequestSheet(props: {
             Agents here can then launch, message and wait on threads there. It appears under
             Authorized clients in that machine's Sharing & access, where it can be revoked.
           </Text>
-          {item.url !== undefined && target.kind === "machine" ? (
+          {item.url !== undefined && useExisting ? (
             <Text className="font-sans text-xs text-foreground-muted" numberOfLines={1}>
               {item.url}
             </Text>
@@ -332,10 +357,7 @@ function LinkRequestSheet(props: {
                 selected={selected === machine.environmentId}
                 separated={index > 0}
                 disabled={busy}
-                onPress={() => {
-                  setChoice(machine.environmentId);
-                  setError(null);
-                }}
+                onPress={() => chooseMachine(machine.environmentId)}
               />
             ))}
             <SettingsChoiceRow
@@ -344,10 +366,7 @@ function LinkRequestSheet(props: {
               selected={selected === ANOTHER_ADDRESS}
               separated={machines.length > 0}
               disabled={busy}
-              onPress={() => {
-                setChoice(ANOTHER_ADDRESS);
-                setError(null);
-              }}
+              onPress={() => chooseMachine(ANOTHER_ADDRESS)}
             />
           </SettingsSection>
         ) : null}
@@ -379,6 +398,20 @@ function LinkRequestSheet(props: {
           </Text>
         ) : target.kind === "none" ? null : (
           <>
+            {target.kind === "machine" && target.urls.length > 0 ? (
+              <SettingsSection title={gt("Choose an address")}>
+                {target.urls.map((url, index) => (
+                  <SettingsChoiceRow
+                    key={url}
+                    label={url}
+                    selected={selectedUrl === url}
+                    separated={index > 0}
+                    disabled={busy}
+                    onPress={() => setAddressChoice({ environmentId: target.environmentId, url })}
+                  />
+                ))}
+              </SettingsSection>
+            ) : null}
             {canMint ? null : (
               <View className="gap-2">
                 <TextInput

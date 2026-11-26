@@ -20,12 +20,20 @@ import * as ConnectionResolver from "./resolver.ts";
 import {
   connectionRouteId,
   connectionRoutes,
+  isLearned,
   routeEntry,
   routeHttpBaseUrl,
   routeKeepsItsHost,
   sendsTokenInClear,
   usableRoutes,
 } from "./routes.ts";
+import {
+  preferOperatorDirectRoutes,
+  requireRouteAdmission,
+  requireVerifiedRoute,
+  verifyRoute,
+  VerifiedRoutePolicy,
+} from "./verifiedRoute.ts";
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
 import * as RpcSession from "../rpc/session.ts";
 import { fetchRemoteEnvironmentDescriptor } from "../environment/descriptor.ts";
@@ -57,9 +65,8 @@ export type RouteCheck = "answered" | "silent" | "unchecked";
 export type RoutePreflight = "ready" | "refused" | "unprepared" | "silent" | "unchecked";
 
 const ROUTE_CHECK_TIMEOUT_MS = 2_500;
-// Preferred direct routes share one head start, so a relay connection does not
-// wait the full probe timeout for a LAN the device has already left. A route
-// that misses it connects over relay, then upgrades with a second reconnect.
+// Unclassified direct routes get a short shared head start; enrolled direct
+// routes keep the same deadline as recovery checks.
 const ROUTE_CHECK_HEAD_START_MS = 500;
 
 export class ConnectionDriver extends Context.Service<
@@ -85,12 +92,13 @@ export const connectOverRoutes = Effect.fn("ConnectionDriver.connectOverRoutes")
     route: ConnectionRoute,
   ) => Effect.Effect<RouteConnection, ConnectionAttemptError, R | Scope.Scope>,
 ) {
-  const routes = usableRoutes(entry);
+  const routes = yield* preferOperatorDirectRoutes(usableRoutes(entry));
   const checks =
     routes.length === 1
       ? []
       : yield* Effect.forEach(routes, (route) => Effect.forkChild(checkRoute(route)));
   const headStart = yield* Effect.forkChild(Effect.sleep(ROUTE_CHECK_HEAD_START_MS));
+  const verifiedDirectDeadline = yield* Effect.forkChild(Effect.sleep(ROUTE_CHECK_TIMEOUT_MS));
   const attemptScope = yield* Scope.Scope;
   let transient: ConnectionAttemptError | undefined;
   let blocked: ConnectionAttemptError | undefined;
@@ -113,12 +121,22 @@ export const connectOverRoutes = Effect.fn("ConnectionDriver.connectOverRoutes")
   });
   const silent: Array<{ readonly route: ConnectionRoute; readonly index: number }> = [];
   for (const [index, route] of routes.entries()) {
+    const profile = Option.getOrNull(route.profile);
+    const operatorDirect =
+      profile?._tag === "BearerConnectionProfile"
+        ? yield* verifyRoute(route.target.environmentId, profile, false).pipe(
+            Effect.map((binding) => binding?.transportRole === "direct"),
+            Effect.orElseSucceed(() => false),
+          )
+        : false;
     const check =
       checks.length === 0
         ? "unchecked"
         : yield* Effect.raceFirst(
             Fiber.join(checks[index]!),
-            Fiber.join(headStart).pipe(Effect.as<RouteCheck>("silent")),
+            Fiber.join(operatorDirect ? verifiedDirectDeadline : headStart).pipe(
+              Effect.as<RouteCheck>("silent"),
+            ),
           );
     if (check === "silent") {
       silent.push({ route, index });
@@ -178,10 +196,16 @@ export const make = Effect.gen(function* () {
   const sessions = yield* RpcSession.RpcSessionFactory;
   const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
   const httpClient = yield* HttpClient.HttpClient;
+  const verifiedRoutes = yield* VerifiedRoutePolicy;
 
   // The descriptor is public, so this sends no credential to whatever
   // answers at a saved LAN address on a different network.
-  const checkDescriptor = (httpBaseUrl: string, environmentId: string, keepsItsHost: boolean) =>
+  const checkDescriptor = (
+    httpBaseUrl: string,
+    environmentId: string,
+    keepsItsHost: boolean,
+    verificationRequired = false,
+  ) =>
     fetchRemoteEnvironmentDescriptor({
       httpBaseUrl,
       timeoutMs: ROUTE_CHECK_TIMEOUT_MS,
@@ -198,30 +222,67 @@ export const make = Effect.gen(function* () {
           : "silent",
       ),
       // A cached descriptor would answer for a host that cannot be reached.
-      Effect.provideService(FetchHttpClient.RequestInit, { cache: "no-store" }),
+      Effect.provideService(FetchHttpClient.RequestInit, {
+        cache: "no-store",
+        ...(verificationRequired ? ({ credentials: "omit", redirect: "error" } as const) : {}),
+      }),
       Effect.provideService(HttpClient.HttpClient, httpClient),
     );
 
-  const checkRoute = (entry: ConnectionCatalogEntry, route: ConnectionRoute) => {
+  const checkRoute = Effect.fn("ConnectionDriver.checkRoute")(function* (
+    entry: ConnectionCatalogEntry,
+    route: ConnectionRoute,
+  ) {
     const httpBaseUrl = routeHttpBaseUrl(route);
-    if (httpBaseUrl === null) return Effect.succeed<RouteCheck>("unchecked");
-    return checkDescriptor(httpBaseUrl, entry.target.environmentId, routeKeepsItsHost(route)).pipe(
-      Effect.withSpan("ConnectionDriver.checkRoute", {
-        attributes: { "connection.target.kind": route.target._tag },
-      }),
+    if (httpBaseUrl === null) return "unchecked" as const;
+    const profile = Option.getOrNull(route.profile);
+    const learned = isLearned(route);
+    if (learned && profile?._tag !== "BearerConnectionProfile") return "unchecked" as const;
+    const enrollment =
+      profile?._tag === "BearerConnectionProfile"
+        ? yield* verifyRoute(
+            entry.target.environmentId,
+            profile,
+            learned || profile.verificationRequired === true,
+          ).pipe(Effect.provideService(VerifiedRoutePolicy, verifiedRoutes), Effect.option)
+        : Option.some(null);
+    if (Option.isNone(enrollment)) return "unchecked" as const;
+    const admission = yield* requireRouteAdmission(enrollment.value).pipe(
+      Effect.provideService(VerifiedRoutePolicy, verifiedRoutes),
+      Effect.option,
     );
-  };
+    if (Option.isNone(admission)) return "unchecked" as const;
+    return yield* checkDescriptor(
+      httpBaseUrl,
+      entry.target.environmentId,
+      routeKeepsItsHost(route),
+      enrollment.value !== null,
+    );
+  });
 
-  const checkHost = (prepared: PreparedConnection) =>
-    checkDescriptor(
+  const checkHost = Effect.fn("ConnectionDriver.checkHost")(function* (
+    prepared: PreparedConnection,
+  ) {
+    yield* Effect.annotateCurrentSpan({ "connection.target.kind": prepared.target._tag });
+    const verificationRequired = prepared.verificationRequired ?? prepared.learnedRoute;
+    if (verificationRequired) {
+      const enrollment = yield* requireVerifiedRoute(prepared.environmentId, {
+        httpBaseUrl: prepared.httpBaseUrl,
+        wsBaseUrl: prepared.socketUrl,
+      }).pipe(
+        Effect.flatMap(requireRouteAdmission),
+        Effect.provideService(VerifiedRoutePolicy, verifiedRoutes),
+        Effect.option,
+      );
+      if (Option.isNone(enrollment)) return "silent" as const;
+    }
+    return yield* checkDescriptor(
       prepared.httpBaseUrl,
       prepared.environmentId,
       prepared.httpBaseUrl.startsWith("https:"),
-    ).pipe(
-      Effect.withSpan("ConnectionDriver.checkHost", {
-        attributes: { "connection.target.kind": prepared.target._tag },
-      }),
+      verificationRequired,
     );
+  });
 
   const connect = Effect.fn("ConnectionDriver.connect")(function* (
     entry: ConnectionCatalogEntry,
@@ -260,7 +321,7 @@ export const make = Effect.gen(function* () {
         }
         return { prepared, session } satisfies RouteConnection;
       }),
-    );
+    ).pipe(Effect.provideService(VerifiedRoutePolicy, verifiedRoutes));
   });
 
   const preflight = (entry: ConnectionCatalogEntry, route: ConnectionRoute) =>

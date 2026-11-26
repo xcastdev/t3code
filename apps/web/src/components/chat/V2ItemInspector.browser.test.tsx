@@ -29,7 +29,10 @@ const artifactAsset = vi.hoisted(() => ({
   images: [] as unknown[],
   refresh: () => {
     artifactAsset.requests.push(artifactAsset.resource);
-    return Promise.resolve("https://environment.example.test/api/assets/signed-output");
+    return Promise.resolve({
+      url: "https://environment.example.test/api/assets/signed-output",
+      learnedRoute: false,
+    });
   },
 }));
 vi.mock(import("~/assets/assetUrls"), async (original) => ({
@@ -43,7 +46,7 @@ vi.mock(import("~/assets/assetUrls"), async (original) => ({
       url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jGfQAAAAASUVORK5CYII=",
     };
   },
-  useAssetUrlRefresh: (_environmentId: unknown, resource: unknown) => {
+  useAssetGrantRefresh: (_environmentId: unknown, resource: unknown) => {
     artifactAsset.resource = resource;
     return artifactAsset.refresh;
   },

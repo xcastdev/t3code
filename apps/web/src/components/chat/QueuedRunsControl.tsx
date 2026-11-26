@@ -30,6 +30,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import { useId, useImperativeHandle, useRef, useState, type ReactNode, type Ref } from "react";
 
+import { requiresAdmittedAsset } from "../../assets/admittedAssetSource";
 import { useAssetUrls } from "../../assets/assetUrls";
 import { threadEnvironment } from "../../state/threads";
 import { useQuietThreadProjection, useQuietThreadShell } from "../../state/entities";
@@ -142,11 +143,13 @@ export function QueuedRunsControl({
       editable: context?.guest === undefined,
       attachments,
       thumbnails: attachments.filter(isImageAttachment).map<ChatImageAttachment>((attachment) => {
-        const previewUrl = queuedImageUrlById.get(attachment.id);
+        const previewUrl =
+          queuedImageUrlById.get(attachment.id) ??
+          (attachment.previewUrl && requiresAdmittedAsset(attachment.previewUrl) ? "" : undefined);
         return {
           ...attachment,
           type: "image",
-          ...(previewUrl ? { previewUrl } : {}),
+          ...(previewUrl === undefined ? {} : { previewUrl }),
         };
       }),
       pending: false,

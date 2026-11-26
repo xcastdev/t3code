@@ -47,11 +47,19 @@ import {
   withoutEnvironmentThemes,
 } from "../state/serverConfigProjection.ts";
 import { environmentMismatchError } from "../connection/errors.ts";
+import {
+  requireRouteAdmission,
+  requireVerifiedRoute,
+  VerifiedRoutePolicy,
+} from "../connection/verifiedRoute.ts";
 import { recordServerClock } from "../clock.ts";
 
 const SOCKET_OPEN_TIMEOUT = "15 seconds";
 
 export interface RpcSession {
+  readonly httpBaseUrl?: string;
+  readonly learnedRoute?: true;
+  readonly verificationRequired?: true;
   readonly client: WsRpcProtocolClient;
   readonly initialConfig: Effect.Effect<ServerConfig, ConnectionAttemptError>;
   readonly subscribeServerConfig: (
@@ -176,6 +184,7 @@ export const make = Effect.fn("RpcSessionFactory.make")(function* (
   options: RpcSessionOptions = {},
 ) {
   const webSocketConstructor = yield* Socket.WebSocketConstructor;
+  const verifiedRoutes = yield* VerifiedRoutePolicy;
   const serverConfigInput: ServerConfigSubscriptionInput = {
     ...(options.environmentThemes === true ? { environmentThemes: true } : {}),
     ...(options.usageLimitSources === true ? { usageLimitSources: true } : {}),
@@ -191,6 +200,15 @@ export const make = Effect.fn("RpcSessionFactory.make")(function* (
   });
 
   const connect = Effect.fnUntraced(function* (connection: PreparedConnection) {
+    if (connection.verificationRequired || connection.learnedRoute) {
+      const enrollment = yield* requireVerifiedRoute(connection.environmentId, {
+        httpBaseUrl: connection.httpBaseUrl,
+        wsBaseUrl: connection.socketUrl,
+      }).pipe(Effect.provideService(VerifiedRoutePolicy, verifiedRoutes));
+      yield* requireRouteAdmission(enrollment).pipe(
+        Effect.provideService(VerifiedRoutePolicy, verifiedRoutes),
+      );
+    }
     const via = connection.target._tag === "RelayConnectionTarget" ? "relay" : "direct";
     const networkHint = via === "relay" ? ` ${NETWORK_BLOCKING_HINT}` : "";
     const mapRpcError = (error: Parameters<typeof mapSessionRpcError>[0]) =>
@@ -455,6 +473,9 @@ export const make = Effect.fn("RpcSessionFactory.make")(function* (
     );
 
     return {
+      httpBaseUrl: connection.httpBaseUrl,
+      ...(connection.learnedRoute ? { learnedRoute: true as const } : {}),
+      ...(connection.verificationRequired ? { verificationRequired: true as const } : {}),
       client: protocolClient,
       initialConfig,
       subscribeServerConfig,

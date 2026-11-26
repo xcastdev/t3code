@@ -9,6 +9,8 @@ import * as HttpApiSchema from "effect/http-api/HttpApiSchema";
 import * as HttpServerRespondable from "effect/http/HttpServerRespondable";
 import * as HttpServerResponse from "effect/http/HttpServerResponse";
 
+import { SELF_HOSTED_RELAY_HOOK_DELIVERY_PATH } from "./selfHostedRelayHooks.ts";
+
 import {
   AuthAccessTokenResult,
   AuthBrowserSessionRequest,
@@ -1061,7 +1063,23 @@ class EnvironmentWebhooksHttpApi extends HttpApiGroup.make("webhooks")
   .add(HttpApiEndpoint.post("webhookPost", WEBHOOK_PATH, webhookEndpoint))
   .add(HttpApiEndpoint.put("webhookPut", WEBHOOK_PATH, webhookEndpoint))
   .add(HttpApiEndpoint.patch("webhookPatch", WEBHOOK_PATH, webhookEndpoint))
-  .add(HttpApiEndpoint.get("webhookGet", WEBHOOK_PATH, webhookEndpoint)) {}
+  .add(HttpApiEndpoint.get("webhookGet", WEBHOOK_PATH, webhookEndpoint))
+  .add(
+    HttpApiEndpoint.post("relayWebhookPost", SELF_HOSTED_RELAY_HOOK_DELIVERY_PATH, webhookEndpoint),
+  )
+  .add(
+    HttpApiEndpoint.put("relayWebhookPut", SELF_HOSTED_RELAY_HOOK_DELIVERY_PATH, webhookEndpoint),
+  )
+  .add(
+    HttpApiEndpoint.patch(
+      "relayWebhookPatch",
+      SELF_HOSTED_RELAY_HOOK_DELIVERY_PATH,
+      webhookEndpoint,
+    ),
+  )
+  .add(
+    HttpApiEndpoint.get("relayWebhookGet", SELF_HOSTED_RELAY_HOOK_DELIVERY_PATH, webhookEndpoint),
+  ) {}
 
 export class EnvironmentHttpApi extends HttpApi.make("environment")
   .add(EnvironmentMetadataHttpApi)

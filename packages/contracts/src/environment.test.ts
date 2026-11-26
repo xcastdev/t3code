@@ -14,6 +14,18 @@ const descriptor = {
 } as const;
 
 describe("ExecutionEnvironmentDescriptor", () => {
+  it("preserves advertised webhook and filter support and accepts older descriptors", () => {
+    expect(decodeDescriptor(descriptor).capabilities).not.toHaveProperty(
+      "genericWebhookDestinations",
+    );
+    expect(
+      decodeDescriptor({
+        ...descriptor,
+        capabilities: { ...descriptor.capabilities, genericWebhookDestinations: true },
+      }).capabilities,
+    ).toHaveProperty("genericWebhookDestinations", true);
+  });
+
   it("decodes old, recognized and future manual installation descriptors", () => {
     expect(decodeDescriptor(descriptor).capabilities.serverInstallation).toBeUndefined();
     for (const installation of [

@@ -815,7 +815,7 @@ export function createMessageAttachmentPreviewProjector() {
       const previousUrl =
         "previewUrl" in previousAttachment ? previousAttachment.previewUrl : undefined;
       const next =
-        !previewUrl || previewUrl === sourceUrl
+        previewUrl === undefined || previewUrl === sourceUrl
           ? attachment
           : previewUrl === previousUrl
             ? previousAttachment

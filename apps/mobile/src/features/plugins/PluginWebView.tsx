@@ -1,3 +1,4 @@
+import { SecureWebView } from "../../native/secureWebView";
 import { mcpAppStyleVariables } from "@t3tools/client-runtime/mcp-apps";
 import {
   makePluginBridge,
@@ -7,7 +8,7 @@ import {
 } from "@t3tools/client-runtime/plugins/bridge";
 import { useEffect, useRef, useState } from "react";
 import { Platform, View } from "react-native";
-import { WebView, type WebViewMessageEvent } from "react-native-webview";
+import { type WebView, type WebViewMessageEvent } from "react-native-webview";
 
 import { AppActivityIndicator } from "../../components/ui/AppActivityIndicator";
 import { AppText as Text } from "../../components/ui/AppText";
@@ -43,6 +44,7 @@ export function PluginWebView(props: {
   const [secret] = useState(uuidv4);
   // The view keeps its first document: a new one would reload the panel.
   const [source] = useState(() => ({ html: pluginOuterDocument(props.document, secret) }));
+  const isolated = props.document.kind === "srcdoc";
   const [loaded, setLoaded] = useState(false);
   const [stopped, setStopped] = useState<"navigated" | "crashed" | null>(null);
   const bridgeRef = useRef<PluginBridge | null>(null);
@@ -88,7 +90,7 @@ export function PluginWebView(props: {
         ? {}
         : {
             backend: {
-              call: (operation, input) => backend().call(operation, input),
+              call: (operation, input, lifetime) => backend().call(operation, input, lifetime),
               subscribe: (topic, params, onEvent) => backend().subscribe(topic, params, onEvent),
             },
           }),
@@ -135,7 +137,9 @@ export function PluginWebView(props: {
           </Text>
         </View>
       ) : (
-        <WebView<object>
+        <SecureWebView
+          verified={isolated}
+          onFenceError={() => stop("crashed")}
           ref={attachWebView}
           source={source}
           accessibilityLabel={props.title}

@@ -47,12 +47,12 @@ it.effect("late completion and repeated startup reuse one durable V2 notice/wake
     for (const statement of projectTerminalMigration.statements) yield* sql.unsafe(statement);
     yield* sql`INSERT INTO t3_workflow_v2_terminal_completions VALUES('project','shared','generation-1','recipient','noticeAndWake',${ordinaryAuthority},'subscribed')`;
     const receipts = new Set<string>();
-    const effects: string[] = [];
-    const dispatch = (command: { readonly commandId: string }) =>
+    const effects: OrchestrationV2ServerCommand[] = [];
+    const dispatch = (command: OrchestrationV2ServerCommand) =>
       Effect.sync(() => {
         if (!receipts.has(command.commandId)) {
           receipts.add(command.commandId);
-          effects.push(command.commandId);
+          effects.push(command);
         }
         return { sequence: 1, storedEvents: [] };
       });
@@ -60,6 +60,11 @@ it.effect("late completion and repeated startup reuse one durable V2 notice/wake
     yield* deliverProjectTerminalCompletion(terminal, dependencies);
     yield* deliverProjectTerminalCompletion(terminal, dependencies);
     assert.equal(effects.length, 2);
+    const [notice, wake] = effects;
+    assert.isTrue(notice?.type === "thread.notice.append" && wake?.type === "message.dispatch");
+    if (notice?.type === "thread.notice.append" && wake?.type === "message.dispatch") {
+      assert.equal(notice.sourceMessageId, wake.messageId);
+    }
     assert.equal(
       (yield* sql`SELECT phase FROM t3_workflow_v2_terminal_completions`)[0]?.phase,
       "delivered",

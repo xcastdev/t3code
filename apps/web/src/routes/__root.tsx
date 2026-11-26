@@ -52,6 +52,7 @@ import { useUiStateStore } from "../uiStateStore";
 import { configureClientTracing } from "../observability/clientTracing";
 import { resolveInitialServerAuthGateState } from "../environments/primary";
 import { GUEST_PAGE_PATH } from "../guestPage";
+import { listHostedRelayPairingBindings } from "../connection/hostedRelayAdmission";
 import { hasHostedPairingRequest, isHostedStaticApp } from "../hostedPairing";
 import { useHostedPromptLinkLanding } from "../components/promptLinks/HostedPromptLinkLanding";
 import { isLocalEnvironmentDisabled } from "../localEnvironment";
@@ -75,7 +76,11 @@ export const Route = createRootRoute({
       };
     }
 
-    if (location.pathname === "/pair" && hasHostedPairingRequest(new URL(window.location.href))) {
+    if (
+      location.pathname === "/pair" &&
+      (hasHostedPairingRequest(new URL(window.location.href)) ||
+        listHostedRelayPairingBindings().length > 0)
+    ) {
       return {
         authGateState: {
           status: "hosted-pairing",

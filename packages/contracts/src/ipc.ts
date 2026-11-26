@@ -21,6 +21,25 @@ import type {
   DesktopAppActivationResponse,
 } from "./desktopAppActivation.ts";
 
+export const VerifiedRouteBindingSchema = Schema.Struct({
+  environmentId: TrimmedNonEmptyString,
+  httpsOrigin: Schema.String.check(
+    Schema.makeFilter((origin) => {
+      try {
+        const url = new URL(origin);
+        return url.protocol === "https:" && url.origin === origin && !url.hostname.endsWith(".");
+      } catch {
+        return false;
+      }
+    }),
+  ),
+  transportRole: Schema.optionalKey(Schema.Literals(["direct", "relay"])),
+  leafSpkiSha256: Schema.optionalKey(
+    Schema.String.check(Schema.isPattern(/^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$/)),
+  ),
+});
+export type VerifiedRouteBinding = typeof VerifiedRouteBindingSchema.Type;
+
 export interface ContextMenuItem<T extends string = string> {
   id: T;
   label: string;
@@ -1085,7 +1104,59 @@ export type DesktopMediaRead = typeof DesktopMediaReadSchema.Type;
 export const SystemSettingsPaneSchema = Schema.Literals(["full-disk-access"]);
 export type SystemSettingsPane = typeof SystemSettingsPaneSchema.Type;
 
+export type DesktopRelayHeaders = readonly (readonly [string, string])[];
+
+export type DesktopRelayExchange =
+  | {
+      readonly kind: "http";
+      readonly url: string;
+      readonly method: string;
+      readonly headers: DesktopRelayHeaders;
+      readonly body: boolean;
+    }
+  | { readonly kind: "socket"; readonly url: string; readonly protocols: readonly string[] };
+
+export type DesktopRelayCommand =
+  | { readonly type: "pull" }
+  | { readonly type: "upload"; readonly bytes: Uint8Array }
+  | { readonly type: "uploadEnd" }
+  | { readonly type: "send"; readonly data: Uint8Array | string }
+  | { readonly type: "close"; readonly code: number; readonly reason: string }
+  | { readonly type: "abort" };
+
+export type DesktopRelayEvent =
+  | {
+      readonly type: "response";
+      readonly status: number;
+      readonly statusText: string;
+      readonly headers: DesktopRelayHeaders;
+      readonly body: boolean;
+    }
+  | { readonly type: "uploadPull" }
+  | { readonly type: "bytes"; readonly bytes: Uint8Array }
+  | { readonly type: "end" }
+  | { readonly type: "open"; readonly protocol: string; readonly extensions: string }
+  | { readonly type: "message"; readonly data: Uint8Array | string }
+  | { readonly type: "sent"; readonly bytes: number }
+  | { readonly type: "close"; readonly code: number; readonly reason: string }
+  | { readonly type: "error"; readonly outcomeUnknown: boolean };
+
+export type DesktopRelayMediaKind = "audio" | "video";
+
+export interface DesktopRelayBridge {
+  readonly origins: readonly string[];
+  open(
+    exchange: DesktopRelayExchange,
+    receive: (event: DesktopRelayEvent) => void,
+  ): (command: DesktopRelayCommand) => void;
+  createMediaLease(url: string, kind: DesktopRelayMediaKind): Promise<string>;
+  disposeMediaLease(url: string): Promise<void>;
+  /** Resolves when saved or when the native dialog is dismissed. */
+  saveMedia(url: string, suggestedName: string): Promise<void>;
+}
+
 export interface DesktopBridge {
+  readonly relayTransport?: DesktopRelayBridge;
   getAppBranding: () => DesktopAppBranding | null;
   /** `null` until the desktop host has read the login shell's environment; ask again later. */
   getRelayTelemetryEnabled: () => boolean | null;
@@ -1187,6 +1258,7 @@ export interface DesktopBridge {
   cancelProviderAuthCallback: (authorizationUrl: string) => Promise<void>;
   startFileDrag: (input: { environmentId: EnvironmentId; path: string }) => Promise<boolean>;
   openExternal: (url: string) => Promise<boolean>;
+  getVerifiedRouteBinding?: (httpsOrigin?: string) => Promise<VerifiedRouteBinding | null>;
   /** Reads http(s) media in the main process, outside renderer CORS and CSP; null on network failure. */
   readMedia: (url: string) => Promise<DesktopMediaRead | null>;
   openSystemSettings: (pane: SystemSettingsPane) => Promise<boolean>;

@@ -70,11 +70,7 @@ export function useAttachmentPreviewHandoff(input: AttachmentPreviewHandoffInput
       const url = serverAttachmentUrlById.get(attachment.id);
       return url === undefined ? [] : [url];
     });
-    if (
-      serverPreviewUrls.length === 0 ||
-      serverPreviewUrls.length !== handoffUrls.length ||
-      serverPreviewUrls.some((previewUrl) => previewUrl.startsWith("blob:"))
-    ) {
+    if (serverPreviewUrls.length === 0 || serverPreviewUrls.length !== handoffUrls.length) {
       continue;
     }
     pendingPreloads.push([row.item.messageId, serverPreviewUrls, handoffUrls]);

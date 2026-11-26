@@ -20,6 +20,17 @@ import * as HttpApiClient from "effect/http-api/HttpApiClient";
 
 const isEnvironmentHttpCommonError = Schema.is(EnvironmentHttpCommonError);
 
+export class HostedRelayAdmissionRequiredError extends Schema.TaggedError<
+  HostedRelayAdmissionRequiredError,
+  { readonly brand: unique symbol }
+>()("HostedRelayAdmissionRequiredError", {}) {
+  override get message() {
+    return "Hosted relay admission is required. Redeem a new operator ticket for this environment.";
+  }
+}
+
+export const isHostedRelayAdmissionRequiredError = Schema.is(HostedRelayAdmissionRequiredError);
+
 export class RemoteEnvironmentAuthFetchError extends Schema.TaggedError<RemoteEnvironmentAuthFetchError>()(
   "RemoteEnvironmentAuthFetchError",
   {
@@ -70,6 +81,7 @@ export type RemoteEnvironmentRequestError =
   | EnvironmentResourceNotFoundError
   | EnvironmentInternalError
   | EnvironmentConnectApprovalPendingError
+  | HostedRelayAdmissionRequiredError
   | RemoteEnvironmentAuthFetchError
   | RemoteEnvironmentAuthInvalidJsonError
   | RemoteEnvironmentAuthUndeclaredStatusError
@@ -124,6 +136,13 @@ const failRemoteRequest = (
   }
   if (isEnvironmentHttpCommonError(cause)) {
     return Effect.fail(cause);
+  }
+  if (
+    HttpClientError.isHttpClientError(cause) &&
+    cause.reason._tag === "TransportError" &&
+    isHostedRelayAdmissionRequiredError(cause.reason.cause)
+  ) {
+    return Effect.fail(cause.reason.cause);
   }
   if (Schema.isSchemaError(cause)) {
     return Effect.fail(

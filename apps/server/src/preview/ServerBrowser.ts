@@ -16,6 +16,11 @@ import {
   type PreviewReportStatusInput,
   PREVIEW_AUTOMATION_SERVER_OPERATIONS,
   PreviewViewportSetting as PreviewViewportSettingSchema,
+  PreviewAssetStreamPresentation,
+  PreviewAssetWidgetMessage,
+  type PreviewAssetWidgetKind,
+  PREVIEW_ASSET_WIDGET_MAX_MESSAGE_BYTES,
+  PREVIEW_ASSET_WIDGET_GESTURE_MS,
   PROVIDER_SEND_TURN_MAX_FILE_BYTES,
   type PreviewAutomationActionEvent,
   type PreviewAutomationClickInput,
@@ -51,6 +56,7 @@ import {
 import { AgentScope, agentScopeLauncherScript } from "@t3tools/shared/AgentScope";
 import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { htmlRenderThemeMessage, readHtmlRenderContentHeight } from "@t3tools/shared/htmlRender";
 import { normalizePreviewUrl } from "@t3tools/shared/preview";
 import { resolvePreviewViewport } from "@t3tools/shared/previewViewport";
 import * as NodeCrypto from "node:crypto";
@@ -59,6 +65,7 @@ import * as NodePath from "node:path";
 import * as NodeUtil from "node:util";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
 import * as FileSystem from "effect/FileSystem";
 import { constVoid } from "effect/Function";
 import * as Layer from "effect/Layer";
@@ -96,6 +103,8 @@ import * as PreviewBrowserHost from "./PreviewBrowserHost.ts";
 import { presentAsChrome, ServerBrowserContexts } from "./ServerBrowserContexts.ts";
 import { BrowserControlInterrupted, SessionControl } from "./SessionControl.ts";
 import { installPdfDocumentNavigation, isPdfAssetUrl } from "./PdfDocumentNavigation.ts";
+import * as LocalAssetNavigation from "./LocalAssetNavigation.ts";
+import * as VerifiedAssetNavigation from "./VerifiedAssetNavigation.ts";
 
 const SERVER_HOST_CLIENT_ID = SERVER_BROWSER_AUTOMATION_CLIENT_ID;
 // Each client's report is capped, but the saved catalog is their union, so it has no cap.
@@ -210,6 +219,13 @@ export type ServerBrowserViewerOutput =
       readonly ack: Effect.Effect<void>;
     }
   | { readonly _tag: "viewport"; readonly width: number; readonly height: number }
+  | { readonly _tag: "assetHeight"; readonly height: number }
+  | { readonly _tag: "widgetReady"; readonly kind: PreviewAssetWidgetKind }
+  | {
+      readonly _tag: "widgetMessage";
+      readonly data: PreviewAssetWidgetMessage["data"];
+      readonly gesture?: number;
+    }
   | {
       readonly _tag: "control";
       readonly canOperate: boolean;
@@ -238,6 +254,7 @@ export type ServerBrowserViewerOutput =
   | {
       readonly _tag: "fileChooser";
       readonly id: string;
+      readonly requestId: string;
       readonly multiple: boolean;
       readonly accept: string;
     }
@@ -259,21 +276,38 @@ export interface ServerBrowserViewer {
 
 export type ProfileReporter = (input: PreviewReportProfilesInput) => Effect.Effect<void>;
 
+type ViewerSettings = {
+  readonly maxWidth: number;
+  readonly maxHeight: number;
+  readonly quality: number;
+  readonly canOperate: boolean;
+};
+
+const decodeAssetPresentation = Schema.decodeUnknownOption(PreviewAssetStreamPresentation);
+const decodeWidgetMessage = Schema.decodeUnknownOption(PreviewAssetWidgetMessage);
+const decodeWidgetData = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Json));
+const encodeAssetMessage = Schema.encodeSync(Schema.fromJsonString(Schema.Json));
+const ASSET_INPUT = new Set(["mouse", "wheel", "key", "text", "resize", "probe"]);
+const MAX_LOCAL_ASSET_VIEWS = 8;
+
 export class ServerBrowser extends Context.Service<
   ServerBrowser,
   {
-    readonly attachViewer: (input: {
-      readonly threadId: string;
-      readonly tabId: string;
-      readonly maxWidth: number;
-      readonly maxHeight: number;
-      readonly quality: number;
-      readonly canOperate: boolean;
-    }) => Effect.Effect<
+    readonly attachViewer: (
+      input: ViewerSettings & {
+        readonly threadId: string;
+        readonly tabId: string;
+      },
+    ) => Effect.Effect<
       ServerBrowserViewer,
       ServerBrowserTabNotFoundError | ServerBrowserLaunchError,
       Scope.Scope
     >;
+    readonly attachAssetViewer: (
+      input: ViewerSettings & {
+        readonly asset: LocalAssetNavigation.LocalAssetNavigation;
+      },
+    ) => Effect.Effect<ServerBrowserViewer, ServerBrowserLaunchError, Scope.Scope>;
 
     readonly answerFileChooser: (input: {
       readonly threadId: string;
@@ -328,6 +362,13 @@ interface Recording {
 }
 
 interface ServerTab {
+  assetHeight?: number;
+  widget?: {
+    readonly kind: PreviewAssetWidgetKind;
+    readonly send: (data: PreviewAssetWidgetMessage["data"]) => Promise<unknown>;
+    readonly armGesture: (id?: number, eventType?: "mouseup" | "keydown") => Promise<void>;
+    readonly pending: Array<Extract<ServerBrowserViewerOutput, { readonly _tag: "widgetMessage" }>>;
+  };
   readonly threadId: ThreadId;
   readonly tabId: string;
   readonly page: Page;
@@ -358,6 +399,7 @@ interface ServerTab {
   readonly downloads: Array<ServerDownload>;
   fileChooser: {
     readonly id: string;
+    readonly requestId: string;
     readonly chooser: FileChooser;
     readonly accept: string;
     readonly offeredTo: string | null;
@@ -1076,13 +1118,172 @@ const make = Effect.gen(function* () {
     }
   };
 
+  const installAssetWidget = async (
+    tab: ServerTab,
+    kind: PreviewAssetWidgetKind,
+    rootUrl: string,
+  ) => {
+    const page = tab.page;
+    let pendingBytes = 0;
+    let root: Frame | undefined;
+    const pending: NonNullable<ServerTab["widget"]>["pending"] = [];
+    const ownsRoot = () => root !== undefined && root.url().split("#", 1)[0] === rootUrl;
+    const close = () => void page.close().catch(constVoid);
+    page.on("framenavigated", (frame) => {
+      if (frame.parentFrame() !== page.mainFrame()) return;
+      if (root === undefined && frame.url() === rootUrl) root = frame;
+      else if (root === frame && !ownsRoot()) close();
+    });
+    page.on("framedetached", (frame) => {
+      if (root === frame && !page.isClosed()) close();
+    });
+    let gesture: {
+      readonly id: number;
+      readonly at: number;
+      readonly sequence: number;
+      readonly wasObserved: () => Promise<boolean>;
+    } | null = null;
+    let gestureSequence = 0;
+    let pendingDelivery = Promise.resolve();
+    let delivering = 0;
+    const armRootInput = async (
+      frame: Frame,
+      sequence: number,
+      eventType: "mouseup" | "keydown",
+    ) => {
+      if (!tab.frameSessions.has(frame)) await recordFrameCopies(tab, frame);
+      const frameSession = tab.frameSessions.get(frame);
+      const session = frameSession ?? tab.cdp;
+      const { frameTree } = await session.send("Page.getFrameTree");
+      const target = frameSession
+        ? frameTree.frame
+        : frameTree.childFrames?.find(({ frame }) => frame.url === rootUrl)?.frame;
+      if (target?.url.split("#", 1)[0] !== rootUrl) return;
+      const { executionContextId } = await session.send("Page.createIsolatedWorld", {
+        frameId: target.id,
+        worldName: "t3-preview-widget-activation",
+      });
+      // Chromium propagates focus and activation up the frame tree.
+      const armed = await session.send("Runtime.evaluate", {
+        contextId: executionContextId,
+        expression: `(() => {
+          globalThis.t3WidgetInput?.abort();
+          const listener = new AbortController();
+          globalThis.t3WidgetInput = listener;
+          globalThis.t3WidgetObserved = undefined;
+          window.addEventListener(${JSON.stringify(eventType)}, (event) => {
+            if (!event.isTrusted ||
+                (event.target !== document && event.target?.ownerDocument !== document) ||
+                (event.type === "mouseup" && event.button !== 0)) return;
+            globalThis.t3WidgetObserved = ${sequence};
+            listener.abort();
+          }, { capture: true, signal: listener.signal });
+          return true;
+        })()`,
+        returnByValue: true,
+      });
+      if (armed.result.value !== true) return;
+      return async () => {
+        const proof = await session.send("Runtime.evaluate", {
+          contextId: executionContextId,
+          expression: `globalThis.t3WidgetObserved === ${sequence} && document.hasFocus() && navigator.userActivation.isActive`,
+          returnByValue: true,
+        });
+        return proof.result.value === true;
+      };
+    };
+    await page.exposeBinding("t3AssetWidgetReceive", ({ frame }, content: unknown) => {
+      if (frame !== page.mainFrame() || !ownsRoot() || typeof content !== "string") return;
+      const size = Buffer.byteLength(content);
+      if (size > PREVIEW_ASSET_WIDGET_MAX_MESSAGE_BYTES) return;
+      const decoded = decodeWidgetData(content);
+      if (Option.isNone(decoded)) return;
+      if (delivering >= 16) return close();
+      delivering++;
+      const data = decoded.value;
+      const request = asRecord(data);
+      const candidate =
+        gesture &&
+        request?.jsonrpc === "2.0" &&
+        typeof request.method === "string" &&
+        (typeof request.id === "string" || typeof request.id === "number")
+          ? gesture
+          : null;
+      if (candidate) gesture = null;
+      pendingDelivery = pendingDelivery
+        .then(async () => {
+          if (!ownsRoot()) return;
+          const activated =
+            candidate &&
+            performance.now() - candidate.at <= PREVIEW_ASSET_WIDGET_GESTURE_MS &&
+            (await candidate.wasObserved().catch(() => false)) &&
+            candidate.sequence === gestureSequence &&
+            performance.now() - candidate.at <= PREVIEW_ASSET_WIDGET_GESTURE_MS;
+          if (!ownsRoot()) return;
+          const message = {
+            _tag: "widgetMessage",
+            data,
+            ...(candidate && activated ? { gesture: candidate.id } : {}),
+          } as const;
+          if (tab.viewers.size > 0) {
+            for (const viewer of tab.viewers) viewer.push(message);
+          } else if (
+            pending.length < 16 &&
+            pendingBytes + size <= PREVIEW_ASSET_WIDGET_MAX_MESSAGE_BYTES
+          ) {
+            pending.push(message);
+            pendingBytes += size;
+          } else close();
+        })
+        .catch(close)
+        .finally(() => {
+          delivering--;
+        });
+    });
+    await page.addInitScript(`(() => {
+      if (window !== window.top) return;
+      const encoder = new TextEncoder();
+      window.addEventListener("message", (event) => {
+        if (event.source !== document.querySelector("iframe")?.contentWindow) return;
+        try {
+          const json = JSON.stringify(event.data);
+          if (json !== undefined && encoder.encode(json).length <= ${PREVIEW_ASSET_WIDGET_MAX_MESSAGE_BYTES}) {
+            void window.t3AssetWidgetReceive(json);
+          }
+        } catch {}
+      });
+    })()`);
+    tab.widget = {
+      kind,
+      pending,
+      armGesture: async (id, eventType) => {
+        gesture = null;
+        const sequence = ++gestureSequence;
+        if (id === undefined || eventType === undefined || !root || !ownsRoot()) return;
+        const at = performance.now();
+        const wasObserved = await armRootInput(root, sequence, eventType).catch(() => undefined);
+        if (wasObserved && ownsRoot()) gesture = { id, at, sequence, wasObserved };
+      },
+      send: async (data) => {
+        if (!ownsRoot()) return;
+        await page.evaluate(
+          `document.querySelector("iframe")?.contentWindow?.postMessage(${encodeAssetMessage(data)}, "*")`,
+        );
+      },
+    };
+  };
+
   const createTab = async (
     snapshot: PreviewSessionSnapshot,
     crashedUrl?: string,
+    localAsset?: {
+      readonly navigation: LocalAssetNavigation.LocalAssetNavigation;
+      readonly signal: AbortSignal;
+    },
   ): Promise<ServerTab> => {
     const opened: Array<() => Promise<void>> = [];
     try {
-      return await setUpTab(snapshot, opened, crashedUrl);
+      return await setUpTab(snapshot, opened, crashedUrl, localAsset);
     } catch (cause) {
       // An unpublished tab is in no list, so nothing else would ever close it.
       for (const close of opened.reverse()) await close().catch(constVoid);
@@ -1094,18 +1295,40 @@ const make = Effect.gen(function* () {
     snapshot: PreviewSessionSnapshot,
     opened: Array<() => Promise<void>>,
     crashedUrl: string | undefined,
+    localAsset:
+      | {
+          readonly navigation: LocalAssetNavigation.LocalAssetNavigation;
+          readonly signal: AbortSignal;
+        }
+      | undefined,
   ): Promise<ServerTab> => {
     const adopted = adoptedPages.get(tabKey(snapshot.threadId, snapshot.tabId));
     adoptedPages.delete(tabKey(snapshot.threadId, snapshot.tabId));
+    const verifiedAsset = snapshot.verifiedAsset
+      ? await runPromise(
+          manager.verifiedAssetFor({
+            threadId: ThreadId.make(snapshot.threadId),
+            tabId: snapshot.tabId,
+          }),
+        )
+      : undefined;
+    if (
+      snapshot.verifiedAsset &&
+      (verifiedAsset === undefined ||
+        verifiedAsset.environmentId !== (await runPromise(environment.getEnvironmentId)))
+    ) {
+      throw new Error("The verified preview route does not match this environment");
+    }
+    const restricted = localAsset !== undefined || verifiedAsset !== undefined;
     const desktop =
-      adopted === undefined && (await desktopRenders(snapshot))
+      !restricted && adopted === undefined && (await desktopRenders(snapshot))
         ? await connectDesktop(snapshot)
         : null;
     if (desktop) opened.push(desktop.close);
     // Attaching over CDP emulates a light scheme; a tab on System follows the desktop's.
     if (desktop) await desktop.page.emulateMedia({ colorScheme: null });
     // Otherwise a desktop that attaches late, or has no channel to draw it, shows its own page.
-    if (!desktop) {
+    if (!desktop && !restricted) {
       await runPromise(
         manager
           .markHeadless({ threadId: ThreadId.make(snapshot.threadId), tabId: snapshot.tabId })
@@ -1115,7 +1338,8 @@ const make = Effect.gen(function* () {
     const isolatedContext =
       adopted === undefined &&
       desktop === null &&
-      ((snapshot.automationOwner !== undefined && snapshot.profileId === undefined) ||
+      (restricted ||
+        (snapshot.automationOwner !== undefined && snapshot.profileId === undefined) ||
         snapshot.profileId === INCOGNITO_BROWSER_PROFILE_ID);
     const context =
       adopted?.page.context() ??
@@ -1123,14 +1347,23 @@ const make = Effect.gen(function* () {
       (await contexts.contextFor(
         snapshot.profileId ?? "default",
         isolatedContext ? tabKey(snapshot.threadId, snapshot.tabId) : undefined,
+        localAsset ? "active" : verifiedAsset !== undefined,
       ));
     if (isolatedContext) opened.push(() => context.close());
+    if (verifiedAsset) await VerifiedAssetNavigation.install(context, verifiedAsset);
+    if (localAsset) {
+      const close = () => void context.close().catch(constVoid);
+      localAsset.signal.addEventListener("abort", close, { once: true });
+      context.once("close", () => localAsset.signal.removeEventListener("abort", close));
+      localAsset.signal.throwIfAborted();
+      await LocalAssetNavigation.install(context, localAsset.navigation);
+    }
     if (adopted?.page.isClosed()) throw new Error("The popup closed before it opened.");
-    if (!desktop) await prepareContext(context);
+    if (!desktop && !localAsset) await prepareContext(context);
     const page = adopted?.page ?? desktop?.page ?? (await context.newPage());
     if (!desktop) opened.push(() => page.close());
     const cdp = await context.newCDPSession(page);
-    await installPdfDocumentNavigation(cdp);
+    if (!restricted) await installPdfDocumentNavigation(cdp);
     // The desktop's page is already a normal browser. A popup's first request
     // went out before it became a tab; everything after presents as Chrome.
     if (!desktop) await presentAsChrome(cdp, host);
@@ -1209,6 +1442,49 @@ const make = Effect.gen(function* () {
       await page.setViewportSize(fixedViewportSize(tab.setting) ?? UNATTACHED_FILL_VIEWPORT);
     }
     await applyRendering(tab, snapshot);
+    if (localAsset) {
+      if (localAsset.navigation.widget) {
+        await installAssetWidget(
+          tab,
+          localAsset.navigation.widget,
+          localAsset.navigation.upstream.href,
+        );
+      } else if (localAsset.navigation.themeFragment) {
+        await page.exposeBinding("t3AssetHeight", ({ frame }, value) => {
+          if (frame !== page.mainFrame()) return;
+          const height = readHtmlRenderContentHeight(value);
+          if (height === undefined || height === tab.assetHeight) return;
+          tab.assetHeight = height;
+          for (const viewer of tab.viewers) viewer.push({ _tag: "assetHeight", height });
+        });
+        await page.addInitScript(`(() => {
+          if (window !== window.top) return;
+          window.addEventListener("message", (event) => {
+            if (event.source === document.querySelector("iframe")?.contentWindow &&
+                event.data?.method === "ui/notifications/size-changed") {
+              void window.t3AssetHeight(event.data);
+            }
+          });
+        })()`);
+      }
+      page.on("popup", (popup) => void popup.close().catch(constVoid));
+      page.on("frameattached", (frame) => void recordFrameCopies(tab, frame));
+      page.on("close", () => {
+        for (const viewer of tab.viewers) viewer.push({ _tag: "gone" });
+      });
+      page.on("dialog", (dialog) => void dialog.dismiss().catch(constVoid));
+      page.on("filechooser", (chooser) => void chooser.setFiles([]).catch(constVoid));
+      const loaded = page.waitForResponse(
+        (response) =>
+          response.url() === localAsset.navigation.upstream.href &&
+          response.request().isNavigationRequest(),
+      );
+      await Promise.all([
+        page.goto(localAsset.navigation.viewUrl.href, { waitUntil: "load" }),
+        loaded,
+      ]);
+      return tab;
+    }
     if (desktop) {
       // The desktop resizes and zooms its webview itself; viewers map input with the new size.
       const remeasure = () => {
@@ -1341,10 +1617,12 @@ const make = Effect.gen(function* () {
       tab.dialog = dialog;
       broadcastControl(tab);
     });
-    page.on("download", (download) => void saveDownload(tab, download));
+    if (!verifiedAsset) page.on("download", (download) => void saveDownload(tab, download));
     updateFileChooserInterception(tab);
     // Popups become tabs and keep `window.opener`, so sign-in popups can report back.
-    page.on("popup", (popup) => void adoptPopup(tab, popup));
+    page.on("popup", (popup) =>
+      verifiedAsset ? void popup.close().catch(constVoid) : void adoptPopup(tab, popup),
+    );
     const key = tabKey(tab.threadId, tab.tabId);
     if (closedPendingTabs.delete(key)) {
       if (desktop) {
@@ -1496,6 +1774,7 @@ const make = Effect.gen(function* () {
       ? {
           _tag: "fileChooser",
           id: tab.fileChooser.id,
+          requestId: tab.fileChooser.requestId,
           multiple: tab.fileChooser.chooser.isMultiple(),
           accept: tab.fileChooser.accept,
         }
@@ -1523,6 +1802,7 @@ const make = Effect.gen(function* () {
     if (previous) closeFileChooser(tab);
     tab.fileChooser = {
       id: NodeCrypto.randomUUID(),
+      requestId: NodeCrypto.randomUUID(),
       chooser,
       accept: accept.slice(0, 1024),
       offeredTo: null,
@@ -2933,7 +3213,28 @@ const make = Effect.gen(function* () {
       if (event.type === "opened" && event.snapshot.runtime === "server") {
         const key = tabKey(event.snapshot.threadId, event.snapshot.tabId);
         if (event.snapshot.automationOwner === undefined || pendingTabs.has(key) || tabs.has(key))
-          await ensureTab(event.snapshot).catch(constVoid);
+          await ensureTab(event.snapshot).catch(async () => {
+            if (!event.snapshot.verifiedAsset || event.snapshot.navStatus._tag !== "Loading")
+              return;
+            await runPromise(
+              manager
+                .reportStatus({
+                  threadId: ThreadId.make(event.threadId),
+                  tabId: event.tabId,
+                  serverControlled: true,
+                  navStatus: {
+                    _tag: "LoadFailed",
+                    url: event.snapshot.navStatus.url,
+                    title: "",
+                    code: -2,
+                    description: "Verified preview could not start",
+                  },
+                  canGoBack: false,
+                  canGoForward: false,
+                })
+                .pipe(Effect.ignore),
+            );
+          });
         return;
       }
       const key = tabKey(event.threadId, event.tabId);
@@ -3158,10 +3459,11 @@ const make = Effect.gen(function* () {
     }
   };
 
-  const attachViewer: ServerBrowser["Service"]["attachViewer"] = Effect.fn(
-    "ServerBrowser.attachViewer",
-  )(function* (input) {
-    const tab = yield* findTab(input.threadId, input.tabId);
+  const attachTabViewer = Effect.fn("ServerBrowser.attachTabViewer")(function* (
+    tab: ServerTab,
+    input: ViewerSettings,
+    assetOnly = false,
+  ) {
     const output = yield* Queue.make<ServerBrowserViewerOutput>({
       capacity: VIEWER_OUTPUT_LIMIT,
       strategy: "dropping",
@@ -3188,10 +3490,11 @@ const make = Effect.gen(function* () {
     const recentFrames: Array<number> = [];
     let screencastParams = Promise.resolve();
     let screencastScale = 1;
+    let assetVisible = true;
     const startScreencast = (scale: number) => {
       screencastScale = scale;
       screencastParams = screencastParams.then(async () => {
-        if (tab.capturing > 0) return;
+        if (!assetVisible || tab.capturing > 0) return;
         await session.send("Page.stopScreencast").catch(constVoid);
         await session
           .send("Page.startScreencast", {
@@ -3213,6 +3516,9 @@ const make = Effect.gen(function* () {
         // Dropped frames must still release Chromium.
         if (Queue.offerUnsafe(output, next)) return;
         if (next._tag === "frame") runFork(next.ack);
+        else if (next._tag === "widgetMessage" || next._tag === "widgetReady") {
+          void tab.page.close().catch(constVoid);
+        }
         // State a stalled viewer cannot miss compacts its backlog. It runs
         // synchronously so an older compaction can never land after a newer one.
         else if (["gone", "reconnect", "control", "viewport", "fileChooser"].includes(next._tag)) {
@@ -3251,18 +3557,36 @@ const make = Effect.gen(function* () {
       }),
       () =>
         Effect.promise(async () => {
+          if (assetOnly) await tab.page.context().close().catch(constVoid);
           await tab.control.disconnect(viewer.id, () => releaseViewerInput(viewer, session));
           tab.viewers.delete(viewer);
-          broadcastControl(tab);
+          if (!assetOnly) broadcastControl(tab);
           reportLiveTabs();
         }),
     );
     if (input.canOperate && tab.control.agentId === null && tab.control.controller === null) {
       yield* Effect.promise(() => tab.control.take(viewer.id));
     }
-    broadcastControl(tab);
-    pushFileChooser(tab);
+    if (!assetOnly) {
+      broadcastControl(tab);
+      pushFileChooser(tab);
+    } else {
+      viewer.push({
+        _tag: "control",
+        canOperate: true,
+        controller: "you",
+        generation: 0,
+        dialog: null,
+      });
+      if (tab.assetHeight !== undefined)
+        viewer.push({ _tag: "assetHeight", height: tab.assetHeight });
+      if (tab.widget) {
+        viewer.push({ _tag: "widgetReady", kind: tab.widget.kind });
+        for (const message of tab.widget.pending.splice(0)) viewer.push(message);
+      }
+    }
     const pushStill = async () => {
+      if (!assetVisible) return;
       const data = await withCaptureLock(tab, async () => {
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
@@ -3342,6 +3666,38 @@ const make = Effect.gen(function* () {
           const message = asRecord(raw);
           if (!message) return;
           try {
+            if (assetOnly) {
+              if (message.type === "widgetMessage" && tab.widget) {
+                const decoded = decodeWidgetMessage(message);
+                if (Option.isSome(decoded)) await tab.widget.send(decoded.value.data);
+                return;
+              }
+              if (message.type === "assetPresentation") {
+                const decoded = decodeAssetPresentation(message);
+                if (Option.isNone(decoded)) return;
+                const { appearance, visible, theme } = decoded.value;
+                if (appearance !== tab.colorScheme) {
+                  await tab.page.emulateMedia({ colorScheme: appearance });
+                  tab.colorScheme = appearance;
+                }
+                if (visible !== assetVisible) {
+                  assetVisible = visible;
+                  if (visible) await viewer.resume();
+                  else {
+                    await releaseViewerInput(viewer, session);
+                    await viewer.pause();
+                  }
+                }
+                if (theme !== undefined && !tab.widget) {
+                  const payload = htmlRenderThemeMessage({ appearance, variables: theme });
+                  await tab.page.evaluate(
+                    `document.querySelector("iframe")?.contentWindow?.postMessage(${encodeAssetMessage(payload)}, "*")`,
+                  );
+                }
+                return;
+              }
+              if (!assetVisible || !ASSET_INPUT.has(String(message.type))) return;
+            }
             if (message.type === "takeControl") {
               const taking = tab.control.take(viewer.id);
               broadcastControl(tab);
@@ -3394,17 +3750,96 @@ const make = Effect.gen(function* () {
                   }),
                 );
               } else {
-                const copyRead = await tab.control.human(viewer.id, () =>
-                  dispatchViewerInput(tab, session, viewer, message),
-                );
+                const copyRead = await tab.control.human(viewer.id, async () => {
+                  if (assetOnly && tab.widget) {
+                    const id = message.widgetGesture;
+                    const eventType =
+                      message.type === "mouse" &&
+                      message.action === "up" &&
+                      message.button === "left"
+                        ? "mouseup"
+                        : message.type === "key" && message.action === "down"
+                          ? "keydown"
+                          : undefined;
+                    if (eventType && typeof id === "number" && Number.isSafeInteger(id) && id > 0) {
+                      await tab.widget.armGesture(id, eventType);
+                    } else if (
+                      eventType ||
+                      (message.type === "mouse" && message.action === "down")
+                    ) {
+                      await tab.widget.armGesture();
+                    }
+                  }
+                  return dispatchViewerInput(tab, session, viewer, message);
+                });
                 await copyRead?.();
               }
             }
           } catch {
-            broadcastControl(tab);
+            if (!assetOnly) broadcastControl(tab);
           }
         }),
     } satisfies ServerBrowserViewer;
+  });
+
+  const attachViewer: ServerBrowser["Service"]["attachViewer"] = Effect.fn(
+    "ServerBrowser.attachViewer",
+  )(function* (input) {
+    const tab = yield* findTab(input.threadId, input.tabId);
+    return yield* attachTabViewer(tab, input);
+  });
+
+  let activeAssetViews = 0;
+  const attachAssetViewer: ServerBrowser["Service"]["attachAssetViewer"] = Effect.fn(
+    "ServerBrowser.attachAssetViewer",
+  )(function* (input) {
+    const reserved = yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        if (activeAssetViews >= MAX_LOCAL_ASSET_VIEWS) return false;
+        activeAssetViews++;
+        return true;
+      }),
+      (reserved) =>
+        Effect.sync(() => {
+          if (reserved) activeAssetViews--;
+        }),
+    );
+    if (!reserved) {
+      return yield* new ServerBrowserLaunchError({
+        cause: new Error("Too many active asset views"),
+      });
+    }
+    const updatedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+    const tab = yield* Effect.acquireRelease(
+      Effect.tryPromise({
+        try: (signal) =>
+          createTab(
+            {
+              threadId: "asset-view",
+              tabId: NodeCrypto.randomUUID(),
+              updatedAt,
+              navStatus: { _tag: "Idle" },
+              runtime: "server",
+              headless: true,
+              viewport: FILL_PREVIEW_VIEWPORT,
+              canGoBack: false,
+              canGoForward: false,
+              colorScheme: input.asset.appearance,
+            },
+            undefined,
+            { navigation: input.asset, signal },
+          ),
+        catch: () =>
+          new ServerBrowserLaunchError({ cause: new Error("Active asset preview failed to load") }),
+      }),
+      (tab) =>
+        Effect.promise(async () => {
+          await tab.page.context().close().catch(constVoid);
+          await tab.control.close().catch(constVoid);
+        }),
+      { interruptible: true },
+    );
+    return yield* attachTabViewer(tab, input, true);
   });
 
   yield* manager.events.pipe(Stream.runForEach(mirrorManagerEvent), Effect.forkScoped);
@@ -3496,6 +3931,7 @@ const make = Effect.gen(function* () {
 
   return ServerBrowser.of({
     attachViewer,
+    attachAssetViewer,
     clearProfile,
     profileReporter,
     openDownload,

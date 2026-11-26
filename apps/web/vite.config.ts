@@ -133,6 +133,7 @@ const browserTestProject = {
   test: {
     name: "browser",
     include: ["src/**/*.browser.test.{ts,tsx}"],
+    exclude: ["src/connection/relayRoutes.browser.test.ts"],
     hookTimeout: 15_000,
     testTimeout: 15_000,
     setupFiles: ["./test/browserSetup.ts"],
@@ -151,6 +152,16 @@ const browserTestProject = {
         },
       },
     },
+  },
+} satisfies TestProjectInlineConfiguration;
+
+// The disposable TLS proof launches Chromium with its own trust database.
+const relayRouteProofProject = {
+  extends: true,
+  test: {
+    name: "relay-route-proof",
+    include: ["src/connection/relayRoutes.browser.test.ts"],
+    testTimeout: 15_000,
   },
 } satisfies TestProjectInlineConfiguration;
 
@@ -444,6 +455,7 @@ export default defineConfig(({ command }) => {
       projects: [
         defineProject(unitTestProject),
         defineProject(browserTestProject),
+        defineProject(relayRouteProofProject),
         defineProject(renderScenariosProject),
       ],
     },

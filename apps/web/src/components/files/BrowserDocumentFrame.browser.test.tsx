@@ -9,12 +9,30 @@ import { page } from "vite-plus/test/browser";
 import "~/index.css";
 import { render } from "../../../test/render";
 
-import { BrowserDocumentFrame, HtmlRenderDocument } from "./BrowserDocumentFrame";
+import { BrowserDocumentFrame, HtmlRenderDocument, OfflineHtmlFile } from "./BrowserDocumentFrame";
 
 const sizeChanged = (height: number) => ({
   jsonrpc: "2.0",
   method: "ui/notifications/size-changed",
   params: { height },
+});
+
+it("renders a downloaded HTML document without running its script or automatic navigation", async () => {
+  const file = new Blob(
+    [
+      '<meta http-equiv="refresh" content="0;url=about:blank">',
+      '<p>Local report</p><a href="https://elsewhere.test">External link</a><script>document.body.textContent = "Script ran";</script>',
+    ],
+    { type: "text/html" },
+  );
+  await using screen = await render(<OfflineHtmlFile file={file} title="Verified report" />);
+  const frame = screen.getByTitle("Verified report");
+  await expect.element(frame).toHaveAttribute("sandbox", "");
+  const preview = frame.element() as HTMLIFrameElement;
+  expect(preview.hasAttribute("src")).toBe(false);
+  expect(preview.srcdoc).toContain("<p>Local report</p>");
+  expect(preview.srcdoc).toContain("<a>External link</a>");
+  expect(preview.srcdoc).not.toMatch(/<script|http-equiv="refresh"|https:\/\//);
 });
 
 describe("HtmlRenderDocument", () => {
@@ -300,6 +318,7 @@ describe("BrowserDocumentFrame", () => {
           src={src}
           title="Report"
           pdf={false}
+          verified
           documentKey={`report:${revision}`}
           documentId="report"
         />
@@ -307,6 +326,12 @@ describe("BrowserDocumentFrame", () => {
     );
     await using screen = await render(frame("1", first));
     const iframes = () => Array.from(screen.container.querySelectorAll("iframe"));
+    await expect
+      .element(screen.getByTitle("Report"))
+      .toHaveAttribute("referrerpolicy", "no-referrer");
+    expect(iframes()[0]?.getAttribute("csp")).toContain(
+      `default-src ${window.location.origin}/api/assets/`,
+    );
     await vi.waitFor(() => expect(reports.map((report) => report.y)).toContain(1200));
 
     await screen.rerender(frame("2", second));

@@ -9,6 +9,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as HttpClient from "effect/http/HttpClient";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
 
 import {
   appendClientConnectionParams,
@@ -48,7 +49,8 @@ import {
   appendOrchestrationProtocol,
   orchestrationProtocolCompatibilityError,
 } from "./compatibility.ts";
-import { credentialConnectionId } from "./routes.ts";
+import { credentialConnectionId, isLearned } from "./routes.ts";
+import { requireRouteAdmission, verifyRoute, VerifiedRoutePolicy } from "./verifiedRoute.ts";
 import { fetchRemoteEnvironmentDescriptor } from "../environment/descriptor.ts";
 
 export class ConnectionResolver extends Context.Service<
@@ -131,6 +133,7 @@ const makePrimaryBroker = Effect.fn("clientRuntime.connection.broker.makePrimary
 
 const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")(function* () {
   const credentials = yield* ConnectionCredentialStore.ConnectionCredentialStore;
+  const verifiedRoutes = yield* VerifiedRoutePolicy;
   const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
 
   return Effect.fn("clientRuntime.connection.broker.bearer")(function* (
@@ -152,34 +155,50 @@ const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")
         actual: profile.environmentId,
       });
     }
-    if (profile.authorization === "t3-connect") {
-      const authorized = yield* remote.authorizeDpop({
-        expectedEnvironmentId: target.environmentId,
-        directEndpoint: { httpBaseUrl: profile.httpBaseUrl, wsBaseUrl: profile.wsBaseUrl },
-      });
-      return { ...authorized, target } satisfies PreparedConnection;
-    }
-    const credential = yield* credentials.get(credentialConnectionId(target.connectionId)).pipe(
-      Effect.flatMap(
-        Option.match({
-          onNone: () => Effect.fail(credentialMissingError(target.connectionId)),
-          onSome: Effect.succeed,
-        }),
-      ),
+    const learned = isLearned(entry);
+    const endpoint = { httpBaseUrl: profile.httpBaseUrl, wsBaseUrl: profile.wsBaseUrl };
+    const enrollment = yield* verifyRoute(
+      target.environmentId,
+      endpoint,
+      learned || profile.verificationRequired === true,
+    ).pipe(Effect.provideService(VerifiedRoutePolicy, verifiedRoutes));
+    yield* requireRouteAdmission(enrollment).pipe(
+      Effect.provideService(VerifiedRoutePolicy, verifiedRoutes),
     );
-    if (!isBearerCredential(credential)) {
-      return yield* credentialMissingError(target.connectionId);
-    }
-    const authorized = yield* remote.authorizeBearer({
-      expectedEnvironmentId: target.environmentId,
-      httpBaseUrl: profile.httpBaseUrl,
-      wsBaseUrl: profile.wsBaseUrl,
-      bearerToken: credential.token,
-      connectionMethod: "direct",
+    const verificationRequired = enrollment !== null;
+    const authorize = Effect.gen(function* () {
+      if (profile.authorization === "t3-connect") {
+        return yield* remote.authorizeDpop({
+          expectedEnvironmentId: target.environmentId,
+          directEndpoint: endpoint,
+        });
+      }
+      const credential = yield* credentials.get(credentialConnectionId(target.connectionId)).pipe(
+        Effect.flatMap(
+          Option.match({
+            onNone: () => Effect.fail(credentialMissingError(target.connectionId)),
+            onSome: Effect.succeed,
+          }),
+        ),
+      );
+      if (!isBearerCredential(credential)) {
+        return yield* credentialMissingError(target.connectionId);
+      }
+      return yield* remote.authorizeBearer({
+        expectedEnvironmentId: target.environmentId,
+        ...endpoint,
+        bearerToken: credential.token,
+        connectionMethod: "direct",
+      });
     });
+    const authorized = yield* verificationRequired
+      ? authorize.pipe(Effect.provideService(FetchHttpClient.RequestInit, { redirect: "error" }))
+      : authorize;
     return {
       ...authorized,
       target,
+      ...(learned ? { learnedRoute: true as const } : {}),
+      ...(verificationRequired ? { verificationRequired: true as const } : {}),
     } satisfies PreparedConnection;
   });
 });

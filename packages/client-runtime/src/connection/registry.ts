@@ -1,4 +1,6 @@
 import { EnvironmentId } from "@t3tools/contracts";
+import type { SelfHostedRelayId } from "@t3tools/contracts/selfHostedRelay";
+import type { SelfHostedRelayDirectoryDiscovery } from "@t3tools/contracts/selfHostedRelayDirectory";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
@@ -50,13 +52,22 @@ import {
   entryWithRoutes,
   findRouteToSameAddress,
   hasSavedBearerRoute,
+  isLearned,
   mergeLearnedRoutes,
+  routeDirectorySource,
   routesAfterRemoving,
   upsertRoute,
   type ReportedEndpoint,
 } from "./routes.ts";
 
 const isSshConnectionProfile = Schema.is(SshConnectionProfile);
+
+function bearerRouteOrigin(route: ConnectionRoute) {
+  const profile = Option.getOrNull(route.profile);
+  return profile?._tag === "BearerConnectionProfile"
+    ? URL.parse(profile.httpBaseUrl)?.origin
+    : undefined;
+}
 
 function unsupportedState(
   entry: ConnectionCatalogEntry,
@@ -91,6 +102,11 @@ export class PlatformEnvironmentRemovalError extends Schema.TaggedError<Platform
   }
 }
 
+type ApplyRelayDirectorySnapshot = (
+  source: { readonly relayId: SelfHostedRelayId; readonly key: string },
+  snapshot: SelfHostedRelayDirectoryDiscovery,
+) => Effect.Effect<void, Persistence.ConnectionPersistenceError | ConnectionAttemptError>;
+
 export class EnvironmentRegistry extends Context.Service<
   EnvironmentRegistry,
   {
@@ -99,6 +115,7 @@ export class EnvironmentRegistry extends Context.Service<
     >;
     readonly networkStatus: SubscriptionRef.SubscriptionRef<NetworkStatus>;
     readonly start: Effect.Effect<void>;
+    readonly applyRelayDirectorySnapshot?: ApplyRelayDirectorySnapshot;
     /**
      * Succeeds with `false` and changes nothing when the environment is
      * platform-managed, since the host owns that entry. With `knownAddressOnly`, it fails like
@@ -200,8 +217,25 @@ export class EnvironmentRegistry extends Context.Service<
   }
 >()("@t3tools/client-runtime/connection/registry/EnvironmentRegistry") {}
 
+function relayDirectorySourceKey(source: Parameters<ApplyRelayDirectorySnapshot>[0]): string {
+  return JSON.stringify([source.relayId, source.key]);
+}
+
+/** Applies a complete, authenticated discovery response for one configured relay account. */
+export const applyRelayDirectorySnapshot = (...args: Parameters<ApplyRelayDirectorySnapshot>) =>
+  Effect.flatMap(
+    EnvironmentRegistry,
+    (registry) =>
+      registry.applyRelayDirectorySnapshot?.(...args) ??
+      new ConnectionBlockedError({
+        reason: "configuration",
+        detail: "The environment registry does not support relay directory discovery.",
+      }),
+  );
+
 interface EnvironmentServiceScope {
   readonly entry: ConnectionCatalogEntry;
+  readonly currentEntry: Ref.Ref<ConnectionCatalogEntry>;
   readonly supervisor: EnvironmentSupervisor.EnvironmentSupervisor["Service"];
   readonly scope: Scope.Closeable;
 }
@@ -363,10 +397,12 @@ export const make = Effect.gen(function* () {
         Effect.gen(function* () {
           const environmentId = entry.target.environmentId;
           const scope = yield* Scope.fork(registryScope);
+          const currentEntry = yield* Ref.make(entry);
           const supervisor = yield* EnvironmentSupervisor.make(entry, {
             // Seed the intent to avoid publishing a false switched-off state
             // before an enabled, compatible environment starts connecting.
             initiallyDesired: entry.enabled && entry.unsupportedReason === undefined,
+            currentEntry,
             learnRoutes: (input) => learnRoutes({ environmentId, ...input }),
           }).pipe(
             Effect.provideService(Connectivity.Connectivity, connectivity),
@@ -377,7 +413,7 @@ export const make = Effect.gen(function* () {
           );
           yield* SubscriptionRef.update(serviceScopes, (current) => {
             const next = new Map(current);
-            next.set(environmentId, { entry, supervisor, scope });
+            next.set(environmentId, { entry, currentEntry, supervisor, scope });
             return next;
           });
           yield* SubscriptionRef.changes(supervisor.state).pipe(
@@ -528,6 +564,18 @@ export const make = Effect.gen(function* () {
   const persistedRoutes = (entry: ConnectionCatalogEntry) =>
     connectionRoutes(entry).map((route) => route.target as PersistedConnectionTarget);
 
+  const removedRouteIds = (
+    previous: ConnectionCatalogEntry,
+    next: ReadonlyArray<PersistedConnectionTarget>,
+  ) => {
+    const kept = new Set(next.map(connectionRouteId));
+    return new Set(
+      connectionRoutes(previous)
+        .map((route) => connectionRouteId(route.target))
+        .filter((id) => !kept.has(id)),
+    );
+  };
+
   /**
    * Pull request routing trust and an unsupported verdict both belong to the saved addresses: a changed set may
    * reach a different server, so both are dropped and the next connection decides.
@@ -549,7 +597,12 @@ export const make = Effect.gen(function* () {
     const saved = (yield* SubscriptionRef.get(entries)).get(environmentId);
     if (
       saved !== undefined &&
-      findRouteToSameAddress(connectionRoutes(saved), route) === undefined
+      findRouteToSameAddress(
+        connectionRoutes(saved).filter(
+          (candidate) => routeDirectorySource(candidate) === undefined,
+        ),
+        route,
+      ) === undefined
     ) {
       return yield* new ConnectionBlockedError({
         reason: "configuration",
@@ -578,11 +631,45 @@ export const make = Effect.gen(function* () {
         let entry = registered;
         if (previous !== undefined) {
           const existing = connectionRoutes(previous);
-          const sameAddress = findRouteToSameAddress(existing, route);
-          const routes = existing.filter(
+          const sameAddress = findRouteToSameAddress(
+            existing.filter((candidate) => routeDirectorySource(candidate) === undefined),
+            route,
+          );
+          if (
+            registration._tag === "BearerConnectionRegistration" &&
+            !registration.profile.verificationRequired
+          ) {
+            const replacing = existing.find(
+              (candidate) =>
+                connectionRouteId(candidate.target) === connectionRouteId(route.target),
+            );
+            const required = [sameAddress, replacing].some(
+              (candidate) =>
+                candidate !== undefined &&
+                Option.exists(
+                  candidate.profile,
+                  (profile) =>
+                    profile._tag === "BearerConnectionProfile" &&
+                    profile.verificationRequired === true,
+                ),
+            );
+            if (required) {
+              return yield* new ConnectionBlockedError({
+                reason: "configuration",
+                detail: "Use a verified pairing link for this address.",
+              });
+            }
+          }
+          const retained =
+            sameAddress !== undefined &&
+            connectionRouteId(sameAddress.target) !== connectionRouteId(route.target)
+              ? routesAfterRemoving(existing, connectionRouteId(sameAddress.target))
+              : existing;
+          const routes = retained.filter(
             (existing) =>
-              existing !== sameAddress ||
-              connectionRouteId(existing.target) === connectionRouteId(route.target),
+              connectionRouteId(existing.target) === connectionRouteId(route.target) ||
+              routeDirectorySource(existing) === undefined ||
+              findRouteToSameAddress([existing], route) === undefined,
           );
           const next = withRoutes(previous, upsertRoute(routes, route));
           if (next.addressesChanged) {
@@ -590,7 +677,12 @@ export const make = Effect.gen(function* () {
           }
           entry = next.entry;
         }
-        yield* registrations.register(registration, persistedRoutes(entry));
+        const targets = persistedRoutes(entry);
+        yield* registrations.register(
+          registration,
+          targets,
+          previous === undefined ? undefined : removedRouteIds(previous, targets),
+        );
         yield* Ref.update(persistedEnvironmentIds, (current) =>
           new Set(current).add(environmentId),
         );
@@ -609,7 +701,16 @@ export const make = Effect.gen(function* () {
     if (next.addressesChanged) {
       yield* forgetRoutingTrust(environmentId, "set-connection-routes");
     }
-    yield* registrations.setRoutes(environmentId, persistedRoutes(next.entry));
+    const targets = persistedRoutes(next.entry);
+    yield* registrations.setRoutes(environmentId, targets, removedRouteIds(previous, targets));
+    if (ownedDataCleanup.clearRoute) {
+      const remainingOrigins = new Set(routes.map(bearerRouteOrigin));
+      for (const origin of new Set(connectionRoutes(previous).map(bearerRouteOrigin))) {
+        if (origin !== undefined && !remainingOrigins.has(origin)) {
+          yield* ownedDataCleanup.clearRoute(environmentId, origin);
+        }
+      }
+    }
     yield* installEntryLocked(next.entry);
   });
 
@@ -916,9 +1017,67 @@ export const make = Effect.gen(function* () {
     typeof globalThis.location === "undefined" || globalThis.location.protocol !== "https:";
 
   /**
-   * Learned routes reuse the active route's credential, so they do not revoke pull request routing
-   * trust the way a newly paired address does.
+   * Learned routes reuse a saved credential and leave pull request routing trust intact.
    */
+  const saveLearnedRoutesLocked = Effect.fn("EnvironmentRegistry.saveLearnedRoutesLocked")(
+    function* (
+      entry: ConnectionCatalogEntry,
+      routes: ReadonlyArray<ConnectionRoute>,
+      withdrawnDirectoryIds: ReadonlyArray<string> = [],
+    ) {
+      const environmentId = entry.target.environmentId;
+      const previous = connectionRoutes(entry);
+      const previousProfiles = new Map(
+        previous.map((route) => [connectionRouteId(route.target), Option.getOrNull(route.profile)]),
+      );
+      const routeOrder = routes.map((route) => connectionRouteId(route.target));
+      const kept = new Set(routeOrder);
+      const addedTargets = routes.flatMap(({ target }) =>
+        previousProfiles.has(connectionRouteId(target))
+          ? []
+          : [target as PersistedConnectionTarget],
+      );
+      const removedConnectionIds = new Set(
+        [...previousProfiles.keys(), ...withdrawnDirectoryIds].filter((id) => !kept.has(id)),
+      );
+      const changedProfiles = routes.flatMap((route) => {
+        const profile = Option.getOrNull(route.profile);
+        return profile === null || previousProfiles.get(connectionRouteId(route.target)) === profile
+          ? []
+          : [profile];
+      });
+      yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          yield* registrations.setLearnedRoutes(environmentId, addedTargets, {
+            profiles: changedProfiles,
+            removedConnectionIds,
+            routeOrder,
+          });
+          if (routes.length === 0) {
+            yield* closeServiceScope(environmentId);
+            yield* SubscriptionRef.update(entries, (current) => {
+              const next = new Map(current);
+              next.delete(environmentId);
+              return next;
+            });
+            return;
+          }
+          const next = entryWithRoutes(entry, routes);
+          const lease = (yield* SubscriptionRef.get(serviceScopes)).get(environmentId);
+          if (lease !== undefined) {
+            yield* Ref.set(lease.currentEntry, next);
+            yield* SubscriptionRef.update(serviceScopes, (current) =>
+              new Map(current).set(environmentId, { ...lease, entry: next }),
+            );
+          }
+          yield* SubscriptionRef.update(entries, (current) =>
+            new Map(current).set(environmentId, next),
+          );
+        }),
+      );
+    },
+  );
+
   const learnRoutes = Effect.fn("EnvironmentRegistry.learnRoutes")(function* (input: {
     readonly environmentId: EnvironmentId;
     readonly activeRoute: ConnectionRoute;
@@ -927,54 +1086,117 @@ export const make = Effect.gen(function* () {
     return yield* withLeaseLock(
       input.environmentId,
       Effect.gen(function* () {
-        if ((yield* Ref.get(platformEnvironmentIds)).has(input.environmentId)) {
-          return Option.none<ConnectionCatalogEntry>();
-        }
+        if ((yield* Ref.get(platformEnvironmentIds)).has(input.environmentId)) return false;
         const entry = (yield* SubscriptionRef.get(entries)).get(input.environmentId);
-        if (entry === undefined) return Option.none<ConnectionCatalogEntry>();
-        const routes = mergeLearnedRoutes({
-          entry,
-          activeRoute: input.activeRoute,
-          reported: input.reported,
-          allowInsecure: allowInsecureRoutes,
-        });
-        if (routes === null) return Option.none<ConnectionCatalogEntry>();
-        const next = entryWithRoutes(entry, routes);
-        const previousProfiles = new Map(
-          connectionRoutes(entry).map((route) => [
-            connectionRouteId(route.target),
-            Option.getOrNull(route.profile),
-          ]),
-        );
-        for (const route of routes) {
-          const profile = Option.getOrNull(route.profile);
-          if (
-            profile === null ||
-            previousProfiles.get(connectionRouteId(route.target)) === profile
-          ) {
-            continue;
-          }
-          yield* profiles.put(profile);
-        }
-        yield* registrations.setRoutes(input.environmentId, persistedRoutes(next));
-        const lease = (yield* SubscriptionRef.get(serviceScopes)).get(input.environmentId);
-        if (lease !== undefined) {
-          yield* SubscriptionRef.update(serviceScopes, (current) =>
-            new Map(current).set(input.environmentId, { ...lease, entry: next }),
-          );
-        }
-        yield* SubscriptionRef.update(entries, (current) =>
-          new Map(current).set(input.environmentId, next),
-        );
-        return Option.some(next);
+        if (entry === undefined) return false;
+        const routes = mergeLearnedRoutes({ ...input, entry, allowInsecure: allowInsecureRoutes });
+        if (routes === null) return false;
+        yield* saveLearnedRoutesLocked(entry, routes);
+        return true;
       }),
     ).pipe(
       Effect.catch((error) =>
         Effect.logWarning("Could not save routes learned from the environment.", {
           environmentId: input.environmentId,
           error,
-        }).pipe(Effect.as(Option.none<ConnectionCatalogEntry>())),
+        }).pipe(Effect.as(false)),
       ),
+    );
+  });
+
+  const withdrawStoredDirectoryRoutes = Effect.fn(
+    "EnvironmentRegistry.withdrawStoredDirectoryRoutes",
+  )(function* (environmentId: EnvironmentId, connectionIds: ReadonlyArray<string>) {
+    if (connectionIds.length === 0) return;
+    yield* registrations
+      .setLearnedRoutes(environmentId, [], {
+        profiles: [],
+        removedConnectionIds: new Set(connectionIds),
+      })
+      .pipe(Effect.uninterruptible);
+  });
+
+  const directorySnapshots = yield* Semaphore.make(1);
+  const applyDirectorySnapshot: ApplyRelayDirectorySnapshot = Effect.fn(
+    "EnvironmentRegistry.applyRelayDirectorySnapshot",
+  )(function* (source, snapshot) {
+    const reported = new Map<EnvironmentId, ReadonlyArray<ReportedEndpoint>>();
+    for (const row of snapshot.environments) {
+      if (row.relayId !== source.relayId || reported.has(row.environmentId)) {
+        return yield* new ConnectionBlockedError({
+          reason: "configuration",
+          detail: "The directory snapshot contains inconsistent relay or environment identities.",
+        });
+      }
+      reported.set(row.environmentId, row.addressHints);
+    }
+    const directorySource = relayDirectorySourceKey(source);
+    yield* directorySnapshots.withPermits(1)(
+      Effect.gen(function* () {
+        const durable = new Map<EnvironmentId, Array<string>>();
+        for (const { environmentId, connectionId } of yield* registrations.listDirectoryRoutes(
+          directorySource,
+        )) {
+          const ids = durable.get(environmentId) ?? [];
+          ids.push(connectionId);
+          durable.set(environmentId, ids);
+        }
+        for (const environmentId of new Set([...durable.keys(), ...reported.keys()])) {
+          const endpoints = reported.get(environmentId) ?? [];
+          const sourceRouteIds = durable.get(environmentId) ?? [];
+          yield* withLeaseLock(
+            environmentId,
+            Effect.gen(function* () {
+              const entry = (yield* SubscriptionRef.get(entries)).get(environmentId);
+              if (
+                entry === undefined ||
+                (yield* Ref.get(platformEnvironmentIds)).has(environmentId)
+              ) {
+                return yield* withdrawStoredDirectoryRoutes(environmentId, sourceRouteIds);
+              }
+              const saved = connectionRoutes(entry);
+              const remaining = saved.filter(
+                (route) =>
+                  routeDirectorySource(route) !== directorySource &&
+                  !sourceRouteIds.includes(connectionRouteId(route.target)),
+              );
+              let routes = remaining.length === saved.length ? saved : remaining;
+              if (endpoints.length > 0) {
+                for (const activeRoute of saved) {
+                  const { target } = activeRoute;
+                  const profile = Option.getOrNull(activeRoute.profile);
+                  if (
+                    target._tag !== "BearerConnectionTarget" ||
+                    isLearned(activeRoute) ||
+                    profile?._tag !== "BearerConnectionProfile" ||
+                    profile.authorization !== undefined ||
+                    profile.connectionId !== target.connectionId ||
+                    profile.environmentId !== environmentId ||
+                    Option.isNone(yield* credentials.get(target.connectionId))
+                  )
+                    continue;
+                  routes =
+                    mergeLearnedRoutes({
+                      entry,
+                      activeRoute,
+                      reported: endpoints,
+                      allowInsecure: allowInsecureRoutes,
+                      directorySource,
+                    }) ?? saved;
+                  break;
+                }
+              }
+              const kept = new Set(routes.map((route) => connectionRouteId(route.target)));
+              const withdrawn = sourceRouteIds.filter((id) => !kept.has(id));
+              if (routes !== saved) {
+                yield* saveLearnedRoutesLocked(entry, routes, withdrawn);
+              } else {
+                yield* withdrawStoredDirectoryRoutes(environmentId, withdrawn);
+              }
+            }),
+          );
+        }
+      }),
     );
   });
 
@@ -1187,6 +1409,7 @@ export const make = Effect.gen(function* () {
     entries,
     networkStatus,
     start,
+    applyRelayDirectorySnapshot: applyDirectorySnapshot,
     register,
     assertKnownAddress,
     reconcilePlatform,

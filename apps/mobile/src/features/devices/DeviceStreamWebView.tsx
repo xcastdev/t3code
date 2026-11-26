@@ -1,3 +1,4 @@
+import { SecureWebView } from "../../native/secureWebView";
 import { Button } from "../../components/ui/Button";
 import deviceStreamScript from "@t3tools/mobile-device-stream";
 import {
@@ -9,10 +10,14 @@ import {
   type Ref,
 } from "react";
 import { Platform, View } from "react-native";
-import { WebView } from "react-native-webview";
+import type { WebView } from "react-native-webview";
 import type { DeviceStreamStatus } from "@t3tools/client-runtime/device/stream";
 
 import { AppActivityIndicator } from "../../components/ui/AppActivityIndicator";
+import {
+  createVerifiedViewerBridge,
+  viewerUsesVerifiedRoute,
+} from "../../lib/verifiedViewerBridge";
 import { AppText } from "../../components/ui/AppText";
 
 import {
@@ -41,8 +46,10 @@ export function DeviceStreamWebView({
 }: DeviceStreamConfiguration & NativeStreamBridge) {
   const [attempt, setAttempt] = useState(0);
   const processRetried = useRef(false);
+  const verified = viewerUsesVerifiedRoute(props.access);
   const configuration = JSON.stringify({
     access: props.access,
+    verified,
     platform: props.platform,
     deviceId: props.deviceId,
     ...(props.serveSimOnly ? { serveSimOnly: true } : {}),
@@ -53,7 +60,15 @@ export function DeviceStreamWebView({
       key={`${attempt}:${configuration}`}
       ref={ref}
       configuration={configuration}
-      baseUrl={deviceStreamBaseUrl(Platform.OS, props.platform, props.access.httpBase)}
+      access={props.access}
+      verified={verified}
+      baseUrl={
+        verified
+          ? Platform.OS === "android"
+            ? "https://localhost/"
+            : "file:///"
+          : deviceStreamBaseUrl(Platform.OS, props.platform, props.access.httpBase)
+      }
       background={props.colors.background}
       onUnauthorized={props.onUnauthorized}
       onInputConnected={props.onInputConnected}
@@ -79,6 +94,8 @@ export function DeviceStreamWebView({
 function DeviceStreamDocumentView({
   ref,
   configuration,
+  access,
+  verified,
   baseUrl,
   background,
   onUnauthorized,
@@ -88,6 +105,8 @@ function DeviceStreamDocumentView({
   onRecoverProcess,
 }: NativeStreamBridge & {
   readonly configuration: string;
+  readonly access: DeviceStreamConfiguration["access"];
+  readonly verified: boolean;
   readonly baseUrl: string;
   readonly background: string;
   readonly onRetry: () => void;
@@ -95,6 +114,7 @@ function DeviceStreamDocumentView({
   readonly onRecoverProcess: () => boolean;
 }) {
   const webView = useRef<WebView<object>>(null);
+  const bridge = useRef<ReturnType<typeof createVerifiedViewerBridge> | null>(null);
   const active = useRef(false);
   const failed = useRef(false);
   const bootstrapTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -108,6 +128,7 @@ function DeviceStreamDocumentView({
   const fail = (message: string) => {
     if (!active.current || failed.current) return;
     failed.current = true;
+    bridge.current?.stop();
     clearBootstrapTimer();
     void onInputConnected(false);
     webView.current?.injectJavaScript("window.T3DeviceStream?.stop(); true;");
@@ -124,17 +145,23 @@ function DeviceStreamDocumentView({
     active.current = true;
     resetInput();
     const view = webView.current;
+    if (verified)
+      bridge.current = createVerifiedViewerBridge(access, (script) =>
+        view?.injectJavaScript(script),
+      );
     bootstrapTimer.current = setTimeout(bootstrapTimedOut, 15_000);
     return () => {
       if (bootstrapTimer.current !== null) clearTimeout(bootstrapTimer.current);
       bootstrapTimer.current = null;
       active.current = false;
+      bridge.current?.stop();
+      bridge.current = null;
       view?.injectJavaScript("window.T3DeviceStream?.stop(); true;");
       resetInput();
     };
-  }, []);
+  }, [access, verified]);
   const source = {
-    html: deviceStreamDocument(configuration, deviceStreamScript),
+    html: deviceStreamDocument(configuration, deviceStreamScript, verified),
     baseUrl,
   };
   const command = (button: keyof DeviceStreamRef) => {
@@ -155,14 +182,16 @@ function DeviceStreamDocumentView({
   };
   return (
     <View className="flex-1" style={{ backgroundColor: background }}>
-      <WebView<object>
+      <SecureWebView
+        verified={verified}
+        onFenceError={() => fail("Device viewer could not load. Reconnect to try again.")}
         ref={webView}
         source={source}
         originWhitelist={["*"]}
         scrollEnabled={false}
         bounces={false}
-        mixedContentMode="always"
-        allowUniversalAccessFromFileURLs
+        mixedContentMode={verified ? "never" : "always"}
+        allowUniversalAccessFromFileURLs={!verified}
         contentInsetAdjustmentBehavior="never"
         setSupportMultipleWindows={false}
         style={{ flex: 1, backgroundColor: background }}
@@ -175,6 +204,7 @@ function DeviceStreamDocumentView({
         }
         onMessage={(event) => {
           if (!active.current || failed.current) return;
+          if (bridge.current?.onMessage(event.nativeEvent.data)) return;
           const message = deviceStreamMessage(event.nativeEvent.data);
           if (message?.type === "unauthorized") void onUnauthorized();
           else if (message?.type === "input") void onInputConnected(message.connected);

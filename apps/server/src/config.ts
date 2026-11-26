@@ -109,6 +109,11 @@ export class ServerConfig extends Context.Service<
     readonly logWebSocketEvents: boolean;
     readonly tailscaleServeEnabled: boolean;
     readonly tailscaleServePort: number;
+    readonly selfHostedRelay?: {
+      readonly homeDirectory: string;
+      readonly port: number;
+      readonly forwardingConfigPath?: string;
+    };
   }
 >()("t3/config/ServerConfig") {
   static readonly layerTest = (

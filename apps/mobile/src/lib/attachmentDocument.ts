@@ -17,6 +17,9 @@ import type { FileBackedComposerAttachment } from "./composerImages";
 import { localAttachmentPreviewAtom, localAttachmentPreviewState } from "./localAttachmentPreview";
 import { downloadAndShareAttachment, shareLocalAttachment } from "./attachmentDownload";
 import { refreshAssetUrl, useFreshAssetUrl, useRefreshAssetUrl } from "../state/assets";
+import { verifiedRouteFor } from "../connection/verified-route";
+import { requestVerifiedRoute, bytesFromBase64 } from "../native/verifiedNetwork";
+import { useVerifiedLocalAsset } from "./useVerifiedLocalAsset";
 import { attachmentDocumentPresentation } from "./attachmentDocumentPresentation";
 
 const isLocalUri = (uri: string) => /^(file|content):/.test(uri);
@@ -48,14 +51,21 @@ async function readAttachmentText(key: AttachmentTextKey, signal: AbortSignal) {
     if (!refreshed) throw new Error("Reconnect to this environment and try again.");
     target = refreshed;
   }
-  const response = await fetch(target, {
-    signal,
-    headers: {
-      ...(key.sizeBytes > 0 ? { Range: `bytes=0-${FILE_TEXT_PREVIEW_MAX_BYTES}` } : {}),
-      ...(key.revision > 0 ? { "Cache-Control": "no-cache" } : {}),
-    },
-  });
-  return readFilePreviewResponse(response, signal);
+  const headers = {
+    ...(key.sizeBytes > 0 ? { Range: `bytes=0-${FILE_TEXT_PREVIEW_MAX_BYTES}` } : {}),
+    ...(key.revision > 0 ? { "Cache-Control": "no-cache" } : {}),
+  };
+  const verified = await requestVerifiedRoute(target, { signal, headers });
+  if (verified !== null) {
+    if (verified.status < 200 || verified.status >= 300)
+      throw new Error("Could not read this file.");
+    const bytes = bytesFromBase64(verified.bodyBase64);
+    return {
+      text: new TextDecoder().decode(bytes.subarray(0, FILE_TEXT_PREVIEW_MAX_BYTES)),
+      truncated: bytes.length > FILE_TEXT_PREVIEW_MAX_BYTES,
+    };
+  }
+  return readFilePreviewResponse(await fetch(target, { signal, headers }), signal);
 }
 
 class AttachmentTextReadError extends Schema.TaggedError<AttachmentTextReadError>()(
@@ -142,11 +152,17 @@ export function useAttachmentDocument(input: {
     hasEnvironment: input.environmentId !== null,
     rendered,
   });
-  const error = attachment
-    ? localPreview.error && (localPreview.error.message || "The local file is unavailable.")
-    : AsyncResult.isFailure(remote)
-      ? (Option.getOrNull(AsyncResult.error(remote))?.message ?? "The attachment is unavailable.")
-      : null;
+  const verified = uri !== null && verifiedRouteFor(uri) !== undefined;
+  const localAudio = useVerifiedLocalAsset(verified && kind === "audio" ? uri : null);
+  const error =
+    localAudio.status === "failed"
+      ? "The audio attachment is unavailable."
+      : attachment
+        ? localPreview.error && (localPreview.error.message || "The local file is unavailable.")
+        : AsyncResult.isFailure(remote)
+          ? (Option.getOrNull(AsyncResult.error(remote))?.message ??
+            "The attachment is unavailable.")
+          : null;
   const share = async () => {
     if (!uri || sharing) return;
     setSharing(true);
@@ -174,7 +190,8 @@ export function useAttachmentDocument(input: {
   return {
     kind,
     ...presentation,
-    uri,
+    uri:
+      verified && kind === "audio" ? (localAudio.status === "ready" ? localAudio.uri : null) : uri,
     /** Native viewers resolve their own fresh URL from this instead of reusing `uri`. */
     resource,
     content,

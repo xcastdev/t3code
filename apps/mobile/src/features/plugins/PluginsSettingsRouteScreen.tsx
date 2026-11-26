@@ -4,7 +4,8 @@ import {
   readPluginArchiveManifest,
   type ClientPluginRecord,
 } from "@t3tools/client-runtime/plugins/client-packages";
-import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
+import { issuedMobileTransferUrl } from "../../lib/verifiedAssetUrl";
+import { requestVerifiedRoute } from "../../native/verifiedNetwork";
 import { attachmentUploadError } from "@t3tools/client-runtime/state/attachment-uploads";
 import { runAttachmentUploadCycle } from "@t3tools/client-runtime/state/attachments";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
@@ -15,7 +16,6 @@ import type {
   PluginManifest,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import * as Option from "effect/Option";
 import { AsyncResult, type AtomRegistry } from "effect/reactivity";
 import { useContext, useState } from "react";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -29,11 +29,9 @@ import { ListSection } from "../../components/ui/ListSection";
 import { ListToggleRow } from "../../components/ui/ListToggleRow";
 import { ScreenScrollView as ScrollView } from "../../components/ui/ScreenScrollView";
 import { beginForegroundHandoff } from "../../lib/foreground-handoff";
-import { appAtomRegistry } from "../../state/atom-registry";
 import { attachmentEnvironment } from "../../state/attachments";
 import { useEnvironments, type EnvironmentPresentation } from "../../state/environments";
 import { pluginEnvironment } from "../../state/plugins";
-import { environmentSession } from "../../state/session";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { SettingsScreen } from "../settings/components/SettingsScreen";
 import { clientPluginStore } from "./clientPluginStore";
@@ -91,23 +89,31 @@ async function uploadPluginPackage(
         mimeType: PLUGIN_PACKAGE_MIME,
         sizeBytes: picked.size,
       },
-      resolveUploadUrl: (relativeUrl) => {
-        const connection = appAtomRegistry.get(
-          environmentSession.preparedConnectionValueAtom(environmentId),
-        );
-        return Option.isNone(connection)
-          ? null
-          : resolveAssetUrl(connection.value.httpBaseUrl, relativeUrl);
-      },
-      transport: (url) =>
+      resolveUploadUrl: (issuedUrl, verificationRequired) =>
+        issuedMobileTransferUrl(environmentId, issuedUrl, verificationRequired),
+      transport: (url, verificationRequired) =>
         Effect.tryPromise({
           try: async (signal) => {
-            const response = await new File(picked.uri).upload(url, {
-              httpMethod: "POST",
-              uploadType: UploadType.BINARY_CONTENT,
-              headers: { "Content-Type": PLUGIN_PACKAGE_MIME },
+            const headers = { "Content-Type": PLUGIN_PACKAGE_MIME };
+            const verified = await requestVerifiedRoute(url, {
+              method: "POST",
+              headers,
               signal,
+              uploadFile: picked.uri,
+              ...(verificationRequired ? { requireVerified: true } : {}),
             });
+            if (verified === null) {
+              signal.throwIfAborted();
+              if (verificationRequired) throw new Error("The upload route could not be verified.");
+            }
+            const response =
+              verified ??
+              (await new File(picked.uri).upload(url, {
+                httpMethod: "POST",
+                uploadType: UploadType.BINARY_CONTENT,
+                headers,
+                signal,
+              }));
             if (response.status < 200 || response.status >= 300) {
               throw new Error(`Upload rejected (${response.status})`);
             }

@@ -4,11 +4,13 @@ import type { SharingOptions } from "expo-sharing";
 
 import { beginForegroundHandoff } from "./foreground-handoff";
 import { uuidv4 } from "./uuid";
+import { requestVerifiedRoute } from "../native/verifiedNetwork";
 
 const ATTACHMENT_DOWNLOAD_DIRECTORY = "t3-attachment-downloads";
 const DOWNLOAD_RETENTION_MS = 24 * 60 * 60_000;
 const DOWNLOAD_DIRECTORY_NAME = /^(\d+)-[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i;
 const activeDirectories = new Set<string>();
+const retainedDirectories = new Map<string, number>();
 
 function downloadFileName(name: string): string {
   const basename = name.split(/[\\/]/).at(-1) ?? "";
@@ -59,6 +61,7 @@ export interface AttachmentPreviewFile {
   readonly uri: string;
   readonly share: (signal: AbortSignal, sourceIdentifier?: string) => Promise<void>;
   readonly dispose: () => void;
+  readonly retainAfterHandoff?: () => void;
 }
 
 async function availableSharing(signal: AbortSignal) {
@@ -83,7 +86,7 @@ async function createCachedAttachmentFile(attachment: AttachmentFileMetadata) {
       if (
         entry instanceof Directory &&
         match &&
-        Number(match[1]) < now - DOWNLOAD_RETENTION_MS &&
+        (retainedDirectories.get(entry.uri) ?? Number(match[1]) + DOWNLOAD_RETENTION_MS) < now &&
         !activeDirectories.has(entry.uri)
       ) {
         removeDownloadDirectory(entry);
@@ -91,6 +94,9 @@ async function createCachedAttachmentFile(attachment: AttachmentFileMetadata) {
     }
   } catch (error) {
     console.warn("[attachment-downloads] could not inspect cached files", error);
+  }
+  for (const [uri, expires] of retainedDirectories) {
+    if (expires < now) retainedDirectories.delete(uri);
   }
 
   const directory = new Directory(cache, `${now}-${uuidv4()}`);
@@ -106,19 +112,27 @@ async function createCachedAttachmentFile(attachment: AttachmentFileMetadata) {
   let disposed = false;
   let shared = false;
   let sharing = false;
+  let retainedForViewer = false;
   const release = () => {
     if (!disposed || sharing) return;
     activeDirectories.delete(directory.uri);
+    if (retainedForViewer) {
+      retainedDirectories.set(directory.uri, Date.now() + DOWNLOAD_RETENTION_MS);
+    }
     // A receiver can still be reading after Android's chooser returns.
-    if (!shared) removeDownloadDirectory(directory);
+    if (!shared && !retainedForViewer) removeDownloadDirectory(directory);
   };
-  const preview: AttachmentPreviewFile = {
+  const preview = {
     uri: file.uri,
     dispose: () => {
+      if (disposed) return;
       disposed = true;
       release();
     },
-    share: async (signal, sourceIdentifier) => {
+    retainAfterHandoff: () => {
+      if (!disposed) retainedForViewer = true;
+    },
+    share: async (signal, sourceIdentifier?: string) => {
       if (disposed || sharing || signal.aborted) return;
       sharing = true;
       try {
@@ -150,14 +164,8 @@ async function createCachedAttachmentFile(attachment: AttachmentFileMetadata) {
         release();
       }
     },
-  };
-  return {
-    file,
-    preview,
-    retainAfterHandoff: () => {
-      shared = true;
-    },
-  };
+  } satisfies AttachmentPreviewFile;
+  return { file, preview };
 }
 
 export function nativeViewerErrorMessage(cause: unknown): string {
@@ -167,21 +175,40 @@ export function nativeViewerErrorMessage(cause: unknown): string {
     : "The file could not be opened. Check the connection and try again.";
 }
 
+async function downloadBytes(
+  url: string,
+  file: import("expo-file-system").File,
+  signal: AbortSignal,
+  requireVerified = false,
+) {
+  const { File } = await import("expo-file-system");
+  if (!requireVerified && /^(file|content):/.test(url)) {
+    await new File(url).copy(file);
+    return;
+  }
+  const result = await requestVerifiedRoute(url, {
+    downloadFile: file.uri,
+    signal,
+    requireVerified,
+  });
+  if (result === null) {
+    if (requireVerified) throw new Error("Verified route is unavailable.");
+    await File.downloadFileAsync(url, file, { signal });
+  } else if (result.status < 200 || result.status >= 300) {
+    throw new Error(`Download failed (${result.status}).`);
+  }
+}
+
 export async function openAttachmentInViewer(input: {
   readonly uri: string;
   readonly attachment: AttachmentFileMetadata;
   readonly signal: AbortSignal;
 }): Promise<void> {
-  const { File } = await import("expo-file-system");
   const { requireNativeModule } = await import("expo");
   if (input.signal.aborted) return;
   const cached = await createCachedAttachmentFile(input.attachment);
   try {
-    if (/^(file|content):/.test(input.uri)) {
-      await new File(input.uri).copy(cached.file);
-    } else {
-      await File.downloadFileAsync(input.uri, cached.file, { signal: input.signal });
-    }
+    await downloadBytes(input.uri, cached.file, input.signal);
     if (input.signal.aborted) return;
     const endHandoff = beginForegroundHandoff();
     try {
@@ -191,7 +218,7 @@ export async function openAttachmentInViewer(input: {
         cached.file.uri,
         input.attachment.mimeType.split(";", 1)[0]?.trim() || "application/octet-stream",
       );
-      cached.retainAfterHandoff();
+      cached.preview.retainAfterHandoff();
     } finally {
       endHandoff();
     }
@@ -205,16 +232,16 @@ export async function downloadAttachmentForPreview(input: {
   readonly url: string;
   readonly attachment: AttachmentFileMetadata;
   readonly signal: AbortSignal;
+  readonly requireVerified?: boolean;
 }): Promise<AttachmentPreviewFile | null> {
   if (input.signal.aborted) return null;
-  const { File } = await import("expo-file-system");
   const cached = await createCachedAttachmentFile(input.attachment);
   try {
     if (input.signal.aborted) {
       cached.preview.dispose();
       return null;
     }
-    await File.downloadFileAsync(input.url, cached.file, { signal: input.signal });
+    await downloadBytes(input.url, cached.file, input.signal, input.requireVerified);
     if (input.signal.aborted) {
       cached.preview.dispose();
       return null;

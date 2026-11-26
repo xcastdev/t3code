@@ -16,12 +16,26 @@ const { refresh, assetUrlState, pdfOpens, pdfWorkerUrl } = await vi.hoisted(asyn
   };
 });
 
+const admittedReads = vi.hoisted(() => ({ required: vi.fn(() => false) }));
+
+vi.mock(import("~/assets/admittedAssetSource"), async (original) => ({
+  ...(await original()),
+  requiresAdmittedAsset: admittedReads.required,
+  readAdmittedStaticAsset: async (_environmentId, url) => (await fetch(url)).blob(),
+}));
+
 vi.mock(import("pdfjs-dist/build/pdf.worker.min.mjs?url"), () => ({
   default: pdfWorkerUrl,
 }));
 
+async function refreshGrant() {
+  const url = await refresh();
+  return url == null ? null : { url, learnedRoute: false };
+}
+
 vi.mock(import("~/assets/assetUrls"), async (original) => ({
   ...(await original()),
+  useAssetGrantRefresh: () => refreshGrant,
   useAssetUrlRefresh: () => refresh,
   useAssetUrlState: assetUrlState,
 }));
@@ -413,6 +427,42 @@ describe("bounded binary previews", () => {
       expect(screen.container.querySelector("img")?.getAttribute("src")).toBe(image),
     );
     expect(refresh).toHaveBeenCalledTimes(2);
+  });
+
+  it("saves the original admitted SVG after displaying a sanitized preview", async () => {
+    const original =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2" onload="window.unexpectedSvgScript=true"><path d="M0 0h2v2H0z"/></svg>';
+    const issued = URL.createObjectURL(new Blob([original], { type: "image/svg+xml" }));
+    refresh.mockReset().mockResolvedValue(issued);
+    admittedReads.required.mockReturnValue(true);
+    try {
+      await using screen = await render(
+        <AttachmentFilePreview
+          name="original.svg"
+          mimeType="image/svg+xml"
+          sizeBytes={original.length}
+          asset={{ environmentId: EnvironmentId.make("svg-save"), attachmentId: "svg" }}
+        />,
+      );
+      let preview = "";
+      await vi.waitFor(async () => {
+        preview = screen.container.querySelector("img")?.getAttribute("src") ?? "";
+        expect(preview).toMatch(/^blob:/);
+        expect(await (await fetch(preview)).text()).not.toContain("onload=");
+      });
+      let saved: Promise<string> | undefined;
+      using _click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+        this: HTMLAnchorElement,
+      ) {
+        if (this.download === "original.svg") saved = fetch(this.href).then((r) => r.text());
+      });
+      await screen.getByRole("button", { name: "Save file" }).click();
+      await vi.waitFor(() => expect(saved).toBeDefined());
+      expect(await saved).toBe(original);
+    } finally {
+      admittedReads.required.mockReturnValue(false);
+      URL.revokeObjectURL(issued);
+    }
   });
 
   it("reads a small ZIP64 archive and rejects understated directory counts", async () => {
@@ -1525,7 +1575,12 @@ it("keeps a workspace PDF open across URL renewals and reloads it when the file 
       fileRevision: "one",
     });
     await screen.rerender(preview("second"));
-    expect(assetUrlState).toHaveBeenLastCalledWith(expect.anything(), expect.anything(), "second");
+    expect(assetUrlState).toHaveBeenLastCalledWith(
+      expect.anything(),
+      expect.anything(),
+      "second",
+      "static",
+    );
     expect(screen.container.querySelector("iframe")).toBe(opened);
 
     assetUrlState.mockReturnValue({
@@ -1582,7 +1637,12 @@ it("loads an edited HTML file outside the workspace from a renewed URL", async (
     waiting: true,
   });
   await screen.rerender(preview("second"));
-  expect(assetUrlState).toHaveBeenLastCalledWith(expect.anything(), expect.anything(), "second");
+  expect(assetUrlState).toHaveBeenLastCalledWith(
+    expect.anything(),
+    expect.anything(),
+    "second",
+    "issued",
+  );
   expect(screen.container.querySelector("iframe")).toBe(opened);
 
   assetUrlState.mockReturnValue({ _tag: "Success", url: "data:text/html,edited", expiresAt: 0 });

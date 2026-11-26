@@ -8,6 +8,7 @@ import {
   type ServerSettings,
   type SettingsSecretValue,
   SimlockDeviceHostConfig,
+  SECRET_REDACTED,
   TextGeneratorConfig,
   UsageLimitSourceConfig,
   isSecretReference,
@@ -28,7 +29,8 @@ import {
   writeSecretFieldValues,
 } from "./sourceControl/sourceControlHostSecrets.ts";
 
-export const SECRET_REDACTED = "\u2022\u2022\u2022\u2022\u2022\u2022";
+export { SECRET_REDACTED };
+export const NOTIFICATION_SIGNING_KEY_PREFIX = "notification-signing-key-";
 
 const providerSecretFields = new Map([
   ["codex", secretSettingsFields(CodexSettings)],
@@ -240,10 +242,10 @@ function mapSecretFieldGroups(
   const externalNotifications = {
     destinations: settings.externalNotifications.destinations.map(
       (destination) =>
-        mapFields(
-          destination,
-          ["webhookUrl"],
-          () => `notification-webhook-${encode(destination.id)}`,
+        mapFields(destination, ["webhookUrl", "signingKey"], (field) =>
+          field === "webhookUrl"
+            ? `notification-webhook-${encode(destination.id)}`
+            : `${NOTIFICATION_SIGNING_KEY_PREFIX}${encode(destination.id)}`,
         ) as typeof destination,
     ),
   };

@@ -19,7 +19,7 @@ import * as Hex from "effect/encoding/Hex";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import type * as Tool from "effect/ai/Tool";
+import * as Tool from "effect/ai/Tool";
 
 import { runtimeModeRank } from "../mcp/delegatedTaskModes.ts";
 import { assertNotLinked } from "../mcp/linkOrigin.ts";
@@ -155,6 +155,7 @@ const make = Effect.gen(function* () {
     success: Schema.Top,
     environmentId: EnvironmentId,
     params: unknown,
+    readOnly: boolean,
   ) {
     const { caller, limits } = yield* forwardingCaller(scope);
     const encoded = (yield* Schema.encodeUnknownEffect(parameters as Schema.Encoder<unknown>)(
@@ -184,6 +185,7 @@ const make = Effect.gen(function* () {
     return yield* peers.call({
       environmentId,
       tool: toolName,
+      readOnly,
       arguments: args,
       limits,
       ...(sender === undefined ? {} : { sender }),
@@ -199,6 +201,7 @@ const make = Effect.gen(function* () {
       OrchestratorMcpThreadReadResult,
       environmentId,
       input,
+      true,
     );
 
   const interruptThread: PeerForwarding["Service"]["interruptThread"] = (
@@ -213,6 +216,7 @@ const make = Effect.gen(function* () {
       OrchestratorMcpThreadInterruptResult,
       environmentId,
       input,
+      false,
     );
 
   const waitForThread: PeerForwarding["Service"]["waitForThread"] = (scope, environmentId, input) =>
@@ -229,6 +233,7 @@ const make = Effect.gen(function* () {
           Math.max(1, input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS),
         ),
       },
+      true,
     );
 
   // While the beta is off, agents start nothing over links. Tasks already running there keep
@@ -247,7 +252,16 @@ const make = Effect.gen(function* () {
           environmentId,
           params as OrchestratorMcpThreadWaitInput,
         ) as Effect.Effect<Tool.Success<typeof tool>, OrchestratorMcpFailure>)
-      : forward(scope, tool.name, tool.parametersSchema, tool.successSchema, environmentId, params);
+      : forward(
+          scope,
+          tool.name,
+          tool.parametersSchema,
+          tool.successSchema,
+          environmentId,
+          params,
+          // Linked invocations cannot acknowledge a child result on the destination.
+          tool.name === "t3_thread_read" || Context.get(tool.annotations, Tool.Readonly),
+        );
     return Effect.andThen(requireEnabled, forwarded);
   };
 

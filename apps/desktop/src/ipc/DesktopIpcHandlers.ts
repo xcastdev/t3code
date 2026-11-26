@@ -1,6 +1,10 @@
-import { startFileDrag } from "./methods/fileDrag.ts";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
+import * as IpcChannels from "./channels.ts";
+import type { DesktopRelayMediaReader } from "./methods/window.ts";
+import type { VerifiedRouteEnrollment } from "../electron/VerifiedRoute.ts";
 
+import { startFileDrag } from "./methods/fileDrag.ts";
 import { receiveProviderAuthCallback, cancelProviderAuthCallback } from "./methods/providerAuth.ts";
 import * as DesktopIpc from "./DesktopIpc.ts";
 import { installNotificationBadge } from "./methods/notificationBadge.ts";
@@ -48,7 +52,8 @@ import {
   getPrimaryPasteEnabled,
   getWindowFullscreenState,
   openExternal,
-  readMedia,
+  makeGetVerifiedRouteBinding,
+  makeReadMedia,
   restartAudioService,
   openSystemSettings,
   checkSystemPermission,
@@ -92,7 +97,10 @@ import {
   addCliCommandToPath,
 } from "./methods/cliCommand.ts";
 
-export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers")(function* () {
+export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers")(function* (
+  verifiedRoutes: ReadonlyArray<VerifiedRouteEnrollment> = [],
+  relayReader?: DesktopRelayMediaReader,
+) {
   const ipc = yield* DesktopIpc.DesktopIpc;
   yield* installNotificationBadge();
   yield* PreviewIpc.installPreviewEventForwarding();
@@ -164,7 +172,17 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* ipc.handle(setTheme);
   yield* ipc.handle(showContextMenu);
   yield* ipc.handle(openExternal);
-  yield* ipc.handle(readMedia);
+  yield* ipc.handle(makeGetVerifiedRouteBinding(verifiedRoutes));
+  if (relayReader === undefined) {
+    yield* ipc.handleSync(
+      DesktopIpc.makeSyncIpcMethod({
+        channel: IpcChannels.RELAY_TRANSPORT_ORIGINS_CHANNEL,
+        result: Schema.Array(Schema.String),
+        handler: () => Effect.succeed([]),
+      }),
+    );
+  }
+  yield* ipc.handle(makeReadMedia(verifiedRoutes, relayReader));
   yield* ipc.handle(receiveProviderAuthCallback);
   yield* ipc.handle(cancelProviderAuthCallback);
   yield* ipc.handle(openSystemSettings);

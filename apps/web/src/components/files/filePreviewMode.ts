@@ -52,13 +52,19 @@ export function workspaceAssetResource(input: {
   readonly workspaceRoot: string;
   readonly absolutePath: string;
 }): AssetResource {
+  const { relativePath } = mediaFileReference(input.absolutePath, input.workspaceRoot);
   if (input.draft) {
-    return { _tag: "draft-workspace-file", cwd: input.workspaceRoot, path: input.absolutePath };
+    return {
+      _tag: "draft-workspace-file",
+      cwd: input.workspaceRoot,
+      path:
+        input.kind === "workspace-file" && /\.html?$/i.test(input.absolutePath)
+          ? (relativePath ?? input.absolutePath)
+          : input.absolutePath,
+    };
   }
-  const insideWorkspace =
-    mediaFileReference(input.absolutePath, input.workspaceRoot).relativePath !== undefined;
   return {
-    _tag: insideWorkspace ? input.kind : "media-file",
+    _tag: relativePath === undefined ? "media-file" : input.kind,
     threadId: input.threadRef.threadId,
     path: input.absolutePath,
   };

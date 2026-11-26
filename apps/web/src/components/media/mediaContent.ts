@@ -68,8 +68,10 @@ async function readMediaBlob(src: string): Promise<Blob> {
   return blob;
 }
 
-export async function downloadMedia(src: string, name: string): Promise<void> {
-  const url = URL.createObjectURL(await readMediaBlob(src));
+export async function downloadMedia(source: string | Blob, name: string): Promise<void> {
+  const url = URL.createObjectURL(
+    typeof source === "string" ? await readMediaBlob(source) : source,
+  );
   try {
     const anchor = document.createElement("a");
     anchor.href = url;
@@ -80,8 +82,8 @@ export async function downloadMedia(src: string, name: string): Promise<void> {
   }
 }
 
-export async function readMediaPng(src: string): Promise<Blob> {
-  const blob = await readMediaBlob(src);
+export async function readMediaPng(source: string | Blob): Promise<Blob> {
+  const blob = typeof source === "string" ? await readMediaBlob(source) : source;
   if (blob.type.split(";", 1)[0] === "image/png") return blob;
 
   const url = URL.createObjectURL(blob);

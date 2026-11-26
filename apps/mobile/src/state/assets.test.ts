@@ -17,16 +17,21 @@ const state = vi.hoisted(() => ({
   mint: vi.fn(),
   assetQuery: vi.fn(),
   executeQuery: vi.fn(),
+  readEnrollment: vi.fn<() => Promise<string | null>>(),
   preparedConnectionAtom: null as unknown,
 }));
 
+vi.mock("expo-secure-store", () => ({
+  getItemAsync: state.readEnrollment,
+  setItemAsync: vi.fn(),
+}));
 vi.mock("react", () => ({ useCallback: <A>(callback: A) => callback }));
 vi.mock("@effect/atom-react", () => ({
   useAtomMount: () => undefined,
   useAtomSubscribe: () => undefined,
   useAtomValue: (atom: unknown) =>
     atom === state.assetAtom
-      ? AsyncResult.success({ relativeUrl: "/api/assets/image.png", expiresAt: 1 })
+      ? AsyncResult.success({ relativeUrl: "https://host.test/api/assets/image.png", expiresAt: 1 })
       : AsyncResult.initial(false),
 }));
 vi.mock("./session", () => ({
@@ -61,6 +66,8 @@ vi.mock("@t3tools/client-runtime/state/runtime", async (importOriginal) => ({
 vi.mock("./use-atom-query-runner", () => ({ useAtomQueryRunner: () => state.mint }));
 
 import { refreshAssetUrl, useRefreshAssetUrl, useAssetUrlState } from "./assets";
+import { refreshVerifiedRoutes, verificationRequiredFor } from "../connection/verified-route";
+import { issuedMobileAssetUrl, issuedMobileTransferUrl } from "../lib/verifiedAssetUrl";
 
 const environmentId = EnvironmentId.make("asset-environment");
 const threadId = ThreadId.make("asset-thread");
@@ -72,7 +79,9 @@ beforeEach(() => {
   state.assetQuery.mockReset().mockReturnValue(state.assetAtom);
   state.mint
     .mockReset()
-    .mockResolvedValue(AsyncResult.success({ relativeUrl: "/api/assets/image.png", expiresAt: 1 }));
+    .mockResolvedValue(
+      AsyncResult.success({ relativeUrl: "https://host.test/api/assets/image.png", expiresAt: 1 }),
+    );
 });
 
 it.each(["workspace-file", "media-file"] as const)(
@@ -116,6 +125,41 @@ it("lets the server authorize an explicit refresh before the client grant loads"
   });
   state.mint.mockResolvedValue(AsyncResult.failure(Cause.fail(denied)));
   await expect(useRefreshAssetUrl(environmentId, resource)()).resolves.toBeNull();
+});
+
+it("keeps explicit verified asset URLs blocked after an issued result marks the origin", async () => {
+  const httpsOrigin = "https://missing-pin.test";
+  const relativeUrl = `${httpsOrigin}/api/assets/image.png`;
+  state.mint.mockResolvedValue(
+    AsyncResult.success({ relativeUrl, expiresAt: 1, verificationRequired: true }),
+  );
+
+  await expect(useRefreshAssetUrl(environmentId, resource)()).resolves.toBeNull();
+  expect(verificationRequiredFor(httpsOrigin)).toBe(true);
+  expect(issuedMobileTransferUrl(environmentId, `${httpsOrigin}/api/assets/other.png`)).toBeNull();
+});
+
+it("requires the issuing environment's enrollment for verified assets", async () => {
+  const httpsOrigin = "https://enrolled-asset.test";
+  const relativeUrl = `${httpsOrigin}/api/assets/image.png`;
+  const asset = { relativeUrl, verificationRequired: true } as const;
+  state.readEnrollment.mockResolvedValueOnce(
+    JSON.stringify([
+      {
+        httpsOrigin,
+        environmentId,
+        leafSpkiSha256: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      },
+    ]),
+  );
+  await refreshVerifiedRoutes();
+
+  expect(issuedMobileAssetUrl(environmentId, asset)).toBe(relativeUrl);
+  expect(issuedMobileAssetUrl("other-environment", asset)).toBeNull();
+
+  state.readEnrollment.mockResolvedValueOnce(null);
+  await refreshVerifiedRoutes();
+  expect(issuedMobileAssetUrl(environmentId, { relativeUrl })).toBeNull();
 });
 
 it("rejects with the server's error and resolves null only without a connection", async () => {

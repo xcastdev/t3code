@@ -10,7 +10,9 @@ export interface ComposerAttachmentUploadRequest {
   readonly attachment: DraftComposerAttachment;
 }
 
-export type ComposerAttachmentUploadState = AttachmentUploadStatus;
+export type ComposerAttachmentUploadState =
+  | AttachmentUploadStatus
+  | { readonly status: "outcome-unknown"; readonly reason: string };
 
 export function composerAttachmentUploadKey(
   environmentId: EnvironmentId,
@@ -80,12 +82,20 @@ export function composerAttachmentUploadBlockReason(input: {
   readonly connected: boolean;
   readonly serverConfig: UploadServerConfig | null;
   readonly states: Readonly<Record<string, ComposerAttachmentUploadState>>;
+  readonly formatUnknownUpload?: (filename: string) => string;
 }): string | null {
-  if (!input.connected) return null;
   for (const attachment of input.attachments) {
-    if (!canUploadComposerAttachment(attachment, input.serverConfig)) continue;
     const state = input.states[composerAttachmentUploadKey(input.environmentId, attachment.id)];
-    if (state?.status === "failed") return "Retry or remove the failed attachment";
+    if (state?.status === "outcome-unknown") {
+      return input.formatUnknownUpload?.(attachment.name) ?? state.reason;
+    }
+    if (
+      input.connected &&
+      state?.status === "failed" &&
+      canUploadComposerAttachment(attachment, input.serverConfig)
+    ) {
+      return "Retry or remove the failed attachment";
+    }
   }
   return null;
 }
@@ -99,6 +109,8 @@ export function composerAttachmentsStillUploading(input: {
   return input.attachments.some((attachment) => {
     if (!canUploadComposerAttachment(attachment, input.serverConfig)) return false;
     const state = input.states[composerAttachmentUploadKey(input.environmentId, attachment.id)];
-    return state?.status !== "ready" && state?.status !== "failed";
+    return (
+      state?.status !== "ready" && state?.status !== "failed" && state?.status !== "outcome-unknown"
+    );
   });
 }

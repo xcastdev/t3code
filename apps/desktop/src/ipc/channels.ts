@@ -6,6 +6,7 @@ export const PICK_THEME_FILES_CHANNEL = "desktop:pick-theme-files";
 export const SET_THEME_CHANNEL = "desktop:set-theme";
 export const CONTEXT_MENU_CHANNEL = "desktop:context-menu";
 export const OPEN_EXTERNAL_CHANNEL = "desktop:open-external";
+export const GET_VERIFIED_ROUTE_BINDING_CHANNEL = "desktop:get-verified-route-binding";
 export const READ_MEDIA_CHANNEL = "desktop:read-media";
 export const OPEN_SYSTEM_SETTINGS_CHANNEL = "desktop:open-system-settings";
 export const PROBE_REMOTE_EDITORS_CHANNEL = "desktop:probe-remote-editors";
@@ -149,3 +150,9 @@ export const USE_MANAGED_PRIMARY_BACKEND_CHANNEL = "desktop:use-managed-primary-
 export const RESTART_AUDIO_SERVICE_CHANNEL = "desktop:restart-audio-service";
 
 export const START_FILE_DRAG_CHANNEL = "desktop:start-file-drag";
+
+export const RELAY_TRANSPORT_ORIGINS_CHANNEL = "desktop:relay-transport-origins";
+export const RELAY_TRANSPORT_OPEN_CHANNEL = "desktop:relay-transport-open";
+export const RELAY_MEDIA_CREATE_CHANNEL = "desktop:relay-media-create";
+export const RELAY_MEDIA_DISPOSE_CHANNEL = "desktop:relay-media-dispose";
+export const RELAY_MEDIA_SAVE_CHANNEL = "desktop:relay-media-save";

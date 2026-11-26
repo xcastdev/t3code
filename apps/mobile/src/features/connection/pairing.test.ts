@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
+import { readVerifiedPairing } from "../../connection/verified-route";
 import { buildPairingUrl, extractPairingUrlFromQrPayload, parsePairingUrl } from "./pairing";
 
 describe("buildPairingUrl", () => {
@@ -33,6 +34,24 @@ describe("extractPairingUrlFromQrPayload", () => {
 });
 
 describe("parsePairingUrl", () => {
+  it("preserves a trusted route from a QR code through the form submit URL", () => {
+    const pin = "++++++++++++++++++++++++++++++++++++++++++8=";
+    const url = `https://relay.example.com:8443/pair#${new URLSearchParams({
+      token: "only-once",
+      environmentId: "env",
+      leafSpkiSha256: pin,
+    })}`;
+    const decoded = parsePairingUrl(
+      extractPairingUrlFromQrPayload(`t3code://pair?${new URLSearchParams({ pairingUrl: url })}`),
+    );
+    expect(decoded.code).toBe("only-once");
+    expect(readVerifiedPairing(buildPairingUrl(decoded.host, decoded.code))).toEqual({
+      httpsOrigin: "https://relay.example.com:8443",
+      environmentId: "env",
+      leafSpkiSha256: pin,
+    });
+  });
+
   it("reads hosted pairing links into backend host fields", () => {
     expect(
       parsePairingUrl(

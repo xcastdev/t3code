@@ -893,3 +893,73 @@ it("matches loopback redirects on everything but the port, and https redirects e
   expect(matches("https://bot.example/cb", "https://bot.example/cb?x=1")).toBe(false);
   expect(matches("https://bot.example/cb", "https://evil.example/cb")).toBe(false);
 });
+
+it.live("keeps peer approval on the issuing environment and the registered callback", () =>
+  withRoutes((issuer, auth) =>
+    withRoutes((replacement) =>
+      Effect.gen(function* () {
+        const registered = yield* issuer(
+          postJson("/oauth/mcp/register", {
+            client_name: "Route proof peer",
+            software_id: MCP_PEER_LINK_SOFTWARE_ID,
+            redirect_uris: [REDIRECT],
+          }),
+        ).pipe(Effect.flatMap(json<{ client_id: string }>));
+        const params = authorizeParams(registered.client_id);
+        const discovery = (handler: Handler, redirectUri: string) =>
+          handler(
+            at(
+              `/oauth/mcp/authorize?${new URLSearchParams({
+                ...params,
+                redirect_uri: redirectUri,
+              })}`,
+            ),
+          );
+        const wrongIssuer = yield* discovery(replacement, params.redirect_uri);
+        expect(wrongIssuer.status).toBe(400);
+        expect(wrongIssuer.headers.get("location")).toBeNull();
+
+        const wrongRedirect = yield* discovery(issuer, "https://replacement.example/callback");
+        expect(wrongRedirect.status).toBe(400);
+        expect(wrongRedirect.headers.get("location")).toBeNull();
+
+        const pairing = yield* auth.issuePairingCredential({
+          purpose: "peer-link",
+          access: "auto",
+        });
+        const approved = yield* decide(issuer, params, {
+          _tag: "pairing-code",
+          access: "auto",
+          code: pairing.credential,
+        });
+        expect(approved.status).toBe(200);
+        const callback = new URL(approved.redirectTo!);
+        expect(callback.origin).toBe("http://localhost:51234");
+        expect(callback.searchParams.get("iss")).toBe(ORIGIN);
+        const tokenResponse = yield* issuer(
+          at(
+            "/oauth/mcp/token",
+            form({
+              grant_type: "authorization_code",
+              code: callback.searchParams.get("code")!,
+              redirect_uri: params.redirect_uri,
+              client_id: params.client_id,
+              code_verifier: verifier,
+              resource: params.resource,
+            }),
+          ),
+        );
+        expect(tokenResponse.status).toBe(200);
+        const token = yield* json<{ access_token: string }>(tokenResponse);
+        const peer = yield* auth.authenticateMcpClient(
+          HttpServerRequest.fromWeb(
+            at("/mcp", {
+              headers: { authorization: `Bearer ${token.access_token}` },
+            }),
+          ),
+        );
+        expect(peer).toMatchObject({ label: "Route proof peer", access: "auto", peerLink: true });
+      }),
+    ),
+  ),
+);

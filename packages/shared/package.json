@@ -3,6 +3,14 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./relayMediaDownload": {
+      "types": "./src/relayMediaDownload.ts",
+      "import": "./src/relayMediaDownload.ts"
+    },
+    "./verifiedDocumentCsp": {
+      "types": "./src/verifiedDocumentCsp.ts",
+      "import": "./src/verifiedDocumentCsp.ts"
+    },
     "./turnWorkCounts": {
       "types": "./src/turnWorkCounts.ts",
       "import": "./src/turnWorkCounts.ts"
@@ -198,6 +206,10 @@
     "./remote": {
       "types": "./src/remote.ts",
       "import": "./src/remote.ts"
+    },
+    "./selfHostedRelayHookProof": {
+      "types": "./src/selfHostedRelayHookProof.ts",
+      "import": "./src/selfHostedRelayHookProof.ts"
     },
     "./relaySigning": {
       "types": "./src/relaySigning.ts",

@@ -3,11 +3,26 @@ import { ownedOmpSessionDirectory } from "@t3tools/provider-omp/server";
 import { liveThreadShell } from "../mcp/McpToolAccess.testkit.ts";
 import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import { makeOmpEvalEnvelope } from "@t3tools/shared/ompEval";
-import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+import * as EffectNodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeHttpPlatform from "@effect/platform-node/NodeHttpPlatform";
 import * as NodeFSP from "node:fs/promises";
+import * as NodeHttp from "node:http";
+import * as NodeHttps from "node:https";
+import * as NodeCrypto from "node:crypto";
+import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
+import * as NodeWS from "@effect/platform-node/NodeWS";
+import * as Deferred from "effect/Deferred";
+import * as Context from "effect/Context";
+import { chromium } from "playwright-core";
 import {
+  makeStaticRelayEdge,
+  connectStaticRelayTunnel,
+} from "@t3tools/relay-core/RelayTunnelTransport";
+import {
+  AuthFilesystemReadScope,
+  AuthSessionId,
+  EnvironmentId,
   AssetAccessError,
   AssetCreateUrlInput,
   AssetPreviewTypeValidationError,
@@ -35,9 +50,28 @@ import * as PlatformError from "effect/PlatformError";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
-import { HttpClientRequest, HttpClientResponse, HttpServerResponse } from "effect/http";
+import {
+  HttpClientRequest,
+  HttpClientResponse,
+  HttpRouter,
+  HttpServer,
+  HttpServerRequest,
+  HttpServerResponse,
+} from "effect/http";
 import { vi } from "vite-plus/test";
 
+import { serveLoopback } from "../relay/fixtures/p1bIngress.testkit.ts";
+import * as Browser from "../preview/ServerBrowser.ts";
+import * as Renderer from "../preview/LocalAssetNavigation.ts";
+import * as BrowserStream from "../preview/ServerBrowserStream.ts";
+import * as PreviewBrowser from "../preview/PreviewBrowser.ts";
+import * as Manager from "../preview/Manager.ts";
+import * as Broker from "../mcp/PreviewAutomationBroker.ts";
+import * as DesktopBrowserChannel from "../preview/DesktopBrowserChannel.ts";
+import * as PreviewAgentActivity from "../preview/PreviewAgentActivity.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
+import * as SessionStore from "../auth/SessionStore.ts";
 import * as AssetSigner from "./AssetSigner.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
@@ -47,7 +81,7 @@ import * as PluginPackageStore from "../plugins/PluginPackageStore.ts";
 import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
 import * as T3ProjectFileLoader from "../project/T3ProjectFileLoader.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
-import { assetFileResponse } from "../http.ts";
+import { assetFileResponse, layerAssetRoute } from "../http.ts";
 import { ASSET_ROUTE_PREFIX, issueAssetUrl, readMcpAppHtml, resolveAsset } from "./AssetAccess.ts";
 import * as NativeAppIconResolver from "./NativeAppIconResolver.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
@@ -227,7 +261,7 @@ const layerTest = Layer.mergeAll(
   AssetSigner.layer.pipe(
     Layer.provideMerge(ServerSecretStore.layer.pipe(Layer.provide(layerConfig))),
   ),
-).pipe(Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)));
+).pipe(Layer.provideMerge(Layer.mergeAll(NodeServices.layer, EffectNodeCrypto.layer)));
 
 const decodeAssetResource = Schema.decodeUnknownOption(AssetCreateUrlInput);
 describe("AssetAccess", () => {
@@ -264,7 +298,7 @@ describe("AssetAccess", () => {
         const bytes = yield* readMcpAppHtml(file);
         expect(bytes?.byteLength).toBe(limit);
         expect(bytes?.every((byte) => byte === 120)).toBe(true);
-      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, EffectNodeCrypto.layer))),
     );
 
     it.effect("rejects snapshots one byte past the limit and much larger files", () =>
@@ -278,7 +312,7 @@ describe("AssetAccess", () => {
           yield* fileSystem.writeFile(file, new Uint8Array(size).fill(120));
           expect(yield* readMcpAppHtml(file)).toBeNull();
         }
-      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, EffectNodeCrypto.layer))),
     );
 
     it.effect("preserves UTF-8 bytes across stream chunks and accepts empty snapshots", () =>
@@ -294,7 +328,7 @@ describe("AssetAccess", () => {
           expect(bytes?.byteLength).toBe(expected.byteLength);
           expect(bytes && new TextDecoder().decode(bytes)).toBe(html);
         }
-      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, EffectNodeCrypto.layer))),
     );
 
     // regression: #17026 apply host color scheme to saved MCP apps
@@ -306,7 +340,7 @@ describe("AssetAccess", () => {
         const error = yield* readMcpAppHtml(path.join(directory, "missing.html")).pipe(Effect.flip);
         expect(error._tag).toBe("PlatformError");
         expect(error.reason._tag).toBe("NotFound");
-      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, EffectNodeCrypto.layer))),
     );
   });
 
@@ -1485,6 +1519,73 @@ describe("AssetAccess", () => {
     }).pipe(Effect.provide(layerTest)),
   );
 
+  it.effect(
+    "serves relative document and stylesheet dependencies through the signed asset route",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped();
+        const page = '<link rel="stylesheet" href="styles/main.css"><video src="media/clip.mp4">';
+        const css = '@import "./theme.css"; body { background: url("../media/cover%20art.png"); }';
+        const theme = "body { color: red; }";
+        yield* fs.makeDirectory(path.join(root, "docs", "styles"), { recursive: true });
+        yield* fs.makeDirectory(path.join(root, "docs", "media"));
+        yield* fs.writeFileString(path.join(root, "docs", "index.html"), page);
+        yield* fs.writeFileString(path.join(root, "docs", "styles", "main.css"), css);
+        yield* fs.writeFileString(path.join(root, "docs", "styles", "theme.css"), theme);
+        yield* fs.writeFileString(path.join(root, "docs", "media", "clip.mp4"), "video");
+        yield* fs.writeFileString(path.join(root, "docs", "media", "cover art.png"), "cover");
+        yield* fs.writeFileString(path.join(root, "docs", "data.txt"), "private");
+        yield* fs.writeFileString(path.join(root, "outside.png"), "outside the document directory");
+
+        const grant = yield* issueAssetUrl({
+          resource: {
+            _tag: "workspace-file",
+            threadId: ThreadId.make("thread-1"),
+            path: "docs/index.html",
+          },
+          workspaceRoot: root,
+        });
+        const documentUrl = new URL(grant.relativeUrl, "https://issuer.example");
+        const stylesheetUrl = new URL("styles/main.css", documentUrl);
+        const handle = yield* HttpRouter.toHttpEffect(layerAssetRoute);
+        const read = (url: URL) =>
+          handle.pipe(
+            Effect.provideService(
+              HttpServerRequest.HttpServerRequest,
+              HttpServerRequest.fromWeb(new Request(url)),
+            ),
+            Effect.map((response) => HttpServerResponse.toWeb(response)),
+          );
+        const document = yield* read(documentUrl);
+        expect(document.status).toBe(200);
+        expect(yield* Effect.promise(() => document.text())).toContain(page);
+
+        for (const [url, mime, body] of [
+          [stylesheetUrl, "text/css", css],
+          [new URL("./theme.css", stylesheetUrl), "text/css", theme],
+          [new URL("../media/cover%20art.png?v=2#sample", stylesheetUrl), "image/png", "cover"],
+          [new URL("media/clip.mp4", documentUrl), "video/mp4", "video"],
+        ] as const) {
+          const response = yield* read(url);
+          expect(response.status).toBe(200);
+          expect(response.headers.get("content-type")).toContain(mime);
+          expect(yield* Effect.promise(() => response.text())).toBe(body);
+        }
+
+        for (const reference of ["data.txt", "../outside.png", "%2e%2e%2foutside.png"]) {
+          expect((yield* read(new URL(reference, documentUrl))).status).toBe(404);
+        }
+      }).pipe(
+        Effect.provideService(BuiltInDrivers.SourceControlDrivers, []),
+        Effect.provideService(RepositoryIdentityResolver.RepositoryIdentityResolver, {
+          resolve: () => Effect.succeed(null),
+        }),
+        Effect.provide(layerTest),
+      ),
+  );
+
   it.effect("rejects workspace files outside the authorized root", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -2110,3 +2211,633 @@ describe("AssetAccess", () => {
     );
   });
 });
+
+it.live("renders real signed assets in an opaque dark Chromium frame", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-hosted-renderer-" });
+    const origin = "https://asset-view.invalid";
+    const issue = Effect.fn("test.issueLocalPreview")(function* (file: string) {
+      const { relativeUrl } = yield* issueAssetUrl({
+        resource: { _tag: "draft-workspace-file", cwd: root, path: file },
+        workspaceRoot: root,
+      });
+      return origin + relativeUrl;
+    });
+    const dispatch = yield* Renderer.makeDispatcher;
+    const browser = yield* Effect.acquireRelease(
+      Effect.promise(() => chromium.launch()),
+      (browser) => Effect.promise(() => browser.close()),
+    );
+    const context = yield* Effect.acquireRelease(
+      Effect.promise(() =>
+        browser.newContext({ offline: true, serviceWorkers: "block", colorScheme: "dark" }),
+      ),
+      (context) => Effect.promise(() => context.close()),
+    );
+    let trapHits = 0;
+    const trapOrigin = yield* serveLoopback(
+      NodeHttp.createServer((_request, response) => {
+        trapHits++;
+        response.end("unexpected");
+      }),
+    );
+    const trapUrl = trapOrigin + "/trap";
+    yield* fs.writeFileString(
+      path.join(root, "nested.svg"),
+      '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>',
+    );
+    const passive = `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" onload="document.documentElement.setAttribute('ran','true')"/>`;
+    yield* fs.writeFileString(path.join(root, "passive.svg"), passive);
+    const svgUrl = yield* issue("passive.svg");
+    const independent = yield* issue("nested.svg");
+    const sound = Buffer.alloc(8_000);
+    sound.write("RIFF", 0);
+    sound.writeUInt32LE(sound.length - 8, 4);
+    sound.write("WAVEfmt ", 8);
+    sound.writeUInt32LE(16, 16);
+    sound.writeUInt16LE(1, 20);
+    sound.writeUInt16LE(1, 22);
+    sound.writeUInt32LE(8000, 24);
+    sound.writeUInt32LE(8000, 28);
+    sound.writeUInt16LE(1, 32);
+    sound.writeUInt16LE(8, 34);
+    sound.write("data", 36);
+    sound.writeUInt32LE(sound.length - 44, 40);
+    yield* fs.writeFile(path.join(root, "sound.wav"), sound);
+    yield* fs.writeFile(
+      path.join(root, "test.woff2"),
+      yield* fs.readFile(
+        new URL(
+          "../../../web/src/terminal/ghostty/fonts/SymbolsNerdFontMono-Regular.woff2",
+          import.meta.url,
+        ).pathname,
+      ),
+    );
+    yield* fs.writeFileString(
+      path.join(root, "theme.css"),
+      `
+      @font-face { font-family: SignedFont; src: url(test.woff2) }
+      body { font-family: SignedFont; background-image: url("${independent}?purpose=css%2Fimage"); }
+      @media (prefers-color-scheme: dark) { body { background-color: #181818 } }
+    `,
+    );
+    yield* fs.writeFileString(
+      path.join(root, "action.js"),
+      `
+      document.querySelector('button').onclick = () => {
+        document.body.dataset.clicked = 'yes';
+        document.querySelector('input').focus();
+      };
+    `,
+    );
+    yield* fs.writeFileString(
+      path.join(root, "report.html"),
+      `
+      <link rel="stylesheet" href="theme.css">
+      <img src="${independent}">
+      <audio controls preload="metadata" src="sound.wav?play=1"></audio>
+      <img src="${trapUrl}">
+      <img src="/api/assets/unsigned.fake/nested.svg">
+      <iframe src="${svgUrl}"></iframe>
+      <button>Update</button><input aria-label="Notes"><script src="action.js"></script>
+    `,
+    );
+    yield* fs.writeFileString(
+      path.join(root, "redirect.html"),
+      `<meta http-equiv="refresh" content="0;url=${trapUrl}"><p>Redirect</p>`,
+    );
+    const assetUrl = yield* issue("report.html");
+    const redirectUrl = yield* issue("redirect.html");
+
+    yield* Effect.promise(async () => {
+      const responses: Array<{
+        path: string;
+        search: string;
+        status: number | undefined;
+        range: string | undefined;
+        csp: string | undefined;
+      }> = [];
+      const asset = Renderer.prepare(assetUrl, origin, "dark", async (request, signal) => {
+        const response = await dispatch(request, signal);
+        responses.push({
+          path: request.url.pathname.slice(request.url.pathname.lastIndexOf("/") + 1),
+          search: request.url.search,
+          status: response?.status,
+          range: response?.headers["content-range"],
+          csp: response?.headers["content-security-policy"],
+        });
+        return response;
+      });
+      expect(asset).not.toBeNull();
+      if (!asset) return;
+      await Renderer.install(context, asset);
+      const page = await context.newPage();
+      await page.goto(asset.viewUrl.href);
+      const frame = page.frameLocator("iframe");
+      await frame.getByRole("button", { name: "Update" }).click();
+      await page.keyboard.type("typed");
+      await page.setViewportSize({ width: 840, height: 480 });
+      const rootFrame = page.frames().find((frame) => frame.url() === assetUrl);
+      expect(rootFrame?.url().split("/").at(-1)).toBe("report.html");
+      expect(
+        await rootFrame?.evaluate(`(async () => {
+        await document.fonts.ready;
+        const audio = document.querySelector("audio");
+        if (audio.readyState === 0) await new Promise((resolve, reject) => {
+          audio.addEventListener("loadedmetadata", resolve, { once: true });
+          audio.addEventListener("error", reject, { once: true });
+        });
+        return {
+          dark: matchMedia("(prefers-color-scheme: dark)").matches,
+          origin: window.origin,
+          color: getComputedStyle(document.body).backgroundColor,
+          clicked: document.body.dataset.clicked,
+          notes: document.querySelector("input").value,
+          image: document.images[0]?.naturalWidth,
+          font: [...document.fonts][0]?.status,
+          duration: audio.duration,
+          width: window.innerWidth,
+        };
+      })()`),
+      ).toEqual({
+        dark: true,
+        origin: "null",
+        color: "rgb(24, 24, 24)",
+        clicked: "yes",
+        notes: "typed",
+        image: 10,
+        font: "loaded",
+        duration: 0.9945,
+        width: 840,
+      });
+      expect(responses).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: "nested.svg",
+            search: "?purpose=css%2Fimage",
+            status: 200,
+          }),
+          expect.objectContaining({
+            path: "sound.wav",
+            search: "?play=1",
+            status: 206,
+            range: "bytes 0-7999/8000",
+          }),
+          expect.objectContaining({
+            path: "passive.svg",
+            status: 200,
+            csp: expect.stringContaining("sandbox, "),
+          }),
+          expect.objectContaining({ path: "nested.svg", status: undefined }),
+        ]),
+      );
+      expect(
+        await page
+          .frames()
+          .find((frame) => frame.url() === svgUrl)
+          ?.locator("svg")
+          .getAttribute("ran"),
+      ).toBeNull();
+      await context.close();
+      expect(page.isClosed()).toBe(true);
+
+      const redirectContext = await browser.newContext({
+        offline: true,
+        serviceWorkers: "block",
+        colorScheme: "dark",
+      });
+      try {
+        const redirect = Renderer.prepare(redirectUrl, origin, "dark", dispatch);
+        if (!redirect) throw new Error("Expected a signed redirect document");
+        await Renderer.install(redirectContext, redirect);
+        const page = await redirectContext.newPage();
+        const redirected = page.waitForResponse((response) => response.url() === redirectUrl);
+        await page.goto(redirect.viewUrl.href);
+        expect((await redirected).status()).toBe(200);
+        expect(trapHits).toBe(0);
+      } finally {
+        await redirectContext.close();
+      }
+    });
+  }).pipe(
+    Effect.provide(Layer.merge(layerTest, NodeHttpPlatform.layer.pipe(Layer.provide(layerTest)))),
+  ),
+);
+
+it.live("streams a signed document over its destination session and closes it on revoke", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-hosted-stream-" });
+    const issuer = "https://localhost";
+    const canonicalOrigin = "https://canonical.t3.test";
+    const relayTls = {
+      key: yield* fs.readFileString(
+        new URL("../peer/fixtures/localhost-key.pem", import.meta.url).pathname,
+      ),
+      cert: yield* fs.readFileString(
+        new URL("../peer/fixtures/localhost-cert.pem", import.meta.url).pathname,
+      ),
+    };
+    const envTls = {
+      key: yield* fs.readFileString(
+        new URL("../relay/fixtures/p1b-ingress-client-key.pem", import.meta.url).pathname,
+      ),
+      cert: yield* fs.readFileString(
+        new URL("../relay/fixtures/p1b-ingress-client-cert.pem", import.meta.url).pathname,
+      ),
+    };
+    const backend = NodeHttp.createServer();
+    const edge = makeStaticRelayEdge({
+      tunnelTls: { ...relayTls, ca: envTls.cert },
+      environmentFingerprint: new NodeCrypto.X509Certificate(envTls.cert).fingerprint256,
+      publicOrigin: issuer,
+      canonicalOrigin,
+      admission: () => "active",
+    });
+    const target = yield* Effect.acquireRelease(
+      Effect.promise(
+        () =>
+          new Promise<{ host: string; port: number }>((resolve, reject) => {
+            edge.tunnelServer.once("error", reject);
+            edge.tunnelServer.listen(0, "127.0.0.1", () => {
+              const address = edge.tunnelServer.address();
+              if (address === null || typeof address === "string")
+                reject(new Error("Expected TCP listener"));
+              else resolve({ host: address.address, port: address.port });
+            });
+          }),
+      ),
+      () =>
+        Effect.promise(
+          () =>
+            new Promise<void>((resolve) => {
+              edge.revoke();
+              edge.tunnelServer.close(() => resolve());
+            }),
+        ),
+    );
+    yield* Effect.acquireRelease(
+      Effect.sync(() =>
+        connectStaticRelayTunnel({
+          relay: { ...target, ...envTls, servername: "localhost", ca: relayTls.cert },
+          relayFingerprint: new NodeCrypto.X509Certificate(relayTls.cert).fingerprint256,
+          publicOrigin: issuer,
+          canonicalOrigin,
+          backend,
+        }),
+      ),
+      (tunnel) => Effect.sync(() => tunnel.close()),
+    );
+    const origin = yield* serveLoopback(
+      NodeHttps.createServer(relayTls, edge.request).on("upgrade", edge.upgrade),
+    );
+    yield* Effect.promise(() => edge.ready);
+    yield* fs.writeFileString(
+      path.join(root, "view.html"),
+      `
+      <style>body{margin:0}input{position:absolute;left:0;top:0;width:150px;height:60px}</style>
+      <input aria-label="Input">
+      <script>
+        parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/size-changed", params: { height: 240 } }, "*");
+        document.querySelector('input').oninput = () => {
+          const image = new Image();
+          image.src = 'pressed.svg?text=' + encodeURIComponent(document.querySelector('input').value);
+          document.body.append(image);
+          const pending = new Image();
+          pending.src = 'pending.svg';
+          document.body.append(pending);
+        };
+      </script>
+    `,
+    );
+    yield* fs.writeFileString(
+      path.join(root, "pressed.svg"),
+      '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12"/>',
+    );
+    const { relativeUrl } = yield* issueAssetUrl({
+      resource: { _tag: "draft-workspace-file", cwd: root, path: "view.html" },
+      workspaceRoot: root,
+    });
+    const config = yield* ServerConfig.ServerConfig;
+    yield* fs.makeDirectory(config.attachmentsDir, { recursive: true });
+    const attachmentId = "thread-1-00000000-0000-4000-8000-000000000032-html";
+    yield* fs.writeFileString(
+      path.join(config.attachmentsDir, `${attachmentId}.html`),
+      `<!doctype html><body style="margin:0">
+      <button style="width:100px;height:75px">Request</button>
+      <iframe title="Nested" style="position:absolute;top:90px;left:0;width:120px;height:80px;border:0"
+        srcdoc="<style>body{margin:0}button{width:100px;height:75px}</style><button onclick=&quot;parent.postMessage('nested-click', '*')&quot;>Nested</button>"></iframe>
+      <script>
+        document.querySelector("button").onclick = () => {
+          parent.postMessage({ jsonrpc: "2.0", id: 2, method: "t3/test" }, "*");
+        };
+        Object.defineProperty(document, "hasFocus", { value: () => false });
+        parent.postMessage({ jsonrpc: "2.0", id: 1, method: "ui/initialize" }, "*");
+        addEventListener("message", (event) => {
+          if (event.source === document.querySelector("iframe").contentWindow &&
+              event.data === "nested-click") {
+            parent.postMessage({ jsonrpc: "2.0", id: 3, method: "t3/test" }, "*");
+            return;
+          }
+          if (event.source !== parent) return;
+          if (event.data.navigate) {
+            location.href = "about:blank";
+            return;
+          }
+          if (event.data.id !== 1) return;
+          parent.postMessage({
+            jsonrpc: "2.0",
+            method: "ui/notifications/initialized",
+            result: event.data.result,
+            color: new URLSearchParams(location.search).get("t3-color-scheme"),
+          }, "*");
+        });
+      </script></body>`,
+    );
+    const widgetGrant = yield* issueAssetUrl({
+      resource: {
+        _tag: "attachment",
+        attachmentId,
+        mimeType: "text/html",
+        disposition: "inline",
+        renderIntent: "mcp-app",
+      },
+    });
+    const trigger = Deferred.makeUnsafe<string>();
+    const pendingRead = Deferred.makeUnsafe<void>();
+    const canceledRead = Deferred.makeUnsafe<void>();
+    const revoke = Deferred.makeUnsafe<void>();
+    const dispatch = yield* Renderer.makeDispatcher;
+    const widgetUrl = new URL(issuer + widgetGrant.relativeUrl + "?t3-color-scheme=dark");
+    const deniedWidget = yield* Effect.promise(() =>
+      dispatch(
+        {
+          url: widgetUrl,
+          type: "document",
+          method: "GET",
+          range: undefined,
+          ifRange: undefined,
+          widget: "plugin-panel",
+        },
+        new AbortController().signal,
+      ),
+    );
+    expect(deniedWidget).toBeNull();
+    // The loopback-only runner maps the test process to root, which Chrome cannot sandbox.
+    yield* Effect.acquireRelease(
+      Effect.sync(() => vi.stubEnv("T3CODE_SERVER_BROWSER_SANDBOX", "0")),
+      () => Effect.sync(() => vi.unstubAllEnvs()),
+    );
+    const viewerLayer = Browser.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Manager.layer,
+          Broker.layer,
+          DesktopBrowserChannel.layer,
+          PreviewAgentActivity.layer,
+          Layer.succeed(ServerEnvironment.ServerEnvironment, {
+            getEnvironmentId: Effect.succeed(EnvironmentId.make("destination")),
+            getDescriptor: Effect.die("unused"),
+          }),
+          Layer.succeed(PreviewBrowser.PreviewBrowser, {
+            executable: Effect.succeed(chromium.executablePath()),
+            installed: Effect.succeedSome(chromium.executablePath()),
+          }),
+        ),
+      ),
+    );
+    const auth = Layer.mock(EnvironmentAuth.EnvironmentAuth, {
+      authenticateWebSocketUpgrade: (_request, purpose) => {
+        expect(purpose).toBe("media");
+        return Effect.succeed({
+          sessionId: AuthSessionId.make("asset-view-test"),
+          subject: "asset-view-test",
+          method: "bearer-access-token",
+          scopes: [AuthFilesystemReadScope],
+        });
+      },
+    });
+    const services = yield* Layer.build(
+      HttpRouter.serve(BrowserStream.routeLayer, { disableListenLog: true }).pipe(
+        Layer.provideMerge(NodeHttpServer.layer(() => backend, { port: 0, host: "127.0.0.1" })),
+        Layer.provide(viewerLayer),
+        Layer.provide(auth),
+        Layer.provide(
+          Layer.mock(SessionStore.SessionStore, {
+            cookieName: "test",
+            legacyCookieName: undefined,
+            awaitInvalidation: (sessionId) => {
+              expect(sessionId).toBe("asset-view-test");
+              return Deferred.await(revoke);
+            },
+          }),
+        ),
+        Layer.provide(
+          Layer.succeed(Renderer.LocalAssetDispatcher, {
+            read: async (request, signal) => {
+              if (request.url.pathname.endsWith("/pending.svg")) {
+                return new Promise<null>((resolve) => {
+                  signal.addEventListener(
+                    "abort",
+                    () => {
+                      Deferred.doneUnsafe(canceledRead, Effect.void);
+                      resolve(null);
+                    },
+                    { once: true },
+                  );
+                  Deferred.doneUnsafe(pendingRead, Effect.void);
+                });
+              }
+              const response = await dispatch(request, signal);
+              if (request.url.pathname.endsWith("/pressed.svg") && response?.status === 200) {
+                Deferred.doneUnsafe(trigger, Effect.succeed(request.url.search));
+              }
+              return response;
+            },
+          }),
+        ),
+      ),
+    );
+    const server = Context.get(services, HttpServer.HttpServer);
+    const direct = HttpServer.formatAddress(server.address);
+    const route = "/api/preview-stream/ws?asset=1&wsTicket=fixture";
+    const directStatus = yield* Effect.promise(
+      () =>
+        new Promise<number | undefined>((resolve, reject) => {
+          const socket = new NodeWS.WebSocket(direct.replace("http:", "ws:") + route, {
+            headers: {
+              host: "localhost",
+              forwarded: "host=localhost;proto=https",
+              "x-forwarded-proto": "https",
+            },
+          });
+          socket.once("error", reject);
+          socket.once("unexpected-response", (_request, response) => {
+            response.resume();
+            resolve(response.statusCode);
+          });
+          socket.once("open", () => {
+            socket.close();
+            reject(new Error("The direct connection was accepted"));
+          });
+        }),
+    );
+    expect(directStatus).toBe(404);
+    const awaitSocketEvent = <A>(
+      event: Deferred.Deferred<A>,
+      disconnected: Deferred.Deferred<number>,
+      label: string,
+    ) =>
+      Effect.raceFirst(
+        Deferred.await(event),
+        Deferred.await(disconnected).pipe(
+          Effect.flatMap((code) =>
+            Effect.die(new Error(`Socket closed (${code}) before ${label}`)),
+          ),
+        ),
+      );
+    const frames = Deferred.makeUnsafe<void>();
+    const measured = Deferred.makeUnsafe<number>();
+    const closed = Deferred.makeUnsafe<number>();
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        const options = {
+          ca: relayTls.cert,
+          servername: "localhost",
+          headers: { host: "localhost" },
+          perMessageDeflate: false,
+        };
+        const client = new NodeWS.WebSocket(origin.replace("https:", "wss:") + route, options);
+        client.once("open", () => {
+          client.send(
+            JSON.stringify({
+              type: "openAsset",
+              appearance: "dark",
+              theme: { "--background": "#181818" },
+              verifiedAssetUrl: issuer + relativeUrl,
+            }),
+          );
+        });
+        client.once("error", (error) => Deferred.doneUnsafe(closed, Effect.die(error)));
+        client.once("close", (code) => Deferred.doneUnsafe(closed, Effect.succeed(code)));
+        client.on("message", (data, binary) => {
+          if (!binary) {
+            const message = JSON.parse(String(data));
+            if (message.type === "assetHeight")
+              Deferred.doneUnsafe(measured, Effect.succeed(message.height));
+            return;
+          }
+          expect(Buffer.isBuffer(data) && data.subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8]));
+          client.send('{"type":"ack"}');
+          if (!Deferred.doneUnsafe(frames, Effect.void)) return;
+          for (const message of [
+            { type: "navigate", url: "https://denied.invalid" },
+            { type: "resize", width: 420, height: 240 },
+            { type: "mouse", action: "down", x: 20, y: 20, button: "left", buttons: 1 },
+            { type: "mouse", action: "up", x: 20, y: 20, button: "left", buttons: 0 },
+            { type: "text", text: "through stream" },
+          ])
+            client.send(JSON.stringify(message));
+        });
+        return client;
+      }),
+      (client) => Effect.sync(() => client.terminate()),
+    );
+    yield* awaitSocketEvent(frames, closed, "the document frame");
+    expect(yield* awaitSocketEvent(measured, closed, "the document height")).toBe(240);
+    expect(yield* awaitSocketEvent(trigger, closed, "the input-triggered asset request")).toBe(
+      "?text=through%20stream",
+    );
+    const widgetReady = Deferred.makeUnsafe<void>();
+    const widgetFrame = Deferred.makeUnsafe<void>();
+    const activated = Deferred.makeUnsafe<unknown>();
+    const nestedActivation = Deferred.makeUnsafe<unknown>();
+    const widgetMessage = Deferred.makeUnsafe<unknown>();
+    const widgetClosed = Deferred.makeUnsafe<number>();
+    const widgetSocket = yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        const options = {
+          ca: relayTls.cert,
+          servername: "localhost",
+          headers: { host: "localhost" },
+        };
+        const client = new NodeWS.WebSocket(origin.replace("https:", "wss:") + route, options);
+        client.once("error", (error) => Deferred.doneUnsafe(widgetClosed, Effect.die(error)));
+        client.once("close", (code) => Deferred.doneUnsafe(widgetClosed, Effect.succeed(code)));
+        client.once("open", () =>
+          client.send(
+            JSON.stringify({
+              type: "openAsset",
+              appearance: "dark",
+              verifiedAssetUrl: widgetUrl.href,
+              widget: "mcp-app",
+            }),
+          ),
+        );
+        client.on("message", (frame, binary) => {
+          if (binary) {
+            client.send('{"type":"ack"}');
+            Deferred.doneUnsafe(widgetFrame, Effect.void);
+            return;
+          }
+          const message = JSON.parse(String(frame));
+          if (message.type === "widgetReady") Deferred.doneUnsafe(widgetReady, Effect.void);
+          if (message.type !== "widgetMessage") return;
+          if (message.data.method === "t3/test") {
+            Deferred.doneUnsafe(
+              message.data.id === 3 ? nestedActivation : activated,
+              Effect.succeed(message.gesture),
+            );
+          } else if (message.data.method === "ui/initialize") {
+            client.send(
+              JSON.stringify({
+                type: "widgetMessage",
+                data: { jsonrpc: "2.0", id: message.data.id, result: { host: "typed-bridge" } },
+              }),
+            );
+          } else {
+            Deferred.doneUnsafe(widgetMessage, Effect.succeed(message.data));
+          }
+        });
+        return client;
+      }),
+      (client) => Effect.sync(() => client.terminate()),
+    );
+    expect(
+      yield* awaitSocketEvent(widgetMessage, widgetClosed, "widget initialization"),
+    ).toMatchObject({
+      method: "ui/notifications/initialized",
+      result: { host: "typed-bridge" },
+      color: "dark",
+    });
+    expect(yield* Deferred.isDone(widgetReady)).toBe(true);
+    yield* awaitSocketEvent(widgetFrame, widgetClosed, "the widget frame");
+    for (const input of [
+      { type: "mouse", action: "down", x: 30, y: 30, button: "left", buttons: 1 },
+      { type: "mouse", action: "up", x: 30, y: 30, button: "left", buttons: 0, widgetGesture: 1 },
+    ])
+      widgetSocket.send(JSON.stringify(input));
+    expect(yield* awaitSocketEvent(activated, widgetClosed, "the widget button response")).toBe(1);
+    for (const input of [
+      { type: "mouse", action: "down", x: 30, y: 120, button: "left", buttons: 1 },
+      { type: "mouse", action: "up", x: 30, y: 120, button: "left", buttons: 0, widgetGesture: 2 },
+    ])
+      widgetSocket.send(JSON.stringify(input));
+    expect(
+      yield* awaitSocketEvent(nestedActivation, widgetClosed, "the nested button response"),
+    ).toBeUndefined();
+    widgetSocket.send('{"type":"widgetMessage","data":{"navigate":true}}');
+    expect(yield* Deferred.await(widgetClosed)).toBe(4404);
+    yield* awaitSocketEvent(pendingRead, closed, "the pending asset request");
+    expect(yield* Deferred.isDone(closed)).toBe(false);
+    expect(yield* Deferred.isDone(canceledRead)).toBe(false);
+    yield* Deferred.succeed(revoke, undefined);
+    yield* Deferred.await(closed);
+    yield* Deferred.await(canceledRead);
+  }).pipe(
+    Effect.provide(Layer.merge(layerTest, NodeHttpPlatform.layer.pipe(Layer.provide(layerTest)))),
+  ),
+);

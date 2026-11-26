@@ -46,6 +46,7 @@ import {
 } from "lucide-react";
 import { Button, InlineButton } from "../ui/button";
 import { FreshSessionRow, ModelSwitchRow } from "./V2LifecycleRow";
+import { requiresAdmittedAsset } from "../../assets/admittedAssetSource";
 import { useAssetUrlRefresh, useAssetUrls, useAssetUrlState } from "../../assets/assetUrls";
 import { AttachmentImage } from "../media/AttachmentImage";
 import { MediaVideoPlayer } from "../media/MediaVideoPlayer";
@@ -200,9 +201,11 @@ function UserVideoAttachment({
       ? null
       : buildAttachmentVideoAsset(environmentId, { id, mimeType, name });
   const resource = asset?.resource ?? null;
-  const assetUrl = useAssetUrlState(ctx.activeThreadEnvironmentId, resource);
+  const assetUrl = useAssetUrlState(ctx.activeThreadEnvironmentId, resource, undefined, "video");
   const refreshAssetUrl = useAssetUrlRefresh(ctx.activeThreadEnvironmentId, resource);
-  const src = assetUrl._tag === "Success" ? assetUrl.url : (file.previewUrl ?? null);
+  const fallback =
+    file.previewUrl && !requiresAdmittedAsset(file.previewUrl) ? file.previewUrl : null;
+  const src = assetUrl._tag === "Success" ? assetUrl.url : fallback;
 
   if (asset === null && src === null) {
     return (
@@ -221,10 +224,9 @@ function UserVideoAttachment({
 
   const player = (
     <MediaVideoPlayer
+      key={assetUrl.localSource ? src : undefined}
       src={src}
-      sourceFailed={
-        file.previewUrl === undefined && resource !== null && assetUrl._tag === "Failure"
-      }
+      sourceFailed={fallback === null && resource !== null && assetUrl._tag === "Failure"}
       label={file.name}
       preload="visible"
       onOpen={() => {
@@ -451,8 +453,15 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
       return url ? [[resource.attachmentId, url] as const] : [];
     }),
   );
-  const messageWithPreviews = projectPreviews(row.message, (attachment) =>
-    previewUrlsById.get(attachment.id),
+  const messageWithPreviews = projectPreviews(
+    row.message,
+    (attachment) =>
+      previewUrlsById.get(attachment.id) ??
+      (isImageAttachment(attachment) &&
+      attachment.previewUrl &&
+      requiresAdmittedAsset(attachment.previewUrl)
+        ? ""
+        : undefined),
   );
   const userImages = (messageWithPreviews.attachments ?? []).filter(isImageAttachment);
   const userFiles = (row.message.attachments ?? []).filter(isFileAttachment);
@@ -681,7 +690,12 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
           annotationImage={annotationImage}
           attachment={attachment}
           onExpandImage={(image) => {
-            const preview = buildExpandedImagePreview(userImages, image.id, copySnapshot);
+            const preview = buildExpandedImagePreview(
+              userImages,
+              image.id,
+              copySnapshot,
+              ctx.activeThreadEnvironmentId,
+            );
             if (preview) onImageExpand(preview);
           }}
           onOpenFile={onFileOpen}
@@ -757,7 +771,12 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
                 className="block h-full w-full cursor-zoom-in"
                 aria-label={`Preview ${image.name}`}
                 onClick={() => {
-                  const preview = buildExpandedImagePreview(regularImages, image.id, copySnapshot);
+                  const preview = buildExpandedImagePreview(
+                    regularImages,
+                    image.id,
+                    copySnapshot,
+                    ctx.activeThreadEnvironmentId,
+                  );
                   if (!preview) return;
                   ctx.onImageExpand(preview);
                 }}

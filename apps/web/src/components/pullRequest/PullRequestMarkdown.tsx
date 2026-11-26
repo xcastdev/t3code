@@ -10,6 +10,7 @@ import {
 import { createContext, useContext } from "react";
 import type { PluggableList } from "unified";
 
+import { requiresAdmittedAsset } from "~/assets/admittedAssetSource";
 import { useAssetUrlRefresh, useAssetUrlState } from "~/assets/assetUrls";
 import { cn } from "~/lib/utils";
 import { PULL_REQUESTS_PANEL_REF } from "~/rightPanelStore";
@@ -46,13 +47,19 @@ function PullRequestHostVideo({
     url: fetchUrl,
     ...(repository ? { repository } : {}),
   };
-  const assetUrl = useAssetUrlState(environmentId, resource);
+  const assetUrl = useAssetUrlState(environmentId, resource, undefined, "video");
   const refreshAssetUrl = useAssetUrlRefresh(environmentId, resource);
   const src =
-    assetUrl._tag === "Success" ? assetUrl.url : assetUrl._tag === "Failure" ? fetchUrl : null;
+    assetUrl._tag === "Success"
+      ? assetUrl.url
+      : assetUrl._tag === "Failure" && !requiresAdmittedAsset(fetchUrl)
+        ? fetchUrl
+        : null;
   return (
     <MediaVideoPlayer
+      key={assetUrl.localSource ? src : undefined}
       src={src === null ? null : src + markdownImageSourceFragment(url)}
+      sourceFailed={assetUrl._tag === "Failure" && src === null}
       originalUrl={url}
       label="Pull request video"
       className="w-full"

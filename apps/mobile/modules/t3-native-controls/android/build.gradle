@@ -25,11 +25,16 @@ android {
 
 dependencies {
   implementation project(':expo-modules-core')
+  implementation 'com.squareup.okhttp3:okhttp:4.12.0'
   implementation 'androidx.compose.ui:ui-android:1.10.6'
   implementation 'androidx.activity:activity:1.8.2'
   implementation 'androidx.compose.material3:material3-android:1.5.0-alpha17'
   implementation 'androidx.window:window:1.5.1'
   testImplementation 'junit:junit:4.13.2'
+  testImplementation project(':expo-secure-store')
+  testImplementation 'org.json:json:20240303'
+  testImplementation 'com.squareup.okhttp3:mockwebserver:4.12.0'
+  testImplementation 'com.squareup.okhttp3:okhttp-tls:4.12.0'
 }
 
 tasks.withType(Test).configureEach {

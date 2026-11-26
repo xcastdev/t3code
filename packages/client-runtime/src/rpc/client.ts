@@ -1,3 +1,4 @@
+import { parseUrl } from "@t3tools/shared/url";
 import {
   EnvironmentAuthorizationError,
   clientRpcRequiredScopes,
@@ -231,6 +232,40 @@ export const requestInSession = Effect.fn("EnvironmentRpc.request")(function* <
   });
   return yield* method(input).pipe(Effect.ensuring(completeObservation));
 });
+
+export const requestSignedTransferUrl = Effect.fn("EnvironmentRpc.requestSignedTransferUrl")(
+  function* <A extends { readonly relativeUrl: string }, E, R>(
+    request: (session: RpcSession) => Effect.Effect<A, E, R>,
+  ) {
+    const session = yield* currentSession();
+    const response = yield* request(session);
+    const base = session.httpBaseUrl === undefined ? null : parseUrl(session.httpBaseUrl);
+    const url = base === null ? null : parseUrl(response.relativeUrl, base.href);
+    if (
+      base === null ||
+      (base.protocol !== "https:" && base.protocol !== "http:") ||
+      url === null ||
+      url.origin !== base.origin ||
+      url.protocol !== base.protocol ||
+      url.username ||
+      url.password
+    ) {
+      const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
+      return yield* new EnvironmentRpcUnavailableError({
+        environmentId: supervisor.target.environmentId,
+        message: "The environment did not issue a usable transfer URL.",
+      });
+    }
+    return {
+      ...response,
+      relativeUrl: url.href,
+      ...(session.learnedRoute ? { learnedRoute: true as const } : {}),
+      ...(session.verificationRequired || session.learnedRoute
+        ? { verificationRequired: true as const }
+        : {}),
+    };
+  },
+);
 
 // The session-bound request owns the existing EnvironmentRpc.request span.
 export const requestGuarded = Effect.fnUntraced(function* <TTag extends EnvironmentUnaryRpcTag>(

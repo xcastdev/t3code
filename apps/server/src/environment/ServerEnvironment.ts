@@ -46,6 +46,7 @@ export class ServerEnvironment extends Context.Service<
   ServerEnvironment,
   {
     readonly getEnvironmentId: Effect.Effect<EnvironmentId>;
+    readonly getLabel?: Effect.Effect<string>;
     readonly getDescriptor: Effect.Effect<ExecutionEnvironmentDescriptor>;
   }
 >()("t3/environment/ServerEnvironment") {}
@@ -238,6 +239,7 @@ export const make = Effect.gen(function* () {
       storageCleanup: true,
       storageCleanupRun: true,
       databaseStorage: true,
+      genericWebhookDestinations: true,
       otlpEndpointCheck: true,
       secretSourceCheck: true,
       projectWorktreeCleanup: true,
@@ -305,6 +307,7 @@ export const make = Effect.gen(function* () {
 
   return ServerEnvironment.of({
     getEnvironmentId: Effect.succeed(environmentId),
+    getLabel: Effect.succeed(label),
     // Publishing opt-in and relay links change at runtime; read the capability per request.
     getDescriptor: readAgentActivityPublishingActive(secrets).pipe(
       Effect.map((agentActivityPublishing) => ({

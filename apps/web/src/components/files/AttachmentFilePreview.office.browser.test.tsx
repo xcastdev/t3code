@@ -7,8 +7,14 @@ const { refresh, assetUrlState } = vi.hoisted(() => ({
   assetUrlState: vi.fn<() => import("~/assets/assetUrls").AssetUrlState>(),
 }));
 
+async function refreshGrant() {
+  const url = await refresh();
+  return url == null ? null : { url, learnedRoute: false };
+}
+
 vi.mock(import("~/assets/assetUrls"), async (original) => ({
   ...(await original()),
+  useAssetGrantRefresh: () => refreshGrant,
   useAssetUrlRefresh: () => refresh,
   useAssetUrlState: assetUrlState,
 }));

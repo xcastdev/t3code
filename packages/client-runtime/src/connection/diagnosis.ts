@@ -23,6 +23,7 @@ export interface ConnectionDiagnosisHop {
 export interface ConnectionDiagnosis {
   /** Names the part that failed, e.g. "Mac mini's tunnel is offline". */
   readonly headline: string;
+  readonly action?: "renew-relay-access";
   readonly hops: ReadonlyArray<ConnectionDiagnosisHop>;
   readonly steps: ReadonlyArray<string>;
   readonly facts: ReadonlyArray<readonly [label: string, value: string]>;
@@ -111,6 +112,8 @@ function headline(host: string, located: Located, failure: ConnectionAttemptErro
       return `${host} is not linked to your T3 Connect account`;
     case "relay_error":
       return "T3 Connect returned an error";
+    case "hosted_relay_admission_required":
+      return "Relay access could not be confirmed. Request a fresh operator ticket.";
     case "tunnel_pending":
       return `${host}'s tunnel is still being set up`;
     case "tunnel_not_enabled":
@@ -185,6 +188,8 @@ function steps(host: string, located: Located, failure: ConnectionAttemptError |
       ];
     case "tunnel_pending":
       return ["Wait a minute. T3 Code retries on its own.", checkHost];
+    case "hosted_relay_admission_required":
+      return ["Renew relay access with a fresh operator ticket."];
     case "relay_error":
       return [
         "Wait a few minutes. T3 Code retries on its own.",
@@ -260,6 +265,7 @@ function helpSection(
     case "session_pending":
     case "approval_pending":
     case "not_linked":
+    case "hosted_relay_admission_required":
     case "tunnel_not_enabled":
       return "sign-in-account-or-link-problems";
     case "relay_error":
@@ -334,11 +340,12 @@ export function presentConnectionDiagnosis(
     located.hop === "tunnel" ||
     (failure === null && input.relayStatus?.status === "offline") ||
     (failure?.via ?? input.via) === "relay";
+  const hostedAdmissionRequired = located.cause === "hosted_relay_admission_required";
   const order: ReadonlyArray<ConnectionHop> = HOP_ORDER[relayPath ? "relay" : "direct"];
   const failedIndex = order.indexOf(located.hop);
   const hops = order.map((hop, index): ConnectionDiagnosisHop => ({
     hop,
-    label: hopLabel(hop, host),
+    label: hostedAdmissionRequired && hop === "relay" ? "Relay" : hopLabel(hop, host),
     result:
       index === failedIndex
         ? "failed"
@@ -362,7 +369,7 @@ export function presentConnectionDiagnosis(
       ? null
       : DateTime.formatIso(DateTime.makeUnsafe(input.state.retryAt)),
   );
-  add("Route", relayPath ? "T3 Connect" : "Direct");
+  add("Route", hostedAdmissionRequired ? "Relay" : relayPath ? "T3 Connect" : "Direct");
   add("App version", input.clientVersion);
   add("Host version", input.serverVersion);
   add("Error", failure?.detail);
@@ -370,11 +377,12 @@ export function presentConnectionDiagnosis(
 
   return {
     headline: headline(host, located, failure),
+    ...(hostedAdmissionRequired ? { action: "renew-relay-access" } : {}),
     hops,
     steps: steps(host, located, failure),
     facts,
     moreInfoUrl:
-      relayPath || located.cause === "session_pending"
+      !hostedAdmissionRequired && (relayPath || located.cause === "session_pending")
         ? t3ConnectTroubleshootingUrl(helpSection(located, failure))
         : null,
   };

@@ -11,7 +11,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
-import type { ConnectionRegistration } from "../connection/catalog.ts";
+import type { ConnectionProfile, ConnectionRegistration } from "../connection/catalog.ts";
 import type { DeferredShellSnapshot } from "../state/shellPullRequests.ts";
 import type { ConnectionTarget, PersistedConnectionTarget } from "../connection/model.ts";
 import type { ShellCacheOrigin } from "./orchestrationCache.ts";
@@ -28,6 +28,7 @@ export class ConnectionPersistenceError extends Schema.TaggedError<ConnectionPer
     operation: Schema.Literals([
       "list-targets",
       "list-disabled-targets",
+      "list-directory-routes",
       "register-connection",
       "set-connection-routes",
       "remove-connection",
@@ -57,22 +58,43 @@ export class ConnectionTargetStore extends Context.Service<
   }
 >()("@t3tools/client-runtime/platform/persistence/ConnectionTargetStore") {}
 
+export interface StoredDirectoryRoute {
+  readonly environmentId: EnvironmentId;
+  readonly connectionId: string;
+}
+
+export interface LearnedRouteChanges {
+  readonly routeOrder?: ReadonlyArray<string>;
+  readonly profiles: ReadonlyArray<ConnectionProfile>;
+  readonly removedConnectionIds: ReadonlySet<string>;
+}
+
 export class ConnectionRegistrationStore extends Context.Service<
   ConnectionRegistrationStore,
   {
-    /**
-     * Records of routes missing from `routes` are dropped.
-     */
+    /** Preserves hidden learned routes unless they or their credential source were removed. */
     readonly register: (
       registration: ConnectionRegistration,
       routes: ReadonlyArray<PersistedConnectionTarget>,
+      removedRouteIds?: ReadonlySet<string>,
     ) => Effect.Effect<void, ConnectionPersistenceError>;
-    /**
-     * `routes` must not be empty.
-     */
+    /** Orders the visible routes and applies explicit removals. */
     readonly setRoutes: (
       environmentId: EnvironmentId,
       routes: ReadonlyArray<PersistedConnectionTarget>,
+      removedRouteIds?: ReadonlySet<string>,
+    ) => Effect.Effect<void, ConnectionPersistenceError>;
+    readonly listDirectoryRoutes: (
+      source: string,
+    ) => Effect.Effect<ReadonlyArray<StoredDirectoryRoute>, ConnectionPersistenceError>;
+    /**
+     * Commits new targets, changed profiles, and removals against the latest stored catalog.
+     * Route order only supplies insertion positions for new targets.
+     */
+    readonly setLearnedRoutes: (
+      environmentId: EnvironmentId,
+      addedTargets: ReadonlyArray<PersistedConnectionTarget>,
+      changes: LearnedRouteChanges,
     ) => Effect.Effect<void, ConnectionPersistenceError>;
     readonly remove: (
       environmentId: EnvironmentId,
@@ -149,6 +171,7 @@ export class EnvironmentCacheStore extends Context.Service<
 >()("@t3tools/client-runtime/platform/persistence/EnvironmentCacheStore") {}
 
 export class EnvironmentOwnedDataCleanup extends Context.Reference<{
+  readonly clearRoute?: (environmentId: EnvironmentId, origin: string) => Effect.Effect<void>;
   readonly clear: (environmentId: EnvironmentId) => Effect.Effect<void>;
 }>("@t3tools/client-runtime/platform/persistence/EnvironmentOwnedDataCleanup", {
   defaultValue: () => ({

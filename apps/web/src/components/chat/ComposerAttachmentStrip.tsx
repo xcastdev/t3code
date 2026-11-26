@@ -17,6 +17,7 @@ import {
 } from "../../composerDraftStore";
 import { retryAttachmentUpload, useAttachmentUploadStore } from "../../lib/attachmentUploadQueue";
 import type { AttachmentUploadState } from "../../lib/attachmentUploadState";
+import { useAttachmentUploadFailureReason } from "../../hooks/useAttachmentUploadFailureReason";
 import { useAttachmentUploadProgress } from "../../hooks/useAttachmentUploadProgress";
 import { isHeicImageFile } from "../../lib/imageCompression";
 import {
@@ -175,6 +176,7 @@ export function ComposerAttachmentMediaRow({
   readonly onRemoveFile: (fileId: string) => void;
 }) {
   const uploadsByImageId = useAttachmentUploadStore((state) => state.uploadsByImageId);
+  const failureReason = useAttachmentUploadFailureReason();
   const pendingSnapShotIdSet = new Set(pendingSnapShotIds);
   const nonPersistedImageIdSet = new Set(nonPersistedImageIds);
   return (
@@ -194,8 +196,13 @@ export function ComposerAttachmentMediaRow({
         ...preparingImages.map((image) => ({ image, ready: null })),
       ]
         .map(({ image, ready }) => {
+          const savedUpload = uploadsByImageId[image.id];
           const upload =
-            ready && supportsAttachmentUploads ? uploadsByImageId[image.id] : undefined;
+            ready &&
+            savedUpload?.environmentId === environmentId &&
+            (supportsAttachmentUploads || savedUpload.status === "failed")
+              ? savedUpload
+              : undefined;
           const source = ready?.source;
           const snapShotAnimationPending =
             source?.kind === "snap-shot" && pendingSnapShotIdSet.has(image.id);
@@ -305,14 +312,14 @@ export function ComposerAttachmentMediaRow({
                             draftTarget: attachmentDraftTarget,
                           })
                         }
-                        disabled={!canOperateThread}
+                        disabled={!canOperateThread || !supportsAttachmentUploads}
                         aria-label={`Retry upload for ${image.name}`}
                       />
                     }
                   >
                     <RefreshIcon />
                   </TooltipTrigger>
-                  <TooltipPopup side="top">{upload.reason}</TooltipPopup>
+                  <TooltipPopup side="top">{failureReason(upload)}</TooltipPopup>
                 </Tooltip>
               )}
               <span
@@ -355,7 +362,12 @@ export function ComposerAttachmentMediaRow({
           supportsAttachmentUploads &&
           maxFileAttachmentBytes !== null &&
           file.sizeBytes <= maxFileAttachmentBytes;
-        const upload = fileCanUpload ? uploadsByImageId[file.id] : undefined;
+        const savedUpload = uploadsByImageId[file.id];
+        const upload =
+          savedUpload?.environmentId === environmentId &&
+          (fileCanUpload || savedUpload.status === "failed")
+            ? savedUpload
+            : undefined;
         return (
           <div
             key={file.id}
@@ -403,14 +415,14 @@ export function ComposerAttachmentMediaRow({
                           draftTarget: attachmentDraftTarget,
                         })
                       }
-                      disabled={!canOperateThread}
+                      disabled={!canOperateThread || !fileCanUpload}
                       aria-label={`Retry upload for ${file.name}`}
                     />
                   }
                 >
                   <RefreshIcon />
                 </TooltipTrigger>
-                <TooltipPopup side="top">{upload.reason}</TooltipPopup>
+                <TooltipPopup side="top">{failureReason(upload)}</TooltipPopup>
               </Tooltip>
             )}
             <Button
@@ -454,6 +466,7 @@ export function ComposerAttachmentFileList({
   readonly onRemoveFile: (fileId: string) => void;
 }) {
   const uploadsByImageId = useAttachmentUploadStore((state) => state.uploadsByImageId);
+  const failureReason = useAttachmentUploadFailureReason();
   return (
     <div className="mb-3 flex flex-col gap-1">
       {files.map((file) => {
@@ -461,7 +474,12 @@ export function ComposerAttachmentFileList({
           supportsAttachmentUploads &&
           maxFileAttachmentBytes !== null &&
           file.sizeBytes <= maxFileAttachmentBytes;
-        const upload = fileCanUpload ? uploadsByImageId[file.id] : undefined;
+        const savedUpload = uploadsByImageId[file.id];
+        const upload =
+          savedUpload?.environmentId === environmentId &&
+          (fileCanUpload || savedUpload.status === "failed")
+            ? savedUpload
+            : undefined;
         const needsReattach = composerFileNeedsReattach(file);
         const canReattachFile = fileStagingLimit !== null && file.sizeBytes <= fileStagingLimit;
         return (
@@ -491,6 +509,10 @@ export function ComposerAttachmentFileList({
                   upload={upload}
                   fallback={formatAttachmentSize(file.sizeBytes)}
                 />
+              ) : upload?.status === "failed" ? (
+                <span role="status" className="line-clamp-2 max-w-48 break-words">
+                  {failureReason(upload)}
+                </span>
               ) : (
                 formatAttachmentSize(file.sizeBytes)
               )}
@@ -509,14 +531,14 @@ export function ComposerAttachmentFileList({
                           draftTarget: attachmentDraftTarget,
                         })
                       }
-                      disabled={!canOperateThread}
+                      disabled={!canOperateThread || !fileCanUpload}
                       aria-label={`Retry upload for ${file.name}`}
                     />
                   }
                 >
                   <RefreshIcon />
                 </TooltipTrigger>
-                <TooltipPopup side="top">{upload.reason}</TooltipPopup>
+                <TooltipPopup side="top">{failureReason(upload)}</TooltipPopup>
               </Tooltip>
             ) : null}
             <Button

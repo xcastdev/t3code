@@ -1,3 +1,4 @@
+import { verifiedViewerCsp } from "../../lib/verifiedViewerScope";
 import type { DeviceHubAccess } from "@t3tools/client-runtime/device/hub-access";
 import type { PreviewStreamHostSetup } from "@t3tools/contracts";
 import type {
@@ -8,6 +9,7 @@ import type {
 
 export interface PreviewStreamConfiguration {
   readonly access: DeviceHubAccess;
+  readonly verified?: boolean;
   readonly threadId: string;
   readonly tabId: string;
   readonly interactive: boolean;
@@ -35,11 +37,11 @@ export type PreviewStreamMessage =
       readonly detail?: string;
     };
 
-export function previewStreamDocument(configuration: string, script: string) {
+export function previewStreamDocument(configuration: string, script: string, verified = false) {
   const safeConfiguration = configuration.replace(/</g, "\\u003c");
   const safeScript = script.replace(/<\/script/gi, "<\\/script");
   const failure = `window.ReactNativeWebView.postMessage(JSON.stringify({type:"status",status:"error",detail:"Browser viewer stopped unexpectedly."}));`;
-  return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  return `<!doctype html><html><head>${verified ? verifiedViewerCsp : ""}<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <style>
   html, body { height: 100%; overflow: hidden; }
   body { margin: 0; }

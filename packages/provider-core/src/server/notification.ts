@@ -239,7 +239,7 @@ export function notificationTurnItem(
   if (notification === undefined) return item;
   const {
     type: _type,
-    messageId: _messageId,
+    messageId: sourceMessageId,
     inputIntent: _inputIntent,
     text: _text,
     attachments: _attachments,
@@ -249,5 +249,5 @@ export function notificationTurnItem(
     modelSwitch: _modelSwitch,
     ...base
   } = item;
-  return { ...base, type: "notification", ...notification };
+  return { ...base, type: "notification", sourceMessageId, ...notification };
 }

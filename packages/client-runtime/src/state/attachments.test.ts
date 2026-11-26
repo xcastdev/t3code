@@ -31,7 +31,10 @@ type RemoveCommand = AtomCommand<
   never
 >;
 
-function makeCreateUploadUrl(attachmentId: string): CreateUploadUrlCommand {
+function makeCreateUploadUrl(
+  attachmentId: string,
+  verificationRequired?: true,
+): CreateUploadUrlCommand {
   return {
     label: "test:create-upload-url",
     run: async () =>
@@ -39,6 +42,7 @@ function makeCreateUploadUrl(attachmentId: string): CreateUploadUrlCommand {
         attachmentId,
         relativeUrl: `/api/attachments/upload/${attachmentId}`,
         expiresAt: 1,
+        ...(verificationRequired ? { verificationRequired } : {}),
       }),
   };
 }
@@ -64,12 +68,21 @@ describe("runAttachmentUploadCycle", () => {
     Effect.gen(function* () {
       removeCalls.length = 0;
       const transferStarted = Promise.withResolvers<void>();
+      const deleteStarted = Promise.withResolvers<void>();
+      const finishDelete = Promise.withResolvers<void>();
       let aborted = false;
       const cycle = yield* Effect.forkChild(
         runAttachmentUploadCycle({
           registry,
           createUploadUrl: makeCreateUploadUrl("pending-cancelled"),
-          remove,
+          remove: {
+            ...remove,
+            run: async (registry, input) => {
+              deleteStarted.resolve();
+              await finishDelete.promise;
+              return remove.run(registry, input);
+            },
+          },
           environmentId,
           upload: uploadInput,
           resolveUploadUrl: () => "https://environment.test/upload",
@@ -83,8 +96,13 @@ describe("runAttachmentUploadCycle", () => {
         }),
       );
       yield* Effect.promise(() => transferStarted.promise);
-      yield* Fiber.interrupt(cycle);
+      const interrupt = yield* Effect.forkChild(Fiber.interrupt(cycle));
+      yield* Effect.promise(() => deleteStarted.promise);
+      const exitWhileDeleting = cycle.pollUnsafe();
+      finishDelete.resolve();
+      yield* Fiber.join(interrupt);
 
+      expect(exitWhileDeleting).toBeUndefined();
       expect(aborted).toBe(true);
       expect(removeCalls).toEqual(["pending-cancelled"]);
     }),
@@ -95,18 +113,23 @@ describe("runAttachmentUploadCycle", () => {
       removeCalls.length = 0;
       const result = yield* runAttachmentUploadCycle({
         registry,
-        createUploadUrl: makeCreateUploadUrl("pending-failed"),
+        createUploadUrl: makeCreateUploadUrl("pending-failed", true),
         remove,
         environmentId,
         upload: uploadInput,
-        resolveUploadUrl: () => "https://environment.test/upload",
-        transport: () => Effect.fail({ _tag: "UploadRejected", status: 413 } as const),
+        resolveUploadUrl: (_url, verificationRequired) =>
+          verificationRequired ? "https://environment.test/upload" : null,
+        transport: (_url, verificationRequired) =>
+          verificationRequired
+            ? Effect.fail({ _tag: "UploadRejected", status: 413 } as const)
+            : Effect.void,
       });
 
       expect(result).toMatchObject({
         status: "failed",
         step: "transfer",
         attachmentId: "pending-failed",
+        error: { _tag: "UploadRejected", status: 413 },
       });
       expect(removeCalls).toEqual([]);
     }),

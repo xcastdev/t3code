@@ -46,6 +46,7 @@ import { pendingDraftWork } from "./pendingDraftWork";
 import { readComposerImageBytes } from "./composerAttachmentFiles";
 import { randomUUID } from "~/lib/utils";
 import { readPreparedConnection } from "~/state/session";
+import { readAdmittedStaticAsset, requiresAdmittedAsset } from "~/assets/admittedAssetSource";
 import { resolveAssetUrl } from "~/assets/assetUrls";
 import { toKindScopedComposerContextId } from "@t3tools/shared/composerContextReferences";
 import { toastManager } from "../ui/toast";
@@ -62,9 +63,15 @@ const isUnreachable = Schema.is(
   Schema.Union([ConnectionTransientError, ConnectionBlockedError, EnvironmentRpcUnavailableError]),
 );
 
-async function downloadAttachmentBlob(url: string): Promise<Blob | null> {
+async function downloadAttachmentBlob(
+  environmentId: EnvironmentId,
+  url: string,
+): Promise<Blob | null> {
   try {
-    const response = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+    const signal = AbortSignal.timeout(60_000);
+    if (requiresAdmittedAsset(url))
+      return await readAdmittedStaticAsset(environmentId, url, signal);
+    const response = await fetch(url, { signal });
     return response.ok ? await response.blob() : null;
   } catch {
     return null;
@@ -193,7 +200,7 @@ export function useComposerContextImport(input: {
         );
         return;
       }
-      const blob = await downloadAttachmentBlob(url);
+      const blob = await downloadAttachmentBlob(sourceEnvironmentId, url);
       if (!blob) {
         fail("Downloading it from the source failed.");
         return;

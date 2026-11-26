@@ -9,9 +9,12 @@ import {
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as RcMap from "effect/RcMap";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as HttpBody from "effect/http/HttpBody";
 import * as HttpClient from "effect/http/HttpClient";
 import * as HttpClientRequest from "effect/http/HttpClientRequest";
@@ -43,6 +46,7 @@ export class PeerMcpClient extends Context.Service<
     readonly call: <S extends Schema.Decoder<unknown>>(input: {
       readonly environmentId: EnvironmentId;
       readonly tool: string;
+      readonly readOnly?: boolean;
       readonly arguments: Record<string, unknown>;
       readonly limits: PeerCallLimits;
       /** The thread here the call is made for, sent as `T3-Sender-Thread`. */
@@ -109,26 +113,30 @@ const make = Effect.gen(function* () {
   const links = yield* PeerLinks.PeerLinks;
   const httpClient = yield* HttpClient.HttpClient;
   // One MCP session per peer and address, reused across calls. The peer keeps
-  // sessions in memory, so a restart there answers 404 and we start a new one.
+  // sessions in memory. A 404 invalidates the cached session.
   const sessions = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
+  const sessionLocks = yield* RcMap.make({
+    lookup: (_key: string) => Semaphore.make(1),
+  });
 
-  const post = (url: string, token: string, body: unknown, headers: Record<string, string>) =>
-    httpClient.execute(
-      HttpClientRequest.post(`${url}/mcp`).pipe(
-        HttpClientRequest.setHeaders({
-          accept: "application/json, text/event-stream",
-          authorization: `Bearer ${token}`,
-          ...headers,
-        }),
-        HttpClientRequest.setBody(HttpBody.text(JSON.stringify(body), "application/json")),
-      ),
-    );
+  const post = (peer: PeerLinks.ResolvedPeerLink, body: unknown, headers: Record<string, string>) =>
+    (peer.transport?.httpClient ?? httpClient)
+      .execute(
+        HttpClientRequest.post(`${peer.transport?.canonicalOrigin ?? peer.url}/mcp`).pipe(
+          HttpClientRequest.setHeaders({
+            accept: "application/json, text/event-stream",
+            authorization: `Bearer ${peer.token}`,
+            ...headers,
+          }),
+          HttpClientRequest.setBody(HttpBody.text(JSON.stringify(body), "application/json")),
+        ),
+      )
+      .pipe(Effect.provideService(FetchHttpClient.RequestInit, { redirect: "manual" }));
 
   const openSession = Effect.fn("PeerMcpClient.openSession")(
-    function* (url: string, token: string, limitHeader: Record<string, string>) {
+    function* (peer: PeerLinks.ResolvedPeerLink, limitHeader: Record<string, string>) {
       const initialized = yield* post(
-        url,
-        token,
+        peer,
         {
           jsonrpc: "2.0",
           id: 0,
@@ -153,15 +161,14 @@ const make = Effect.gen(function* () {
         });
       }
       yield* post(
-        url,
-        token,
+        peer,
         { jsonrpc: "2.0", method: "notifications/initialized" },
         { ...limitHeader, "mcp-session-id": sessionId, "mcp-protocol-version": PROTOCOL_VERSION },
       );
       return sessionId;
     },
     // Only the handshake is bounded: a forwarded tool call may wait for minutes.
-    (effect, url) => Effect.timeout(effect, PeerLinks.probeTimeout(url)),
+    (effect, peer) => Effect.timeout(effect, PeerLinks.probeTimeout(peer.url)),
   );
 
   const call: PeerMcpClient["Service"]["call"] = Effect.fn("PeerMcpClient.call")(
@@ -187,10 +194,30 @@ const make = Effect.gen(function* () {
                 .join("/"),
             };
       const sessionKey = `${input.environmentId} ${resolved.url}`;
+      const getSession = Effect.gen(function* () {
+        const existing = (yield* Ref.get(sessions)).get(sessionKey);
+        if (existing !== undefined) return existing;
+        const lock = yield* RcMap.get(sessionLocks, sessionKey);
+        return yield* lock.withPermits(1)(
+          Effect.gen(function* () {
+            const current = (yield* Ref.get(sessions)).get(sessionKey);
+            if (current !== undefined) return current;
+            const id = yield* openSession(resolved, limitHeader);
+            yield* Ref.update(sessions, (entries) => new Map(entries).set(sessionKey, id));
+            return id;
+          }),
+        );
+      }).pipe(Effect.scoped);
+      const evictSession = (sessionId: string) =>
+        Ref.update(sessions, (current) => {
+          if (current.get(sessionKey) !== sessionId) return current;
+          const next = new Map(current);
+          next.delete(sessionKey);
+          return next;
+        });
       const callOnce = (sessionId: string) =>
         post(
-          resolved.url,
-          resolved.token,
+          resolved,
           {
             jsonrpc: "2.0",
             id: 1,
@@ -204,17 +231,20 @@ const make = Effect.gen(function* () {
             "mcp-protocol-version": PROTOCOL_VERSION,
           },
         );
-      const existing = (yield* Ref.get(sessions)).get(sessionKey);
-      const sessionId = existing ?? (yield* openSession(resolved.url, resolved.token, limitHeader));
-      // The initialized session outlives a tool request, including a long wait or cancellation.
-      if (existing === undefined) {
-        yield* Ref.update(sessions, (current) => new Map(current).set(sessionKey, sessionId));
-      }
+      const sessionId = yield* getSession;
       let response = yield* callOnce(sessionId);
       if (response.status === 404) {
-        const renewed = yield* openSession(resolved.url, resolved.token, limitHeader);
-        yield* Ref.update(sessions, (current) => new Map(current).set(sessionKey, renewed));
+        yield* evictSession(sessionId);
+        if (input.readOnly !== true) {
+          return yield* new OrchestratorMcpFailure({
+            code: "orchestration_error",
+            message:
+              "The linked environment answered HTTP 404. The tool outcome is unknown. Check the linked environment before repeating the call.",
+          });
+        }
+        const renewed = yield* getSession;
         response = yield* callOnce(renewed);
+        if (response.status === 404) yield* evictSession(renewed);
       }
       if (response.status === 401) {
         return yield* new OrchestratorMcpFailure({

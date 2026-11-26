@@ -8,9 +8,16 @@ import * as FetchHttpClient from "effect/http/FetchHttpClient";
 
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
 import * as RpcSession from "../rpc/session.ts";
-import type { ConnectionCatalogEntry } from "./catalog.ts";
+import { BearerConnectionProfile, type ConnectionCatalogEntry } from "./catalog.ts";
 import * as ConnectionDriver from "./driver.ts";
-import { ConnectionTransientError, SshConnectionTarget, type PreparedConnection } from "./model.ts";
+import {
+  BearerConnectionTarget,
+  ConnectionBlockedError,
+  ConnectionTransientError,
+  RelayConnectionTarget,
+  SshConnectionTarget,
+  type PreparedConnection,
+} from "./model.ts";
 import * as ConnectionResolver from "./resolver.ts";
 
 const sshTarget = (connectionId: string) =>
@@ -72,3 +79,106 @@ describe("ConnectionDriver", () => {
     }),
   );
 });
+
+it.effect("re-prepares a saved route after reconnect while the relay is unavailable", () =>
+  Effect.gen(function* () {
+    const expected = {
+      environmentId: EnvironmentId.make("environment-1"),
+      label: "Test environment",
+    };
+    const httpBaseUrl = "https://cached.example.test";
+    const wsBaseUrl = "wss://cached.example.test";
+    const direct = {
+      target: new BearerConnectionTarget({ ...expected, connectionId: "cached" }),
+      profile: Option.some(
+        new BearerConnectionProfile({
+          ...expected,
+          connectionId: "cached",
+          httpBaseUrl,
+          wsBaseUrl,
+        }),
+      ),
+    };
+    const entry: ConnectionCatalogEntry = {
+      ...direct,
+      enabled: true,
+      alternateRoutes: [{ target: new RelayConnectionTarget(expected), profile: Option.none() }],
+    };
+    const freshKey = yield* Ref.make(true);
+    const opened = yield* Ref.make<ReadonlyArray<string>>([]);
+    const descriptorReads: Array<{ url: string; cache: RequestCache | undefined }> = [];
+    const http = FetchHttpClient.layer.pipe(
+      Layer.provide(
+        Layer.succeed(FetchHttpClient.Fetch, async (url, init) => {
+          descriptorReads.push({ url: String(url), cache: init?.cache });
+          // The wrong key can advertise the same public ID.
+          return Response.json({
+            ...expected,
+            serverVersion: "0.0.0-test",
+            platform: { os: "linux", arch: "x64" },
+            capabilities: { repositoryIdentity: true },
+          });
+        }),
+      ),
+    );
+    const driver = yield* ConnectionDriver.make.pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          http,
+          Layer.mock(RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization)({
+            rememberCheckedDescriptor: () => Effect.void,
+          }),
+          Layer.mock(ConnectionResolver.ConnectionResolver)({
+            prepare: ({ target }) =>
+              Effect.gen(function* () {
+                if (target._tag === "RelayConnectionTarget") {
+                  return yield* new ConnectionTransientError({
+                    reason: "relay-unavailable",
+                    detail: "Fixture relay offline",
+                  });
+                }
+                if (!(yield* Ref.get(freshKey))) {
+                  return yield* new ConnectionBlockedError({
+                    reason: "configuration",
+                    detail: "Fixture TLS key mismatch",
+                  });
+                }
+                return {
+                  ...expected,
+                  target,
+                  httpBaseUrl,
+                  socketUrl: wsBaseUrl + "/ws",
+                  httpAuthorization: { _tag: "Bearer", token: "saved session" },
+                } satisfies PreparedConnection;
+              }),
+          }),
+          Layer.mock(RpcSession.RpcSessionFactory)({
+            connect: ({ socketUrl }) =>
+              Ref.update(opened, (urls) => [...urls, socketUrl]).pipe(
+                Effect.andThen(
+                  new ConnectionTransientError({
+                    reason: "transport",
+                    detail: "Fixture closed the established route",
+                  }),
+                ),
+              ),
+          }),
+        ),
+      ),
+    );
+
+    // Preparing is the injectable boundary. The loopback TLS proof exercises the actual pin.
+    const connect = driver.connect(entry, () => Effect.void).pipe(Effect.scoped, Effect.flip);
+    expect((yield* connect).reason).toBe("transport");
+    expect(yield* Ref.get(opened)).toEqual([wsBaseUrl + "/ws"]);
+    yield* Ref.set(freshKey, false);
+    expect((yield* connect).reason).toBe("relay-unavailable");
+    expect(yield* Ref.get(opened)).toEqual([wsBaseUrl + "/ws"]);
+    expect(descriptorReads).toEqual(
+      Array.from({ length: 2 }, () => ({
+        url: httpBaseUrl + "/.well-known/t3/environment",
+        cache: "no-store",
+      })),
+    );
+  }),
+);

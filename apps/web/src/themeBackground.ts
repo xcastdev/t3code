@@ -2,6 +2,11 @@ import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
 import { executeAtomQuery } from "@t3tools/client-runtime/state/runtime";
 import type { EnvironmentId } from "@t3tools/contracts";
 
+import {
+  readAdmittedStaticAsset,
+  requiresAdmittedAsset,
+  sanitizeStaticPreviewBlob,
+} from "./assets/admittedAssetSource";
 import { appAtomRegistry, subscribeAtomChanges } from "./rpc/atomRegistry";
 import { assetEnvironment } from "./state/assets";
 import { themeEnvironmentIdAtom } from "./state/primaryEnvironment";
@@ -43,10 +48,13 @@ async function loadBackground(
   if (minted._tag !== "Success" || connection._tag === "None") return null;
   const url = resolveAssetUrl(connection.value.httpBaseUrl, minted.value.relativeUrl);
   if (url === null) return null;
-  const response = await fetch(url, { signal });
-  if (!response.ok) return null;
-  const image = await response.blob();
-  return image.type.startsWith("image/") ? URL.createObjectURL(image) : null;
+  const image = requiresAdmittedAsset(url)
+    ? await sanitizeStaticPreviewBlob(
+        await readAdmittedStaticAsset(environmentId, url, signal),
+        signal,
+      )
+    : await fetch(url, { signal }).then((response) => (response.ok ? response.blob() : null));
+  return image?.type.startsWith("image/") ? URL.createObjectURL(image) : null;
 }
 
 /**

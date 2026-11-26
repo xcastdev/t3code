@@ -3,6 +3,9 @@ import { describe, expect, it } from "@effect/vitest";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- Effect's Crypto has no generateKeyPairSync.
 import * as NodeCrypto from "node:crypto";
 import * as Clock from "effect/Clock";
+import * as CryptoError from "effect/crypto/CryptoError";
+import * as Signature from "effect/crypto/Signature";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -13,6 +16,9 @@ import * as HttpRouter from "effect/http/HttpRouter";
 import * as HttpApi from "effect/http-api/HttpApi";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 
+import { SelfHostedRelayId } from "@t3tools/contracts/selfHostedRelay";
+import { SELF_HOSTED_RELAY_HOOK_PROOF_HEADER } from "@t3tools/contracts/selfHostedRelayHooks";
+import { signSelfHostedRelayHookDelivery } from "@t3tools/shared/selfHostedRelayHookProof";
 import { RELAY_HOOK_DELIVERY_TYP, signRelayJwt } from "@t3tools/shared/relayJwt";
 import {
   EnvironmentHttpApi,
@@ -26,7 +32,7 @@ import {
   type WebhookTriggerResult,
 } from "./ScheduledTaskService.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
-import { CLOUD_MINT_PUBLIC_KEY, RELAY_ISSUER_SECRET } from "../cloud/config.ts";
+import { CLOUD_MINT_PUBLIC_KEY, RELAY_ISSUER_SECRET, RELAY_URL_SECRET } from "../cloud/config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as RelayDeliveryProof from "./RelayDeliveryProof.ts";
 import { WEBHOOK_MAX_BODY_BYTES } from "./webhookRoute.ts";
@@ -37,6 +43,11 @@ class WebhookTestApi extends HttpApi.make("environment").add(EnvironmentHttpApi.
 const environmentId = EnvironmentId.make("env-1");
 const relayIssuer = "https://relay.example.test";
 const mintKeys = NodeCrypto.generateKeyPairSync("ed25519", {
+  privateKeyEncoding: { format: "pem", type: "pkcs8" },
+  publicKeyEncoding: { format: "pem", type: "spki" },
+});
+const relayId = SelfHostedRelayId.make("self-hosted-relay");
+const selfHostedKeys = NodeCrypto.generateKeyPairSync("ed25519", {
   privateKeyEncoding: { format: "pem", type: "pkcs8" },
   publicKeyEncoding: { format: "pem", type: "spki" },
 });
@@ -75,11 +86,21 @@ const handlerFor = (
     request: WebhookTriggerRequest,
   ) => Effect.Effect<WebhookTriggerResult, ScheduledTaskError>,
   secrets: ReadonlyMap<string, string> = linkedSecrets,
+  selfHostedAuthority: (typeof RelayDeliveryProof.SelfHostedRelayHookAuthority)["Service"] = null,
+  getEnvironmentId = Effect.succeed(environmentId),
+  signatureLayer: Layer.Layer<Signature.Signature> = PlatformNodeCrypto.layerSignature,
 ) =>
   HttpRouter.toWebHandler(
     HttpApiBuilder.layer(WebhookTestApi).pipe(
       Layer.provide(WebhookRoute.layer),
-      Layer.provide(RelayDeliveryProof.layer),
+      Layer.provide(
+        RelayDeliveryProof.layer.pipe(
+          Layer.provide(signatureLayer),
+          Layer.provide(
+            Layer.succeed(RelayDeliveryProof.SelfHostedRelayHookAuthority, selfHostedAuthority),
+          ),
+        ),
+      ),
       Layer.provide(Layer.mock(ScheduledTaskService)({ triggerWebhook: trigger })),
       Layer.provide(
         Layer.mock(ServerSecretStore.ServerSecretStore)({
@@ -93,7 +114,7 @@ const handlerFor = (
       ),
       Layer.provide(
         Layer.mock(ServerEnvironment.ServerEnvironment)({
-          getEnvironmentId: Effect.succeed(environmentId),
+          getEnvironmentId,
         }),
       ),
       Layer.provide(
@@ -102,7 +123,7 @@ const handlerFor = (
           Layer.provideMerge(Etag.layerWeak),
         ),
       ),
-      Layer.provide([NodeServices.layer, PlatformNodeCrypto.layerSignature]),
+      Layer.provide([NodeServices.layer, PlatformNodeCrypto.layer]),
     ),
     { disableLogger: true },
   );
@@ -114,6 +135,233 @@ const post = (
 ) => new Request(`http://env.local${path}`, { method: "POST", body, headers });
 
 describe("webhook route", () => {
+  it("rejects missing or invalid self-hosted proof without calling the task service", async () => {
+    let calls = 0;
+    const { handler, dispose } = handlerFor(() => {
+      calls += 1;
+      return Effect.succeed({ _tag: "not_found" });
+    });
+    try {
+      const attempts: ReadonlyArray<Record<string, string>> = [
+        {},
+        { [SELF_HOSTED_RELAY_HOOK_PROOF_HEADER]: "malformed" },
+      ];
+      for (const headers of attempts) {
+        const response = await handler(post("/api/relay-hooks/id/tok", "{}", headers));
+        expect(response.status).toBe(401);
+        expect(response.headers.get("x-t3-hook-outcome")).toBe("invalid_relay_proof");
+        expect(await response.json()).toEqual({ error: "invalid_relay_proof" });
+      }
+      expect(calls).toBe(0);
+    } finally {
+      await dispose();
+    }
+  });
+
+  it.live("extracts the exact self-hosted request and admits only verified relay metadata", () =>
+    Effect.gen(function* () {
+      const body = new Uint8Array([255, 10, 0, 13]);
+      const headers = {
+        authorization: "sha256=sender-signature",
+        "x-sender-signature": "sha256=exact",
+        "x-sender-event-id": "event-1",
+      };
+      const rawTarget = "/api/relay-hooks/%69d/t%6fk?x=%2f&x=+&bare";
+      const delivery = {
+        relayId,
+        environmentId,
+        hookId: "id",
+        deliveryId: "delivery-1",
+        receivedAt: DateTime.formatIso(
+          DateTime.makeUnsafe((yield* Clock.currentTimeMillis) - 60_000),
+        ),
+        method: "POST",
+        rawTarget,
+        body,
+        headers,
+        privateKey: selfHostedKeys.privateKey,
+      } as const;
+      const sign = (
+        overrides: Partial<Parameters<typeof signSelfHostedRelayHookDelivery>[0]> = {},
+      ) =>
+        signSelfHostedRelayHookDelivery({ ...delivery, ...overrides }).pipe(
+          Effect.provide(PlatformNodeCrypto.layer),
+        );
+      const proof = yield* sign();
+      const received: Array<WebhookTriggerRequest> = [];
+      const { handler, dispose } = handlerFor(
+        (request) => {
+          received.push(request);
+          return Effect.succeed({
+            _tag: "accepted",
+            deliveryId: ScheduledTaskWebhookDeliveryId.make("delivery:1"),
+            outcome: "accepted",
+          });
+        },
+        new Map([[RELAY_URL_SECRET, "https://untrusted-address-hint.test"]]),
+        { relayId, publicKey: selfHostedKeys.publicKey },
+      );
+      const send = ({
+        target = rawTarget,
+        method = "POST",
+        requestHeaders = headers,
+        token = proof,
+      }: {
+        target?: string;
+        method?: string;
+        requestHeaders?: Record<string, string>;
+        token?: string;
+      } = {}) =>
+        Effect.promise(() =>
+          handler(
+            new Request(`http://env.local${target}`, {
+              method,
+              ...(method === "GET" ? {} : { body }),
+              headers: { ...requestHeaders, [SELF_HOSTED_RELAY_HOOK_PROOF_HEADER]: token },
+            }),
+          ),
+        );
+      try {
+        const wronglySigned = yield* sign({ privateKey: mintKeys.privateKey });
+        for (const change of [
+          { target: rawTarget.replace("%69", "i") },
+          { target: rawTarget.replace("%6f", "o") },
+          { target: rawTarget.replace("%2f", "%2F") },
+          { target: rawTarget.replace("+", "%20") },
+          { token: wronglySigned },
+        ]) {
+          const response = yield* send(change);
+          expect(response.status).toBe(401);
+          expect(response.headers.get("x-t3-hook-outcome")).toBe("invalid_relay_proof");
+        }
+        expect(received).toHaveLength(0);
+        const response = yield* send({
+          requestHeaders: {
+            ...headers,
+            "x-unsigned-signature": "unsigned-value",
+            "x-t3-relay-delivery-id": "untrusted-id",
+            "x-t3-relay-received-at": "untrusted-time",
+          },
+        });
+        expect(response.status).toBe(202);
+        expect(received).toEqual([
+          expect.objectContaining({
+            hookId: "id",
+            token: "tok",
+            method: "POST",
+            path: "/api/hooks/id",
+            query: "x=%2f&x=+&bare",
+            headers,
+            body,
+            relaySource: "self-hosted",
+            relayIssuer: relayId,
+            relayDeliveryId: delivery.deliveryId,
+            receivedAt: delivery.receivedAt,
+          }),
+        ]);
+
+        const direct = yield* send({ target: "/api/hooks/id/tok" });
+        expect(direct.status).toBe(202);
+        expect(received[1]?.relayDeliveryId).toBeUndefined();
+        expect(received[1]?.relaySource).toBeUndefined();
+        expect(received[1]?.headers).toEqual(expect.objectContaining(headers));
+        expect(received[1]?.headers[SELF_HOSTED_RELAY_HOOK_PROOF_HEADER]).toBeUndefined();
+
+        const getTarget = "/api/relay-hooks/id/tok?";
+        const getProof = yield* sign({
+          method: "GET",
+          rawTarget: getTarget,
+          body: new Uint8Array(),
+          deliveryId: "delivery-2",
+        });
+        expect((yield* send({ target: getTarget, method: "GET", token: getProof })).status).toBe(
+          202,
+        );
+        expect(
+          (yield* send({ target: getTarget.slice(0, -1), method: "GET", token: getProof })).status,
+        ).toBe(401);
+      } finally {
+        yield* Effect.promise(() => dispose());
+      }
+    }),
+  );
+
+  it("reports verifier runtime defects with a retryable response", async () => {
+    let calls = 0;
+    const { handler, dispose } = handlerFor(
+      () => {
+        calls += 1;
+        return Effect.succeed({ _tag: "not_found" });
+      },
+      new Map(),
+      { relayId, publicKey: selfHostedKeys.publicKey },
+      Effect.die(new Error("private runtime details")),
+    );
+    try {
+      const response = await handler(
+        post("/api/relay-hooks/id/tok", "{}", { [SELF_HOSTED_RELAY_HOOK_PROOF_HEADER]: "proof" }),
+      );
+      expect(response.status).toBe(500);
+      expect(response.headers.get("x-t3-hook-outcome")).toBe("error");
+      expect(await response.json()).toEqual({ error: "internal_error" });
+      expect(calls).toBe(0);
+    } finally {
+      await dispose();
+    }
+  });
+
+  it.live("reports a typed signature provider failure with a retryable response", () =>
+    Effect.gen(function* () {
+      const rawTarget = "/api/relay-hooks/id/tok";
+      const proof = yield* signSelfHostedRelayHookDelivery({
+        ...selfHostedKeys,
+        relayId,
+        environmentId,
+        hookId: "id",
+        deliveryId: "delivery-1",
+        receivedAt: DateTime.formatIso(yield* DateTime.now),
+        method: "POST",
+        rawTarget,
+        body: new TextEncoder().encode("{}"),
+        headers: {},
+      }).pipe(Effect.provide(PlatformNodeCrypto.layer));
+      const unavailable = new CryptoError.CryptoError({
+        module: "Signature",
+        method: "verify",
+        reason: new CryptoError.Unsupported({ description: "private provider diagnostic" }),
+      });
+      const signatureLayer = Layer.effect(
+        Signature.Signature,
+        Effect.map(Signature.Signature, (signature) => ({
+          ...signature,
+          verify: () => Effect.fail(unavailable),
+        })),
+      ).pipe(Layer.provide(PlatformNodeCrypto.layerSignature));
+      let calls = 0;
+      const { handler, dispose } = handlerFor(
+        () => {
+          calls += 1;
+          return Effect.succeed({ _tag: "not_found" });
+        },
+        new Map(),
+        { relayId, publicKey: selfHostedKeys.publicKey },
+        Effect.succeed(environmentId),
+        signatureLayer,
+      );
+      try {
+        const response = yield* Effect.promise(() =>
+          handler(post(rawTarget, "{}", { [SELF_HOSTED_RELAY_HOOK_PROOF_HEADER]: proof })),
+        );
+        expect(response.status).toBe(500);
+        expect(response.headers.get("x-t3-hook-outcome")).toBe("error");
+        expect(yield* Effect.promise(() => response.json())).toEqual({ error: "internal_error" });
+        expect(calls).toBe(0);
+      } finally {
+        yield* Effect.promise(() => dispose());
+      }
+    }),
+  );
+
   it.live("trusts the relay's delivery id and receive time only with its signed proof", () =>
     Effect.gen(function* () {
       const received: Array<WebhookTriggerRequest> = [];
@@ -161,6 +409,14 @@ describe("webhook route", () => {
         undefined,
       ]);
       expect(received[0]?.receivedAt).toBe(receivedAt);
+      expect(received[0]?.relayIssuer).toBe(relayIssuer);
+      expect(received.map((request) => request.relaySource)).toEqual([
+        "hosted",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+      ]);
       expect(received.slice(1).every((request) => request.receivedAt === undefined)).toBe(true);
     }),
   );

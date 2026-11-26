@@ -49,6 +49,7 @@ import { presentConnectionState } from "./presentation.ts";
 import * as EnvironmentSupervisor from "./supervisor.ts";
 import * as ConnectionWakeups from "./wakeups.ts";
 import { connectionRouteId, entryWithRoutes, isLearned, mergeLearnedRoutes } from "./routes.ts";
+import { VerifiedRoutePolicy } from "./verifiedRoute.ts";
 
 const TARGET = new PrimaryConnectionTarget({
   environmentId: EnvironmentId.make("environment-1"),
@@ -219,7 +220,7 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
     reportProgress: (progress: ConnectionDriver.ConnectionDriverProgress) => Effect.Effect<void>,
   ) {
     yield* reportProgress({ stage: "preparing" });
-    const prepared = yield* prepare(target);
+    const prepared = { ...(yield* prepare(target)), target };
     yield* reportProgress({ stage: "opening", prepared });
 
     const attempt = yield* Ref.updateAndGet(sessionCount, (count) => count + 1);
@@ -2288,6 +2289,127 @@ describe("EnvironmentSupervisor routes", () => {
     }),
   );
 
+  it.effect.each([
+    "healthy",
+    "recovered",
+    "relay offline",
+    "withdrawn",
+    "slow direct",
+    "slow recovery",
+  ] as const)(
+    "selects an operator-enrolled public direct route with %s enrollment/reachability",
+    (scenario) =>
+      Effect.gen(function* () {
+        const relayOrigin = "https://relay.example.test";
+        const directOrigin = "https://direct.example.test:8443";
+        const environmentId = TARGET.environmentId;
+        const relay = {
+          target: new BearerConnectionTarget({
+            environmentId,
+            label: TARGET.label,
+            connectionId: "paired-alias",
+          }),
+          profile: Option.some(
+            new BearerConnectionProfile({
+              environmentId,
+              label: TARGET.label,
+              connectionId: "paired-alias",
+              httpBaseUrl: relayOrigin,
+              wsBaseUrl: "wss://relay.example.test",
+            }),
+          ),
+        };
+        const saved = { ...relay, enabled: true };
+        const routes = mergeLearnedRoutes({
+          entry: saved,
+          activeRoute: relay,
+          reported: [{ httpBaseUrl: directOrigin, kind: "direct" }],
+          allowInsecure: false,
+          directorySource: "directory",
+        })!;
+        const cached = entryWithRoutes(saved, routes);
+        expect(cached.target).toBe(relay.target);
+        const recovering = scenario === "recovered" || scenario === "slow recovery";
+        const delayed = scenario === "slow direct" || scenario === "slow recovery";
+        const reachable = yield* Ref.make(!recovering);
+        const probeStarted = yield* Queue.unbounded<void>();
+        const directId = connectionRouteId(routes[1]!.target);
+        const preflights: string[] = [];
+        const checkRoute = (route: ConnectionRoute) =>
+          isLearned(route)
+            ? Ref.get(reachable).pipe(
+                Effect.tap((ready) =>
+                  ready && delayed
+                    ? Queue.offer(probeStarted, undefined).pipe(
+                        Effect.andThen(Effect.sleep("1 second")),
+                      )
+                    : Effect.void,
+                ),
+                Effect.map((ready) => (ready ? ("answered" as const) : ("silent" as const))),
+              )
+            : Effect.succeed(
+                scenario === "relay offline" ? ("silent" as const) : ("answered" as const),
+              );
+        const harness = yield* makeHarness({
+          checkRoute,
+          preflight: (route) =>
+            Effect.sync(() => preflights.push(connectionRouteId(route.target))).pipe(
+              Effect.andThen(checkRoute(route)),
+              Effect.map((check) => (check === "answered" ? ("ready" as const) : check)),
+            ),
+          prepare: (_attempt, target) => Effect.succeed(preparedFor(target)),
+        });
+        const supervisor = yield* EnvironmentSupervisor.make(cached, {
+          initiallyDesired: true,
+        }).pipe(
+          Effect.provide(harness.dependencies),
+          Effect.provideService(VerifiedRoutePolicy, {
+            readEnrollment: (origin) =>
+              Effect.succeed(
+                origin === relayOrigin
+                  ? { httpsOrigin: origin, environmentId, transportRole: "relay" as const }
+                  : origin === directOrigin && scenario !== "withdrawn"
+                    ? { httpsOrigin: origin, environmentId, transportRole: "direct" as const }
+                    : null,
+              ),
+            enforce: () => Effect.succeed(true),
+          }),
+        );
+        const active = SubscriptionRef.get(supervisor.prepared).pipe(
+          Effect.map((prepared) => connectionRouteId(Option.getOrThrow(prepared).target)),
+        );
+        if (scenario === "slow direct") {
+          yield* Queue.take(probeStarted);
+          yield* TestClock.adjust("1 second");
+        }
+        yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+        expect(yield* active).toBe(
+          scenario === "healthy" || scenario === "relay offline" || scenario === "slow direct"
+            ? directId
+            : relay.target.connectionId,
+        );
+        if (recovering) {
+          yield* Ref.set(reachable, true);
+          yield* harness.wake("network-changed");
+          if (delayed) {
+            yield* Queue.take(probeStarted);
+            yield* TestClock.adjust("1 second");
+            yield* Queue.take(probeStarted);
+            yield* TestClock.adjust("1 second");
+          }
+          yield* awaitState(
+            supervisor.state,
+            (state) => state.phase === "connected" && state.generation === 2,
+          );
+          expect(yield* active).toBe(directId);
+          expect(yield* Ref.get(harness.releaseCount)).toBe(1);
+        }
+        yield* TestClock.adjust("2 minutes");
+        expect(yield* Ref.get(harness.sessionCount)).toBe(recovering ? 2 : 1);
+        if (scenario === "withdrawn") expect(preflights).toEqual([]);
+      }),
+  );
+
   it.effect("moves back to the LAN route when the network changes and it answers again", () =>
     Effect.gen(function* () {
       const lanReachable = yield* Ref.make(false);
@@ -2571,6 +2693,7 @@ describe("EnvironmentSupervisor routes", () => {
         const current = yield* Ref.make(relayEntry);
         const supervisor = yield* EnvironmentSupervisor.make(relayEntry, {
           initiallyDesired: true,
+          currentEntry: current,
           learnRoutes: ({ activeRoute, reported }) =>
             Effect.gen(function* () {
               yield* Deferred.succeed(discoveryStarted, undefined);
@@ -2581,14 +2704,14 @@ describe("EnvironmentSupervisor routes", () => {
                 reported,
                 allowInsecure: true,
               });
-              if (routes === null) return Option.none();
+              if (routes === null) return false;
               const next = entryWithRoutes(entry, routes);
               yield* Ref.set(current, next);
               yield* Ref.update(learned, (all) => [
                 ...all,
                 ...routes.filter(isLearned).map((route) => connectionRouteId(route.target)),
               ]);
-              return Option.some(next);
+              return true;
             }),
         }).pipe(Effect.provide(harness.dependencies));
 
@@ -2625,5 +2748,100 @@ describe("EnvironmentSupervisor routes", () => {
           `learned:${TARGET.environmentId}:${discovery !== "initial" ? "https://fixture.tail1234.ts.net" : "http://192.168.1.10:3773"}`,
         ]);
       }),
+  );
+  it.effect.each(["withdrawn", "profile replaced", "donor replaced"] as const)(
+    "releases an unpublished session when its learned candidate is %s",
+    (change) =>
+      Effect.gen(function* () {
+        const learned = mergeLearnedRoutes({
+          entry: LAN_ENTRY,
+          activeRoute: LAN_ROUTE,
+          reported: [{ httpBaseUrl: "https://learned.example.test", kind: "tailnet" }],
+          allowInsecure: false,
+        })!.find(isLearned)!;
+        const initial = entryWithRoutes(LAN_ENTRY, [learned, LAN_ROUTE]);
+        const currentEntry = yield* Ref.make(initial);
+        const started = yield* Deferred.make<void>();
+        const finish = yield* Deferred.make<void>();
+        const attempts: Array<string> = [];
+        const harness = yield* makeHarness({
+          prepare: (_attempt, target) =>
+            Effect.sync(() => {
+              attempts.push(connectionRouteId(target));
+              return preparedFor(target);
+            }),
+          ready: (attempt) =>
+            attempt === 1
+              ? Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(finish)))
+              : Effect.void,
+        });
+        const supervisor = yield* EnvironmentSupervisor.make(initial, {
+          currentEntry,
+          initiallyDesired: true,
+        }).pipe(Effect.provide(harness.dependencies));
+        yield* Deferred.await(started);
+
+        const revisedRoute = (route: ConnectionRoute) => ({
+          ...route,
+          profile: Option.some(
+            new BearerConnectionProfile({
+              ...(Option.getOrThrow(route.profile) as BearerConnectionProfile),
+              httpBaseUrl: "https://replacement.example.test",
+              wsBaseUrl: "wss://replacement.example.test",
+            }),
+          ),
+        });
+        const updated =
+          change === "withdrawn"
+            ? [LAN_ROUTE]
+            : change === "profile replaced"
+              ? [LAN_ROUTE, revisedRoute(learned)]
+              : [revisedRoute(LAN_ROUTE), learned];
+        yield* Ref.set(currentEntry, entryWithRoutes(initial, updated));
+        yield* Deferred.succeed(finish, undefined);
+
+        yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+        expect(yield* Ref.get(harness.releaseCount)).toBe(1);
+        expect(attempts).toEqual([
+          connectionRouteId(learned.target),
+          connectionRouteId(LAN_ROUTE.target),
+        ]);
+        expect(Option.getOrThrow(yield* SubscriptionRef.get(supervisor.prepared)).target).toEqual(
+          LAN_ROUTE.target,
+        );
+      }),
+  );
+
+  it.effect("keeps a healthy session when a pending better route is withdrawn", () =>
+    Effect.gen(function* () {
+      const currentEntry = yield* Ref.make(RELAY_ENTRY);
+      const started = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        preflight: () =>
+          Deferred.succeed(started, undefined).pipe(
+            Effect.andThen(Deferred.await(finish)),
+            Effect.as("ready" as const),
+          ),
+        prepare: (_attempt, target) => Effect.succeed(preparedFor(target)),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(RELAY_ENTRY, {
+        initiallyDesired: true,
+        currentEntry,
+      }).pipe(Effect.provide(harness.dependencies));
+      const connected = yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+      yield* Ref.set(currentEntry, LAN_THEN_RELAY_ENTRY);
+      yield* harness.wake("network-changed");
+      yield* Deferred.await(started);
+      yield* Ref.set(currentEntry, RELAY_ENTRY);
+      yield* Deferred.succeed(finish, undefined);
+      yield* TestClock.adjust("60 seconds");
+      expect(yield* Ref.get(harness.prepareCount)).toBe(1);
+      expect(yield* Ref.get(harness.releaseCount)).toBe(0);
+      expect(yield* SubscriptionRef.get(supervisor.state)).toMatchObject({
+        phase: "connected",
+        generation: connected.generation,
+      });
+    }),
   );
 });

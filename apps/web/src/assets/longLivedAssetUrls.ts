@@ -1,6 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
 import {
-  type AssetUrlState,
   assetUrlStateFromResult,
   blockedAssetUrlState,
   EMPTY_ASSET_URL_ATOM,
@@ -9,6 +8,7 @@ import { AssetResource, type AssetCreateUrlResult, EnvironmentId } from "@t3tool
 import * as Schema from "effect/Schema";
 import { AsyncResult, Atom } from "effect/reactivity";
 
+import { type AssetUrlState, isLearnedAssetGrant } from "~/assets/assetUrls";
 import { assetEnvironment } from "~/state/assets";
 import { useFilesystemReadAccess } from "~/state/filesystem";
 import { usePreparedConnection } from "~/state/session";
@@ -80,6 +80,14 @@ export function useLongLivedAssetUrl(
       : longLivedAssetUrl({ environmentId, input: { resource } }),
   );
   if (blocked !== null) return blocked;
+  if (result._tag === "Success" && isLearnedAssetGrant(result.value)) {
+    const issuer = URL.parse(result.value.relativeUrl);
+    if (issuer === null) return { _tag: "Failure" };
+    const state = assetUrlStateFromResult(result, issuer.origin);
+    return state._tag === "Success"
+      ? { ...state, learnedRoute: true, url: result.value.relativeUrl }
+      : state;
+  }
   return assetUrlStateFromResult(
     result,
     preparedConnection._tag === "Some" ? preparedConnection.value.httpBaseUrl : null,

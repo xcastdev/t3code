@@ -2797,6 +2797,8 @@ it.effect("a file picker closes when its page is replaced while control changes 
       yield* second.input({ type: "takeControl" });
       let reoffered = yield* Queue.take(second.output);
       while (reoffered._tag !== "fileChooser") reoffered = yield* Queue.take(second.output);
+      expect(reoffered.requestId).toBe(offered.requestId);
+      expect(reoffered.id).not.toBe(offered.id);
       current.resolve(false);
       let closed = yield* Queue.take(second.output);
       while (closed._tag !== "fileChooserClosed") closed = yield* Queue.take(second.output);

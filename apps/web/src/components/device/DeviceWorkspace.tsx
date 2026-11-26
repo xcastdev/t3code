@@ -1,11 +1,9 @@
 import * as Schema from "effect/Schema";
 import type { DeviceHostSummary, DeviceSummary, EnvironmentId } from "@t3tools/contracts";
 import { useRef, useState } from "react";
-import {
-  captureDeviceScreenshot,
-  DeviceScreenshotError,
-} from "@t3tools/client-runtime/device/screenshot";
+import { DeviceScreenshotError } from "@t3tools/client-runtime/device/screenshot";
 import { refreshDeviceHubAccess, useDeviceHubAccess } from "~/state/device";
+import { captureWebDeviceScreenshot } from "./deviceHubApi";
 import { DeviceControlsRail } from "./DeviceControlsRail";
 import { DeviceStreamView } from "./DeviceStreamView";
 import { DeviceToolsPanel } from "./DeviceToolsPanel";
@@ -45,7 +43,7 @@ export function DeviceWorkspace(props: {
     capturing.current = true;
     setScreenshotPending(true);
     setScreenshotError(null);
-    return captureDeviceScreenshot(
+    return captureWebDeviceScreenshot(
       { access, platform: props.device.platform, deviceId: props.device.id },
       // Never aborted: see `capturing` above.
       new AbortController().signal,

@@ -1,10 +1,38 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Socket from "effect/socket/Socket";
-import { vi } from "vite-plus/test";
+import { onTestFinished, vi } from "vite-plus/test";
 
-vi.mock("expo", () => ({ requireOptionalNativeModule: () => null }));
+const savedEnrollment = vi.hoisted(() => ({
+  value: null as string | null,
+  relay: new Map<string, string>(),
+}));
 
+const expo = vi.hoisted(() => ({ native: null as object | null }));
+vi.mock("expo", () => ({ requireOptionalNativeModule: () => expo.native }));
+vi.mock("expo-secure-store", () => ({
+  getItemAsync: async (key: string) =>
+    key === "t3code.verified-routes.v1"
+      ? savedEnrollment.value
+      : (savedEnrollment.relay.get(key) ?? null),
+  setItemAsync: async (key: string, value: string) => {
+    if (key === "t3code.verified-routes.v1") savedEnrollment.value = value;
+    else savedEnrollment.relay.set(key, value);
+  },
+  deleteItemAsync: async (key: string) => {
+    savedEnrollment.relay.delete(key);
+  },
+}));
+
+import {
+  clearNativeRelayAdmission,
+  installNativeRelayAdmission,
+} from "../connection/relay-admission";
+import {
+  enrollVerifiedRoute,
+  markVerificationRequired,
+  readVerifiedRouteEnrollment,
+} from "../connection/verified-route";
 import * as NativeWebSocket from "./nativeWebSocket.ios";
 
 function setup() {
@@ -12,6 +40,8 @@ function setup() {
   let nextId = 7;
   const native = {
     connect: vi.fn(() => nextId++),
+    connectVerified: vi.fn(() => nextId++),
+    connectVerifiedRelay: vi.fn(() => nextId++),
     sendText: vi.fn(),
     sendBinary: vi.fn(),
     close: vi.fn(),
@@ -57,6 +87,215 @@ describe("NativeWebSocket", () => {
     expect(native.sendBinary).toHaveBeenCalledWith(id, bytes);
   });
 
+  it("uses the verified constructor for every upgrade to an enrolled origin", async () => {
+    const { native, sockets } = setup();
+    const origin = "https://relay.example.com:8443";
+    const leafSpkiSha256 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    await enrollVerifiedRoute({ httpsOrigin: origin, environmentId: "env", leafSpkiSha256 });
+
+    for (const ticket of ["one", "two"]) {
+      const url = `wss://relay.example.com:8443/ws?ticket=${ticket}`;
+      const dialed = Promise.withResolvers<void>();
+      native.connectVerified.mockImplementationOnce(() => {
+        dialed.resolve();
+        return ticket === "one" ? 8 : 9;
+      });
+      const socket = new NativeWebSocket.Connection(sockets, url, ["t3"]);
+      await dialed.promise;
+      expect(native.connectVerified).toHaveBeenLastCalledWith(url, ["t3"], origin, leafSpkiSha256);
+      socket.close();
+    }
+    expect(native.connect).toHaveBeenCalledOnce();
+    sockets.dispose();
+  });
+
+  it("refreshes relay admission on every pinned upgrade and refuses after clear", async () => {
+    const { native, sockets } = setup();
+    const origin = "https://admitted.example.com:8443";
+    const leafSpkiSha256 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const binding = { httpsOrigin: origin, environmentId: "env", leafSpkiSha256 };
+    await enrollVerifiedRoute(binding);
+    for (const ticket of ["one", "two"]) {
+      await installNativeRelayAdmission(binding, `relay-${ticket}`);
+      const url = `wss://admitted.example.com:8443/ws?ticket=${ticket}`;
+      const dialed = Promise.withResolvers<void>();
+      native.connectVerifiedRelay.mockImplementationOnce(() => {
+        dialed.resolve();
+        return ticket === "one" ? 8 : 9;
+      });
+      const socket = new NativeWebSocket.Connection(sockets, url, ["t3"]);
+      await dialed.promise;
+      expect(native.connectVerifiedRelay).toHaveBeenLastCalledWith(
+        url,
+        ["t3"],
+        origin,
+        leafSpkiSha256,
+        `Bearer relay-${ticket}`,
+      );
+      socket.close();
+    }
+    await clearNativeRelayAdmission(binding);
+    const socket = new NativeWebSocket.Connection(
+      sockets,
+      "wss://admitted.example.com:8443/ws?ticket=three",
+      ["t3"],
+    );
+    const closed = Promise.withResolvers<Socket.WebSocketEvent>();
+    socket.addEventListener("close", closed.resolve);
+    expect(await closed.promise).toMatchObject({ code: 1006, wasClean: false });
+    expect(native.connectVerifiedRelay).toHaveBeenCalledTimes(2);
+    expect(native.connectVerified).not.toHaveBeenCalled();
+    expect(native.connect).toHaveBeenCalledExactlyOnceWith("ws://host/ws", ["t3"]);
+    sockets.dispose();
+  });
+
+  it.effect.each(["missing pin", "corrupt pin", "restored pin after clear"] as const)(
+    "refuses a bare WSS ticket after a cold start with %s",
+    (failure) =>
+      Effect.gen(function* () {
+        savedEnrollment.value = null;
+        savedEnrollment.relay.clear();
+        const origin = "https://cold-wss.test";
+        const binding = {
+          httpsOrigin: origin,
+          environmentId: "env",
+          leafSpkiSha256: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        };
+        yield* Effect.promise(() => enrollVerifiedRoute(binding));
+        const pinOnly = savedEnrollment.value;
+        if (failure === "restored pin after clear") {
+          yield* Effect.promise(() => installNativeRelayAdmission(binding, "relay-session"));
+          yield* Effect.promise(() => clearNativeRelayAdmission(binding));
+          savedEnrollment.value = pinOnly;
+        } else {
+          savedEnrollment.value = failure === "missing pin" ? null : "{bad";
+        }
+
+        const { native, sockets } = setup();
+        sockets.dispose();
+        native.connect.mockClear();
+        expo.native = native;
+        const ordinary = vi.fn();
+        vi.stubGlobal("WebSocket", ordinary);
+        onTestFinished(() => {
+          expo.native = null;
+          vi.unstubAllGlobals();
+        });
+        vi.resetModules();
+        const { layer } = yield* Effect.promise(() => import("./nativeWebSocket.ios"));
+        yield* Effect.gen(function* () {
+          const connect = yield* Socket.WebSocketConstructor;
+          const attempted = Promise.withResolvers<void>();
+          native.connect.mockImplementationOnce(() => {
+            attempted.resolve();
+            return 8;
+          });
+          native.connectVerified.mockImplementationOnce(() => {
+            attempted.resolve();
+            return 8;
+          });
+          native.connectVerifiedRelay.mockImplementationOnce(() => {
+            attempted.resolve();
+            return 8;
+          });
+          const socket = connect("wss://cold-wss.test/ws?ticket=signed", ["t3"]);
+          const closed = Promise.withResolvers<Socket.WebSocketEvent>();
+          socket.addEventListener("close", closed.resolve);
+          expect(
+            yield* Effect.promise(() => Promise.race([closed.promise, attempted.promise])),
+          ).toMatchObject({
+            code: 1006,
+            wasClean: false,
+          });
+        }).pipe(Effect.provide(layer));
+        expect(ordinary).not.toHaveBeenCalled();
+        expect(native.connect).not.toHaveBeenCalled();
+        expect(native.connectVerified).not.toHaveBeenCalled();
+        expect(native.connectVerifiedRelay).not.toHaveBeenCalled();
+      }),
+  );
+
+  it.effect.each(["missing", "unreadable"] as const)(
+    "guards the global WSS fallback with a %s pin store",
+    (pinStore) =>
+      Effect.gen(function* () {
+        savedEnrollment.value = pinStore === "missing" ? null : "{bad";
+        savedEnrollment.relay.clear();
+        savedEnrollment.relay.set(
+          "t3code.verified-route-policy.v1",
+          JSON.stringify({ "https://protected-global.test": "verified" }),
+        );
+        const ordinary = vi.fn(function OrdinaryWebSocket() {});
+        vi.stubGlobal("WebSocket", ordinary);
+        onTestFinished(() => {
+          vi.unstubAllGlobals();
+        });
+        vi.resetModules();
+        const { layer } = yield* Effect.promise(() => import("./nativeWebSocket.ios"));
+        yield* Effect.gen(function* () {
+          const connect = yield* Socket.WebSocketConstructor;
+          expect(() => connect("wss://protected-global.test/ws?ticket=signed")).toThrow();
+          expect(ordinary).not.toHaveBeenCalled();
+          const direct = "wss://explicit-direct.test/ws";
+          if (pinStore === "missing") {
+            connect(direct);
+            expect(ordinary).toHaveBeenCalledExactlyOnceWith(direct, undefined);
+          } else {
+            expect(() => connect(direct)).toThrow();
+            expect(ordinary).not.toHaveBeenCalled();
+          }
+        }).pipe(Effect.provide(layer));
+        savedEnrollment.value = null;
+      }),
+  );
+
+  it("refuses ordinary WSS for a required origin or an explicitly verified ticket without a pin", async () => {
+    const { native, sockets } = setup();
+    native.connect.mockClear();
+    const httpsOrigin = "https://missing-pin.test";
+    savedEnrollment.value = null;
+    await enrollVerifiedRoute({
+      httpsOrigin,
+      environmentId: "env",
+      leafSpkiSha256: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    });
+    const marked = "wss://missing-pin.test/ws?ticket=secret";
+    markVerificationRequired(marked);
+    savedEnrollment.value = "{corrupt";
+    for (const [url, requireVerified] of [
+      [marked, false],
+      ["wss://unknown-issuer.test/ws?ticket=secret", true],
+    ] as const) {
+      const socket = new NativeWebSocket.Connection(sockets, url, [], { requireVerified });
+      expect(native.connect).not.toHaveBeenCalled();
+      const closed = Promise.withResolvers<Socket.WebSocketEvent>();
+      socket.addEventListener("close", closed.resolve);
+      expect(await closed.promise).toMatchObject({ code: 1006, wasClean: false });
+    }
+    expect(native.connect).not.toHaveBeenCalled();
+    expect(native.connectVerified).not.toHaveBeenCalled();
+    sockets.dispose();
+  });
+
+  it("never dials if closed during the verified enrollment lookup", async () => {
+    const { native, sockets } = setup();
+    const httpsOrigin = "https://cancel-preflight.test";
+    savedEnrollment.value = null;
+    await enrollVerifiedRoute({
+      httpsOrigin,
+      environmentId: "env",
+      leafSpkiSha256: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    });
+    const socket = new NativeWebSocket.Connection(sockets, "wss://cancel-preflight.test/ws");
+    const closed = Promise.withResolvers<Socket.WebSocketEvent>();
+    socket.addEventListener("close", closed.resolve);
+    socket.close();
+    expect(await closed.promise).toMatchObject({ code: 1006, wasClean: false });
+    await readVerifiedRouteEnrollment(httpsOrigin);
+    expect(native.connectVerified).not.toHaveBeenCalled();
+    sockets.dispose();
+  });
+
   it("reports the server's close frame once and ignores later events", () => {
     const { emit, socket, events, id } = setup();
     emit("open", { id });
@@ -99,6 +338,18 @@ describe("NativeWebSocket", () => {
     emit("close", { id, code: 1000, reason: "", wasClean: true });
     expect(once).toHaveBeenCalledTimes(1);
     expect(always).not.toHaveBeenCalled();
+  });
+
+  it("forwards close while connecting and drops a late upgrade event", () => {
+    const { native, emit, socket, events, id } = setup();
+    socket.close();
+    expect(native.close).toHaveBeenCalledExactlyOnceWith(id, 1000, "");
+    emit("open", { id });
+    emit("message", { id, text: "late" });
+    expect(socket.readyState).toBe(NativeWebSocket.Connection.CLOSING);
+    emit("close", { id, code: 1006, reason: "", wasClean: false });
+    expect(events).toEqual([{ type: "close", code: 1006, reason: "", wasClean: false }]);
+    expect(socket.readyState).toBe(NativeWebSocket.Connection.CLOSED);
   });
 
   it("closes open sockets and stops listening when disposed", () => {

@@ -3,6 +3,7 @@ import {
   type LinkableMachine,
   linkDestination,
 } from "@t3tools/client-runtime/link-request";
+import { useGT } from "gt-react";
 import { useId } from "react";
 
 import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
@@ -99,6 +100,46 @@ export function LinkMachineSelect({
           <SelectItem value={ANOTHER_ADDRESS} hideIndicator>
             Another address…
           </SelectItem>
+        </SelectPopup>
+      </Select>
+    </div>
+  );
+}
+
+export function LinkMachineAddressSelect({
+  urls,
+  value,
+  onChange,
+  disabled,
+}: {
+  readonly urls: ReadonlyArray<string>;
+  readonly value: string | null;
+  readonly onChange: (url: string) => void;
+  readonly disabled: boolean;
+}) {
+  const gt = useGT();
+  const labelId = useId();
+  return (
+    <div className="space-y-1.5">
+      <span id={labelId} className="block text-xs font-medium text-foreground">
+        {gt("Address")}
+      </span>
+      <Select<string>
+        value={value}
+        disabled={disabled}
+        onValueChange={(next) => {
+          if (next !== null) onChange(next);
+        }}
+      >
+        <SelectTrigger aria-labelledby={labelId}>
+          <SelectValue placeholder={gt("Choose an address")} />
+        </SelectTrigger>
+        <SelectPopup alignItemWithTrigger={false}>
+          {urls.map((url) => (
+            <SelectItem key={url} value={url}>
+              <span className="break-all">{url}</span>
+            </SelectItem>
+          ))}
         </SelectPopup>
       </Select>
     </div>

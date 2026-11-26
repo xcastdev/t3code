@@ -56,8 +56,19 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 
-import { isBrowserPreviewFile, openFileInPreview } from "~/browser/openFileInPreview";
-import { useAssetUrlRefresh, useAssetUrlState } from "~/assets/assetUrls";
+import {
+  filePreviewOpenMode,
+  isAdmittedPreviewDocument,
+  isBrowserPreviewFile,
+} from "~/browser/filePreviewOpenMode";
+import { openFileInPreview } from "~/browser/openFileInPreview";
+import { readAdmittedStaticAsset, requiresAdmittedAsset } from "~/assets/admittedAssetSource";
+import { saveBlob } from "~/lib/saveBlob";
+import {
+  prepareVerifiedPreviewSource,
+  readVerifiedPreviewAsset,
+} from "~/browser/readVerifiedPreviewAsset";
+import { useAssetGrantRefresh, useAssetUrlRefresh, useAssetUrlState } from "~/assets/assetUrls";
 import { OpenInPicker } from "~/components/chat/OpenInPicker";
 import { MediaVideoPlayer } from "~/components/media/MediaVideoPlayer";
 import { MediaActions, type MediaActionSource } from "~/components/media/MediaActions";
@@ -79,17 +90,17 @@ import { type DraftId, useComposerDraftStore } from "~/composerDraftStore";
 import { buildFileReviewComment, type ReviewCommentContext } from "~/reviewCommentContext";
 import { assetEnvironment } from "~/state/assets";
 import { usePreviewAvailable } from "~/browser/previewRuntime";
-import { useEnvironmentHttpBaseUrl, usePrimaryEnvironmentId } from "~/state/environments";
+import { usePrimaryEnvironmentId } from "~/state/environments";
 import { hostEnvironmentIdAtom } from "~/state/primaryEnvironment";
 import { previewEnvironment } from "~/state/preview";
 import { serverEnvironment } from "~/state/server";
-import { useEnvironmentScope } from "~/state/session";
+import { useEnvironmentScope, usePreparedConnection } from "~/state/session";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { useAtomQueryRunner } from "~/state/use-atom-query-runner";
 
 import { AttachmentFilePreview } from "./AttachmentFilePreview";
 import { AudioPreview } from "./AudioPreview";
-import { BrowserDocumentFrame, isPdfPreviewFile } from "./BrowserDocumentFrame";
+import { BrowserDocumentFrame, isPdfPreviewFile, OfflineHtmlFile } from "./BrowserDocumentFrame";
 import { DelimitedTablePreview } from "./DelimitedTablePreview";
 import { PreviewImage } from "./PreviewImage";
 import FileBrowserPanel from "./FileBrowserPanel";
@@ -196,12 +207,15 @@ function WorkspaceImagePreview(props: {
     workspaceRoot: props.workspaceRoot,
     absolutePath: props.absolutePath,
   });
-  const assetUrl = useAssetUrlState(props.environmentId, resource);
+  const assetUrl = useAssetUrlState(props.environmentId, resource, props.workspaceMutationId);
   const revisionSuffix =
     props.workspaceMutationId === null
       ? ""
       : `${assetUrl._tag === "Success" && assetUrl.url.includes("?") ? "&" : "?"}workspace-revision=${encodeURIComponent(props.workspaceMutationId)}`;
-  const imageUrl = assetUrl._tag === "Success" ? `${assetUrl.url}${revisionSuffix}` : null;
+  const imageUrl =
+    assetUrl._tag === "Success"
+      ? assetUrl.url + (assetUrl.localSource ? "" : revisionSuffix)
+      : null;
   const actionsSource: MediaActionSource = {
     kind: "image",
     name: props.alt,
@@ -252,7 +266,12 @@ export function WorkspaceBrowserPreview(props: {
   });
   // Each workspace mutation re-mints the URL: a file outside the workspace is signed by its
   // inode, which an atomic replace changes.
-  const assetUrl = useAssetUrlState(props.environmentId, resource, props.workspaceMutationId);
+  const assetUrl = useAssetUrlState(
+    props.environmentId,
+    resource,
+    props.workspaceMutationId,
+    pdf ? "static" : "issued",
+  );
   // The HTML frame keeps its first URL per key, so the key moves only once the re-minted URL arrives.
   const [settledMutationId, setSettledMutationId] = useState(props.workspaceMutationId);
   if (
@@ -264,6 +283,8 @@ export function WorkspaceBrowserPreview(props: {
   }
   const fileRevision = pdf && assetUrl._tag === "Success" ? assetUrl.fileRevision : undefined;
   const revision = fileRevision ?? (pdf ? props.workspaceMutationId : settledMutationId);
+  const documentId = `${props.environmentId}:${resource._tag}:${props.threadRef.threadId}:${props.absolutePath}`;
+  const documentKey = `${documentId}:${revision}`;
   const revisionSuffix =
     revision === null
       ? ""
@@ -286,15 +307,162 @@ export function WorkspaceBrowserPreview(props: {
       </div>
     );
   }
+  if (!pdf && requiresAdmittedAsset(assetUrl.url)) {
+    return (
+      <HostedWorkspaceDocument
+        key={documentKey}
+        documentKey={documentKey}
+        environmentId={props.environmentId}
+        threadRef={props.threadRef}
+        absolutePath={props.absolutePath}
+        draft={props.draft}
+        issuedUrl={assetUrl.url}
+        title={props.title}
+      />
+    );
+  }
+  if (assetUrl.learnedRoute) {
+    return (
+      <VerifiedWorkspaceDocument
+        key={documentKey}
+        environmentId={props.environmentId}
+        issuedUrl={assetUrl.url}
+        title={props.title}
+        pdf={pdf}
+      />
+    );
+  }
   return (
     <BrowserDocumentFrame
-      src={`${assetUrl.url}${revisionSuffix}`}
-      documentKey={`${props.environmentId}:${resource._tag}:${props.threadRef.threadId}:${props.absolutePath}:${revision}`}
-      documentId={`${props.environmentId}:${resource._tag}:${props.threadRef.threadId}:${props.absolutePath}`}
+      src={assetUrl.url + (assetUrl.localSource ? "" : revisionSuffix)}
+      local={assetUrl.localSource === true}
+      documentKey={documentKey}
+      documentId={documentId}
       title={props.title}
       pdf={pdf}
     />
   );
+}
+
+function HostedWorkspaceDocument(props: {
+  readonly documentKey: string;
+  readonly environmentId: EnvironmentId;
+  readonly threadRef: ScopedThreadRef;
+  readonly absolutePath: string;
+  readonly draft: boolean;
+  readonly issuedUrl: string;
+  readonly title: string;
+}) {
+  const refreshDownload = useAssetGrantRefresh(
+    props.environmentId,
+    props.draft
+      ? null
+      : {
+          _tag: "media-file",
+          threadId: props.threadRef.threadId,
+          path: props.absolutePath,
+          disposition: "attachment",
+        },
+  );
+  const [saving, setSaving] = useState(false);
+  return (
+    <>
+      {!props.draft ? (
+        <div className={FILE_SURFACE_SUBHEADER_CLASS}>
+          <FileSurfaceAction
+            label={saving ? "Preparing file…" : "Save file"}
+            disabled={saving}
+            onPress={() => {
+              setSaving(true);
+              void refreshDownload()
+                .then((grant) => {
+                  if (!grant || (!grant.learnedRoute && !requiresAdmittedAsset(grant.url)))
+                    throw new Error("The original file is unavailable.");
+                  return readVerifiedPreviewAsset(props.environmentId, grant.url);
+                })
+                .then((blob) => saveBlob(blob, props.title.split(/[\\/]/).at(-1) ?? props.title))
+                .catch(() => toastManager.add({ type: "error", title: "Unable to download file" }))
+                .finally(() => setSaving(false));
+            }}
+          >
+            <DownloadIcon className="size-3.5" />
+          </FileSurfaceAction>
+        </div>
+      ) : null}
+      <BrowserDocumentFrame
+        src={props.issuedUrl}
+        documentKey={props.documentKey}
+        title={props.title}
+        pdf={false}
+        verified
+        environmentId={props.environmentId}
+      />
+    </>
+  );
+}
+
+function VerifiedWorkspaceDocument(props: {
+  readonly environmentId: EnvironmentId;
+  readonly issuedUrl: string;
+  readonly title: string;
+  readonly pdf: boolean;
+}) {
+  const [issuedUrl] = useState(props.issuedUrl);
+  const source = useVerifiedWorkspaceSource(props.environmentId, issuedUrl, true, !props.pdf);
+  if (source.failed) return <FileSurfaceFailure message="Unable to load file preview." />;
+  if (source.url === null) return <FileSurfaceLoading />;
+  return !props.pdf && source.blob !== undefined ? (
+    <OfflineHtmlFile file={source.blob} title={props.title} />
+  ) : (
+    <BrowserDocumentFrame
+      src={source.url}
+      title={props.title}
+      pdf={props.pdf}
+      local={source.blob !== undefined}
+      verified
+    />
+  );
+}
+
+function useVerifiedWorkspaceSource(
+  environmentId: EnvironmentId,
+  url: string | null,
+  learned: boolean,
+  html = false,
+) {
+  const [settled, setSettled] = useState<{
+    environmentId: EnvironmentId;
+    issuedUrl: string;
+    url: string | null;
+    blob?: Blob;
+  } | null>(null);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- authorizes the issued URL and owns an object URL when native loading is unavailable
+  useEffect(() => {
+    if (!learned || url === null) return;
+    const controller = new AbortController();
+    let localUrl: string | undefined;
+    void prepareVerifiedPreviewSource(environmentId, url, { html, signal: controller.signal })
+      .then((source) => {
+        if (controller.signal.aborted) return;
+        if (typeof source === "string") {
+          setSettled({ environmentId, issuedUrl: url, url: source });
+        } else {
+          localUrl = URL.createObjectURL(source);
+          setSettled({ environmentId, issuedUrl: url, url: localUrl, blob: source });
+        }
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setSettled({ environmentId, issuedUrl: url, url: null });
+      });
+    return () => {
+      controller.abort();
+      if (localUrl !== undefined) URL.revokeObjectURL(localUrl);
+    };
+  }, [environmentId, html, learned, url]);
+  if (!learned) return { url, failed: false };
+  const current =
+    settled?.issuedUrl === url && settled.environmentId === environmentId ? settled : null;
+  return { url: current?.url ?? null, blob: current?.blob, failed: current?.url === null };
 }
 
 function WorkspaceVideoPreview(props: {
@@ -306,6 +474,7 @@ function WorkspaceVideoPreview(props: {
   readonly name: string;
   readonly workspaceMutationId: string | null;
 }) {
+  const [sourceAttempt, setSourceAttempt] = useState(0);
   const resource = workspaceAssetResource({
     kind: "media-file",
     threadRef: props.threadRef,
@@ -318,6 +487,8 @@ function WorkspaceVideoPreview(props: {
     props.environmentId,
     resource,
     props.workspaceMutationId ?? undefined,
+    "video",
+    sourceAttempt,
   );
   const refreshAssetUrl = useAssetUrlRefresh(props.environmentId, resource);
   // Servers that report the file's revision let an unchanged file stay loaded; older ones
@@ -329,19 +500,32 @@ function WorkspaceVideoPreview(props: {
     revision === null
       ? ""
       : `${assetUrl._tag === "Success" && assetUrl.url.includes("?") ? "&" : "?"}${fileRevision !== undefined ? "file" : "workspace"}-revision=${encodeURIComponent(revision)}`;
-  const latestUrl = assetUrl._tag === "Success" ? `${assetUrl.url}${revisionSuffix}` : null;
+  const learned = assetUrl.learnedRoute === true;
+  const { url: latestUrl, failed: sourceFailed } = useVerifiedWorkspaceSource(
+    props.environmentId,
+    assetUrl._tag === "Success"
+      ? learned || assetUrl.localSource
+        ? assetUrl.url
+        : `${assetUrl.url}${revisionSuffix}`
+      : null,
+    learned,
+  );
 
   return (
     <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden p-4">
       <MediaVideoPlayer
+        key={assetUrl.localSource ? latestUrl : undefined}
         src={latestUrl}
-        sourceFailed={assetUrl._tag === "Failure"}
+        sourceFailed={assetUrl._tag === "Failure" || sourceFailed}
         label={props.name}
-        revision={revision}
+        revision={assetUrl.localSource ? latestUrl : revision}
         preload="metadata"
         className="flex h-full min-h-0 w-full max-w-5xl items-center justify-center"
         videoClassName="aspect-auto max-h-full w-auto max-w-full"
-        onRetry={refreshAssetUrl}
+        onRetry={() => {
+          setSourceAttempt((attempt) => attempt + 1);
+          return refreshAssetUrl();
+        }}
         actionsSource={{
           kind: "video",
           name: props.name,
@@ -363,6 +547,7 @@ function WorkspaceAudioPreview(props: {
   readonly name: string;
   readonly workspaceMutationId: string | null;
 }) {
+  const [sourceAttempt, setSourceAttempt] = useState(0);
   const resource = workspaceAssetResource({
     kind: "media-file",
     threadRef: props.threadRef,
@@ -374,6 +559,8 @@ function WorkspaceAudioPreview(props: {
     props.environmentId,
     resource,
     props.workspaceMutationId ?? undefined,
+    "audio",
+    sourceAttempt,
   );
   const refreshAssetUrl = useAssetUrlRefresh(props.environmentId, resource);
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
@@ -383,13 +570,23 @@ function WorkspaceAudioPreview(props: {
     revision === null
       ? ""
       : `${assetUrl._tag === "Success" && assetUrl.url.includes("?") ? "&" : "?"}${fileRevision !== undefined ? "file" : "workspace"}-revision=${encodeURIComponent(revision)}`;
-  const url = assetUrl._tag === "Success" ? `${assetUrl.url}${revisionSuffix}` : null;
-  if (assetUrl._tag === "Failure" || (url !== null && failedUrl === url)) {
+  const learned = assetUrl.learnedRoute === true;
+  const { url, failed } = useVerifiedWorkspaceSource(
+    props.environmentId,
+    assetUrl._tag === "Success"
+      ? learned || assetUrl.localSource
+        ? assetUrl.url
+        : `${assetUrl.url}${revisionSuffix}`
+      : null,
+    learned,
+  );
+  if (assetUrl._tag === "Failure" || failed || (url !== null && failedUrl === url)) {
     return (
       <FileSurfaceFailure
         message="Unable to load audio."
         onRetry={() => {
           setFailedUrl(null);
+          setSourceAttempt((attempt) => attempt + 1);
           void refreshAssetUrl().catch(() => undefined);
         }}
       />
@@ -398,9 +595,10 @@ function WorkspaceAudioPreview(props: {
   if (url === null) return <FileSurfaceLoading />;
   return (
     <AudioPreview
+      key={assetUrl.localSource ? url : undefined}
       src={url}
       name={props.name}
-      revision={revision}
+      revision={assetUrl.localSource ? url : revision}
       onError={() => setFailedUrl(url)}
     />
   );
@@ -436,6 +634,7 @@ function WorkspaceDocumentPreview(props: {
     props.environmentId,
     revisioned ? resource : null,
     props.workspaceMutationId ?? undefined,
+    "issued",
   );
   const resolved =
     assetUrl._tag === "Success" ? (assetUrl.fileRevision ?? props.workspaceMutationId) : undefined;
@@ -1187,8 +1386,11 @@ export default function FilePreviewPanel({
   const hostEnvironmentId = useAtomValue(hostEnvironmentIdAtom);
   const remoteOpenState = useRemoteOpenState(environmentId);
   const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
-  const environmentHttpBaseUrl = useEnvironmentHttpBaseUrl(environmentId);
-  const previewAvailable = usePreviewAvailable(environmentId);
+  const browserAvailable = usePreviewAvailable(environmentId);
+  const connection = usePreparedConnection(environmentId);
+  const prepared = connection._tag === "Some" ? connection.value : null;
+  const environmentHttpBaseUrl = prepared?.httpBaseUrl;
+  const previewAvailable = browserAvailable || prepared?.learnedRoute === true;
   const createAssetUrl = useAtomQueryRunner(assetEnvironment.createUrl, {
     reportFailure: false,
   });
@@ -1198,6 +1400,10 @@ export default function FilePreviewPanel({
   const isVideo = relativePath !== null && isWorkspaceVideoPreviewPath(relativePath);
   const isAudio = relativePath !== null && !isVideo && isWorkspaceAudioPreviewPath(relativePath);
   const isImage = relativePath !== null && !isVideo && isWorkspaceImagePreviewPath(relativePath);
+  const hostedSvg =
+    isImage &&
+    relativePath !== null &&
+    isAdmittedPreviewDocument(relativePath, environmentHttpBaseUrl);
   const isMedia = isImage || isVideo || isAudio;
   const isPdf = relativePath !== null && isPdfPreviewFile(relativePath);
   const isDocument =
@@ -1363,13 +1569,16 @@ export default function FilePreviewPanel({
       : tableDelimiter
         ? setRenderTablePreferred
         : setRenderBrowserFilePreferred;
-  const canOpenInBrowser =
-    canOperatePreview &&
-    previewPath !== null &&
-    attachment === undefined &&
-    !isVideo &&
-    previewAvailable &&
-    isBrowserPreviewFile(previewPath);
+  const browserOpenMode =
+    previewPath === null || attachment !== undefined || isVideo
+      ? null
+      : filePreviewOpenMode({
+          path: previewPath,
+          httpBaseUrl: environmentHttpBaseUrl,
+          canReadFiles,
+          canOperatePreview,
+          previewAvailable,
+        });
   // Navigating up preserves the file tab; retain the trail's path spelling to find its folder tab.
   const navigateToFolder = (crumbPath: string) => {
     const path =
@@ -1424,13 +1633,14 @@ export default function FilePreviewPanel({
   };
 
   const handleOpenInBrowser = () => {
-    if (!canReadFiles || !canOperatePreview || !absolutePath || !environmentHttpBaseUrl) return;
+    if (browserOpenMode === null || !absolutePath || !environmentHttpBaseUrl) return;
     void (async () => {
       const result = await openFileInPreview({
         threadRef,
         filePath: absolutePath,
         workspaceRoot: cwd,
         httpBaseUrl: environmentHttpBaseUrl,
+        requireAdmittedDocument: browserOpenMode === "admitted-document",
         createAssetUrl,
         openPreview,
       });
@@ -1536,7 +1746,7 @@ export default function FilePreviewPanel({
               <WrapTextIcon className="size-3.5" />
             </FileSurfaceAction>
           ) : null}
-          {canOpenInBrowser ? (
+          {browserOpenMode !== null ? (
             <FileSurfaceAction label="Open file in preview browser" onPress={handleOpenInBrowser}>
               <Globe2 className="size-3.5" />
             </FileSurfaceAction>
@@ -1617,7 +1827,7 @@ export default function FilePreviewPanel({
               name={relativePath}
               workspaceMutationId={workspaceMutationId}
             />
-          ) : relativePath && isImage && absolutePath ? (
+          ) : relativePath && isImage && !hostedSvg && absolutePath ? (
             <WorkspaceImagePreview
               key={absolutePath}
               environmentId={environmentId}
@@ -1628,7 +1838,7 @@ export default function FilePreviewPanel({
               alt={relativePath}
               workspaceMutationId={workspaceMutationId}
             />
-          ) : relativePath && renderBrowserFile && absolutePath ? (
+          ) : relativePath && (renderBrowserFile || hostedSvg) && absolutePath ? (
             <WorkspaceBrowserPreview
               key={absolutePath}
               environmentId={environmentId}
@@ -1843,7 +2053,10 @@ export function WorkspaceLargeTextPreview(props: {
     revision,
   ]);
   const [loaded, setLoaded] = useState<{ revision: string; url: string } | null>(null);
-  if (assetUrl._tag === "Success" && loaded?.revision !== contentRevision) {
+  if (
+    assetUrl._tag === "Success" &&
+    (loaded?.revision !== contentRevision || (assetUrl.localSource && loaded.url !== assetUrl.url))
+  ) {
     setLoaded({ revision: contentRevision, url: assetUrl.url });
   }
   if (assetUrl._tag === "Failure")
@@ -1858,7 +2071,9 @@ export function WorkspaceLargeTextPreview(props: {
     );
   if (assetUrl._tag !== "Success" || loaded === null)
     return <div className="p-6 text-xs text-muted-foreground">Loading…</div>;
-  const src = `${loaded.url}${loaded.url.includes("?") ? "&" : "?"}revision=${encodeURIComponent(loaded.revision)}`;
+  const src = assetUrl.localSource
+    ? loaded.url
+    : `${loaded.url}${loaded.url.includes("?") ? "&" : "?"}revision=${encodeURIComponent(loaded.revision)}`;
   return (
     <>
       <div className={FILE_SURFACE_SUBHEADER_CLASS}>
@@ -1883,9 +2098,17 @@ export function WorkspaceLargeTextPreview(props: {
             void (async () => {
               const url = await refreshAssetUrl();
               if (!url) throw new Error("Reconnect to the environment and try again.");
-              const response = await fetch(url);
-              if (!response.ok) throw new Error("The file could not be loaded. Try again.");
-              const downloadUrl = URL.createObjectURL(await response.blob());
+              const file = requiresAdmittedAsset(url)
+                ? await readAdmittedStaticAsset(
+                    props.environmentId,
+                    url,
+                    AbortSignal.timeout(60_000),
+                  )
+                : await fetch(url).then((response) => {
+                    if (!response.ok) throw new Error("The file could not be loaded. Try again.");
+                    return response.blob();
+                  });
+              const downloadUrl = URL.createObjectURL(file);
               setTimeout(() => URL.revokeObjectURL(downloadUrl), 30_000);
               const anchor = document.createElement("a");
               anchor.href = downloadUrl;

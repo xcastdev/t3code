@@ -1,9 +1,11 @@
+import { verifiedViewerCsp } from "../../lib/verifiedViewerScope";
 import type { DeviceHubAccess } from "@t3tools/client-runtime/device/hub-access";
 import type { DevicePlatform } from "@t3tools/contracts";
 import type { PlatformOSType } from "react-native";
 
 export interface DeviceStreamConfiguration {
   readonly access: DeviceHubAccess;
+  readonly verified?: boolean;
   readonly platform: DevicePlatform;
   readonly deviceId: string;
   /** See `DeviceStreamTarget.serveSimOnly`. */
@@ -31,11 +33,11 @@ export function deviceStreamBaseUrl(
   return `${new URL(httpBase).origin}/`;
 }
 
-export function deviceStreamDocument(configuration: string, script: string) {
+export function deviceStreamDocument(configuration: string, script: string, verified = false) {
   const safeConfiguration = configuration.replace(/</g, "\\u003c");
   const safeScript = script.replace(/<\/script/gi, "<\\/script");
   const failure = `window.ReactNativeWebView.postMessage(JSON.stringify({type:"status",status:"error",detail:"Device viewer stopped unexpectedly."}));`;
-  return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"></head><body><script>window.addEventListener("error",function(){${failure}});window.addEventListener("unhandledrejection",function(){${failure}});\n${safeScript}\ntry{T3DeviceStream.start(${safeConfiguration});}catch{${failure}}</script></body></html>`;
+  return `<!doctype html><html><head>${verified ? verifiedViewerCsp : ""}<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"></head><body><script>window.addEventListener("error",function(){${failure}});window.addEventListener("unhandledrejection",function(){${failure}});\n${safeScript}\ntry{T3DeviceStream.start(${safeConfiguration});}catch{${failure}}</script></body></html>`;
 }
 
 export function deviceStreamMessage(data: string) {

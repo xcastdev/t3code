@@ -1749,6 +1749,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
     type: Schema.Literal("notification"),
+    sourceMessageId: Schema.optional(MessageId),
     ...OrchestrationV2Notification.fields,
   }),
   Schema.Struct({
@@ -2012,6 +2013,7 @@ export type OrchestrationV2ProjectedTurnItem = typeof OrchestrationV2ProjectedTu
 const OrchestrationV2EventBase = Schema.Struct({
   id: EventId,
   threadId: ThreadId,
+  projectId: Schema.optional(ProjectId),
   runId: Schema.optional(RunId),
   nodeId: Schema.optional(NodeId),
   driver: Schema.optional(ProviderDriverKind),
@@ -2640,6 +2642,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,
     type: Schema.Literal("notification"),
+    sourceMessageId: Schema.optional(MessageId),
     ...OrchestrationV2Notification.fields,
   }),
   Schema.Struct({
@@ -3733,6 +3736,7 @@ const OrchestrationV2InternalCommand = Schema.Union([
     projectId: ProjectId,
     threadId: ThreadId,
     turnItemId: TurnItemId,
+    sourceMessageId: Schema.optional(MessageId),
     notification: OrchestrationV2Notification,
   }),
   Schema.Struct({

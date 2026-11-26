@@ -1,5 +1,6 @@
 import type { DesktopSshEnvironmentTarget, EnvironmentId } from "@t3tools/contracts";
 import { resolveRemotePairingTarget } from "@t3tools/shared/remote";
+import { parseUrl } from "@t3tools/shared/url";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -7,6 +8,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as HttpClient from "effect/http/HttpClient";
+import * as FetchHttpClient from "effect/http/FetchHttpClient";
 
 import { bootstrapRemoteBearerSession } from "../authorization/remote.ts";
 import { deriveWsBaseUrl, normalizeHttpBaseUrl } from "../environment/endpoint.ts";
@@ -32,13 +34,19 @@ import {
 import * as Persistence from "../platform/persistence.ts";
 import * as EnvironmentRegistry from "./registry.ts";
 import { orchestrationProtocolCompatibilityError } from "./compatibility.ts";
-import { connectionRoutes, routeEntry, sshTargetKey } from "./routes.ts";
+import { pairedBearerRoute, routeEntry, sshTargetKey } from "./routes.ts";
+import {
+  requireRouteAdmission,
+  requireVerifiedRoute,
+  VerifiedRoutePolicy,
+} from "./verifiedRoute.ts";
 
 export interface PairingConnectionInput {
   readonly pairingUrl?: string;
   readonly host?: string;
   readonly pairingCode?: string;
   readonly expectedEnvironmentId?: EnvironmentId;
+  readonly verificationRequired?: true;
 }
 
 export interface SshConnectionInput {
@@ -102,15 +110,33 @@ export const preparePairingRegistration = Effect.fn(
   "clientRuntime.connection.onboarding.preparePairingRegistration",
 )(function* (input: PairingConnectionInput) {
   const target = yield* resolvePairingTarget(input);
+  const policy = yield* VerifiedRoutePolicy;
+  const enrollment = policy.requireAdmission
+    ? yield* policy.readEnrollment(new URL(target.httpBaseUrl).origin)
+    : null;
+  const hostedRelay = enrollment?.transportRole === "relay";
+  const verificationRequired = input.verificationRequired || hostedRelay;
+  const expectedEnvironmentId =
+    input.expectedEnvironmentId ?? (hostedRelay ? enrollment.environmentId : undefined);
+  if (verificationRequired) {
+    if (expectedEnvironmentId === undefined) {
+      return yield* new ConnectionBlockedError({
+        reason: "configuration",
+        detail: "Verified pairing requires an expected environment.",
+      });
+    }
+    yield* requireRouteAdmission(yield* requireVerifiedRoute(expectedEnvironmentId, target));
+  }
   const presentation = yield* ClientCapabilities.ClientPresentation;
+  const withPairingRequestPolicy = <A, E, R>(request: Effect.Effect<A, E, R>) =>
+    verificationRequired
+      ? request.pipe(Effect.provideService(FetchHttpClient.RequestInit, { redirect: "error" }))
+      : request;
   const descriptor = yield* fetchRemoteEnvironmentDescriptor({
     httpBaseUrl: target.httpBaseUrl,
-  }).pipe(Effect.mapError(mapRemoteEnvironmentError));
+  }).pipe(Effect.mapError(mapRemoteEnvironmentError), withPairingRequestPolicy);
   // Checked before redeeming the one-time code, so a wrong link is not spent.
-  if (
-    input.expectedEnvironmentId !== undefined &&
-    descriptor.environmentId !== input.expectedEnvironmentId
-  ) {
+  if (expectedEnvironmentId !== undefined && descriptor.environmentId !== expectedEnvironmentId) {
     return yield* differentMachineError(descriptor.label);
   }
   const connectionId = bearerConnectionId(descriptor.environmentId, target.httpBaseUrl);
@@ -126,6 +152,7 @@ export const preparePairingRegistration = Effect.fn(
       label: descriptor.label,
       httpBaseUrl: target.httpBaseUrl,
       wsBaseUrl: target.wsBaseUrl,
+      ...(verificationRequired ? { verificationRequired: true as const } : {}),
     }),
   };
   // The registry checks again under its lease; this early check keeps a refused code unspent.
@@ -142,7 +169,7 @@ export const preparePairingRegistration = Effect.fn(
     httpBaseUrl: target.httpBaseUrl,
     credential: target.credential,
     clientMetadata: presentation.metadata,
-  }).pipe(Effect.mapError(mapRemoteEnvironmentError));
+  }).pipe(Effect.mapError(mapRemoteEnvironmentError), withPairingRequestPolicy);
 
   return new BearerConnectionRegistration({
     ...route,
@@ -177,13 +204,8 @@ const updateBearerConnection = Effect.fn(
   const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
   const credentials = yield* ConnectionCredentialStore.ConnectionCredentialStore;
   const saved = (yield* SubscriptionRef.get(registry.entries)).get(input.environmentId);
-  const route =
-    saved === undefined
-      ? undefined
-      : connectionRoutes(saved).find(
-          (candidate) => candidate.target._tag === "BearerConnectionTarget",
-        );
-  const entry = saved === undefined || route === undefined ? saved : routeEntry(saved, route);
+  const route = saved === undefined ? undefined : pairedBearerRoute(saved);
+  const entry = saved === undefined || route === undefined ? undefined : routeEntry(saved, route);
   const credential =
     entry?.target._tag === "BearerConnectionTarget"
       ? yield* credentials.get(entry.target.connectionId)
@@ -240,6 +262,16 @@ export const prepareBearerConnectionUpdate = Effect.fn(
         detail: cause instanceof Error ? cause.message : "The environment URL is invalid.",
       }),
   });
+  const previous = entry.profile.value;
+  if (
+    previous.verificationRequired &&
+    new URL(httpBaseUrl).origin !== parseUrl(previous.httpBaseUrl)?.origin
+  ) {
+    return yield* new ConnectionBlockedError({
+      reason: "configuration",
+      detail: "Pair at the new address before changing a verified environment route.",
+    });
+  }
   const connectionId = entry.target.connectionId;
   return new BearerConnectionRegistration({
     target: new BearerConnectionTarget({
@@ -248,6 +280,7 @@ export const prepareBearerConnectionUpdate = Effect.fn(
       connectionId,
     }),
     profile: new BearerConnectionProfile({
+      ...previous,
       connectionId,
       environmentId: options.input.environmentId,
       label,
@@ -306,6 +339,7 @@ export const make = Effect.gen(function* () {
   const httpClient = yield* HttpClient.HttpClient;
   const ssh = yield* ClientCapabilities.SshEnvironmentGateway;
   const credentials = yield* ConnectionCredentialStore.ConnectionCredentialStore;
+  const verifiedRoutes = yield* VerifiedRoutePolicy;
 
   // Provisioning retains the delegated onboarding operation spans.
   return ConnectionOnboarding.of({
@@ -316,6 +350,7 @@ export const make = Effect.gen(function* () {
       Effect.provideService(EnvironmentRegistry.EnvironmentRegistry, registry),
       Effect.provideService(ClientCapabilities.ClientPresentation, presentation),
       Effect.provideService(HttpClient.HttpClient, httpClient),
+      Effect.provideService(VerifiedRoutePolicy, verifiedRoutes),
     ),
     registerSsh: Effect.fnUntraced(
       function* (input) {

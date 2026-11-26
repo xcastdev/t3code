@@ -1,6 +1,18 @@
+import {
+  assertHostedRelayAdmission,
+  assertHostedStreamTarget,
+  hostedAdmissionRequired,
+} from "~/connection/hostedRelayAdmission";
+import {
+  environmentRelayAdmissionRequired,
+  fetchEnvironmentResource,
+} from "~/connection/environmentTransport";
+import { captureDeviceScreenshot } from "@t3tools/client-runtime/device/screenshot";
+import { readDeviceEventStream } from "./deviceEventStream";
 import { withDeviceHubQuery } from "@t3tools/client-runtime/state/deviceHubAccess";
 import type { DeviceHubAccess } from "@t3tools/client-runtime/state/deviceHubAccess";
 import type { DevicePlatform } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
 
 export interface DeviceAxElement {
   readonly id: string;
@@ -46,17 +58,37 @@ const hubUrl = (target: DeviceHubTarget, path: string, params?: Record<string, s
   return withDeviceHubQuery(`${vendorBase(target)}${path}${search}`, target.access);
 };
 
+const DEVICE_API_PATH = /^\/api\/device-hub\/vendor\/(serve-emu|serve-sim)\//u;
+
+export async function fetchDeviceHubResource(
+  access: DeviceHubAccess,
+  url: string,
+  init?: RequestInit,
+) {
+  assertHostedStreamTarget(url, access.environmentId, DEVICE_API_PATH);
+  return fetchEnvironmentResource(url, init);
+}
+
+export function captureWebDeviceScreenshot(target: DeviceHubTarget, signal: AbortSignal) {
+  return captureDeviceScreenshot(target, signal, (url, init) =>
+    fetchDeviceHubResource(target.access, url, init),
+  );
+}
+
 const fetchJson = async (
   target: DeviceHubTarget,
   url: string,
   signal?: AbortSignal,
 ): Promise<unknown> => {
-  const response = await fetch(url, {
+  const response = await fetchDeviceHubResource(target.access, url, {
     cache: "no-store",
     credentials: target.access.credentials ? "include" : "same-origin",
     ...(signal ? { signal } : {}),
   });
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  if (!response.ok) {
+    void response.body?.cancel().catch(() => {});
+    throw new Error(`${response.status} ${response.statusText}`);
+  }
   return response.json();
 };
 
@@ -162,12 +194,68 @@ const openEventSource = (
   url: string,
   onMessage: (data: unknown) => void,
 ): (() => void) => {
-  const source = new EventSource(url, { withCredentials: target.access.credentials });
-  source.addEventListener("message", (event) => {
+  const parse = (data: string) => {
     try {
-      onMessage(JSON.parse(String(event.data)));
+      onMessage(JSON.parse(data));
     } catch {}
-  });
+  };
+  if (environmentRelayAdmissionRequired(url)) {
+    const controller = new AbortController();
+    const admission =
+      hostedAdmissionRequired(url) && target.access.environmentId !== undefined
+        ? assertHostedRelayAdmission({
+            environmentId: target.access.environmentId,
+            httpsOrigin: new URL(url).origin,
+          })
+        : undefined;
+    const signal = admission ? AbortSignal.any([controller.signal, admission]) : controller.signal;
+    void (async () => {
+      let access = target.access;
+      let currentUrl = url;
+      let retry = 1_000;
+      while (!signal.aborted) {
+        let received = false;
+        try {
+          const response = await fetchDeviceHubResource(access, currentUrl, {
+            headers: { Accept: "text/event-stream" },
+            cache: "no-store",
+            signal,
+          });
+          await readDeviceEventStream(response, signal, (data) => {
+            received = true;
+            parse(data);
+          });
+        } catch {
+          if (signal.aborted) return;
+        }
+        const environmentId = target.access.environmentId;
+        if (signal.aborted || environmentId === undefined) return;
+        if (received) retry = 1_000;
+        const { renewDeviceHubAccess } = await import("~/state/device");
+        let next: DeviceHubAccess | null = null;
+        while (next === null && !signal.aborted) {
+          await Effect.runPromise(Effect.sleep(retry), { signal });
+          retry = Math.min(retry * 2, 30_000);
+          next = await renewDeviceHubAccess(environmentId, access.query.hostId ?? "local");
+        }
+        if (
+          signal.aborted ||
+          next === null ||
+          next.environmentId !== environmentId ||
+          next.httpBase !== target.access.httpBase ||
+          next.wsBase !== target.access.wsBase
+        )
+          return;
+        const endpoint = new URL(url);
+        for (const key of Object.keys(target.access.query)) endpoint.searchParams.delete(key);
+        access = next;
+        currentUrl = withDeviceHubQuery(endpoint.toString(), access);
+      }
+    })().catch(() => {});
+    return () => controller.abort();
+  }
+  const source = new EventSource(url, { withCredentials: target.access.credentials });
+  source.addEventListener("message", (event) => parse(String(event.data)));
   return () => source.close();
 };
 

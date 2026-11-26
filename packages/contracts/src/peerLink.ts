@@ -35,16 +35,15 @@ export type PeerLinkSummary = typeof PeerLinkSummary.Type;
 export const PeerLinkCreateInput = Schema.Struct({
   /** Where the peer answers: an https, Tailscale, LAN or loopback base URL. */
   url: TrimmedNonEmptyString,
-  /** More addresses for the same peer, tried after `url`. */
+  /** Other candidate addresses, saved for explicit approval later. */
   alternateUrls: Schema.optionalKey(Schema.Array(TrimmedNonEmptyString)),
   /** A pairing code from the peer (`t3 pair` there, or its Connections settings). */
   pairingCode: TrimmedNonEmptyString,
   access: AuthMcpClientAccess,
-  /**
-   * The environment the user means. Addresses that answer as another one are
-   * skipped, and only those that answer as this one are kept.
-   */
+  /** The environment the selected address is expected to reach. */
   expectedEnvironmentId: Schema.optionalKey(EnvironmentId),
+  /** Required when the client selected a known environment from its catalog. */
+  addressConfirmed: Schema.optionalKey(Schema.Literal(true)),
   /** What the user calls that environment, to name it when it cannot be reached. */
   expectedLabel: Schema.optionalKey(TrimmedNonEmptyString),
 });
@@ -88,8 +87,9 @@ export const PeerLinkRequestAnswerInput = Schema.Struct({
       environmentId: Schema.optionalKey(EnvironmentId),
       /** What the client calls that machine. */
       label: Schema.optionalKey(TrimmedNonEmptyString),
-      /** The addresses the client knows for that machine, most preferred first. */
+      /** The selected address first, followed by any saved candidates. */
       urls: Schema.NonEmptyArray(TrimmedNonEmptyString),
+      addressConfirmed: Schema.optionalKey(Schema.Literal(true)),
       access: AuthMcpClientAccess,
       pairingCode: TrimmedNonEmptyString,
     }),

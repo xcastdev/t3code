@@ -1,7 +1,7 @@
 import * as ExternalNotificationDispatcher from "../notifications/ExternalNotificationDispatcher.ts";
 import * as ExternalNotificationGateway from "../notifications/ExternalNotificationGateway.ts";
 import * as ExternalNotificationRuntime from "../notifications/ExternalNotificationRuntime.ts";
-import * as HomeAssistantWebhookAdapter from "../notifications/HomeAssistantWebhookAdapter.ts";
+import * as ExternalNotificationTransport from "../notifications/ExternalNotificationTransport.ts";
 import * as AuthSessions from "../persistence/AuthSessions.ts";
 import * as ProjectWorkQuery from "../projectWork/ProjectWorkQuery.ts";
 import * as ThreadHistoryService from "./ThreadHistoryService.ts";
@@ -595,7 +595,9 @@ const layerExternalNotifications = ExternalNotificationRuntime.layer.pipe(
     ExternalNotificationGateway.layer.pipe(
       Layer.provide(AuthSessions.layer),
       Layer.provideMerge(
-        ExternalNotificationDispatcher.layer.pipe(Layer.provide(HomeAssistantWebhookAdapter.layer)),
+        ExternalNotificationDispatcher.layer.pipe(
+          Layer.provide(ExternalNotificationTransport.layer),
+        ),
       ),
     ),
   ),

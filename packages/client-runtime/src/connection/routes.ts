@@ -10,6 +10,7 @@ import * as Option from "effect/Option";
 import {
   BearerConnectionProfile,
   type ConnectionCatalogEntry,
+  type ConnectionProfile,
   type ConnectionRoute,
 } from "./catalog.ts";
 import { BearerConnectionTarget, type ConnectionTarget } from "./model.ts";
@@ -221,6 +222,18 @@ export function connectionRouteAddress(route: ConnectionRoute): string | null {
 export const hasSavedBearerRoute = (entry: ConnectionCatalogEntry) =>
   connectionRoutes(entry).some((r) => !isLearned(r) && r.target._tag === "BearerConnectionTarget");
 
+export function pairedBearerRoute(entry: ConnectionCatalogEntry): ConnectionRoute | undefined {
+  return connectionRoutes(entry).find((route) => {
+    const profile = Option.getOrNull(route.profile);
+    return (
+      route.target._tag === "BearerConnectionTarget" &&
+      !isLearned(route) &&
+      profile?._tag === "BearerConnectionProfile" &&
+      profile.authorization === undefined
+    );
+  });
+}
+
 export function hasRelayRoute(
   entry: Pick<ConnectionCatalogEntry, "target" | "alternateRoutes">,
 ): boolean {
@@ -235,8 +248,9 @@ export function mergeLearnedRoutes(input: {
   readonly reported: ReadonlyArray<ReportedEndpoint>;
   /** Plain HTTP routes are unusable from an HTTPS page (mixed content). */
   readonly allowInsecure: boolean;
+  readonly directorySource?: string;
 }): ReadonlyArray<ConnectionRoute> | null {
-  const { entry } = input;
+  const { entry, directorySource } = input;
   const active = input.activeRoute.target;
   const saved = connectionRoutes(entry);
   if (active._tag !== "RelayConnectionTarget" && active._tag !== "BearerConnectionTarget") {
@@ -267,9 +281,16 @@ export function mergeLearnedRoutes(input: {
     // A loopback address names whichever device opens it, never the server.
     if (isLocalLoopbackHost(url.hostname)) continue;
     reported.set(url.origin, url);
-    if (endpoint.kind === "tailnet") tailscaleOrigins.add(url.origin);
+    if (directorySource === undefined && endpoint.kind === "tailnet") {
+      tailscaleOrigins.add(url.origin);
+    }
   }
-  const normalized = (url: string) => url.replace(/\/+$/, "");
+  const normalized = (url: string) => {
+    if (directorySource !== undefined && URL.canParse(url)) {
+      return new URL(url).origin;
+    }
+    return url.replace(/\/+$/, "");
+  };
   const known = new Set(
     saved.flatMap((route) => {
       const url = routeHttpBaseUrl(route);
@@ -280,11 +301,19 @@ export function mergeLearnedRoutes(input: {
     const url = routeHttpBaseUrl(route);
     if (!isLearned(route)) {
       return [
-        url === null || !reported.has(normalized(url))
+        directorySource !== undefined || url === null || !reported.has(normalized(url))
           ? route
           : withNetwork(route, tailscaleOrigins.has(normalized(url))),
       ];
     }
+    if (routeDirectorySource(route) !== directorySource) return [route];
+    if (
+      directorySource !== undefined &&
+      sharedCredential !== undefined &&
+      route.target._tag === "BearerConnectionTarget" &&
+      credentialConnectionId(route.target.connectionId) !== sharedCredential
+    )
+      return [];
     if (url === null || !reported.has(normalized(url)) || known.has(normalized(url))) return [];
     if (sendsTokenInClear(saved, route, tailscaleOrigins.has(normalized(url)))) return [];
     known.add(normalized(url));
@@ -306,6 +335,7 @@ export function mergeLearnedRoutes(input: {
       entry.target.environmentId,
       url.origin,
       sharedCredential,
+      directorySource,
     );
     next = insertRoute(next, {
       target: new BearerConnectionTarget({
@@ -321,20 +351,25 @@ export function mergeLearnedRoutes(input: {
           httpBaseUrl,
           wsBaseUrl: `${url.protocol === "https:" ? "wss:" : "ws:"}//${url.host}/`,
           learned: true,
+          ...(directorySource === undefined ? {} : { directorySource, verificationRequired: true }),
           ...(authorization === undefined ? {} : { authorization }),
           ...(tailscaleOrigins.has(url.origin) ? { network: "tailscale" as const } : {}),
         }),
       ),
     });
   }
-  const signature = (routes: ReadonlyArray<ConnectionRoute>) =>
-    routes
-      .map(
-        (route) =>
-          `${connectionRouteId(route.target)} ${routeHttpBaseUrl(route) ?? ""} ${connectionRouteKind(route)}`,
-      )
-      .join("\n");
-  return signature(saved) === signature(next) ? null : next;
+  return saved.length === next.length &&
+    saved.every(
+      (route, index) =>
+        route.target === next[index]?.target && route.profile === next[index]?.profile,
+    )
+    ? null
+    : next;
+}
+
+export function routeDirectorySource(route: ConnectionRoute): string | undefined {
+  const profile = Option.getOrNull(route.profile);
+  return profile?._tag === "BearerConnectionProfile" ? profile.directorySource : undefined;
 }
 
 // A paired token goes to a plain HTTP address outside the tailnet only when
@@ -391,17 +426,12 @@ function withNetwork(route: ConnectionRoute, tailscale: boolean): ConnectionRout
   const profile = Option.getOrNull(route.profile);
   if (profile?._tag !== "BearerConnectionProfile") return route;
   if ((profile.network === "tailscale") === tailscale) return route;
+  const { network: _network, ...rest } = profile;
   return {
     target: route.target,
     profile: Option.some(
       new BearerConnectionProfile({
-        connectionId: profile.connectionId,
-        environmentId: profile.environmentId,
-        label: profile.label,
-        httpBaseUrl: profile.httpBaseUrl,
-        wsBaseUrl: profile.wsBaseUrl,
-        ...(profile.learned === undefined ? {} : { learned: profile.learned }),
-        ...(profile.authorization === undefined ? {} : { authorization: profile.authorization }),
+        ...rest,
         ...(tailscale ? { network: "tailscale" as const } : {}),
       }),
     ),
@@ -412,10 +442,15 @@ function learnedConnectionId(
   environmentId: string,
   origin: string,
   sharedCredential: string | undefined,
+  directorySource: string | undefined,
 ): string {
+  const namespace =
+    directorySource === undefined
+      ? `learned:${environmentId}`
+      : `learned:${encodeURIComponent(directorySource)}|${encodeURIComponent(environmentId)}`;
   return sharedCredential === undefined
-    ? `learned:${environmentId}:${origin}`
-    : `learned:${environmentId}:${origin}@${sharedCredential}`;
+    ? `${namespace}:${origin}`
+    : `${namespace}:${origin}@${sharedCredential}`;
 }
 
 export function credentialConnectionId(connectionId: string): string {
@@ -427,7 +462,22 @@ export function credentialConnectionId(connectionId: string): string {
 
 export function isLearned(route: ConnectionRoute): boolean {
   const profile = Option.getOrNull(route.profile);
-  return profile?._tag === "BearerConnectionProfile" && profile.learned === true;
+  return (
+    route.target._tag === "BearerConnectionTarget" &&
+    (route.target.connectionId.startsWith("learned:") ||
+      (profile?._tag === "BearerConnectionProfile" && profile.learned === true))
+  );
+}
+
+export function borrowedCredentialRouteId(
+  connectionId: string,
+  profile: ConnectionProfile | null | undefined,
+): string | undefined {
+  if (profile?._tag === "BearerConnectionProfile" && profile.authorization === "t3-connect") {
+    return RELAY_ROUTE_ID;
+  }
+  const credentialId = credentialConnectionId(connectionId);
+  return credentialId === connectionId ? undefined : credentialId;
 }
 
 /**
@@ -445,11 +495,12 @@ export function routesAfterRemoving(
   return routes.filter((route) => {
     if (route === removed) return false;
     if (!isLearned(route)) return true;
-    const profile = Option.getOrNull(route.profile);
-    if (profile?._tag === "BearerConnectionProfile" && profile.authorization === "t3-connect") {
-      return removed.target._tag !== "RelayConnectionTarget";
-    }
-    return credentialConnectionId(connectionRouteId(route.target)) !== removedId;
+    return (
+      borrowedCredentialRouteId(
+        connectionRouteId(route.target),
+        Option.getOrNull(route.profile),
+      ) !== removedId
+    );
   });
 }
 

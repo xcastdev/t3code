@@ -1,3 +1,4 @@
+import { installVerifiedViewerTransport } from "../../lib/verifiedViewer.browser";
 import {
   createPreviewFramePainter,
   createPreviewStreamClient,
@@ -65,6 +66,7 @@ export function pictureInPicture() {
 
 export function start(configuration: PreviewStreamConfiguration) {
   stop();
+  if (configuration.verified) installVerifiedViewerTransport();
   const post = (message: PreviewStreamMessage) => {
     // oxlint-disable-next-line unicorn/require-post-message-target-origin -- The native WebView bridge takes one string.
     window.ReactNativeWebView.postMessage(JSON.stringify(message));

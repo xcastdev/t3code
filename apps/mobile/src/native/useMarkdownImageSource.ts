@@ -2,7 +2,8 @@ import { resolveFilesystemReadAccess } from "@t3tools/client-runtime/state/files
 import { useEnvironmentPresentation } from "../state/presentation";
 import { useEnvironmentQuery } from "../state/query";
 import { resolveMobileMarkdownMediaSource } from "../lib/markdownMediaSource";
-import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
+import { requestVerifiedRoute } from "./verifiedNetwork";
+import { issuedMobileAssetUrl } from "../lib/verifiedAssetUrl";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import type { MarkdownImageSourceResolver } from "./SelectableMarkdownText.types";
 import { normalizeNativeMarkdownUrl } from "../lib/markdownLinks";
@@ -12,6 +13,21 @@ import * as Option from "effect/Option";
 import { assetEnvironment } from "../state/assets";
 import { environmentSession, usePreparedConnection } from "../state/session";
 import { useAtomQueryRunner } from "../state/use-atom-query-runner";
+
+async function resolveImageUri(uri: string): Promise<{ uri: string }> {
+  const result = await requestVerifiedRoute(uri, {});
+  if (result === null) return { uri };
+  const mimeType = new Headers(result.headers).get("Content-Type")?.split(";", 1)[0]?.trim();
+  if (
+    result.status < 200 ||
+    result.status >= 300 ||
+    !mimeType ||
+    !/^image\/[a-z\d.+-]+$/i.test(mimeType)
+  ) {
+    throw new Error("Could not load Markdown image");
+  }
+  return { uri: `data:${mimeType};base64,${result.bodyBase64}` };
+}
 
 export function useMarkdownImageSource(props: {
   readonly environmentId: EnvironmentId;
@@ -39,7 +55,7 @@ export function useMarkdownImageSource(props: {
         workspaceRoot,
         imageEmbed: true,
       });
-      if (media?.access === "direct") return { uri: normalizeNativeMarkdownUrl(media.uri) };
+      if (media?.access === "direct") return resolveImageUri(normalizeNativeMarkdownUrl(media.uri));
       if (
         captured ||
         !fileAccess.canReadFiles ||
@@ -54,9 +70,9 @@ export function useMarkdownImageSource(props: {
         throw new Error("Markdown image is unavailable");
       const result = await createUrl({ environmentId, input: { resource: media.resource } });
       if (result._tag !== "Success") throw new Error("Could not authorize Markdown image");
-      const uri = resolveAssetUrl(httpBaseUrl, result.value.relativeUrl);
+      const uri = issuedMobileAssetUrl(environmentId, result.value);
       if (uri === null) throw new Error("Markdown image URL is invalid");
-      return { uri };
+      return resolveImageUri(uri);
     },
     [
       captured,

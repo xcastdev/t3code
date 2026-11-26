@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { PROJECT_FAVICON_MAX_DATA_URL_LENGTH } from "@t3tools/client-runtime/project-favicon-cache";
+import { EnvironmentId } from "@t3tools/contracts";
 
 const native = vi.hoisted(() => ({
   load: vi.fn(async (_url: string, options: { maxWidth: number; maxHeight: number }) => ({
@@ -12,11 +13,20 @@ const native = vi.hoisted(() => ({
   read: vi.fn(),
   remove: vi.fn(),
 }));
+const secureValues = vi.hoisted(() => new Map<string, string>());
+vi.mock("expo-secure-store", () => ({
+  getItemAsync: async (key: string) => secureValues.get(key) ?? null,
+}));
 vi.mock("expo-image", () => ({
   Image: {
     loadAsync: native.load,
     writeToCacheAsync: native.write,
     getCachePathAsync: native.path,
+  },
+}));
+vi.mock("../native/verifiedNetwork", () => ({
+  fetchRoute: async () => {
+    throw new Error("Pinned route unavailable");
   },
 }));
 vi.mock("expo-file-system", () => ({
@@ -27,10 +37,17 @@ vi.mock("expo-file-system", () => ({
   },
 }));
 
-import { downscaleProjectFavicon } from "./projectFaviconDatabaseCache";
+import {
+  downscaleProjectFavicon,
+  projectFaviconDatabaseCache,
+} from "./projectFaviconDatabaseCache";
 
 const png = "iVBORw0KGgoAAAAA";
-const image = { url: "https://remote/icon.png" };
+const image = {
+  url: "https://remote/icon.png",
+  mimeType: "image/png",
+  bytes: new Uint8Array([1, 2]),
+};
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -43,6 +60,26 @@ beforeEach(() => {
 });
 
 describe("mobile project icon thumbnails", () => {
+  it("does not fall back to the signed URL after a required issuer loses its enrollment", async () => {
+    const url = "https://favicon-required.example.test/api/assets/signed/icon.png";
+    secureValues.set(
+      "t3code.verified-route-policy.v1",
+      JSON.stringify({ [new URL(url).origin]: "verified" }),
+    );
+    await expect(
+      projectFaviconDatabaseCache.resolve(
+        {
+          environmentId: EnvironmentId.make("favicon-required"),
+          cwd: "/fixture",
+          faviconPath: "icon.png",
+        },
+        url,
+        new AbortController().signal,
+      ),
+    ).resolves.toBeNull();
+    expect(native.load).not.toHaveBeenCalled();
+  });
+
   it("reduces an oversized encoding and deletes temporary thumbnail files", async () => {
     native.read.mockResolvedValueOnce(
       `iVBORw0KGgo${"a".repeat(PROJECT_FAVICON_MAX_DATA_URL_LENGTH)}`,

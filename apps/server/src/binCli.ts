@@ -20,6 +20,7 @@ import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
 import { extendConnectionAttemptTimeout, keepOutboundFetchOnHttp1 } from "./outboundHttp.ts";
 import { sharedServerCommandFlags } from "./cli/config.ts";
 import { projectCommand } from "./cli/project.ts";
+import { relayCommand } from "./cli/relay.ts";
 import { threadCommand } from "./cli/thread.ts";
 import { runDefaultServerCommand, serveCommand, startCommand } from "./cli/server.ts";
 import { updateCommand } from "./cli/update.ts";
@@ -72,7 +73,7 @@ export const makeCli = ({ cloudEnabled = hasCloudPublicConfig } = {}) =>
     Command.withDescription(
       "Run T3 Code in this terminal and open it in your browser. To use it from your other devices, run `t3 up`.",
     ),
-    Command.withHandler(runDefaultServerCommand),
+    Command.withHandler((flags) => runDefaultServerCommand(flags)),
     Command.withSubcommands([
       Command.make("help").pipe(
         Command.withDescription("Show command help."),
@@ -84,6 +85,7 @@ export const makeCli = ({ cloudEnabled = hasCloudPublicConfig } = {}) =>
       acpMcpCallCommand,
       startCommand,
       serveCommand,
+      relayCommand,
       appCommand,
       pairCommand,
       authCommand,

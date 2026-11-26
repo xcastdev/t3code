@@ -1,16 +1,24 @@
 import { expect, it } from "@effect/vitest";
-import { AuthSessionId, AuthSettingsWriteScope } from "@t3tools/contracts";
+import {
+  AuthSessionId,
+  AuthSettingsWriteScope,
+  DEFAULT_EXTERNAL_NOTIFICATION_EVENTS,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Sessions from "../persistence/AuthSessions.ts";
 import * as Sqlite from "../persistence/Sqlite.ts";
 import * as Settings from "../serverSettings.ts";
-import * as Adapter from "./HomeAssistantWebhookAdapter.ts";
+import * as Transport from "./ExternalNotificationTransport.ts";
+import {
+  notificationEnvironment,
+  type NotificationSample,
+} from "./externalNotificationTestFixtures.ts";
 import * as Dispatcher from "./ExternalNotificationDispatcher.ts";
 import * as Gateway from "./ExternalNotificationGateway.ts";
 
-const setup = (sent: Adapter.ExternalNotificationPayload[]) =>
+const setup = (sent: NotificationSample[]) =>
   Gateway.layer.pipe(
     Layer.provideMerge(Sessions.layer),
     Layer.provide(
@@ -25,12 +33,14 @@ const setup = (sent: Adapter.ExternalNotificationPayload[]) =>
                     name: "Home",
                     kind: "home-assistant",
                     enabled: false,
+                    events: DEFAULT_EXTERNAL_NOTIFICATION_EVENTS,
                     webhookUrl: "https://home.test/api/webhook/PRIVATE",
                   },
                 ],
               },
             }),
-            Layer.succeed(Adapter.HomeAssistantWebhookAdapter, {
+            notificationEnvironment(),
+            Layer.succeed(Transport.ExternalNotificationTransport, {
               send: (_url, payload) =>
                 Effect.sync(() => {
                   sent.push(payload);
@@ -63,7 +73,7 @@ const sessionInput = (
 });
 
 it.effect("tests a saved disabled destination, then refuses the same revoked session", () => {
-  const sent: Adapter.ExternalNotificationPayload[] = [];
+  const sent: NotificationSample[] = [];
   const sessionId = AuthSessionId.make("notification-test");
   return Effect.gen(function* () {
     const sessions = yield* Sessions.AuthSessionRepository;
@@ -74,7 +84,7 @@ it.effect("tests a saved disabled destination, then refuses the same revoked ses
       status: "delivered",
     });
     expect(sent).toEqual([
-      { schemaVersion: 1, test: true, kind: "test", title: "T3 Code test notification" },
+      expect.objectContaining({ eventType: "test", environmentId: "test-environment" }),
     ]);
     yield* sessions.revoke({ sessionId, revokedAt: now });
     expect(yield* gateway.test({ destinationId: "ha" }, sessionId).pipe(Effect.flip)).toMatchObject(
@@ -88,7 +98,7 @@ it.effect("tests a saved disabled destination, then refuses the same revoked ses
 });
 
 it.effect("missing, expired, and settings-read-only sessions cannot send externally", () => {
-  const sent: Adapter.ExternalNotificationPayload[] = [];
+  const sent: NotificationSample[] = [];
   return Effect.gen(function* () {
     const sessions = yield* Sessions.AuthSessionRepository;
     const now = yield* DateTime.now;
@@ -110,7 +120,7 @@ it.effect("missing, expired, and settings-read-only sessions cannot send externa
 });
 
 it.effect("an authorized test returns only a safe status for an unconfigured destination", () => {
-  const sent: Adapter.ExternalNotificationPayload[] = [];
+  const sent: NotificationSample[] = [];
   const sessionId = AuthSessionId.make("notification-test");
   return Effect.gen(function* () {
     const sessions = yield* Sessions.AuthSessionRepository;

@@ -1,3 +1,5 @@
+import { SecureWebView } from "../../native/secureWebView";
+import { signedDocumentResources, useVerifiedWebResources } from "../../lib/verifiedWebResources";
 import { AppActivityIndicator } from "../../components/ui/AppActivityIndicator";
 import { useNavigation } from "@react-navigation/native";
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
@@ -11,12 +13,19 @@ import {
 } from "@t3tools/shared/htmlRender";
 import { useEffect, useRef, useState } from "react";
 import { Platform, Pressable, View, type ColorValue } from "react-native";
-import { WebView, type WebViewMessageEvent } from "react-native-webview";
+import { type WebView, type WebViewMessageEvent } from "react-native-webview";
 
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { AppText as Text } from "../../components/ui/AppText";
 import { mobileHtmlRenderTheme } from "../../lib/htmlRenderTheme";
 import { tryOpenExternalUrl } from "../../lib/openExternalUrl";
+import {
+  framedWebDocument,
+  readFramedWebMessage,
+  useVerifiedWebDocument,
+} from "../../lib/verifiedWebDocument";
+import { uuidv4 } from "../../lib/uuid";
+import { FilePreviewNotice } from "../files/FilePreviewFeedback";
 import { useAssetUrlState, useRefreshAssetUrl } from "../../state/assets";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
 import { webViewDecelerationRate } from "../../lib/webViewDecelerationRate";
@@ -41,36 +50,45 @@ function useHtmlRenderTheme() {
   });
 }
 
-function postTheme(view: WebView<object> | null, theme: HtmlRenderTheme) {
-  view?.injectJavaScript(
-    `window.postMessage(${JSON.stringify(htmlRenderThemeMessage(theme))}, "*"); true;`,
-  );
+function postTheme(view: WebView<object> | null, theme: HtmlRenderTheme, framed: boolean) {
+  const message = JSON.stringify(htmlRenderThemeMessage(theme));
+  const post = framed
+    ? `window.__t3McpAppReceive?.(${message});`
+    : `window.postMessage(${message}, "*");`;
+  view?.injectJavaScript(`${post} true;`);
 }
 
 const OVERFLOW_MESSAGE_TYPE = "t3-html-render-overflow";
 
-const OVERFLOW_SCRIPT = `(function(){var last;function report(){var d=document.documentElement,b=document.body;var x=Math.max(d.scrollWidth,b?b.scrollWidth:0)>window.innerWidth+1,y=Math.max(d.scrollHeight,b?b.scrollHeight:0)>window.innerHeight+1,o=x+","+y;if(o===last)return;last=o;window.ReactNativeWebView.postMessage(JSON.stringify({type:${JSON.stringify(OVERFLOW_MESSAGE_TYPE)},x:x,y:y}));}report();if(window.ResizeObserver){var r=new ResizeObserver(report);r.observe(document.documentElement);if(document.body)r.observe(document.body);}window.addEventListener("resize",report);})();true;`;
+const overflowObserver = (post: string) =>
+  `function(){var last;function report(){var d=document.documentElement,b=document.body;var x=Math.max(d.scrollWidth,b?b.scrollWidth:0)>window.innerWidth+1,y=Math.max(d.scrollHeight,b?b.scrollHeight:0)>window.innerHeight+1,o=x+","+y;if(o===last)return;last=o;var message={type:${JSON.stringify(OVERFLOW_MESSAGE_TYPE)},x:x,y:y};${post}}report();if(window.ResizeObserver){var r=new ResizeObserver(report);r.observe(document.documentElement);if(document.body)r.observe(document.body);}window.addEventListener("resize",report);}`;
+const OVERFLOW_SCRIPT = `(${overflowObserver("window.ReactNativeWebView.postMessage(JSON.stringify(message));")})();true;`;
+const FRAMED_OVERFLOW_SCRIPT = `<script>window.addEventListener("DOMContentLoaded",${overflowObserver('window.parent.postMessage(message,"*");')});</script>`;
 
 type Overflow = { readonly x: boolean; readonly y: boolean };
 
 const NO_OVERFLOW: Overflow = { x: false, y: false };
 
-function readOverflowMessage(data: string): Overflow | null {
+function parseRenderMessage(message: unknown): unknown {
+  if (typeof message !== "string") return message;
   try {
-    const message: unknown = JSON.parse(data);
-    return typeof message === "object" &&
-      message !== null &&
-      "type" in message &&
-      message.type === OVERFLOW_MESSAGE_TYPE &&
-      "x" in message &&
-      typeof message.x === "boolean" &&
-      "y" in message &&
-      typeof message.y === "boolean"
-      ? { x: message.x, y: message.y }
-      : null;
+    return JSON.parse(message);
   } catch {
     return null;
   }
+}
+
+function readOverflowMessage(message: unknown): Overflow | null {
+  return typeof message === "object" &&
+    message !== null &&
+    "type" in message &&
+    message.type === OVERFLOW_MESSAGE_TYPE &&
+    "x" in message &&
+    typeof message.x === "boolean" &&
+    "y" in message &&
+    typeof message.y === "boolean"
+    ? { x: message.x, y: message.y }
+    : null;
 }
 
 const withoutFragment = (url: string) => url.split("#", 1)[0];
@@ -86,16 +104,33 @@ export function HtmlRenderWebView(props: {
   const [generation, setGeneration] = useState(0);
   const [loaded, setLoaded] = useState(false);
   const [overflow, setOverflow] = useState(NO_OVERFLOW);
+  const [secret] = useState(uuidv4);
   const webView = useRef<WebView<object>>(null);
   const crashes = useRef(0);
   const shownTheme = useRef<HtmlRenderTheme | null>(null);
-  const source = { uri: props.uri + htmlRenderThemeFragment(initialTheme) };
+  const document = useVerifiedWebDocument(
+    props.uri,
+    signedDocumentResources,
+    props.nested ? FRAMED_OVERFLOW_SCRIPT : undefined,
+  );
+  const isolated = document.kind === "local";
+  const sandbox = isolated ? document.sandbox : undefined;
+  const resourceAccess = isolated ? document.resourceAccess : undefined;
+  const handleResource = useVerifiedWebResources(
+    resourceAccess ? props.uri : null,
+    webView,
+    generation,
+    resourceAccess,
+  );
+  const source = isolated
+    ? { html: sandbox ? framedWebDocument(document, "", secret) : document.html }
+    : { uri: props.uri + htmlRenderThemeFragment(initialTheme) };
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- posts theme changes into the already loaded WebView
   useEffect(() => {
     if (shownTheme.current === null || shownTheme.current === theme) return;
     shownTheme.current = theme;
-    postTheme(webView.current, theme);
-  }, [theme]);
+    postTheme(webView.current, theme, sandbox !== undefined);
+  }, [theme, sandbox]);
   const restart = () => {
     crashes.current += 1;
     if (crashes.current > 1) {
@@ -108,6 +143,9 @@ export function HtmlRenderWebView(props: {
     setGeneration((value) => value + 1);
   };
   const scrollable = !props.nested || overflow.x || overflow.y;
+  if (document.kind === "failed")
+    return <FilePreviewNotice>Rendered preview unavailable.</FilePreviewNotice>;
+  if (document.kind === "loading") return <AppActivityIndicator />;
   return (
     <View
       style={
@@ -120,7 +158,9 @@ export function HtmlRenderWebView(props: {
             }
       }
     >
-      <WebView<object>
+      <SecureWebView
+        verified={isolated}
+        onFenceError={props.onLoadError}
         key={generation}
         ref={webView}
         source={source}
@@ -148,19 +188,29 @@ export function HtmlRenderWebView(props: {
         onLoadEnd={() => {
           setLoaded(true);
           shownTheme.current = theme;
-          if (theme !== initialTheme) postTheme(webView.current, theme);
+          if (isolated || theme !== initialTheme)
+            postTheme(webView.current, theme, sandbox !== undefined);
         }}
         onError={props.onLoadError}
         onHttpError={props.onLoadError}
         onContentProcessDidTerminate={restart}
         onRenderProcessGone={restart}
-        {...(props.nested
+        onMessage={
+          isolated || props.nested
+            ? (event: WebViewMessageEvent) => {
+                const data = event.nativeEvent.data;
+                const message: unknown = sandbox
+                  ? readFramedWebMessage(data, secret)?.message
+                  : data;
+                if (handleResource(message) || !props.nested) return;
+                const next = readOverflowMessage(parseRenderMessage(message));
+                if (next !== null) setOverflow(next);
+              }
+            : undefined
+        }
+        {...(props.nested && sandbox === undefined
           ? {
               injectedJavaScript: OVERFLOW_SCRIPT,
-              onMessage: (event: WebViewMessageEvent) => {
-                const next = readOverflowMessage(event.nativeEvent.data);
-                if (next !== null) setOverflow(next);
-              },
             }
           : {})}
       />
@@ -191,7 +241,7 @@ export function ThreadHtmlRender(props: {
     mimeType: "text/html",
     disposition: "inline" as const,
   };
-  const asset = useAssetUrlState(props.environmentId, resource);
+  const asset = useAssetUrlState(props.environmentId, resource, undefined, "web-document");
   const refresh = useRefreshAssetUrl(props.environmentId, resource);
   // Signed URLs are re-minted periodically; following them would reload the page.
   const [uri, setUri] = useState<string | null>(null);

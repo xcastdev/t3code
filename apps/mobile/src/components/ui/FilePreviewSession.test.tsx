@@ -12,6 +12,16 @@ const harness = vi.hoisted(() => ({
   refreshAssetUrl:
     vi.fn<(environmentId: string, resource: { url: string }) => Promise<string | null>>(),
   alert: vi.fn(),
+  download: vi.fn(),
+  initializeVerifiedRoutes: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
+  supportsVerifiedRoutes: vi.fn<() => Promise<boolean>>().mockResolvedValue(true),
+  native: {
+    presentFiles: vi.fn(),
+    presentFile: vi.fn(),
+    updateFile: vi.fn(),
+    dismissFile: vi.fn(),
+    isFilePreviewFinished: () => false,
+  },
   previews: [] as unknown[],
   mounts: 0,
   presentationFinished: false,
@@ -21,14 +31,22 @@ vi.mock("../../state/assets", () => ({ refreshAssetUrl: harness.refreshAssetUrl 
 vi.mock("../../lib/localAttachmentPreview", () => ({ loadLocalAttachmentPreview: vi.fn() }));
 vi.mock("../../lib/attachmentDownload", () => ({
   downloadAndShareAttachment: vi.fn(),
+  downloadAttachmentForPreview: harness.download,
   nativeViewerErrorMessage: () => "",
   shareLocalAttachment: vi.fn(),
 }));
+vi.mock("../../connection/verified-route", () => ({
+  initializeVerifiedRoutes: harness.initializeVerifiedRoutes,
+  supportsVerifiedRoutes: harness.supportsVerifiedRoutes,
+  verificationRequiredFor: (url: string) => url.startsWith("https://pinned.test/"),
+}));
 vi.mock("../../lib/previewPresentation", () => ({ usePreviewPresentation: () => {} }));
 vi.mock("./Dialog", () => ({ alert: harness.alert }));
+vi.mock("expo", () => ({ requireNativeModule: () => harness.native }));
 
 import type { FilePreviewItem, FilePreviewViewerProps } from "./FilePreviewModal.types";
 import { FilePreviewSession } from "./FilePreviewSession";
+import { FilePreviewModal } from "./FilePreviewModal";
 
 function Viewer(props: FilePreviewViewerProps) {
   useState(() => harness.mounts++);
@@ -104,6 +122,213 @@ it.each([true, false])(
     expect(harness.mounts).toBe(1);
   },
 );
+
+it.each([true, false])(
+  "hands the viewer only local files for a verified gallery (progressive: %s)",
+  async (progressiveGallery) => {
+    const slow = Promise.withResolvers<{ uri: string; dispose: () => void }>();
+    harness.refreshAssetUrl.mockImplementation(async (_environmentId, resource) =>
+      resource.url.endsWith("slow.png")
+        ? "https://pinned.test/slow.png?ticket=slow"
+        : "https://pinned.test/a.png?ticket=selected",
+    );
+    harness.download.mockImplementation(async ({ url }: { url: string }) => {
+      if (url.includes("/slow.png")) return slow.promise;
+      return {
+        uri: url.includes("/a.png") ? "file:///cache/a.png" : "file:///cache/bare.png",
+        dispose: vi.fn(),
+      };
+    });
+    const selected = {
+      ...image("https://github.com/a.png"),
+      name: "Selected.png",
+      mimeType: "image/png",
+      srcFragment: "#view",
+      sourceIdentifier: "thumbnail",
+    };
+    const bare: FilePreviewItem = {
+      kind: "image",
+      uri: "https://pinned.test/bare.png?ticket=bare#page",
+    };
+    await using _preview = await openGallery(
+      selected,
+      [image("https://github.com/slow.png"), selected, bare],
+      progressiveGallery,
+    );
+    expect(JSON.stringify(harness.previews)).not.toContain("pinned.test");
+    if (progressiveGallery) {
+      expect(harness.previews.at(-1)).toMatchObject({
+        selectedIndex: 1,
+        images: [
+          expect.not.objectContaining({ uri: expect.anything() }),
+          {
+            uri: "file:///cache/a.png#view",
+            name: "Selected.png",
+            mimeType: "image/png",
+            sourceIdentifier: "thumbnail",
+          },
+          { uri: "file:///cache/bare.png#page" },
+        ],
+      });
+    } else {
+      expect(harness.previews).toEqual([]);
+    }
+    await act(async () => slow.resolve({ uri: "file:///cache/slow.png", dispose: vi.fn() }));
+    expect(harness.previews.at(-1)).toMatchObject({
+      images: [
+        { uri: "file:///cache/slow.png" },
+        { uri: "file:///cache/a.png#view" },
+        { uri: "file:///cache/bare.png#page" },
+      ],
+    });
+    expect(harness.mounts).toBe(1);
+    expect(harness.download).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: "https://pinned.test/a.png?ticket=selected",
+        attachment: { name: "Selected.png", mimeType: "image/png" },
+        requireVerified: true,
+      }),
+    );
+  },
+);
+
+it.each(["wrong pin", "missing enrollment", "missing native capability"])(
+  "fails closed for a verified document with %s",
+  async (message) => {
+    harness.download.mockReset().mockRejectedValue(new Error(message));
+    if (message === "missing native capability") {
+      harness.supportsVerifiedRoutes.mockResolvedValueOnce(false);
+    }
+    const selected: FilePreviewItem = {
+      kind: "document",
+      uri: "https://pinned.test/report.docx?ticket=document",
+    };
+    await using preview = await openGallery(selected, [], false);
+    expect(harness.previews).toEqual([]);
+    expect(preview.onRequestClose).toHaveBeenCalledOnce();
+    if (message === "missing native capability") expect(harness.download).not.toHaveBeenCalled();
+  },
+);
+
+it("withholds an unclassified bare URL when cold enrollment loading fails", async () => {
+  harness.initializeVerifiedRoutes.mockRejectedValueOnce(new Error("SecureStore unavailable"));
+  await using preview = await openGallery(
+    { kind: "image", uri: "https://not-loaded.test/image.png?ticket=secret" },
+    [],
+    false,
+  );
+  expect(harness.previews).toEqual([]);
+  expect(preview.onRequestClose).toHaveBeenCalledOnce();
+});
+
+it("passes an explicit direct document URL through to the viewer", async () => {
+  harness.download.mockClear();
+  const uri = "https://direct.test/report.pdf?ticket=direct#page=2";
+  await using _preview = await openGallery({ kind: "pdf", uri }, [], false);
+  expect(harness.previews.at(-1)).toMatchObject({ kind: "pdf", uri });
+  expect(harness.download).not.toHaveBeenCalled();
+});
+
+it("keeps files from initial and progressive native handoffs until dismissal", async () => {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  const first = Promise.withResolvers<void>();
+  const second = Promise.withResolvers<void>();
+  const slow = Promise.withResolvers<{ uri: string; dispose: () => void }>();
+  const selected = { kind: "image", uri: "file:///selected.png" } as const;
+  const bare = { kind: "image", uri: "https://pinned.test/bare.png" } as const;
+  const neighbor = image("https://github.com/slow.png");
+  const disposeBare = vi.fn();
+  const disposeSlow = vi.fn();
+  const disposeDocument = vi.fn();
+  harness.refreshAssetUrl.mockResolvedValue("https://pinned.test/slow.png");
+  harness.download.mockImplementation(async ({ url }: { url: string }) => {
+    if (url.endsWith("/slow.png")) return slow.promise;
+    if (url.endsWith("/document.pdf"))
+      return { uri: "file:///cache/document.pdf", dispose: disposeDocument };
+    return { uri: "file:///cache/bare.png", dispose: disposeBare };
+  });
+  harness.native.presentFiles.mockReset().mockReturnValue(first.promise);
+  harness.native.presentFile.mockReset().mockReturnValue(second.promise);
+  harness.native.updateFile.mockResolvedValue(undefined);
+  harness.native.dismissFile.mockResolvedValue(undefined);
+  const root = createRoot(document.createElement("div"));
+  await using _root = { [Symbol.asyncDispose]: () => act(async () => root.unmount()) };
+  const onRequestClose = vi.fn();
+  const render = (source: Parameters<typeof FilePreviewModal>[0]["source"]) =>
+    act(async () =>
+      root.render(<FilePreviewModal source={source} onRequestClose={onRequestClose} />),
+    );
+
+  await render({ ...selected, gallery: [bare, selected, neighbor] });
+  expect(harness.native.presentFiles).toHaveBeenCalledWith(
+    [null, "file:///selected.png", null],
+    expect.any(Array),
+    1,
+    expect.any(Array),
+    expect.any(String),
+  );
+  await act(async () => slow.resolve({ uri: "file:///cache/slow.png", dispose: disposeSlow }));
+  expect(harness.native.updateFile).toHaveBeenCalledWith(
+    expect.any(String),
+    0,
+    "file:///cache/bare.png",
+  );
+  expect(harness.native.updateFile).toHaveBeenCalledWith(
+    expect.any(String),
+    2,
+    "file:///cache/slow.png",
+  );
+
+  await render({ kind: "pdf", uri: "https://pinned.test/document.pdf", name: "document" });
+  expect(harness.download).toHaveBeenCalledWith(
+    expect.objectContaining({ attachment: { name: "document.pdf", mimeType: "application/pdf" } }),
+  );
+  expect(harness.native.presentFile).toHaveBeenCalledWith(
+    "file:///cache/document.pdf",
+    "document",
+    "",
+    expect.any(String),
+  );
+  expect(disposeBare).not.toHaveBeenCalled();
+  expect(disposeSlow).not.toHaveBeenCalled();
+  await act(async () => first.resolve());
+  expect(disposeBare).toHaveBeenCalledOnce();
+  expect(disposeSlow).toHaveBeenCalledOnce();
+  expect(onRequestClose).not.toHaveBeenCalled();
+
+  await render(null);
+  expect(disposeDocument).not.toHaveBeenCalled();
+  await act(async () => second.resolve());
+  expect(disposeDocument).toHaveBeenCalledOnce();
+  expect(onRequestClose).not.toHaveBeenCalled();
+});
+
+it("cancels pending verified downloads on close and source change", async () => {
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  const pending: AbortSignal[] = [];
+  harness.download.mockImplementation(({ signal }: { signal: AbortSignal }) => {
+    pending.push(signal);
+    return new Promise(() => {});
+  });
+  const root = createRoot(document.createElement("div"));
+  await using _root = { [Symbol.asyncDispose]: () => act(async () => root.unmount()) };
+  const render = (uri: string | null) =>
+    act(async () =>
+      root.render(
+        <FilePreviewSession
+          source={uri === null ? null : { kind: "document", uri }}
+          onRequestClose={() => {}}
+          progressiveGallery={false}
+          Viewer={Viewer}
+        />,
+      ),
+    );
+  await render("https://pinned.test/a.pdf");
+  await render("https://pinned.test/b.pdf");
+  expect(pending.map((signal) => signal.aborted)).toEqual([true, false]);
+  await render(null);
+  expect(pending.map((signal) => signal.aborted)).toEqual([true, true]);
+});
 
 it.each([true, false])(
   "handles a failed sibling without leaving a pending page (progressive: %s)",

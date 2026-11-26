@@ -1,4 +1,6 @@
 import { mcpAppStyleVariables } from "@t3tools/client-runtime/mcp-apps";
+import type { PreviewAssetWidgetConnection } from "@t3tools/client-runtime/preview/server-browser-stream";
+import type { EnvironmentId } from "@t3tools/contracts";
 import {
   makePluginBridge,
   type PluginBridge,
@@ -12,10 +14,12 @@ import {
 } from "@t3tools/shared/mcpApp";
 import { useEffect, useRef, useState } from "react";
 
+import { HostedAssetDocument } from "~/components/files/HostedAssetDocument";
 import { isElectron } from "~/env";
 import { useHtmlRenderTheme } from "~/hooks/useHtmlRenderTheme";
 import { useStableCallback } from "~/hooks/useStableCallback";
 import { observeResize } from "~/lib/observeResize";
+import { listenToWidgetFrame } from "../widgetFrameConnection";
 
 // Exclude activation left by input elsewhere in T3, as MCP app frames do.
 const PAGE_ACTIVATION_MS = 5_000;
@@ -39,6 +43,7 @@ const withPanelBootstrap = (html: string) =>
 
 type PluginPanelDocument =
   | { readonly kind: "src"; readonly url: string }
+  | { readonly kind: "hosted"; readonly url: string; readonly environmentId: EnvironmentId }
   | { readonly kind: "srcdoc"; readonly html: string };
 
 type PluginPanelBridgeOptions = Omit<PluginBridgeOptions, "post" | "hostContext">;
@@ -51,8 +56,8 @@ export function PluginPanelFrame(props: {
   readonly chatTarget: PluginHostContext["chatTarget"];
 }) {
   const theme = useHtmlRenderTheme();
-  const frameRef = useRef<HTMLIFrameElement>(null);
   const bridgeRef = useRef<PluginBridge | null>(null);
+  const connectionRef = useRef<PreviewAssetWidgetConnection | null>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
   const [navigatedAway, setNavigatedAway] = useState(false);
   const readLive = useStableCallback(() => ({ theme, size, props }));
@@ -72,14 +77,13 @@ export function PluginPanelFrame(props: {
   const onFrameLoad = () => {
     loads.current += 1;
     if (loads.current > 1) {
-      bridgeRef.current?.dispose();
+      connectionRef.current?.dispose();
       setNavigatedAway(true);
     }
   };
 
-  const attachFrame = (frame: HTMLIFrameElement) => {
-    frameRef.current = frame;
-    const target = () => frameRef.current?.contentWindow ?? null;
+  const connectPanel = (post: (message: unknown) => void): PreviewAssetWidgetConnection => {
+    connectionRef.current?.dispose();
     const hostContext = (): Omit<PluginHostContext, "apiVersion"> => {
       const current = readLive();
       return {
@@ -104,15 +108,14 @@ export function PluginPanelFrame(props: {
       manifest: options().manifest,
       panelId: options().panelId,
       pluginVersion: options().pluginVersion,
-      // Opaque origins require "*"; the window reference scopes delivery to this frame.
-      post: (message) => target()?.postMessage(message, "*"),
+      post,
       hostContext,
       state: { get: () => options().state.get(), set: (value) => options().state.set(value) },
       ...(options().backend === undefined
         ? {}
         : {
             backend: {
-              call: (operation, input) => backend().call(operation, input),
+              call: (operation, input, lifetime) => backend().call(operation, input, lifetime),
               subscribe: (topic, params, onEvent) => backend().subscribe(topic, params, onEvent),
             },
           }),
@@ -124,24 +127,36 @@ export function PluginPanelFrame(props: {
       chatTargets: (query) => options().chatTargets(query),
     });
     bridgeRef.current = bridge;
+    const connection: PreviewAssetWidgetConnection = {
+      receive: (data, activated) => bridge.receive(data, activated),
+      dispose: () => {
+        bridge.dispose();
+        if (bridgeRef.current === bridge) {
+          bridgeRef.current = null;
+          connectionRef.current = null;
+        }
+      },
+    };
+    connectionRef.current = connection;
+    return connection;
+  };
+  const connect = useStableCallback(connectPanel);
+
+  const attachFrame = useStableCallback((frame: HTMLIFrameElement) => {
+    const target = frame.contentWindow;
+    // The opaque document has no origin for a narrower postMessage target.
+    const connection = connect((message) => target?.postMessage(message, "*"));
     // Real input in the frame focuses it and activates this page; recent page input does not count.
     const activated = () =>
-      document.activeElement === frameRef.current &&
+      document.activeElement === frame &&
       navigator.userActivation?.isActive === true &&
       performance.now() - lastPageInputAt >= PAGE_ACTIVATION_MS;
-    const receive = (event: MessageEvent) => {
-      if (event.source !== null && event.source === target()) {
-        bridge.receive(event.data, activated());
-      }
-    };
-    window.addEventListener("message", receive);
+    const stopListening = listenToWidgetFrame(frame, connection, activated);
     return () => {
-      window.removeEventListener("message", receive);
-      bridge.dispose();
-      bridgeRef.current = null;
-      frameRef.current = null;
+      stopListening();
+      connection.dispose();
     };
-  };
+  });
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- pushes theme, size and chat target to the panel's bridge in the iframe
   useEffect(() => {
@@ -149,12 +164,28 @@ export function PluginPanelFrame(props: {
     // oxlint-disable-next-line react/exhaustive-effect-dependencies -- Context changes trigger a resend.
   }, [theme, size, props.chatTarget, props.destination]);
 
+  if (
+    props.document.kind === "hosted" &&
+    (props.destination.kind !== "environment" ||
+      props.destination.environmentId !== props.document.environmentId)
+  ) {
+    return null;
+  }
+
   return (
     <div ref={attachBox} className="relative size-full min-h-0 overflow-hidden">
       {navigatedAway ? (
         <p className="flex size-full items-center justify-center text-muted-foreground text-xs">
           {props.title} left its page and was stopped
         </p>
+      ) : props.document.kind === "hosted" ? (
+        <HostedAssetDocument
+          environmentId={props.document.environmentId}
+          src={props.document.url}
+          title={props.title}
+          className="h-full"
+          widget={{ kind: "plugin-panel", connect }}
+        />
       ) : (
         <iframe
           ref={attachFrame}

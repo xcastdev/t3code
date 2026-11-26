@@ -921,10 +921,9 @@ export function useComposerSend(input: ComposerSendInput) {
     // Uploads finish after the message shows as sending; the turn starts once they land.
     if (turnUsesAttachmentUploads) {
       for (const attachment of composerAttachmentsSnapshot) {
-        const upload =
-          readAttachmentUpload(attachment.id)?.status === "failed"
-            ? retryAttachmentUpload
-            : startAttachmentUpload;
+        const state = readAttachmentUpload(attachment.id);
+        if (state?.status === "failed" && state.failure !== undefined) continue;
+        const upload = state?.status === "failed" ? retryAttachmentUpload : startAttachmentUpload;
         upload({
           environmentId,
           image: attachment,

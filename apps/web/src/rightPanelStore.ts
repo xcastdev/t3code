@@ -4,7 +4,13 @@ import {
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
 import type { PluginPanelKey } from "@t3tools/client-runtime/plugins/commands";
-import { EnvironmentId, RunId, ThreadId, type ScopedThreadRef } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  RunId,
+  ThreadId,
+  type AssetResource,
+  type ScopedThreadRef,
+} from "@t3tools/contracts";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 
@@ -41,6 +47,14 @@ export interface DeviceTabTarget {
   name: string;
 }
 
+type LocalFilePreview =
+  | Blob
+  | string
+  | {
+      readonly environmentId: EnvironmentId;
+      readonly resource: Extract<AssetResource, { _tag: "workspace-file" | "media-file" }>;
+    };
+
 export type RightPanelSurface =
   | { id: `browser:${string}`; kind: "preview"; resourceId: string }
   | { id: "browser:new"; kind: "preview"; resourceId: null }
@@ -61,12 +75,13 @@ export type RightPanelSurface =
       folderTrail?: string;
     }
   | {
-      id: `file:${string}` | `attachment:${string}`;
+      id: `file:${string}` | `attachment:${string}` | `local-preview:${string}`;
       kind: "file";
       relativePath: string;
       revealLine: number | null;
       revealRequestId: number;
       attachment?: ChatFileAttachment;
+      localPreview?: LocalFilePreview;
       /** Deepest workspace path retained for navigating back down after moving up. */
       folderTrail?: string;
     }
@@ -175,6 +190,7 @@ interface RightPanelStoreState {
   openDevice: (ref: ScopedThreadRef, target: DeviceTabTarget, automatic?: boolean) => void;
   renameDevice: (ref: ScopedThreadRef, surfaceId: string, title: string) => void;
   openBrowser: (ref: ScopedThreadRef, tabId: string | null) => void;
+  openLocalFilePreview: (ref: ScopedThreadRef, path: string, source: LocalFilePreview) => void;
   openFile: (ref: ScopedThreadRef, relativePath: string, line?: number) => void;
   /** Moves in place; "" opens the root explorer. folderTrail keeps the return path; keepSource opens beside the source. */
   navigateFolder: (
@@ -631,6 +647,11 @@ export function migratePersistedRightPanelState(persistedState: unknown): {
                       surface = rest;
                     }
                     if (surface.kind === "file") {
+                      if (
+                        surface.id.startsWith("local-preview:") ||
+                        surface.localPreview !== undefined
+                      )
+                        return [];
                       const revealLine =
                         typeof surface.revealLine === "number" &&
                         Number.isFinite(surface.revealLine)
@@ -996,6 +1017,28 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             ),
           }));
         }),
+      openLocalFilePreview: (ref, path, source) =>
+        set((state) =>
+          userAction(state, scopedThreadKey(ref), (current) => {
+            const id = `local-preview:${path}` as const;
+            const surface: RightPanelSurface = {
+              id,
+              kind: "file",
+              relativePath: path,
+              revealLine: null,
+              revealRequestId: 0,
+              localPreview: source,
+            };
+            return {
+              ...current,
+              isOpen: true,
+              activeSurfaceId: id,
+              surfaces: current.surfaces.some((entry) => entry.id === id)
+                ? current.surfaces.map((entry) => (entry.id === id ? surface : entry))
+                : [...current.surfaces, surface],
+            };
+          }),
+        ),
       openFile: (ref, requestedPath, line) =>
         set((state) =>
           userAction(state, scopedThreadKey(ref), (current) => {
@@ -1381,7 +1424,18 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               : [
                   [
                     threadKey,
-                    { ...threadState, surfaces: threadState.surfaces.map(withoutReveal) },
+                    {
+                      ...threadState,
+                      activeSurfaceId: threadState.activeSurfaceId?.startsWith("local-preview:")
+                        ? null
+                        : threadState.activeSurfaceId,
+                      surfaces: threadState.surfaces
+                        .filter(
+                          (surface) =>
+                            surface.kind !== "file" || surface.localPreview === undefined,
+                        )
+                        .map(withoutReveal),
+                    },
                   ],
                 ],
           ),
@@ -1416,6 +1470,7 @@ useRightPanelStore.subscribe((next, previous) => {
     for (const surface of closedInOrder.map(withoutReveal)) {
       if (
         surface.kind === "terminal" ||
+        (surface.kind === "file" && surface.localPreview !== undefined) ||
         (surface.kind === "preview" && surface.resourceId !== null)
       )
         continue;

@@ -60,9 +60,15 @@ vi.mock(import("~/hooks/useTheme"), async (original) => ({
 vi.mock(import("~/hooks/useWorkspaceMutationRefresh"), () => ({
   useWorkspaceMutationRefresh: vi.fn(),
 }));
+async function mintGrant() {
+  const url = await state.mintUrl();
+  return url === null ? null : { url, learnedRoute: false };
+}
+
 vi.mock(import("~/assets/assetUrls"), async (original) => ({
   ...(await original()),
   useAssetUrlRefresh: () => state.mintUrl,
+  useAssetGrantRefresh: () => mintGrant,
   useAssetUrlState: () => state.assetUrl,
 }));
 // The Word engine compiles a large WebAssembly bundle; these tests only need the URL it loads.

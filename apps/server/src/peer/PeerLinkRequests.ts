@@ -334,6 +334,7 @@ const make = Effect.gen(function* () {
             ...(answer.environmentId === undefined
               ? {}
               : { expectedEnvironmentId: answer.environmentId }),
+            ...(answer.addressConfirmed === true ? { addressConfirmed: true } : {}),
             ...(answer.label === undefined ? {} : { expectedLabel: answer.label }),
           })
           .pipe(

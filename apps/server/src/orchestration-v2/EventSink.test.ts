@@ -16,6 +16,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Stream from "effect/Stream";
 import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as ProjectStore from "./ProjectStore.ts";
@@ -86,6 +87,74 @@ function makeThread(threadId: ThreadId, now: DateTime.Utc): OrchestrationV2AppTh
     lastVisitedAt: null,
   };
 }
+
+it.effect("stores the project each notification belonged to when it committed", () =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const store = yield* EventStore.EventStoreV2;
+    const now = yield* DateTime.now;
+    const threadId = ThreadId.make("notice-thread");
+    const original = makeThread(threadId, now);
+    const adoptedProjectId = ProjectId.make("adopted-project");
+    const notice = (id: string) => ({
+      id: EventId.make(id),
+      type: "message.updated" as const,
+      threadId,
+      occurredAt: now,
+      payload: {
+        id: MessageId.make(id),
+        threadId,
+        runId: null,
+        nodeId: null,
+        role: "system" as const,
+        text: "Completed",
+        attachments: [],
+        streaming: false,
+        createdAt: now,
+        updatedAt: now,
+        createdBy: "system" as const,
+        creationSource: "server" as const,
+        notification: {
+          source: { kind: "background_task" as const },
+          outcome: "completed" as const,
+          summary: "Completed",
+        },
+      },
+    });
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make("notice-thread-created"),
+          type: "thread.created",
+          threadId,
+          occurredAt: now,
+          payload: original,
+        },
+        notice("first-notice"),
+      ],
+    });
+    yield* sink.write({
+      events: [
+        notice("second-notice"),
+        {
+          id: EventId.make("notice-thread-adopted"),
+          type: "thread.metadata-updated",
+          threadId,
+          occurredAt: now,
+          payload: { ...original, projectId: adoptedProjectId },
+        },
+        notice("third-notice"),
+      ],
+    });
+    const events = yield* store
+      .read({ threadId, eventType: "message.updated" })
+      .pipe(Stream.runCollect);
+    assert.deepEqual(
+      Array.from(events, ({ event }) => event.projectId),
+      [original.projectId, original.projectId, adoptedProjectId],
+    );
+  }).pipe(Effect.provide(makeLayer())),
+);
 
 it.effect("rejects a planned fork whose source was deleted before it committed", () =>
   Effect.gen(function* () {

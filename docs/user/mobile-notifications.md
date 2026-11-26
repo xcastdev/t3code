@@ -14,8 +14,16 @@ Android notifications require Android 7.0 or newer and Google Play services. And
 
 Notification permission and Android notification channels are controlled in system Settings. Background delivery requires T3 Connect; a direct or Tailscale connection alone does not enable push notifications. The mobile app does not need to maintain a connection to your environment. Force-stopping the Android app in system Settings prevents push delivery until you open it again.
 
-## Home Assistant notifications
+## Webhook notifications
 
-To send thread-finished, failed, or needs-input notifications to Home Assistant, open **Settings → Integrations → Notifications** on web or desktop, or **Settings → Notifications → Home Assistant** on mobile. Select an environment, add its webhook URL, enable the destination, and save. Destinations start disabled, and saving does not send a notification.
+Open **Settings → Devices → Notifications** on web or desktop, or **Settings → Notifications** on mobile. Select an environment, add a Home Assistant or generic webhook destination, and enter its URL. Select the events it should receive, enable the destination, and save. You can add several destinations of the same type with different URLs or event filters.
 
-After saving, use **Send test** to check a configured URL. The test sends even when the destination is disabled. Disable or remove a destination, or clear its URL, to stop future notifications. Saved webhook URLs stay hidden; enter a replacement to change one. Each environment has its own destinations.
+New destinations start disabled. Use **Send test** after saving to check the URL, even while the destination is disabled. Clearing the event selection stops automatic delivery for that destination. Saved URLs and signing keys stay hidden. Enter a new value to replace one.
+
+If a webhook hostname uses split DNS to resolve to a private address, add its exact origin to the server’s `T3CODE_EXTERNAL_NOTIFICATION_PRIVATE_ORIGINS` environment variable and restart the server. For multiple origins, use a comma-separated list such as `https://home.example.com,http://automation.example.com:8123`. Include the scheme and any non-default port. Leave out paths and webhook credentials.
+
+### Receive generic webhook events
+
+Each JSON payload includes a schema version, an event type, a timestamp, an occurrence ID, and the originating environment ID and name. Events include the applicable thread, project, and task IDs. Use the environment ID and occurrence ID together to deduplicate events at the receiver.
+
+Set a signing key on the destination to authenticate requests. Read the raw request body before parsing JSON. Compute HMAC-SHA256 using the signing key and the exact body bytes, then compare the lowercase hexadecimal digest with the value after `sha256=` in the `X-T3-Signature` header. Reject missing or malformed signatures and use a constant-time comparison for valid-length digests.

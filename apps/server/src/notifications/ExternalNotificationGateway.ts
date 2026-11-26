@@ -3,6 +3,8 @@ import {
   EnvironmentAuthorizationError,
   authScopeRequiredResponse,
   type AuthSessionId,
+  type ExternalNotificationTestInput,
+  type ExternalNotificationTestResult,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -16,9 +18,9 @@ export class ExternalNotificationGateway extends Context.Service<
   ExternalNotificationGateway,
   {
     readonly test: (
-      input: { readonly destinationId: string },
+      input: ExternalNotificationTestInput,
       sessionId: AuthSessionId,
-    ) => Effect.Effect<Dispatcher.ExternalNotificationTestResult, EnvironmentAuthorizationError>;
+    ) => Effect.Effect<ExternalNotificationTestResult, EnvironmentAuthorizationError>;
   }
 >()("t3/notifications/ExternalNotificationGateway") {}
 
@@ -31,7 +33,7 @@ const make = Effect.gen(function* () {
   const dispatcher = yield* Dispatcher.ExternalNotificationDispatcher;
   return ExternalNotificationGateway.of({
     test: Effect.fn("ExternalNotificationGateway.test")(function* (
-      input: { readonly destinationId: string },
+      input: ExternalNotificationTestInput,
       sessionId: AuthSessionId,
     ) {
       const session = yield* sessions

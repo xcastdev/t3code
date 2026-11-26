@@ -35,7 +35,11 @@ import { useAtomCommand } from "../../state/use-atom-command";
 import { accessConfig } from "../auth/ConnectAgentSurface";
 import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
 import { LinkAccessPicker } from "../settings/LinkAccessPicker";
-import { LinkAddressWarning, LinkMachineBadge } from "../settings/LinkMachineSelect";
+import {
+  LinkAddressWarning,
+  LinkMachineAddressSelect,
+  LinkMachineBadge,
+} from "../settings/LinkMachineSelect";
 import { Button } from "../ui/button";
 import { Dialog } from "../ui/dialog";
 import { Input } from "../ui/input";
@@ -176,6 +180,10 @@ function LinkRequestDialog(props: {
   const machines = rankMachinesByHint(listed, item.hint);
   // Null until the user picks; until then the hint's best match is picked.
   const [choice, setChoice] = useState<string | null>(null);
+  const [addressChoice, setAddressChoice] = useState<{
+    environmentId: EnvironmentId;
+    url: string;
+  } | null>(null);
   const [address, setAddress] = useState(item.url ?? "");
   const [access, setAccess] = useState<AuthMcpClientAccess>(() => linkRequestDefaultAccess(item));
   const [pairingCode, setPairingCode] = useState("");
@@ -200,6 +208,12 @@ function LinkRequestDialog(props: {
   const mayMint = useEnvironmentScope(targetId, AuthAccessWriteScope);
   const needsAddress =
     target.kind === "address" || (target.kind === "machine" && target.urls.length === 0);
+  const selectedUrl =
+    target.kind === "machine" &&
+    addressChoice?.environmentId === target.environmentId &&
+    target.urls.includes(addressChoice.url)
+      ? addressChoice.url
+      : null;
   // This client mints a code there when it is connected with a session that may
   // create pairing links, and only for its own addresses: anything can answer
   // as that machine at one typed in, so that one gets a code the user fetched.
@@ -218,10 +232,14 @@ function LinkRequestDialog(props: {
   const current: LinkStep = steps.includes(step) ? step : "access";
   const machineReady =
     target.kind !== "none" && (useExisting || !needsAddress || address.trim().length > 0);
-  const ready = machineReady && (useExisting || canMint || pairingCode.trim().length > 0);
+  const ready =
+    machineReady &&
+    (useExisting ||
+      ((needsAddress || selectedUrl !== null) && (canMint || pairingCode.trim().length > 0)));
 
   const reset = () => {
     setChoice(null);
+    setAddressChoice(null);
     setAddress(item.url ?? "");
     setAccess(linkRequestDefaultAccess(item));
     setPairingCode("");
@@ -256,14 +274,17 @@ function LinkRequestDialog(props: {
     }
     return linkRequestAnswerInput(item, {
       type: "link",
-      target: target.kind === "machine" && target.urls.length > 0 ? target : { url: address },
+      target:
+        target.kind === "machine" && selectedUrl !== null
+          ? { ...target, selectedUrl }
+          : { url: address },
       access,
       pairingCode: code,
     });
   };
 
   const submit = async () => {
-    if (inFlight.current || target.kind === "none") return;
+    if (inFlight.current || !ready) return;
     inFlight.current = true;
     setBusy(true);
     setError(null);
@@ -333,6 +354,7 @@ function LinkRequestDialog(props: {
                     disabled={busy}
                     onChange={(next) => {
                       setChoice(next);
+                      setAddressChoice(null);
                       setError(null);
                     }}
                   />
@@ -359,11 +381,21 @@ function LinkRequestDialog(props: {
               </>
             ) : (
               <>
-                {item.url !== undefined && target.kind === "machine" ? (
+                {item.url !== undefined && useExisting ? (
                   <p className="truncate text-xs text-muted-foreground">{item.url}</p>
                 ) : null}
                 {useExisting ? null : (
                   <>
+                    {target.kind === "machine" && target.urls.length > 0 ? (
+                      <LinkMachineAddressSelect
+                        urls={target.urls}
+                        value={selectedUrl}
+                        onChange={(url) =>
+                          setAddressChoice({ environmentId: target.environmentId, url })
+                        }
+                        disabled={busy}
+                      />
+                    ) : null}
                     {needsAddress ? <LinkAddressWarning address={address} /> : null}
                     {canMint ? null : (
                       <label className="block space-y-1.5">

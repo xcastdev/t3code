@@ -6,6 +6,7 @@ import * as Config from "effect/Config";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import type * as Redacted from "effect/Redacted";
 import * as Option from "effect/Option";
 
 import * as Electron from "electron";
@@ -19,6 +20,12 @@ import {
   replacedVersionedAppImagePath,
 } from "./DesktopLinuxUrlHandler.ts";
 import * as ElectronProtocol from "../electron/ElectronProtocol.ts";
+import {
+  parseVerifiedRouteEnrollments,
+  type VerifiedRouteEnrollment,
+} from "../electron/VerifiedRoute.ts";
+
+import { loadDesktopRelayCredentials } from "../electron/DesktopRelayPolicy.ts";
 
 export interface DesktopPreReadyCommandLineReader {
   readonly hasSwitch: (switchName: string) => boolean;
@@ -52,6 +59,8 @@ export class DesktopPreReadyElectronOptions extends Context.Service<
   {
     readonly linux: DesktopEarlyElectronStartup.EarlyLinuxElectronOptions | null;
     readonly linuxPasswordStoreCommandLine: string | null;
+    readonly verifiedRoutes: ReadonlyArray<VerifiedRouteEnrollment>;
+    readonly relayCredentials?: ReadonlyMap<string, Redacted.Redacted<string>>;
   }
 >()("@t3tools/desktop/app/DesktopPreReadyPlatform/DesktopPreReadyElectronOptions") {}
 
@@ -68,6 +77,12 @@ export const make = Effect.gen(function* () {
   const platform = yield* HostProcess.Platform;
   const homeDirectory = yield* HostProcess.HomeDirectory;
   const linuxDesktopEntryConfig = yield* LinuxDesktopEntryConfig;
+  const verifiedRouteConfig = yield* Config.String("T3CODE_DESKTOP_VERIFIED_ROUTE").pipe(
+    Config.option,
+  );
+  const relayCredentialsConfig = yield* Config.String("T3CODE_DESKTOP_RELAY_FORWARDING").pipe(
+    Config.option,
+  );
   return yield* Effect.sync((): DesktopPreReadyElectronOptions["Service"] => {
     const linuxPasswordStoreCommandLine =
       platform === "linux"
@@ -183,7 +198,45 @@ export const make = Effect.gen(function* () {
       }
     }
 
-    return { linux, linuxPasswordStoreCommandLine };
+    const verifiedRoutes = parseVerifiedRouteEnrollments(
+      Option.getOrUndefined(verifiedRouteConfig),
+    );
+    if (verifiedRoutes.length > 0) {
+      const commandLine = Electron.app.commandLine;
+      if (
+        commandLine.hasSwitch("ignore-certificate-errors") ||
+        commandLine.hasSwitch("ignore-certificate-errors-spki-list")
+      ) {
+        throw new Error("Verified desktop routes require Chromium certificate verification.");
+      }
+      // Cross-origin connection coalescing can bypass the hostname verifier.
+      commandLine.appendSwitch("disable-http2");
+      commandLine.appendSwitch("disable-quic");
+      commandLine.appendSwitch("disable-http-cache");
+      // Electron 44 installs the JS verifier on the current NetworkContext only.
+      const networkFeature = "NetworkServiceInProcess2";
+      const disabledFeatures = commandLine.getSwitchValue("disable-features").split(",");
+      if (disabledFeatures.includes(networkFeature)) {
+        throw new Error("Verified desktop routes require an in-process Chromium network service.");
+      }
+      const enabledFeatures = commandLine.getSwitchValue("enable-features");
+      commandLine.appendSwitch(
+        "enable-features",
+        enabledFeatures ? `${enabledFeatures},${networkFeature}` : networkFeature,
+      );
+    }
+
+    const relayCredentials = loadDesktopRelayCredentials(
+      Option.getOrUndefined(relayCredentialsConfig),
+      verifiedRoutes,
+      platform,
+    );
+    return {
+      linux,
+      linuxPasswordStoreCommandLine,
+      verifiedRoutes,
+      ...(relayCredentials.size === 0 ? {} : { relayCredentials }),
+    };
   });
 }).pipe(Effect.withSpan("desktop.electron.configureBeforeReady"));
 

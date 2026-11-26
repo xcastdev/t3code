@@ -23,6 +23,7 @@ export interface EnvironmentConnectionPresentation {
    * says where to approve it and shows the code, and is not a failure.
    */
   readonly awaitingApproval?: true;
+  readonly hostedRelayAdmissionRequired?: true;
 }
 
 /**
@@ -78,6 +79,9 @@ export function presentConnectionState(
         phase: state.lastFailure?.reason === "unsupported" ? "unsupported" : "error",
         error: state.lastFailure?.message ?? null,
         traceId: state.lastFailure?.traceId ?? null,
+        ...(state.lastFailure?.failureCause === "hosted_relay_admission_required"
+          ? { hostedRelayAdmissionRequired: true as const }
+          : {}),
       };
   }
 }

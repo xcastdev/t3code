@@ -3,6 +3,8 @@ import * as NodeURL from "node:url";
 import { defineConfig, normalizePath } from "vite-plus";
 import "vite-plus/test/config";
 
+const browserPreviewRouteTest = "src/features/browser/BrowserPreviewRouteScreen.test.tsx";
+
 const reactTests = [
   "src/features/threads/git/GitBranchesSheet.test.tsx",
   "src/features/threads/new-task-flow-provider.test.tsx",
@@ -35,6 +37,7 @@ const reactTests = [
   "src/features/threads/PendingUserInputCard.test.tsx",
   "src/features/threads/NewTaskDraftRouteScreen.test.tsx",
   "src/native/NativeHeaderToolbar.test.tsx",
+  "src/native/secureWebView.test.tsx",
   "src/components/ComposerEditor.ios.test.tsx",
   "src/native/V5StackHeader.ios.test.tsx",
   "src/native/createV5StackNavigator.ios.test.tsx",
@@ -65,6 +68,7 @@ const babel: {
 } = require("@babel/core");
 const babelConfig = require("./babel.config.js")({ cache: () => {} });
 const testPlatform = process.env.T3_MOBILE_TEST_PLATFORM === "android" ? "android" : "ios";
+const previewStreamScript = "@t3tools/mobile-preview-stream";
 
 export default defineConfig({
   test: {
@@ -76,20 +80,36 @@ export default defineConfig({
         test: {
           name: "unit",
           include: ["**/*.test.{ts,tsx,mjs}"],
-          exclude: ["**/node_modules/**", ...reactTests],
+          exclude: ["**/node_modules/**", ...reactTests, browserPreviewRouteTest],
           setupFiles: [
             "../../packages/shared/src/testing/longTempDir.ts",
             "../../packages/shared/src/testing/providerEnv.ts",
           ],
         },
       },
-      {
-        extends: true,
+      ...[
+        {
+          name: "react",
+          platform: testPlatform,
+          include: testPlatform === "ios" ? [...reactTests, browserPreviewRouteTest] : reactTests,
+        },
+        { name: "react-android", platform: "android", include: [browserPreviewRouteTest] },
+      ].map(({ name, platform, include }) => ({
+        extends: true as const,
         plugins: [
           {
-            name: `mobile-release-react-compiler-${testPlatform}`,
+            name: "mock-mobile-preview-stream-script",
+            resolveId(id: string) {
+              if (id === previewStreamScript) return `\0${id}`;
+            },
+            load(id: string) {
+              if (id === `\0${previewStreamScript}`) return 'export default ""';
+            },
+          },
+          {
+            name: `mobile-release-react-compiler-${platform}`,
             enforce: "pre",
-            async transform(code, id) {
+            async transform(code: string, id: string) {
               if (
                 !normalizePath(id).startsWith(sourceRoot) ||
                 !/\.tsx?$/.test(id) ||
@@ -111,7 +131,7 @@ export default defineConfig({
                 caller: {
                   name: "metro",
                   bundler: "metro",
-                  platform: testPlatform,
+                  platform,
                   isDev: false,
                   isServer: false,
                   isNodeModule: false,
@@ -124,13 +144,14 @@ export default defineConfig({
           },
         ],
         test: {
-          name: "react",
-          include: reactTests,
+          name,
+          include,
+          env: { T3_MOBILE_TEST_PLATFORM: platform },
           // Native components mock React Native and render through react-dom in these tests.
           environment: "jsdom",
           setupFiles: ["../../packages/shared/src/testing/providerEnv.ts"],
         },
-      },
+      })),
     ],
   },
 });

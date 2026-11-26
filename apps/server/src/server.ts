@@ -12,6 +12,7 @@ import * as ProjectTerminals from "./terminal/ProjectTerminalService.ts";
 import * as ProjectWorkRuntime from "./projectWork/ProjectWorkRuntime.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import type { RelayManagedEndpointRuntimeConfig } from "@t3tools/contracts/relay";
+import { SELF_HOSTED_RELAY_HOOK_INGRESS_PATH } from "@t3tools/contracts/selfHostedRelayHooks";
 import * as Random from "effect/Random";
 import * as EnvironmentKeys from "./cloud/environmentKeys.ts";
 import * as AssetSigner from "./assets/AssetSigner.ts";
@@ -30,6 +31,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { EnvironmentHttpApi, type RepositoryIdentity } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Cause from "effect/Cause";
+import * as Config from "effect/Config";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Deferred from "effect/Deferred";
@@ -45,7 +47,10 @@ import * as HostPowerMonitor from "./background/HostPowerMonitor.ts";
 import * as NonBlockingSpawner from "./process/NonBlockingSpawner.ts";
 import * as KeepAwake from "./background/KeepAwake.ts";
 import * as ServerConfig from "./config.ts";
-import { withRootRequestSpans, withUntracedRequests } from "./http.ts";
+import { attachRelayProofEnvironment } from "./relay/RelayProofEnvironment.ts";
+import * as SelfHostedRelayConnector from "./relay/SelfHostedRelayConnector.ts";
+import { loadSelfHostedRelayConnectorConfig } from "./relay/SelfHostedRelayForwardingConfig.ts";
+import { redactWebhookRequestLogs, withRootRequestSpans, withUntracedRequests } from "./http.ts";
 import * as ServerHttp from "./http.ts";
 import {
   guardHttpResponseWriteErrors,
@@ -126,6 +131,7 @@ import * as PortScanner from "./preview/PortScanner.ts";
 import * as ServerBrowser from "./preview/ServerBrowser.ts";
 import * as PreviewAgentActivity from "./preview/PreviewAgentActivity.ts";
 import * as DesktopBrowserChannel from "./preview/DesktopBrowserChannel.ts";
+import * as LocalAssetNavigation from "./preview/LocalAssetNavigation.ts";
 import * as ServerBrowserStream from "./preview/ServerBrowserStream.ts";
 import * as PreviewBrowser from "./preview/PreviewBrowser.ts";
 import * as ProcessRunner from "./processRunner.ts";
@@ -396,27 +402,75 @@ export const layerApplicationHttpServer = Layer.unwrap(
     });
     yield* ManagedLimits.closeTailscaleServeTo(policy, { host: bindHost, port: config.port });
     const runSync = Effect.runSyncWith(yield* Effect.context<never>());
-    return NodeHttpServer.layer(
-      () => {
-        const server = rejectRequestsUntilServing(
-          keepIdleConnections(guardHttpResponseWriteErrors(NodeHttp.createServer())),
+    const server = rejectRequestsUntilServing(
+      keepIdleConnections(guardHttpResponseWriteErrors(NodeHttp.createServer())),
+    );
+    if (config.privateNetworkOnly) {
+      runSync(closeNonPrivateNetworkConnections(server));
+    }
+    const connectorPath = yield* Config.String("T3CODE_RELAY_CONNECTOR_CONFIG").pipe(Config.option);
+    let hookAuthority: typeof RelayDeliveryProof.SelfHostedRelayHookAuthority.Service = null;
+    let selfHostedRelayHookBaseUrl: string | null = null;
+    if (Option.isSome(connectorPath)) {
+      const proofPath = yield* Config.String("T3CODE_STATIC_RELAY_PROOF_CONFIG").pipe(
+        Config.option,
+      );
+      if (Option.isSome(proofPath)) {
+        return yield* new SelfHostedRelayConnector.SelfHostedRelayConnectorError({
+          reason: "conflicting_configuration",
+        });
+      }
+      if (!ManagedLimits.allowsRemoteClients(policy)) {
+        return yield* ManagedLimits.refuseRemoteClients(
+          policy,
+          "so the self-hosted relay connector cannot be started",
         );
-        if (config.privateNetworkOnly) {
-          runSync(closeNonPrivateNetworkConnections(server));
-        }
-        return server;
-      },
-      {
+      }
+      const identity = yield* Effect.provide(
+        ServerEnvironment.ServerEnvironmentIdentity,
+        ServerEnvironment.layerIdentity,
+      );
+      const environmentId = yield* identity.getEnvironmentId;
+      const connector = yield* loadSelfHostedRelayConnectorConfig(
+        connectorPath.value,
+        environmentId,
+      );
+      hookAuthority = connector.hookAuthority ?? null;
+      const hookOrigin = connector.hookAuthority?.hookOrigin;
+      if (hookOrigin !== undefined) {
+        selfHostedRelayHookBaseUrl =
+          hookOrigin +
+          SELF_HOSTED_RELAY_HOOK_INGRESS_PATH.replace(
+            "/:environmentId/:hookId/:token",
+            `/${encodeURIComponent(environmentId)}`,
+          );
+      }
+      yield* SelfHostedRelayConnector.start(server, connector, { host: bindHost, environmentId });
+    } else {
+      yield* attachRelayProofEnvironment(server, {
         host: bindHost,
-        port: config.port,
-        gracefulShutdownTimeout: HTTP_PREEMPTIVE_SHUTDOWN_GRACE_MS,
-        // Context takeover stays enabled (ws default) so the compression
-        // window is shared across frames — that also makes small frames cheap
-        // to compress, so no size threshold is set (ws only honors
-        // `threshold` when context takeover is disabled).
-        websocket: { perMessageDeflate: true },
-      },
-    ).pipe(Layer.merge(layerSpawner));
+        environmentIdPath: config.environmentIdPath,
+      });
+    }
+    return NodeHttpServer.layer(() => server, {
+      host: bindHost,
+      port: config.port,
+      gracefulShutdownTimeout: HTTP_PREEMPTIVE_SHUTDOWN_GRACE_MS,
+      // Context takeover stays enabled (ws default) so the compression
+      // window is shared across frames — that also makes small frames cheap
+      // to compress, so no size threshold is set (ws only honors
+      // `threshold` when context takeover is disabled).
+      websocket: { perMessageDeflate: true },
+    }).pipe(
+      Layer.merge(layerSpawner),
+      Layer.merge(Layer.succeed(RelayDeliveryProof.SelfHostedRelayHookAuthority, hookAuthority)),
+      Layer.merge(
+        Layer.succeed(
+          SelfHostedRelayConnector.SelfHostedRelayHookBaseUrl,
+          selfHostedRelayHookBaseUrl,
+        ),
+      ),
+    );
   }),
 ).pipe(
   Layer.provide(ManagedPolicy.layer),
@@ -626,16 +680,18 @@ const layerScheduledTaskWebhookOrigin = Layer.effect(
   ScheduledTaskWebhookOrigin,
   Effect.gen(function* () {
     const secrets = yield* ServerSecretStore.ServerSecretStore;
+    const selfHostedRelayHookBaseUrl = yield* SelfHostedRelayConnector.SelfHostedRelayHookBaseUrl;
     return Effect.gen(function* () {
       const [relayUrl, tunnelConfig] = yield* Effect.all([
         secrets.get(RELAY_URL_SECRET),
         secrets.get(CLOUD_ENDPOINT_RUNTIME_CONFIG),
       ]).pipe(Effect.orElseSucceed(() => [Option.none(), Option.none()] as const));
       if (Option.isNone(relayUrl) || Option.isNone(tunnelConfig)) {
-        return { relayHookBaseUrl: null };
+        return { relayHookBaseUrl: null, selfHostedRelayHookBaseUrl };
       }
       const config = decodeRuntimeConfig(new TextDecoder().decode(tunnelConfig.value));
       return {
+        selfHostedRelayHookBaseUrl,
         relayHookBaseUrl: relayHookBaseUrl({
           relayUrl: new TextDecoder().decode(relayUrl.value),
           tunnelName: Option.isSome(config) ? config.value.tunnelName : undefined,
@@ -931,7 +987,7 @@ const layerMakeRoutes = Layer.mergeAll(
       ServerHttp.layerAssetRoute,
       ServerHttp.layerAttachmentUploadRoute,
       DeviceHubProxy.layer,
-      ServerBrowserStream.routeLayer,
+      ServerBrowserStream.routeLayer.pipe(Layer.provide(LocalAssetNavigation.layer)),
       McpCatalogGatewayHttpServer.layer,
       ProjectMcpOAuthHttp.layer,
     ),
@@ -1430,12 +1486,34 @@ const layerMakeServer = Layer.unwrap(
 
     const layerRoutes = serveClientApplication(layerMakeRoutes.pipe(Layer.provide(layerLauncher)), {
       disableLogger: !config.logWebSocketEvents,
+      middleware: redactWebhookRequestLogs,
       routerConfig: HTTP_ROUTER_CONFIG,
     }).pipe(
       withUntracedRequests,
       withRootRequestSpans,
       Layer.tap(() => Deferred.succeed(routesReady, undefined).pipe(Effect.orDie)),
     );
+    const relayOptions = config.selfHostedRelay;
+    const layerRelay =
+      relayOptions === undefined
+        ? Layer.empty
+        : Layer.unwrap(
+            Effect.gen(function* () {
+              if (relayOptions.forwardingConfigPath !== undefined) {
+                const policy = yield* ManagedPolicy.ManagedPolicy;
+                if (!ManagedLimits.allowsRemoteClients(policy)) {
+                  return yield* ManagedLimits.refuseRemoteClients(
+                    policy,
+                    "so self-hosted relay forwarding cannot listen",
+                  );
+                }
+              }
+              const { layer } = yield* Effect.promise(
+                () => import("./relay/SelfHostedRelayApplication.ts"),
+              );
+              return layer(relayOptions);
+            }),
+          ).pipe(Layer.provide(ManagedPolicy.layer));
     const layerServerApplication = Layer.mergeAll(
       layerRoutes,
       layerHttpListening,
@@ -1447,6 +1525,7 @@ const layerMakeServer = Layer.unwrap(
     );
 
     return layerServerApplication.pipe(
+      Layer.provide(layerRelay),
       Layer.provide(CloudLink.layer.pipe(Layer.provideMerge(ConnectReachability.layer))),
       Layer.provideMerge(layerRuntimeServices),
       Layer.provideMerge(
@@ -1458,7 +1537,7 @@ const layerMakeServer = Layer.unwrap(
       Layer.provideMerge(
         RelayTracing.layerServerRelayBroker.pipe(Layer.provide(ManagedPolicy.layer)),
       ),
-      Layer.provideMerge(layerApplicationHttpServer),
+      Layer.provideMerge(layerApplicationHttpServer.pipe(Layer.provide(layerActivation))),
       Layer.provide(layerApplicationObservability),
       Layer.provideMerge(FetchHttpClient.layer),
       Layer.provide(VcsProcess.layer),

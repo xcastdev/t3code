@@ -209,14 +209,25 @@ export class ServerBrowserContexts {
     await browser.close().catch(constVoid);
   }
 
-  contextFor(profileId: string, isolationKey?: string): Promise<BrowserContext> {
+  contextFor(
+    profileId: string,
+    isolationKey?: string,
+    verifiedAsset: boolean | "active" = false,
+  ): Promise<BrowserContext> {
     if (this.closing) return Promise.reject(new Error("The preview browser is closed."));
-    const key = JSON.stringify([profileId, isolationKey ?? null]);
+    if (verifiedAsset && isolationKey === undefined) {
+      return Promise.reject(
+        new Error("Verified asset previews require an isolated browser context."),
+      );
+    }
+    const key = verifiedAsset
+      ? JSON.stringify([profileId, isolationKey, verifiedAsset])
+      : JSON.stringify([profileId, isolationKey ?? null]);
     const cached = this.contexts.get(key);
     if (cached) return cached;
     const cleared = this.clearing.get(key)?.catch(constVoid) ?? Promise.resolve();
     const pending = cleared
-      .then(() => this.createContext(profileId, isolationKey))
+      .then(() => this.createContext(profileId, isolationKey, verifiedAsset))
       .then(async (context) => {
         context.on("close", () => {
           if (this.contexts.get(key) === pending) this.contexts.delete(key);
@@ -236,8 +247,21 @@ export class ServerBrowserContexts {
     return pending;
   }
 
-  private async createContext(profileId: string, isolationKey?: string) {
+  private async createContext(
+    profileId: string,
+    isolationKey: string | undefined,
+    verifiedAsset: boolean | "active",
+  ) {
     const contextOptions = { viewport: { width: 1280, height: 800 }, deviceScaleFactor: 2 };
+    if (verifiedAsset) {
+      return this.sharedContext({
+        ...contextOptions,
+        offline: true,
+        javaScriptEnabled: verifiedAsset === "active",
+        serviceWorkers: "block",
+        acceptDownloads: false,
+      });
+    }
     if (isolationKey !== undefined || profileId === INCOGNITO_BROWSER_PROFILE_ID) {
       return this.sharedContext(contextOptions);
     }

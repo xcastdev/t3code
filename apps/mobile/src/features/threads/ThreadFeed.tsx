@@ -93,7 +93,7 @@ import {
   codexArtifactTemplatePresentationLabel,
   type CodexArtifactTemplate,
 } from "@t3tools/shared/codexArtifactTemplates";
-import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
+import { issuedMobileAssetUrl } from "../../lib/verifiedAssetUrl";
 import { formatAttachmentSize } from "@t3tools/client-runtime/state/attachments";
 import {
   executeAtomQuery,
@@ -763,7 +763,7 @@ function MessageAttachmentFile(props: {
         const error = squashAtomCommandFailure(result);
         return finish(error instanceof Error ? error.message : "The attachment is unavailable.");
       }
-      const url = resolveAssetUrl(httpBaseUrl, result.value.relativeUrl);
+      const url = issuedMobileAssetUrl(props.environmentId, result.value);
       if (url === null) return finish("The attachment could not be opened.");
       const shared = await settlePromise(() =>
         downloadAndShareAttachment({

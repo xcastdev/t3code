@@ -15,6 +15,8 @@ import {
   useSortable,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
+import { Link } from "@tanstack/react-router";
+import { useGT } from "gt-react";
 import { CSS } from "@dnd-kit/utilities";
 import {
   type ConnectionRoute,
@@ -30,6 +32,7 @@ import { useState } from "react";
 
 import { requestConfirmDialog } from "~/confirmDialog";
 import { environmentCatalog } from "~/connection/catalog";
+import { listHostedRelayPairingBindings } from "~/connection/hostedRelayAdmission";
 import { cn } from "~/lib/utils";
 import type { EnvironmentPresentation } from "~/state/environments";
 import { usePreparedConnection } from "~/state/session";
@@ -44,7 +47,18 @@ export function EnvironmentRoutesList({
   readonly environment: EnvironmentPresentation;
   readonly onAddRoute: () => void;
 }) {
+  const gt = useGT();
   const saved = connectionRoutes(environment.entry);
+  const savedOrigins = new Set(
+    saved.map((route) => {
+      const address = connectionRouteAddress(route);
+      return address === null ? undefined : URL.parse(address)?.origin;
+    }),
+  );
+  const hasHostedRelay = listHostedRelayPairingBindings().some(
+    (binding) =>
+      binding.environmentId === environment.environmentId && savedOrigins.has(binding.httpsOrigin),
+  );
   const savedIds = saved.map((route) => connectionRouteId(route.target));
   const [pending, setPending] = useState<ReadonlyArray<string> | null>(null);
   const shownPending = pendingRouteOrder(pending, savedIds);
@@ -121,6 +135,11 @@ export function EnvironmentRoutesList({
           <PlusIcon className="size-3" />
           Add route
         </Button>
+        {hasHostedRelay ? (
+          <Button size="xs" variant="ghost-muted" render={<Link to="/pair" />}>
+            {gt("Renew relay access")}
+          </Button>
+        ) : null}
       </div>
     </div>
   );

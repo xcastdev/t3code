@@ -147,6 +147,7 @@ function assertOnlyDeclaredWorkflowObjectsAdded(
         { migration_id: 18, name: "ExternalNotifications" },
         { migration_id: 19, name: "AssistantRoutines" },
         { migration_id: 20, name: "McpCatalogAliases" },
+        { migration_id: 21, name: "ExternalNotificationOccurrences" },
       ],
     );
     const declarations = [

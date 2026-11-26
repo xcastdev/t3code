@@ -46,6 +46,7 @@ export const resolveDeviceHubAccess = Effect.fn("clientRuntime.state.resolveDevi
         client.webSocketTicketFor({ headers, params: { use: "media" } }),
     });
     return {
+      environmentId: input.prepared.environmentId,
       httpBase,
       wsBase,
       query: { wsTicket: Redacted.value(ticket.ticket) },

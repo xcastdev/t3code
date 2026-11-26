@@ -11,6 +11,7 @@ import { Button } from "../ui/button";
 import { Dialog, DialogPopup, DialogTitle } from "../ui/dialog";
 import type { ExpandedImageItem, ExpandedImagePreview } from "./ExpandedImagePreview";
 import { resolveExternalWebLinkHost } from "./externalLinkContextMenu";
+import { requiresAdmittedAsset } from "../../assets/admittedAssetSource";
 import { useAssetUrlRefresh, useAssetUrlState } from "../../assets/assetUrls";
 import { OpenMediaLink } from "../media/OpenMediaLink";
 import { MediaActions, type MediaActionSource } from "../media/MediaActions";
@@ -61,15 +62,23 @@ function itemMimeType(item: ExpandedImageItem): string | undefined {
 
 function ExpandedVideo({ item }: { readonly item: ExpandedImageItem }) {
   const asset = item.actionsSource?.asset;
-  const assetUrl = useAssetUrlState(asset?.environmentId ?? null, asset?.resource ?? null);
+  const assetUrl = useAssetUrlState(
+    asset?.environmentId ?? null,
+    asset?.resource ?? null,
+    undefined,
+    "video",
+  );
   const refreshAssetUrl = useAssetUrlRefresh(asset?.environmentId ?? null, asset?.resource ?? null);
   const src = asset
     ? assetUrl._tag === "Success"
       ? assetUrl.url + (item.srcFragment ?? "")
       : null
-    : item.src;
+    : item.src && !requiresAdmittedAsset(item.src)
+      ? item.src
+      : null;
   return (
     <MediaVideoPlayer
+      key={assetUrl.localSource ? src : undefined}
       src={src}
       label={item.name}
       sourceFailed={assetUrl._tag === "Failure"}
@@ -109,6 +118,17 @@ export const ExpandedImageDialog = memo(function ExpandedImageDialog({
   const index =
     imageCount > 0 ? (((preview.index + imageOffset) % imageCount) + imageCount) % imageCount : 0;
   const item = preview.images[index];
+  const imageAsset = item?.type !== "video" ? item?.actionsSource?.asset : undefined;
+  const imageState = useAssetUrlState(
+    imageAsset?.environmentId ?? null,
+    imageAsset?.resource ?? null,
+  );
+  const imageSrc =
+    imageState._tag === "Success" && imageState.localSource
+      ? imageState.url + (item?.srcFragment ?? "")
+      : item?.src && !requiresAdmittedAsset(item.src)
+        ? item.src
+        : null;
   const source: MediaActionSource = item?.actionsSource ?? {
     kind: item?.type === "video" ? "video" : "image",
     name: item?.name ?? "Media",
@@ -228,7 +248,13 @@ export const ExpandedImageDialog = memo(function ExpandedImageDialog({
                   className="h-[min(var(--media-height),40rem)] w-[min(var(--media-width),42rem)] transition-opacity duration-140 ease-out starting:opacity-0 rounded-lg border border-border/70 bg-background p-4 text-xs leading-5 shadow-2xl motion-reduce:transition-none"
                 />
               ) : null
-            ) : item.src === null || failedImageSrc === item.src ? (
+            ) : imageSrc === null && imageAsset && imageState._tag === "Loading" ? (
+              <div
+                role="status"
+                aria-label="Loading image"
+                className={EXPANDED_MEDIA_STATE_CLASS_NAME}
+              />
+            ) : imageSrc === null || failedImageSrc === imageSrc ? (
               <ExpandedMediaFailure>
                 <p>
                   {openOriginalLink
@@ -240,11 +266,11 @@ export const ExpandedImageDialog = memo(function ExpandedImageDialog({
             ) : (
               <ZoomableImage
                 ref={zoomableImageRef}
-                key={`${index}:${item.src}`}
-                src={item.src}
+                key={`${index}:${imageSrc}`}
+                src={imageSrc}
                 name={item.name}
                 mimeType={itemMimeType(item)}
-                onError={() => setFailedImageSrc(item.src)}
+                onError={() => setFailedImageSrc(imageSrc)}
               />
             )}
             <div className="mt-2 flex max-w-[var(--media-width)] items-center justify-center gap-1.5 text-xs text-white/80 max-sm:px-10">

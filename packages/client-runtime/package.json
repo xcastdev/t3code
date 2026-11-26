@@ -163,6 +163,10 @@
       "types": "./src/t3ToolSummary.ts",
       "default": "./src/t3ToolSummary.ts"
     },
+    "./self-hosted-relay": {
+      "types": "./src/selfHostedRelay/index.ts",
+      "default": "./src/selfHostedRelay/index.ts"
+    },
     "./relay": {
       "types": "./src/relay/index.ts",
       "default": "./src/relay/index.ts"

@@ -139,7 +139,7 @@ describe("workspaceAssetResource", () => {
     expect(workspaceAssetResource({ ...input, draft: true })).toEqual({
       _tag: "draft-workspace-file",
       cwd: "/repo",
-      path: "/repo/docs/index.html",
+      path: "docs/index.html",
     });
     expect(
       workspaceAssetResource({ ...input, absolutePath: "/tmp/screenshots/shot.png", draft: true }),

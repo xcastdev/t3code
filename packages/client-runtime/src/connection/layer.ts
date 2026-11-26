@@ -13,6 +13,8 @@ import * as ConnectionOnboarding from "./onboarding.ts";
 import { connectionRoutes, hasRelayRoute } from "./routes.ts";
 import * as PlatformConnectionSource from "../platform/source.ts";
 import * as RelayEnvironmentDiscovery from "../relay/discovery.ts";
+import * as SelfHostedRelayDiscovery from "../selfHostedRelay/discovery.ts";
+import { SelfHostedRelayDirectory } from "../selfHostedRelay/index.ts";
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
 import * as RpcSession from "../rpc/session.ts";
 
@@ -80,6 +82,7 @@ export function layerWithOptions(options: RpcSession.RpcSessionOptions) {
   const layerConnectionServices = Layer.mergeAll(
     layerRegistry,
     RelayEnvironmentDiscovery.layer,
+    SelfHostedRelayDiscovery.layer.pipe(Layer.provide(layerRegistry)),
     layerOnboarding,
     ConnectionResolver.layer,
   );
@@ -89,6 +92,9 @@ export function layerWithOptions(options: RpcSession.RpcSessionOptions) {
       const platformSource = yield* PlatformConnectionSource.PlatformConnectionSource;
       yield* watchDiscoveredCompatibility().pipe(Effect.forkScoped);
       yield* registry.start;
+      const relayDirectory = yield* SelfHostedRelayDirectory;
+      // Account recovery can wait on another client while platform connections start.
+      yield* relayDirectory.start.pipe(Effect.interruptible, Effect.forkScoped);
       yield* platformSource.registrations.pipe(
         Stream.runForEach(registry.reconcilePlatform),
         Effect.forkScoped,

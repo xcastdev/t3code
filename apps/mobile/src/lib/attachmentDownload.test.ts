@@ -62,6 +62,7 @@ vi.mock("expo-file-system", () => {
 });
 
 vi.mock("expo", () => ({ requireNativeModule: () => ({ openFile: mocks.open }) }));
+vi.mock("expo-secure-store", () => ({ getItemAsync: async () => null }));
 
 vi.mock("expo-sharing", () => ({
   isAvailableAsync: mocks.available,
@@ -231,6 +232,17 @@ describe("downloadAndShareAttachment", () => {
 });
 
 describe("attachment preview files", () => {
+  it("refuses an ordinary download when a verified preview has no active binding", async () => {
+    const loading = downloadAttachmentForPreview({
+      ...input,
+      signal: new AbortController().signal,
+      requireVerified: true,
+    });
+    await expect(loading).rejects.toThrow("Could not download the attachment.");
+    expect(mocks.download).not.toHaveBeenCalled();
+    expect(mocks.deleted).toHaveBeenCalledOnce();
+  });
+
   it("does not start a native request after cancellation during setup", async () => {
     const controller = new AbortController();
     const loading = downloadAttachmentForPreview({ ...input, signal: controller.signal });
@@ -252,6 +264,22 @@ describe("attachment preview files", () => {
     file?.dispose();
     file?.dispose();
     expect(mocks.deleted).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains a file handed to a native viewer across cache pruning after its owner closes", async () => {
+    const download = () =>
+      downloadAttachmentForPreview({ ...input, signal: new AbortController().signal });
+    const displayed = await download();
+    const directory = displayed!.uri.slice(0, displayed!.uri.lastIndexOf("/"));
+    displayed!.retainAfterHandoff!();
+    vi.mocked(Date.now).mockReturnValue(NOW + DAY_MS + 1);
+    displayed!.dispose();
+    (await download())?.dispose();
+    expect(mocks.directories.has(directory)).toBe(true);
+
+    vi.mocked(Date.now).mockReturnValue(NOW + 2 * DAY_MS + 2);
+    (await download())?.dispose();
+    expect(mocks.directories.has(directory)).toBe(false);
   });
 
   it.each([undefined, "share-button"])(

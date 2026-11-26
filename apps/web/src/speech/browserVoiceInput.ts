@@ -11,9 +11,16 @@ import {
   type VoiceTranscriptionOptions,
 } from "@t3tools/client-runtime/voice-input";
 import type { PreparedConnection } from "@t3tools/client-runtime/connection";
-import type { SpeechTranscriptionOptions, SpeechStreamText } from "@t3tools/contracts";
+import {
+  SPEECH_STREAM_PATH,
+  type SpeechTranscriptionOptions,
+  type SpeechStreamText,
+} from "@t3tools/contracts";
 import type { CloudSpeechModelId, CloudSpeechProvider } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
+
+import { assertHostedStreamTarget } from "~/connection/hostedRelayAdmission";
+import { openEnvironmentSocket } from "~/connection/environmentTransport";
 
 import { createBrowserPcmCapture } from "./browserPcmCapture";
 import { runEnvironmentSpeech } from "./runEnvironmentSpeech";
@@ -117,6 +124,10 @@ export function createBrowserVoiceInputPlatform(input: {
       transcribe: transcribeRecording,
       streaming: openSpeechStream({
         url,
+        createSocket: (endpoint) => {
+          assertHostedStreamTarget(endpoint, input.prepared.environmentId, SPEECH_STREAM_PATH);
+          return openEnvironmentSocket(endpoint);
+        },
         canSend: input.hasAudioConsent,
         options: recordingOptions,
         signal: options.signal,

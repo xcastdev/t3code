@@ -16,6 +16,7 @@ import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as HttpRouter from "effect/http/HttpRouter";
 import * as HttpServer from "effect/http/HttpServer";
 import * as HttpServerRequest from "effect/http/HttpServerRequest";
+import * as HttpServerResponse from "effect/http/HttpServerResponse";
 import * as HttpApi from "effect/http-api/HttpApi";
 import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
 
@@ -67,6 +68,15 @@ export const descriptorOf = (
 export const servePeer = <E, R>(
   initial: ExecutionEnvironmentDescriptor,
   tools: Layer.Layer<never, E, R>,
+  intercept?: {
+    readonly before?: (
+      request: HttpServerRequest.HttpServerRequest,
+    ) => HttpServerResponse.HttpServerResponse | undefined;
+    readonly after?: (
+      request: HttpServerRequest.HttpServerRequest,
+      response: HttpServerResponse.HttpServerResponse,
+    ) => HttpServerResponse.HttpServerResponse;
+  },
 ) =>
   Effect.gen(function* () {
     const descriptor = yield* Ref.make(initial);
@@ -106,7 +116,10 @@ export const servePeer = <E, R>(
           if (authorization !== undefined) {
             yield* Ref.update(bearers, (seen) => [...seen, authorization]);
           }
-          return yield* httpEffect;
+          const early = intercept?.before?.(request);
+          if (early !== undefined) return early;
+          const response = yield* httpEffect;
+          return intercept?.after?.(request, response) ?? response;
         }),
       { global: true },
     );

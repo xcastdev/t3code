@@ -1,4 +1,4 @@
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, ThreadId, type DesktopRelayBridge } from "@t3tools/contracts";
 import type {
   PreviewStreamControl,
   PreviewStreamEvents,
@@ -7,13 +7,32 @@ import type {
 import { describe, expect, it, vi } from "vite-plus/test";
 import { userEvent } from "vite-plus/test/browser";
 
-import { act, render } from "../../test/render";
+import { HostedAssetDocument } from "~/components/files/HostedAssetDocument";
+import { setAppearanceMode } from "~/hooks/useTheme";
+import { act, render, stubGlobal } from "../../test/render";
 
 const mocks = vi.hoisted(() => ({
-  createClient: vi.fn<(target: unknown, handlers: PreviewStreamEvents) => unknown>(),
+  createClient:
+    vi.fn<
+      (
+        target: unknown,
+        handlers: PreviewStreamEvents,
+        openSocket: (url: string) => WebSocket,
+      ) => unknown
+    >(),
   sent: [] as PreviewStreamInput[],
-  access: { url: "ws://preview.test", token: "test" },
+  access: {
+    url: "ws://preview.test",
+    token: "test",
+    environmentId: undefined as EnvironmentId | undefined,
+  },
   painted: null as (() => void) | null,
+  assetUrlState: vi.fn<() => import("~/assets/assetUrls").AssetUrlState>(),
+}));
+
+vi.mock(import("~/assets/assetUrls"), async (original) => ({
+  ...(await original()),
+  useAssetUrlState: mocks.assetUrlState,
 }));
 
 vi.mock(import("@t3tools/client-runtime/preview/server-browser-stream"), async (original) => ({
@@ -35,11 +54,69 @@ import { ServerBrowserSurface } from "./ServerBrowserSurface";
 function setup() {
   mocks.sent.length = 0;
   mocks.painted = null;
+  mocks.access.environmentId = undefined;
+  mocks.assetUrlState.mockReset();
   mocks.createClient.mockReset().mockImplementation(() => ({
     send: (input: PreviewStreamInput) => mocks.sent.push(input),
     stop: () => undefined,
   }));
 }
+
+it("keeps the paired workspace document stream open across grant renewals until its revision changes", async () => {
+  setup();
+  setAppearanceMode("dark");
+  const environmentId = EnvironmentId.make("workspace-document");
+  const origin = "https://document-relay.test";
+  const threadRef = { environmentId, threadId: ThreadId.make("workspace-thread") };
+  const { WorkspaceBrowserPreview } = await import("~/components/files/FilePreviewPanel");
+  mocks.access.environmentId = environmentId;
+  using _desktop = stubGlobal("desktopBridge", {
+    getLocalEnvironmentEnabled: () => false,
+    getClientSettings: async () => null,
+    getVerifiedRouteBinding: async () => ({
+      environmentId,
+      httpsOrigin: origin,
+      transportRole: "relay",
+    }),
+    relayTransport: { origins: [origin] },
+  });
+  const preview = (grant: string, revision: string) => {
+    mocks.assetUrlState.mockReturnValue({
+      _tag: "Success",
+      url: `${origin}/api/assets/${grant}/index.html`,
+      expiresAt: 0,
+    });
+    return (
+      <div style={{ width: 400, height: 300, display: "flex" }}>
+        <WorkspaceBrowserPreview
+          environmentId={environmentId}
+          threadRef={threadRef}
+          draft
+          absolutePath="/repo/index.html"
+          workspaceRoot="/repo"
+          title="Workspace document"
+          workspaceMutationId={revision}
+        />
+      </div>
+    );
+  };
+  await using screen = await render(preview("original.grant", "one"));
+  const canvas = () => screen.container.querySelector("canvas");
+  await vi.waitFor(() => expect(mocks.createClient).toHaveBeenCalled());
+  const initialCanvas = canvas();
+  expect(initialCanvas).not.toBeNull();
+
+  await screen.rerender(preview("renewed.grant", "one"));
+  expect(canvas()).toBe(initialCanvas);
+
+  await screen.rerender(preview("updated.grant", "two"));
+  await vi.waitFor(() =>
+    expect(mocks.createClient.mock.lastCall?.[0]).toMatchObject({
+      asset: { verifiedAssetUrl: `${origin}/api/assets/updated.grant/index.html` },
+    }),
+  );
+  expect(canvas()).not.toBe(initialCanvas);
+});
 
 async function renderSurface(controller: PreviewStreamControl["controller"]) {
   const container = document.createElement("div");
@@ -71,6 +148,78 @@ async function renderSurface(controller: PreviewStreamControl["controller"]) {
 }
 
 const keys = () => mocks.sent.filter((input) => input.type === "key");
+
+describe("enrolled Electron widget stream", () => {
+  const environmentId = EnvironmentId.make("widget-destination");
+  const origin = "https://widget-relay.test";
+  const src = `${origin}/api/assets/signed.widget/app.html`;
+  const endpoint = "wss://widget-relay.test/api/preview-stream/ws?asset=1&wsTicket=fixture";
+
+  it.each([
+    { bindingEnvironment: environmentId, admitted: true },
+    { bindingEnvironment: EnvironmentId.make("other-destination"), admitted: false },
+  ])(
+    "opens the main-owned socket only for the matching binding ($admitted)",
+    async ({ bindingEnvironment, admitted }) => {
+      setup();
+      setAppearanceMode("dark");
+      mocks.access.environmentId = environmentId;
+      const open = vi.fn<DesktopRelayBridge["open"]>(() => () => {});
+      const readBinding = vi.fn(async () => ({
+        environmentId: bindingEnvironment,
+        httpsOrigin: origin,
+        transportRole: "relay",
+      }));
+      vi.stubGlobal("desktopBridge", {
+        getVerifiedRouteBinding: readBinding,
+        relayTransport: { origins: [origin], open },
+      });
+      using _desktop = { [Symbol.dispose]: () => vi.unstubAllGlobals() };
+      await using screen = await render(
+        <div style={{ width: 400, height: 300, display: "flex" }}>
+          <HostedAssetDocument
+            environmentId={environmentId}
+            src={src}
+            title="Widget"
+            widget={{ kind: "mcp-app", connect: () => ({ receive: vi.fn(), dispose: vi.fn() }) }}
+          />
+        </div>,
+      );
+      expect(document.documentElement.classList.contains("dark")).toBe(true);
+      expect(readBinding).toHaveBeenCalledWith(origin);
+      expect(screen.container.querySelector("iframe")).toBeNull();
+      if (!admitted) {
+        await expect.element(screen.getByText("Unable to load file preview.")).toBeVisible();
+        expect(mocks.createClient).not.toHaveBeenCalled();
+        expect(open).not.toHaveBeenCalled();
+        return;
+      }
+
+      await vi.waitFor(() => expect(mocks.createClient).toHaveBeenCalled());
+      const [target, , openSocket] = mocks.createClient.mock.lastCall!;
+      expect(target).toMatchObject({
+        asset: {
+          verifiedAssetUrl: `${src}?t3-color-scheme=dark`,
+          appearance: "dark",
+          widget: "mcp-app",
+        },
+      });
+      expect(() => openSocket(endpoint.replace("/ws?", "/other?"))).toThrow();
+      expect(() => openSocket(endpoint.replace("wss:", "ws:"))).toThrow();
+      expect(open).not.toHaveBeenCalled();
+      const socket = openSocket(endpoint);
+      try {
+        await vi.waitFor(() => expect(open).toHaveBeenCalledOnce());
+        expect(open).toHaveBeenCalledWith(
+          { kind: "socket", url: endpoint, protocols: [] },
+          expect.any(Function),
+        );
+      } finally {
+        socket.close();
+      }
+    },
+  );
+});
 
 describe("ServerBrowserSurface clipboard commands", () => {
   it("sends a native Copy or Cut menu command to the page once", async () => {

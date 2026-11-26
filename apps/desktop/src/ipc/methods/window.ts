@@ -13,6 +13,7 @@ import {
   PRIMARY_LOCAL_ENVIRONMENT_ID,
   REMOTE_CAPABLE_EDITOR_IDS,
   SystemSettingsPaneSchema,
+  VerifiedRouteBindingSchema,
   type DesktopEnvironmentBootstrap,
   type PickedThemeFile,
 } from "@t3tools/contracts";
@@ -46,7 +47,11 @@ import * as ElectronMenu from "../../electron/ElectronMenu.ts";
 import * as ElectronShell from "../../electron/ElectronShell.ts";
 import * as ElectronTheme from "../../electron/ElectronTheme.ts";
 import * as ElectronWindow from "../../electron/ElectronWindow.ts";
+import { isVerifiedRouteHost, type VerifiedRouteEnrollment } from "../../electron/VerifiedRoute.ts";
 import * as Electron from "electron";
+import type { installDesktopRelayIpc } from "../../electron/DesktopRelayIpc.ts";
+import type { DesktopRelayTransport } from "../../electron/DesktopRelayTransport.ts";
+import { isRelayMediaTarget, parseRelayHttp } from "../../electron/DesktopRelayPolicy.ts";
 import * as MacPermissions from "../../permissions/MacPermissions.ts";
 import { safariPermissionCheck } from "../../preview/BrowserImport/SafariPermission.ts";
 import * as IpcChannels from "../channels.ts";
@@ -389,6 +394,11 @@ export const openExternal = DesktopIpc.makeIpcMethod({
   }),
 });
 
+export interface DesktopRelayMediaReader {
+  readonly transport: DesktopRelayTransport;
+  readonly ownerFor: ReturnType<typeof installDesktopRelayIpc>["ownerFor"];
+}
+
 const READ_MEDIA_MAX_BYTES = 256 * 1024 * 1024;
 
 // No URL field: media URLs can carry signed query tokens.
@@ -397,47 +407,125 @@ class MediaReadError extends Schema.TaggedError<MediaReadError>()("MediaReadErro
   cause: Schema.Defect(),
 }) {}
 
+export const makeGetVerifiedRouteBinding = (
+  verifiedRoutes: ReadonlyArray<VerifiedRouteEnrollment>,
+) =>
+  DesktopIpc.makeIpcMethod({
+    channel: IpcChannels.GET_VERIFIED_ROUTE_BINDING_CHANNEL,
+    payload: Schema.UndefinedOr(VerifiedRouteBindingSchema.fields.httpsOrigin),
+    result: Schema.NullOr(VerifiedRouteBindingSchema),
+    handler: Effect.fn("desktop.ipc.window.getVerifiedRouteBinding")((httpsOrigin) => {
+      const binding =
+        httpsOrigin === undefined
+          ? verifiedRoutes[0]
+          : verifiedRoutes.find((route) => route.origin === httpsOrigin);
+      return Effect.succeed(
+        binding?.environmentId === undefined
+          ? null
+          : ({
+              environmentId: binding.environmentId,
+              httpsOrigin: binding.origin,
+              leafSpkiSha256: binding.spkiSha256,
+              transportRole: binding.transportRole ?? "direct",
+            } as const),
+      );
+    }),
+  });
+
 // The renderer can display media it cannot fetch(); reading here keeps Save and Copy working for it.
-export const readMedia = DesktopIpc.makeIpcMethod({
-  channel: IpcChannels.READ_MEDIA_CHANNEL,
-  payload: Schema.String,
-  result: Schema.NullOr(DesktopMediaReadSchema),
-  handler: Effect.fn("desktop.ipc.window.readMedia")(function* (url, event) {
-    const window = yield* (yield* ElectronWindow.ElectronWindow).main;
-    if (
-      event === undefined ||
-      Option.isNone(window) ||
-      window.value.webContents.id !== event.sender.id ||
-      !/^https?:$/.test(URL.parse(url)?.protocol ?? "")
-    ) {
-      return null;
-    }
-    const session = window.value.webContents.session;
-    return yield* Effect.tryPromise({
-      try: async () => {
-        // Like an <img>, send the session's cookies.
-        const response = await session.fetch(url, { credentials: "include" });
-        const mimeType = response.headers.get("content-type") ?? "";
-        if (!response.ok || !response.body) {
-          await response.body?.cancel();
-          return { status: response.status, mimeType, data: new Uint8Array() };
-        }
-        // The whole body crosses IPC, so stop before a huge file can exhaust main-process memory.
-        const chunks: Uint8Array[] = [];
-        let size = 0;
-        for await (const chunk of response.body) {
-          size += chunk.byteLength;
-          if (size > READ_MEDIA_MAX_BYTES) {
-            return { status: 413, mimeType, data: new Uint8Array() };
+export const makeReadMedia = (
+  verifiedRoutes: ReadonlyArray<VerifiedRouteEnrollment> = [],
+  relayReader?: DesktopRelayMediaReader,
+) =>
+  DesktopIpc.makeIpcMethod({
+    channel: IpcChannels.READ_MEDIA_CHANNEL,
+    payload: Schema.String,
+    result: Schema.NullOr(DesktopMediaReadSchema),
+    handler: Effect.fn("desktop.ipc.window.readMedia")(function* (value, event) {
+      const url = URL.parse(value);
+      const window = yield* (yield* ElectronWindow.ElectronWindow).main;
+      if (
+        event === undefined ||
+        Option.isNone(window) ||
+        window.value.webContents.id !== event.sender.id ||
+        (url?.protocol !== "http:" && url?.protocol !== "https:")
+      ) {
+        return null;
+      }
+      const binding = verifiedRoutes.find((candidate) => url.origin === candidate.origin);
+      const enrolled = binding !== undefined;
+      if (
+        verifiedRoutes.some((binding) => isVerifiedRouteHost(url, binding)) &&
+        (!enrolled || url.username || url.password)
+      ) {
+        return null;
+      }
+      const session = window.value.webContents.session;
+      return yield* Effect.tryPromise({
+        try: async (signal) => {
+          const relayRequest =
+            binding?.transportRole === "relay"
+              ? parseRelayHttp({ url: value, method: "GET", headers: [], body: false })
+              : null;
+          const owner =
+            binding?.transportRole === "relay" ? relayReader?.ownerFor(event) : undefined;
+          if (
+            binding?.transportRole === "relay" &&
+            (relayReader === undefined ||
+              owner === undefined ||
+              relayRequest === null ||
+              !isRelayMediaTarget(value))
+          )
+            return null;
+          const admitted =
+            relayRequest !== null && relayReader !== undefined && owner !== undefined
+              ? await relayReader.transport.request(
+                  relayRequest,
+                  AbortSignal.any([owner.signal, signal]),
+                  undefined,
+                  undefined,
+                  READ_MEDIA_MAX_BYTES,
+                )
+              : null;
+          const response =
+            admitted !== null
+              ? new Response(admitted.body, {
+                  status: admitted.status,
+                  statusText: admitted.statusText,
+                  headers: admitted.headers.map(([name, value]) => [name, value]),
+                })
+              : await session.fetch(
+                  enrolled ? url.href : value,
+                  enrolled
+                    ? {
+                        credentials: "omit",
+                        redirect: "error",
+                        cache: "no-store",
+                        bypassCustomProtocolHandlers: true,
+                      }
+                    : { credentials: "include" },
+                );
+          const mimeType = response.headers.get("content-type") ?? "";
+          if (!response.ok || !response.body) {
+            await response.body?.cancel();
+            return { status: response.status, mimeType, data: new Uint8Array() };
           }
-          chunks.push(chunk);
-        }
-        return { status: response.status, mimeType, data: Buffer.concat(chunks) };
-      },
-      catch: (cause) => new MediaReadError({ message: "Could not read media.", cause }),
-    }).pipe(Effect.orElseSucceed(() => null));
-  }),
-});
+          // The whole body crosses IPC, so stop before a huge file can exhaust main-process memory.
+          const chunks: Uint8Array[] = [];
+          let size = 0;
+          for await (const chunk of response.body) {
+            size += chunk.byteLength;
+            if (size > READ_MEDIA_MAX_BYTES) {
+              return { status: 413, mimeType, data: new Uint8Array() };
+            }
+            chunks.push(chunk);
+          }
+          return { status: response.status, mimeType, data: Buffer.concat(chunks) };
+        },
+        catch: (cause) => new MediaReadError({ message: "Could not read media.", cause }),
+      }).pipe(Effect.orElseSucceed(() => null));
+    }),
+  });
 
 export const openSystemSettings = DesktopIpc.makeIpcMethod({
   channel: IpcChannels.OPEN_SYSTEM_SETTINGS_CHANNEL,

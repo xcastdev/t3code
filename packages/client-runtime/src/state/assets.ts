@@ -1,3 +1,4 @@
+import { parseUrl } from "@t3tools/shared/url";
 import {
   type AssetCreateUrlInput,
   type AssetCreateUrlResult,
@@ -23,7 +24,7 @@ import { AsyncResult, Atom, AtomRegistry } from "effect/reactivity";
 
 import * as EnvironmentRegistry from "../connection/registry.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
-import { request } from "../rpc/client.ts";
+import { requestInSession, requestSignedTransferUrl } from "../rpc/client.ts";
 import type { ProjectFaviconCache, ProjectFaviconTarget } from "../projectFaviconCache.ts";
 import { createEnvironmentQueryAtomFamily } from "./runtime.ts";
 
@@ -159,6 +160,7 @@ function keepUnchangedFile(
     next._tag !== "Success" ||
     next.value.fileRevision === undefined ||
     next.value.fileRevision !== shown.value.fileRevision ||
+    parseUrl(next.value.relativeUrl)?.origin !== parseUrl(shown.value.relativeUrl)?.origin ||
     shown.value.expiresAt - now <= KEEP_URL_MIN_LIFE_MS
   ) {
     return next;
@@ -255,7 +257,9 @@ export function createAssetEnvironmentAtoms<R, E>(
       limit = Semaphore.makeUnsafe(ASSET_URL_MAX_IN_FLIGHT);
       mintLimits.set(environmentId, limit);
     }
-    return request(WS_METHODS.assetsCreateUrl, input).pipe(limit.withPermit);
+    return requestSignedTransferUrl((session) =>
+      requestInSession(session, WS_METHODS.assetsCreateUrl, input),
+    ).pipe(limit.withPermit);
   };
   const execute = Effect.fn("assets.createUrl")(function* (input: AssetCreateUrlInput) {
     const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
@@ -282,10 +286,9 @@ export function createAssetEnvironmentAtoms<R, E>(
       return yield* error;
     const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
     // Map the full cause so retry defects and interruption survive.
-    const asset = yield* registry
+    return yield* registry
       .run(local.environmentId, mint(local.environmentId, input))
       .pipe(Effect.catchCause((cause) => Effect.failCause(Cause.map(cause, () => error))));
-    return { ...asset, relativeUrl: new URL(asset.relativeUrl, local.httpBaseUrl).href };
   });
   const createUrl = createEnvironmentQueryAtomFamily(runtime, {
     label: "environment-data:assets:create-url",

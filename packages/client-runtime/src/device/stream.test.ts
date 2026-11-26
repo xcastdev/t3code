@@ -102,6 +102,73 @@ describe("native device stream transport", () => {
     return { client, opened, waitForSocket, events, fetch };
   }
 
+  it("paints admitted MJPEG bytes without exposing the ticket URL to an image loader", async () => {
+    const jpeg = [255, 216, 255, 217];
+    const body = new Uint8Array([
+      ...new TextEncoder().encode("--frame\r\nContent-Length: 4\r\n\r\n"),
+      ...jpeg,
+    ]);
+    vi.stubGlobal("createImageBitmap", async () => ({
+      width: 10,
+      height: 20,
+      close: vi.fn(),
+    }));
+    const fetchResource = vi.fn<typeof fetch>(
+      async () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(body);
+            },
+          }),
+        ),
+    );
+    const onMjpegFallback = vi.fn();
+    let painted!: () => void;
+    const presenting = new Promise<void>((resolve) => {
+      painted = resolve;
+    });
+    const client = createDeviceStreamClient(
+      {
+        platform: "ios",
+        deviceId: "test device",
+        preferMjpeg: true,
+        videoOnly: true,
+        access: {
+          httpBase: "https://environment.test/api/device-hub",
+          wsBase: "wss://environment.test/api/device-hub",
+          credentials: false,
+          query: { wsTicket: "stream-ticket" },
+        },
+        transport: { fetchResource, fetchMjpeg: true },
+      },
+      {
+        present: () => {
+          painted();
+          return true;
+        },
+      },
+      {
+        onStatus: () => {},
+        onScreen: () => {},
+        onUnauthorized: () => {},
+        onMjpegFallback,
+        onInputConnected: () => {},
+      },
+    );
+    try {
+      client.start();
+      expect(onMjpegFallback).not.toHaveBeenCalled();
+      await presenting;
+      expect(fetchResource).toHaveBeenCalledExactlyOnceWith(
+        "https://environment.test/api/device-hub/vendor/serve-sim/helper/test%20device/stream.mjpeg?wsTicket=stream-ticket",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    } finally {
+      client.stop();
+    }
+  });
+
   it("renews an expired Android ticket when the HTTP upgrade is rejected instead of retrying it forever", async () => {
     const { client, opened, events } = setup("android");
     client.start();

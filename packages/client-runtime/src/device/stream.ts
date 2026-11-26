@@ -11,6 +11,9 @@ import * as Option from "effect/Option";
 import { createCanvasFrameSink, type DeviceFrameSink } from "./frame.ts";
 import { type DeviceHubAccess, withDeviceHubQuery } from "./hubAccess.ts";
 import type { DevicePlatform } from "@t3tools/contracts";
+import { readMjpegFrames } from "./mjpeg.ts";
+
+export { readMjpegFrames };
 
 export type DeviceStreamStatus = "connecting" | "streaming" | "error";
 
@@ -119,6 +122,11 @@ export interface DeviceStreamTarget {
   readonly platform: DevicePlatform;
   readonly deviceId: string;
   readonly access: DeviceHubAccess;
+  readonly transport?: {
+    readonly fetchResource?: typeof fetch;
+    readonly createSocket?: (url: string) => WebSocket;
+    readonly fetchMjpeg?: boolean;
+  };
   /** Native iOS WebViews can use MJPEG without cross-origin fetch or secure-context support. */
   readonly preferMjpeg?: boolean;
   readonly panelId?: 1 | 3;
@@ -410,7 +418,10 @@ export function createDeviceStreamClient(
   output: HTMLCanvasElement | DeviceFrameSink,
   events: DeviceStreamEvents,
 ): DeviceStreamClient {
-  const { access, platform, deviceId } = target;
+  const { access, platform, deviceId, transport } = target;
+  const fetchResource: typeof fetch =
+    transport?.fetchResource ?? ((input, init) => fetch(input, init));
+  const createSocket = transport?.createSocket ?? ((url: string) => new WebSocket(url));
   const sink = "present" in output ? output : createCanvasFrameSink(output);
   // Android normally streams over serve-emu's socket; a serve-sim-only host serves it like iOS.
   const serveSimOnly = target.serveSimOnly === true;
@@ -573,8 +584,12 @@ export function createDeviceStreamClient(
     controller = null;
     closeDecoder();
     connecting();
-    events.onMjpegFallback(mjpegUrl());
-    if (!releaseImage) observeMjpegImage();
+    if (transport?.fetchMjpeg) {
+      void readMjpegVideo();
+    } else {
+      events.onMjpegFallback(mjpegUrl());
+      if (!releaseImage) observeMjpegImage();
+    }
   };
 
   const paint = (source: CanvasImageSource, width: number, height: number) => {
@@ -710,6 +725,41 @@ export function createDeviceStreamClient(
     events.onUnauthorized();
   };
 
+  const readMjpegVideo = async () => {
+    const videoController = new AbortController();
+    controller = videoController;
+    const isCurrent = () => !stopped && mjpeg && controller === videoController;
+    try {
+      const response = await fetchResource(mjpegUrl(), {
+        signal: videoController.signal,
+        credentials: access.credentials ? "include" : "same-origin",
+      });
+      if (!isCurrent() || !response.ok || !response.body) {
+        await response.body?.cancel();
+        if (!isCurrent()) return;
+        if (response.status === 401 || response.status === 403) return handleUnauthorized();
+        throw new Error("Device video unavailable");
+      }
+      for await (const frame of readMjpegFrames(response.body)) {
+        const bitmap = await createImageBitmap(new Blob([frame], { type: "image/jpeg" }));
+        try {
+          if (!isCurrent()) return;
+          paint(bitmap, bitmap.width, bitmap.height);
+        } finally {
+          bitmap.close();
+        }
+      }
+    } catch {
+      if (!isCurrent()) return;
+    } finally {
+      videoController.abort();
+    }
+    if (isCurrent()) {
+      controller = null;
+      void switchToWebRtc("Could not receive the device stream. Reconnect to try again.", false);
+    }
+  };
+
   const readIosVideo = async () => {
     const lifecycle = generation;
     const feedGeneration = ++videoGeneration;
@@ -724,7 +774,7 @@ export function createDeviceStreamClient(
     let retryDetail: string | undefined;
     let leaseEnd: string | undefined;
     try {
-      const response = await fetch(httpUrl(videoPath), {
+      const response = await fetchResource(httpUrl(videoPath), {
         signal: videoController.signal,
         credentials: access.credentials ? "include" : "same-origin",
       });
@@ -848,7 +898,7 @@ export function createDeviceStreamClient(
     primeController = controller;
     const timeout = setTimeout(() => controller.abort(), 2_000);
     try {
-      const response = await fetch(httpUrl(`/helper/${device}/stream.mjpeg`), {
+      const response = await fetchResource(httpUrl(`/helper/${device}/stream.mjpeg`), {
         signal: controller.signal,
         credentials: access.credentials ? "include" : "same-origin",
       });
@@ -872,7 +922,7 @@ export function createDeviceStreamClient(
     const probe = new AbortController();
     const timeout = setTimeout(() => probe.abort(), TRANSPORT_PROBE_TIMEOUT_MS);
     try {
-      const response = await fetch(httpUrl(`/api?device=${device}`), {
+      const response = await fetchResource(httpUrl(`/api?device=${device}`), {
         signal: probe.signal,
         credentials: access.credentials ? "include" : "same-origin",
       });
@@ -899,7 +949,7 @@ export function createDeviceStreamClient(
     current.video.srcObject = null;
     current.video.remove();
     // Releases the capture session; best effort because the page may be unloading.
-    void fetch(webRtcUrl("close"), {
+    void fetchResource(webRtcUrl("close"), {
       method: "POST",
       keepalive: true,
       headers: { "content-type": "application/json" },
@@ -1021,7 +1071,7 @@ export function createDeviceStreamClient(
         iceGatheringDeadlineMs = Math.min(iceGatheringDeadlineMs * 2, ICE_GATHERING_MAX_TIMEOUT_MS);
         return retry("Device stream found no network candidates yet. Retrying…");
       }
-      const response = await fetch(webRtcUrl("offer"), {
+      const response = await fetchResource(webRtcUrl("offer"), {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -1112,7 +1162,12 @@ export function createDeviceStreamClient(
     const session = generation;
     if (!serveSimOnly) await primeIosHelper(session);
     if (stopped || generation !== session) return;
-    const ws = new WebSocket(wsUrl(`/helper/ws?device=${device}`));
+    let ws: WebSocket;
+    try {
+      ws = createSocket(wsUrl(`/helper/ws?device=${device}`));
+    } catch {
+      return handleUnauthorized();
+    }
     ws.binaryType = "arraybuffer";
     socket = ws;
     iosInputAdmitted = false;
@@ -1197,9 +1252,12 @@ export function createDeviceStreamClient(
   /** `inputOnly` keeps a socket for input beside a WebRTC feed, so its reconnects leave video alone. */
   const connectAndroid = (inputOnly = false) => {
     if (stopped) return;
-    const ws = new WebSocket(
-      wsUrl(`/ws?device=${device}&${inputOnly ? "video=0" : "frame-meta=1"}`),
-    );
+    let ws: WebSocket;
+    try {
+      ws = createSocket(wsUrl(`/ws?device=${device}&${inputOnly ? "video=0" : "frame-meta=1"}`));
+    } catch {
+      return handleUnauthorized();
+    }
     ws.binaryType = "arraybuffer";
     socket = ws;
     ws.onopen = () => {

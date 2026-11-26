@@ -15,6 +15,7 @@ import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as PeerLinks from "../peer/PeerLinks.ts";
+import * as PeerRelayDirectory from "../peer/PeerRelayDirectory.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
@@ -90,7 +91,9 @@ const environmentLinkCommand = Command.make("link", {
     ),
   ),
   alternateUrl: Flag.String("url").pipe(
-    Flag.withDescription("Another address for the same environment, tried after the first."),
+    Flag.withDescription(
+      "Save another address for the same environment. To approve it, link again with that address and a fresh pairing code.",
+    ),
     Flag.atLeast(0),
   ),
   pairingCode: Flag.String("pairing-code").pipe(
@@ -120,6 +123,23 @@ const environmentLinkCommand = Command.make("link", {
         );
       }),
     ),
+  ),
+);
+
+const encodeLookupResult = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+
+const environmentLookupCommand = Command.make("lookup", {
+  selector: Argument.String("environment").pipe(
+    Argument.withDescription("Exact environment ID or label in the configured relay directory."),
+  ),
+}).pipe(
+  Command.withDescription("Look up an environment and print its candidate origins as JSON."),
+  Command.withHandler(({ selector }) =>
+    Effect.gen(function* () {
+      const directory = yield* PeerRelayDirectory.PeerRelayDirectory;
+      const result = yield* directory.lookup(selector);
+      yield* Console.log(yield* encodeLookupResult(result));
+    }).pipe(Effect.provide(PeerRelayDirectory.layer)),
   ),
 );
 
@@ -166,6 +186,7 @@ export const environmentCommand = Command.make("environment").pipe(
   Command.withSubcommands([
     environmentLinkCommand,
     environmentListCommand,
+    environmentLookupCommand,
     environmentUnlinkCommand,
   ]),
 );

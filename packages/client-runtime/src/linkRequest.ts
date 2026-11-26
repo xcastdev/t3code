@@ -326,7 +326,9 @@ export function linkRequestAnswerInput(
         readonly type: "link";
         /** The machine picked, or an address typed in its place. */
         readonly target:
-          | Pick<LinkableMachine, "environmentId" | "label" | "urls">
+          | (Pick<LinkableMachine, "environmentId" | "label" | "urls"> & {
+              readonly selectedUrl?: string;
+            })
           | { readonly url: string };
         readonly access: AuthMcpClientAccess;
         readonly pairingCode: string;
@@ -344,15 +346,16 @@ export function linkRequestAnswerInput(
     if (url.length === 0) return null;
     return { ...base, answer: { type: "link", urls: [url], access: answer.access, pairingCode } };
   }
-  const [first, ...rest] = target.urls;
-  if (first === undefined) return null;
+  const first = target.selectedUrl;
+  if (first === undefined || !target.urls.includes(first)) return null;
   return {
     ...base,
     answer: {
       type: "link",
       environmentId: target.environmentId,
       label: target.label,
-      urls: [first, ...rest],
+      urls: [first],
+      addressConfirmed: true,
       access: answer.access,
       pairingCode,
     },

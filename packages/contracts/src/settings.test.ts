@@ -638,3 +638,33 @@ describe("server model preferences", () => {
     expect(decodeServerSettingsPatch(input)).toEqual(input);
   });
 });
+
+it("round-trips absent and explicit external notification filters independently", () => {
+  const home = { id: "home", name: "Home", kind: "home-assistant", enabled: true };
+  const generic = {
+    id: "generic",
+    name: "Generic",
+    kind: "generic-webhook",
+    events: [],
+    signingKey: "signed",
+  };
+  const { externalNotifications } = decodeServerSettingsPatch({
+    externalNotifications: { destinations: [home, generic] },
+  });
+  expect(externalNotifications?.destinations).toEqual([
+    { ...home, webhookUrl: "" },
+    { ...generic, enabled: false, webhookUrl: "" },
+  ]);
+  expect(
+    encodeServerSettings(decodeServerSettings({ externalNotifications })).externalNotifications,
+  ).toEqual(externalNotifications);
+});
+
+it("requires a destination list with a notification revision", () => {
+  const revision = "revision";
+  expect(() => decodeServerSettingsPatch({ externalNotifications: { revision } })).toThrow();
+  const externalNotifications = { destinations: [], revision };
+  expect(decodeServerSettingsPatch({ externalNotifications }).externalNotifications).toEqual(
+    externalNotifications,
+  );
+});

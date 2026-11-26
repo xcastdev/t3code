@@ -8,6 +8,7 @@ type GestureHandlers = Record<string, (event: unknown, manager?: unknown) => voi
 type Transform = [{ translateX: number }, { translateY: number }, { scale: number }];
 
 const harness = vi.hoisted(() => ({
+  localUri: null as string | null,
   failImage: () => {},
   loadImage: (_event: { source: { width: number; height: number } }) => {},
   Passthrough: ({ children }: { children?: unknown }) => children,
@@ -77,6 +78,12 @@ vi.mock("expo-image", () => ({
     harness.loadImage = props.onLoad;
     return <img alt="" />;
   },
+}));
+vi.mock("../../lib/useVerifiedLocalAsset", () => ({
+  useVerifiedLocalAsset: (uri: string | null) => ({
+    status: "ready",
+    uri: harness.localUri ?? uri,
+  }),
 }));
 vi.mock("expo/fetch", () => ({ fetch: vi.fn() }));
 vi.mock("react-native-svg", () => ({ parse: vi.fn(), SvgAst: () => null }));
@@ -396,5 +403,23 @@ it("zooms the inline image around the pinch and keeps it until the source or fra
     }
   } finally {
     await act(async () => root.unmount());
+  }
+});
+
+it("opens the original image identity while its thumbnail uses a local lease", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const root = createRoot(document.createElement("div"));
+  const onPressPreview = vi.fn();
+  harness.localUri = "file:///cache/temporary-thumbnail.png";
+  try {
+    await act(async () => root.render(markdownImage("hero", onPressPreview)));
+    await act(async () => harness.pressable.onPress?.({ nativeEvent: {} }));
+    expect(onPressPreview).toHaveBeenCalledWith(
+      expect.objectContaining({ uri: "https://example.test/hero.png" }),
+    );
+  } finally {
+    harness.localUri = null;
+    act(() => root.unmount());
+    vi.unstubAllGlobals();
   }
 });

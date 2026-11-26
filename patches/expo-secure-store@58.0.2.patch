@@ -1,0 +1,37 @@
+diff --git a/android/src/main/java/expo/modules/securestore/SecureStoreModule.kt b/android/src/main/java/expo/modules/securestore/SecureStoreModule.kt
+--- a/android/src/main/java/expo/modules/securestore/SecureStoreModule.kt
++++ b/android/src/main/java/expo/modules/securestore/SecureStoreModule.kt
+@@ -242,7 +242,16 @@
+       throw WriteException("Could not JSON-encode the encrypted item for SecureStore - the string $encryptedItemString is null or empty", key, keychainService)
+     }
+ 
+-    return prefs.edit().putString(key, encryptedItemString).commit()
++    return synchronized(prefs) {
++      val previous = prefs.getString(key, null)
++      val success = prefs.edit().putString(key, encryptedItemString).commit()
++      if (!success) {
++        // Failed commits still replace the SharedPreferences in-memory value.
++        prefs.edit().putString(key, previous).commit()
++        throw WriteException("Could not write the encrypted item to SecureStore", key, keychainService)
++      }
++      true
++    }
+   }
+ 
+   private fun deleteItemImpl(key: String, options: SecureStoreOptions) {
+diff --git a/expo-module.config.json b/expo-module.config.json
+--- a/expo-module.config.json
++++ b/expo-module.config.json
+@@ -4,11 +4,6 @@
+     "modules": ["SecureStoreModule"]
+   },
+   "android": {
+-    "modules": ["expo.modules.securestore.SecureStoreModule"],
+-    "publication": {
+-      "groupId": "host.exp.exponent",
+-      "artifactId": "expo.modules.securestore",
+-      "repository": "local-maven-repo"
+-    }
++    "modules": ["expo.modules.securestore.SecureStoreModule"]
+   }
+ }

@@ -1,5 +1,6 @@
 import {
   AuthOrchestrationOperateScope,
+  AuthPreviewOperateScope,
   EnvironmentId,
   ProjectId,
   ThreadId,
@@ -7,15 +8,21 @@ import {
   type EditorId,
   type ThreadPullRequestLink,
 } from "@t3tools/contracts";
+import { RelayConnectionTarget, type PreparedConnection } from "@t3tools/client-runtime/connection";
+import * as Option from "effect/Option";
 import { AsyncResult } from "effect/reactivity";
 import { expect, it, vi } from "vite-plus/test";
 import { userEvent } from "vite-plus/test/browser";
 
-import { act, render } from "../../test/render";
-import { useRightPanelStore } from "../rightPanelStore";
+import { act, render, stubGlobal } from "../../test/render";
+import { selectActiveRightPanelSurface, useRightPanelStore } from "../rightPanelStore";
+import { setAppearanceMode } from "../hooks/useTheme";
 
 const state = vi.hoisted(() => ({
   allowed: true,
+  canOperatePreview: true,
+  prepared: null as PreparedConnection | null,
+  createAssetUrl: vi.fn(),
   listeners: new Set<() => void>(),
   openEditor: vi.fn(),
   link: vi.fn(),
@@ -28,10 +35,14 @@ const state = vi.hoisted(() => ({
   pullRequests: [] as ThreadPullRequestLink[],
 }));
 
-vi.mock(import("../state/use-atom-query-runner"), async (original) => ({
-  ...(await original()),
-  useAtomQueryRunner: (() => state.search) as never,
-}));
+vi.mock(import("../state/use-atom-query-runner"), async (original) => {
+  const { assetEnvironment } = await import("../state/assets");
+  return {
+    ...(await original()),
+    useAtomQueryRunner: ((query: unknown) =>
+      query === assetEnvironment.createUrl ? state.createAssetUrl : state.search) as never,
+  };
+});
 vi.mock(import("../state/use-atom-command"), async (original) => {
   const { threadEnvironment } = await import("../state/threads");
   return {
@@ -48,10 +59,13 @@ vi.mock(import("../state/session"), async (original) => {
   const { useSyncExternalStore } = await import("react");
   const readEnvironmentScope = (id: EnvironmentId | null, scope: AuthEnvironmentScope) =>
     id !== null &&
+    (scope !== AuthPreviewOperateScope || state.canOperatePreview) &&
     (scope !== AuthOrchestrationOperateScope || id !== threadRef.environmentId || state.allowed);
   return {
     ...(await original()),
     readEnvironmentScope,
+    readPreparedConnection: () => state.prepared,
+    usePreparedConnection: () => Option.fromNullishOr(state.prepared),
     useEnvironmentScope: (id: EnvironmentId | null, scope: AuthEnvironmentScope) =>
       useSyncExternalStore(
         (listener) => {
@@ -130,6 +144,9 @@ const serverConfig = {
 function setup() {
   using stack = new DisposableStack();
   state.allowed = true;
+  state.canOperatePreview = true;
+  state.prepared = null;
+  state.createAssetUrl.mockReset();
   state.listeners.clear();
   state.pullRequests = [];
   state.openEditor.mockReset().mockResolvedValue(AsyncResult.success(undefined));
@@ -182,6 +199,54 @@ async function setAllowed(allowed: boolean) {
     for (const listener of state.listeners) listener();
   });
 }
+
+it("opens a paired relay SVG from a file link with filesystem read access", async () => {
+  using _setup = setup();
+  setAppearanceMode("dark");
+  const { environmentId } = threadRef;
+  const origin = "https://file-link-relay.test";
+  const relativeUrl = "/api/assets/signed.grant/diagram.svg";
+  const label = "Paired relay";
+  state.canOperatePreview = false;
+  state.prepared = {
+    environmentId,
+    label,
+    httpBaseUrl: origin,
+    socketUrl: "wss://file-link-relay.test/ws",
+    httpAuthorization: null,
+    target: new RelayConnectionTarget({ environmentId, label }),
+    learnedRoute: true,
+  };
+  state.createAssetUrl.mockResolvedValue(AsyncResult.success({ relativeUrl, expiresAt: 0 }));
+  using _desktop = stubGlobal("desktopBridge", {
+    getLocalEnvironmentEnabled: () => false,
+    getClientSettings: async () => null,
+    getVerifiedRouteBinding: async () => ({
+      environmentId,
+      httpsOrigin: origin,
+      transportRole: "relay",
+      leafSpkiSha256: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    }),
+    relayTransport: { origins: [origin] },
+  });
+  const { byThreadKey, threadPanelVisibilityByThreadKey } = useRightPanelStore.getState();
+  using _restorePanel = {
+    [Symbol.dispose]: () =>
+      useRightPanelStore.setState({ byThreadKey, threadPanelVisibilityByThreadKey }),
+  };
+  state.choose.mockResolvedValue("open-in-browser");
+  await using screen = await renderMarkdown("[Diagram](docs/diagram.svg)");
+  await screen.openContextMenu();
+  expect(offeredActions()).toContain("open-in-browser");
+  await vi.waitFor(() =>
+    expect(
+      selectActiveRightPanelSurface(useRightPanelStore.getState().byThreadKey, threadRef),
+    ).toMatchObject({
+      kind: "file",
+      localPreview: origin + relativeUrl,
+    }),
+  );
+});
 
 it("removes host actions after revocation while keeping file preview and copying", async () => {
   using _setup = setup();

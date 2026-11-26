@@ -16,7 +16,7 @@ import { HtmlRenderDialog } from "./HtmlRenderDialog";
 
 const dialog = (
   <HtmlRenderDialog
-    src="https://environment.test/page.html"
+    source={{ src: "https://environment.test/page.html" }}
     htmlRender={{ attachmentId: "html", title: "Diagram", height: 400 }}
     onClose={() => {}}
   />

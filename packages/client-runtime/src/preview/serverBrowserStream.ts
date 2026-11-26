@@ -2,6 +2,10 @@
 import { type DeviceHubAccess, withDeviceHubQuery } from "../device/hubAccess.ts";
 import {
   PREVIEW_STREAM_HOST_SETUP_CLOSE_CODE,
+  PREVIEW_ASSET_WIDGET_MAX_MESSAGE_BYTES,
+  PREVIEW_ASSET_WIDGET_GESTURE_MS,
+  type PreviewAssetStreamOpen,
+  type PreviewAssetStreamPresentation,
   type PreviewStreamHostSetup,
   type PreviewViewportSetting,
 } from "@t3tools/contracts";
@@ -51,6 +55,7 @@ const isPreviewStreamDialog = (value: unknown): value is PreviewStreamControl["d
 
 /** Coordinates are page CSS px. */
 export type PreviewStreamInput =
+  | PreviewAssetStreamPresentation
   | { readonly type: "takeControl" }
   | { readonly type: "releaseControl" }
   | { readonly type: "dialog"; readonly accept: boolean; readonly promptText?: string }
@@ -103,6 +108,8 @@ export interface PreviewStreamDownload {
 export interface PreviewStreamFileChooser {
   readonly multiple: boolean;
   readonly accept: string;
+  /** Identifies the page request across offers. Only an offer's upload URL can answer it. */
+  readonly requestId?: string;
   /** POST multipart `file` parts here; an empty form cancels the page's picker. */
   readonly uploadUrl: string;
   readonly credentials: boolean;
@@ -124,10 +131,11 @@ const previewStreamUploadUrl = (
 export async function uploadPreviewStreamFiles(
   chooser: PreviewStreamFileChooser,
   files: ReadonlyArray<Blob & { readonly name?: string }>,
+  fetchResource: typeof fetch = fetch,
 ): Promise<void> {
   const body = new FormData();
   for (const file of files) body.append("file", file, file.name ?? "file");
-  const response = await fetch(chooser.uploadUrl, {
+  const response = await fetchResource(chooser.uploadUrl, {
     method: "POST",
     body,
     credentials: chooser.credentials ? "include" : "omit",
@@ -181,11 +189,20 @@ export interface PreviewStreamTarget {
   readonly maxHeight: number;
   /** Passive viewers reduce their own access, including automatic control grants. */
   readonly interactive?: boolean;
+  readonly asset?: PreviewAssetStreamOpen;
+}
+
+export interface PreviewAssetWidgetConnection {
+  readonly receive: (data: unknown, activated: boolean) => void;
+  readonly dispose: () => void;
 }
 
 export interface PreviewStreamEvents {
   readonly onFrame: (jpeg: ArrayBuffer) => void;
   readonly onViewport: (viewport: PreviewStreamViewport) => void;
+  readonly onAssetHeight?: (height: number) => void;
+  readonly connectWidget?: (post: (data: unknown) => void) => PreviewAssetWidgetConnection;
+  readonly widgetHasActivation?: () => boolean;
   readonly onProbe?: (probe: PreviewStreamProbe) => void;
   readonly onPointer?: (pointer: PreviewStreamPointer) => void;
   readonly onControl?: (control: PreviewStreamControl) => void;
@@ -201,14 +218,51 @@ export interface PreviewStreamEvents {
 }
 
 export interface PreviewStreamClient {
-  readonly send: (input: PreviewStreamInput) => boolean;
+  readonly send: (input: PreviewStreamInput, activateWidget?: boolean) => boolean;
   readonly stop: () => void;
+}
+
+const widgetEncoder = new TextEncoder();
+
+function encodeWidgetMessage(data: unknown): string | undefined {
+  try {
+    const json = JSON.stringify(data);
+    if (
+      json !== undefined &&
+      json.length <= PREVIEW_ASSET_WIDGET_MAX_MESSAGE_BYTES &&
+      widgetEncoder.encode(json).byteLength <= PREVIEW_ASSET_WIDGET_MAX_MESSAGE_BYTES
+    ) {
+      return `{"type":"widgetMessage","data":${json}}`;
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+function oversizedMcpReply(data: unknown): string | undefined {
+  if (typeof data !== "object" || data === null || !("jsonrpc" in data) || data.jsonrpc !== "2.0") {
+    return;
+  }
+  if (
+    !("id" in data) ||
+    !(typeof data.id === "string" || (typeof data.id === "number" && Number.isFinite(data.id))) ||
+    !("result" in data || "error" in data) ||
+    "method" in data
+  ) {
+    return;
+  }
+  return encodeWidgetMessage({
+    jsonrpc: "2.0",
+    id: data.id,
+    error: { code: -32000, message: "MCP app response exceeds 1 MiB." },
+  });
 }
 
 const ACK_MESSAGE = JSON.stringify({ type: "ack" });
 export function createPreviewStreamClient(
   target: PreviewStreamTarget,
   events: PreviewStreamEvents,
+  createSocket: (url: string) => WebSocket = (url) => new WebSocket(url),
 ): PreviewStreamClient {
   const query = new URLSearchParams({
     threadId: target.threadId,
@@ -216,6 +270,11 @@ export function createPreviewStreamClient(
     maxWidth: String(Math.max(1, Math.round(target.maxWidth))),
     maxHeight: String(Math.max(1, Math.round(target.maxHeight))),
   });
+  if (target.asset) {
+    query.delete("threadId");
+    query.delete("tabId");
+    query.set("asset", "1");
+  }
   if (target.interactive === false) query.set("interactive", "false");
   const url = withDeviceHubQuery(`${target.access.wsBase}/ws?${query.toString()}`, target.access);
   let stopped = false;
@@ -224,6 +283,22 @@ export function createPreviewStreamClient(
   let failures = 0;
   let control: PreviewStreamControl | null = null;
   let fileChooser: string | null = null;
+  let widgetConnection: PreviewAssetWidgetConnection | null = null;
+  let widgetSocket: WebSocket | null = null;
+  let gestureSequence = 0;
+  let localGesture: { readonly id: number; readonly at: number } | null = null;
+
+  const disposeWidget = () => {
+    widgetSocket = null;
+    localGesture = null;
+    const current = widgetConnection;
+    widgetConnection = null;
+    try {
+      current?.dispose();
+    } catch {
+      // Bridge cleanup must leave the socket closed even when the host fails.
+    }
+  };
 
   // The server re-offers a picker still open, under a new id, when this viewer reattaches.
   const withdrawFileChooser = () => {
@@ -234,13 +309,20 @@ export function createPreviewStreamClient(
 
   const connect = () => {
     if (stopped) return;
-    const ws = new WebSocket(url);
+    let ws: WebSocket;
+    try {
+      ws = createSocket(url);
+    } catch {
+      events.onUnauthorized();
+      return;
+    }
     ws.binaryType = "arraybuffer";
     socket = ws;
     let opened = false;
     ws.addEventListener("open", () => {
       if (socket !== ws) return;
       opened = true;
+      if (target.asset) ws.send(JSON.stringify(target.asset));
       events.onConnectedChange(true);
     });
     ws.addEventListener("message", (event) => {
@@ -259,6 +341,35 @@ export function createPreviewStreamClient(
         return;
       }
       if (typeof message !== "object" || message === null) return;
+      const record = message as Record<string, unknown>;
+      if (record.type === "widgetReady" || record.type === "widgetMessage") {
+        if (!target.asset?.widget || !events.connectWidget) return;
+        try {
+          if (record.type === "widgetReady") {
+            if (widgetSocket !== null || record.kind !== target.asset.widget) return;
+            widgetSocket = ws;
+            widgetConnection = events.connectWidget((data) => {
+              if (widgetSocket !== ws || socket !== ws || ws.readyState !== WebSocket.OPEN) return;
+              const payload =
+                encodeWidgetMessage(data) ??
+                (record.kind === "mcp-app" ? oversizedMcpReply(data) : undefined);
+              if (payload !== undefined) ws.send(payload);
+            });
+          } else if (widgetSocket === ws && "data" in record) {
+            const candidate = localGesture;
+            const matches = candidate !== null && record.gesture === candidate.id;
+            const activated =
+              matches &&
+              performance.now() - candidate.at <= PREVIEW_ASSET_WIDGET_GESTURE_MS &&
+              events.widgetHasActivation?.() === true;
+            if (matches) localGesture = null;
+            widgetConnection?.receive(record.data, activated);
+          }
+        } catch {
+          ws.close();
+        }
+        return;
+      }
       const {
         type,
         x,
@@ -272,6 +383,7 @@ export function createPreviewStreamClient(
         dialog,
         text,
         id,
+        requestId,
         fileName,
         sizeBytes,
         multiple,
@@ -290,6 +402,7 @@ export function createPreviewStreamClient(
         events.onFileChooser?.({
           multiple,
           accept,
+          ...(typeof requestId === "string" ? { requestId } : {}),
           uploadUrl: previewStreamUploadUrl(target, id),
           credentials: target.access.credentials,
         });
@@ -320,6 +433,14 @@ export function createPreviewStreamClient(
           sizeBytes,
           url: previewStreamDownloadUrl(target, id),
         });
+      } else if (
+        type === "assetHeight" &&
+        Number.isSafeInteger(height) &&
+        typeof height === "number" &&
+        height > 0 &&
+        height <= 20_000
+      ) {
+        events.onAssetHeight?.(height);
       } else if (type === "viewport" && typeof width === "number" && typeof height === "number") {
         failures = 0;
         events.onViewport({ width, height });
@@ -354,6 +475,7 @@ export function createPreviewStreamClient(
       if (socket !== ws) return;
       socket = null;
       control = null;
+      disposeWidget();
       withdrawFileChooser();
       if (opened) events.onConnectedChange(false);
       if (stopped) return;
@@ -381,11 +503,17 @@ export function createPreviewStreamClient(
   connect();
 
   return {
-    send: (input) => {
+    send: (input, activateWidget = false) => {
       if (socket?.readyState !== WebSocket.OPEN) return false;
       if (!control?.canOperate) return false;
       if (input.type !== "takeControl" && control.controller !== "you") return false;
-      socket.send(JSON.stringify(input));
+      if (activateWidget && widgetSocket === socket) {
+        const id = ++gestureSequence;
+        socket.send(JSON.stringify({ ...input, widgetGesture: id }));
+        localGesture = { id, at: performance.now() };
+      } else {
+        socket.send(JSON.stringify(input));
+      }
       return true;
     },
     stop: () => {
@@ -394,6 +522,7 @@ export function createPreviewStreamClient(
       const ws = socket;
       socket = null;
       control = null;
+      disposeWidget();
       withdrawFileChooser();
       ws?.close();
     },

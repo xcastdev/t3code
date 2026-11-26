@@ -11,6 +11,7 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 
 import * as Electron from "electron";
+import { DESKTOP_RELAY_MEDIA_SCHEME } from "./DesktopRelayMedia.ts";
 
 export const DESKTOP_HOST = "app";
 const DESKTOP_PRODUCTION_SCHEME = "t3code";
@@ -87,7 +88,7 @@ function makeDesktopContentSecurityPolicy(input: DesktopProtocolRegistrationInpu
     `script-src ${scriptSources.join(" ")}`,
     `connect-src ${connectSources.join(" ")}`,
     `img-src 'self' ${input.scheme}: blob: data: http: https:`,
-    `media-src 'self' ${input.scheme}: blob: http: https:`,
+    `media-src 'self' ${input.scheme}: ${DESKTOP_RELAY_MEDIA_SCHEME}: blob: http: https:`,
     "style-src 'self' 'unsafe-inline'",
     `font-src 'self' ${input.scheme}: data:`,
     "worker-src 'self' blob:",
@@ -110,6 +111,10 @@ function withContentSecurityPolicy(response: Response, policy: string): Response
 // Must run synchronously before Electron emits ready.
 function registerDesktopSchemePrivilegesSync(): void {
   Electron.protocol.registerSchemesAsPrivileged([
+    {
+      scheme: DESKTOP_RELAY_MEDIA_SCHEME,
+      privileges: { standard: true, secure: true, stream: true },
+    },
     {
       scheme: DESKTOP_PRODUCTION_SCHEME,
       privileges: {

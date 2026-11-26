@@ -162,6 +162,7 @@ export const PreviewSessionSnapshot = Schema.Struct({
   runtime: Schema.optional(PreviewRuntime),
   /** The server runs this tab in headless Chromium, so the desktop streams it like other clients. */
   headless: Schema.optional(Schema.Boolean),
+  verifiedAsset: Schema.optionalKey(Schema.Literal(true)),
   automationOwner: Schema.optional(Schema.String),
   reveal: Schema.optional(Schema.Boolean),
   revealRequest: Schema.optional(Schema.Struct({ id: Schema.String, force: Schema.Boolean })),
@@ -172,6 +173,7 @@ export type PreviewSessionSnapshot = typeof PreviewSessionSnapshot.Type;
 export const PreviewOpenInput = Schema.Struct({
   threadId: ThreadId,
   url: Schema.optional(Url),
+  verifiedAssetUrl: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(4608))),
   viewport: Schema.optional(PreviewViewportSetting),
   profileId: Schema.optional(BrowserProfileId),
   runtime: Schema.optional(PreviewRuntime),
@@ -239,6 +241,7 @@ export type PreviewListInput = typeof PreviewListInput.Type;
 
 export const PreviewListResult = Schema.Struct({
   sessions: Schema.Array(PreviewSessionSnapshot),
+  verifiedAssetOrigin: Schema.optionalKey(Schema.String),
   /** Identifies the current server process so revision resets are safe. */
   serverEpoch: TrimmedNonEmptyString,
   revision: NonNegativeInt,
@@ -400,9 +403,51 @@ export class PreviewClearProfileError extends Schema.TaggedError<PreviewClearPro
   }
 }
 
+export class PreviewVerifiedAssetUnavailableError extends Schema.TaggedError<PreviewVerifiedAssetUnavailableError>()(
+  "PreviewVerifiedAssetUnavailableError",
+  {},
+) {
+  override get message() {
+    return "The server browser has no matching verified asset route.";
+  }
+}
+
 export const PreviewError = Schema.Union([
   PreviewSessionLookupError,
   PreviewInvalidUrlError,
   PreviewControlRequiredError,
+  PreviewVerifiedAssetUnavailableError,
 ]);
 export type PreviewError = typeof PreviewError.Type;
+
+const PreviewAssetAppearance = {
+  appearance: Schema.Literals(["light", "dark"]),
+  theme: Schema.optionalKey(Schema.Record(Schema.String, Schema.String)),
+};
+
+export const PreviewAssetWidgetKind = Schema.Literals(["mcp-app", "plugin-panel"]);
+export type PreviewAssetWidgetKind = typeof PreviewAssetWidgetKind.Type;
+
+export const PREVIEW_ASSET_WIDGET_MAX_MESSAGE_BYTES = 1024 * 1024;
+export const PREVIEW_ASSET_WIDGET_GESTURE_MS = 2_000;
+
+export const PreviewAssetWidgetMessage = Schema.Struct({
+  type: Schema.Literal("widgetMessage"),
+  data: Schema.Json,
+});
+export type PreviewAssetWidgetMessage = typeof PreviewAssetWidgetMessage.Type;
+
+export const PreviewAssetStreamOpen = Schema.Struct({
+  type: Schema.Literal("openAsset"),
+  verifiedAssetUrl: TrimmedNonEmptyString.check(Schema.isMaxLength(4608)),
+  ...PreviewAssetAppearance,
+  widget: Schema.optionalKey(PreviewAssetWidgetKind),
+});
+export type PreviewAssetStreamOpen = typeof PreviewAssetStreamOpen.Type;
+
+export const PreviewAssetStreamPresentation = Schema.Struct({
+  type: Schema.Literal("assetPresentation"),
+  visible: Schema.Boolean,
+  ...PreviewAssetAppearance,
+});
+export type PreviewAssetStreamPresentation = typeof PreviewAssetStreamPresentation.Type;

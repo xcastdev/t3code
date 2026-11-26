@@ -1,4 +1,7 @@
 import {
+  catalogDirectoryRoutes,
+  setLearnedRoutesInCatalog,
+  putConnectionProfileInCatalog,
   putRemoteDpopTokenInCatalog,
   registerConnectionInCatalog,
   removeConnectionFromCatalog,
@@ -9,8 +12,11 @@ import {
   Persistence,
 } from "@t3tools/client-runtime/platform";
 import { TokenStore } from "@t3tools/client-runtime/authorization";
+import { SelfHostedRelayAccountStore } from "@t3tools/client-runtime/self-hosted-relay";
 import {
-  ConnectionTransientError,
+  BearerConnectionProfile,
+  BearerConnectionRegistration,
+  type ConnectionTransientError,
   CredentialStore,
   ProfileStore,
   PullRequestRoutingPermissions,
@@ -22,11 +28,14 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
 import * as CatalogStore from "./catalog-store";
+import * as RelayAccountStore from "./selfHostedRelayAccountStore";
+import { routeOrigin, verifiedRouteFor } from "./verified-route";
 
 function targetPersistenceError(
   operation:
     | "list-targets"
     | "list-disabled-targets"
+    | "list-directory-routes"
     | "register-connection"
     | "set-connection-routes"
     | "remove-connection"
@@ -42,6 +51,7 @@ function targetPersistenceError(
 export const layer = Layer.effectContext(
   Effect.gen(function* () {
     const catalog = yield* CatalogStore.make();
+    const relayAccount = yield* RelayAccountStore.make();
     const githubRoutingPermissions = yield* makePullRequestRoutingPermissions({
       read: catalog.read.pipe(Effect.map((document) => document.githubRoutingPermissions ?? [])),
       write: (githubRoutingPermissions) =>
@@ -60,15 +70,48 @@ export const layer = Layer.effectContext(
     });
     const registrationStore = Persistence.ConnectionRegistrationStore.of({
       register: Effect.fn("Persistence.ConnectionRegistrationStore.register")(
-        (registration, routes) =>
-          catalog
-            .update((document) => registerConnectionInCatalog(document, registration, routes))
-            .pipe(Effect.mapError((error) => targetPersistenceError("register-connection", error))),
+        (registration, routes, removedRouteIds) => {
+          const classified =
+            registration._tag === "BearerConnectionRegistration" &&
+            registration.profile.verificationRequired === undefined
+              ? new BearerConnectionRegistration({
+                  ...registration,
+                  profile: new BearerConnectionProfile({
+                    ...registration.profile,
+                    verificationRequired: false,
+                  }),
+                })
+              : registration;
+          return catalog
+            .update((document) =>
+              registerConnectionInCatalog(document, classified, routes, removedRouteIds),
+            )
+            .pipe(Effect.mapError((error) => targetPersistenceError("register-connection", error)));
+        },
       ),
       setRoutes: Effect.fn("Persistence.ConnectionRegistrationStore.setRoutes")(
-        (environmentId, routes) =>
+        (environmentId, routes, removedRouteIds) =>
           catalog
-            .update((document) => setRoutesInCatalog(document, environmentId, routes))
+            .update((document) =>
+              setRoutesInCatalog(document, environmentId, routes, removedRouteIds),
+            )
+            .pipe(
+              Effect.mapError((error) => targetPersistenceError("set-connection-routes", error)),
+            ),
+      ),
+      listDirectoryRoutes: Effect.fn("Persistence.ConnectionRegistrationStore.listDirectoryRoutes")(
+        (source) =>
+          catalog.readFresh.pipe(
+            Effect.map((document) => catalogDirectoryRoutes(document, source)),
+            Effect.mapError((error) => targetPersistenceError("list-directory-routes", error)),
+          ),
+      ),
+      setLearnedRoutes: Effect.fn("Persistence.ConnectionRegistrationStore.setLearnedRoutes")(
+        (environmentId, routes, changes) =>
+          catalog
+            .update((document) =>
+              setLearnedRoutesInCatalog(document, environmentId, routes, changes),
+            )
             .pipe(
               Effect.mapError((error) => targetPersistenceError("set-connection-routes", error)),
             ),
@@ -90,17 +133,32 @@ export const layer = Layer.effectContext(
     const profileStore = ProfileStore.make({
       get: (connectionId) =>
         catalog.read.pipe(
-          Effect.map((document) =>
-            Option.fromUndefinedOr(
-              document.profiles.find((candidate) => candidate.connectionId === connectionId),
-            ),
-          ),
+          Effect.map((document) => {
+            const profile = document.profiles.find(
+              (candidate) => candidate.connectionId === connectionId,
+            );
+            if (profile?._tag !== "BearerConnectionProfile") {
+              return Option.fromUndefinedOr(profile);
+            }
+            // An old TLS profile can outlive its separate enrollment record.
+            if (
+              !profile.learned &&
+              profile.verificationRequired === undefined &&
+              !(profile.httpBaseUrl.startsWith("http://") && profile.wsBaseUrl.startsWith("ws://"))
+            ) {
+              return Option.none();
+            }
+            const binding = verifiedRouteFor(profile.httpBaseUrl);
+            return binding !== undefined &&
+              (binding.environmentId !== profile.environmentId ||
+                !profile.wsBaseUrl.startsWith("wss:") ||
+                routeOrigin(profile.wsBaseUrl) !== binding.httpsOrigin)
+              ? Option.none()
+              : Option.some(profile);
+          }),
         ),
       put: (profile) =>
-        catalog.update((document) => ({
-          ...document,
-          profiles: replaceCatalogValue(document.profiles, (value) => value.connectionId, profile),
-        })),
+        catalog.update((document) => putConnectionProfileInCatalog(document, profile)),
       remove: (connectionId) =>
         catalog.update((document) => ({
           ...document,
@@ -164,6 +222,7 @@ export const layer = Layer.effectContext(
       Context.add(ProfileStore.ConnectionProfileStore, profileStore),
       Context.add(CredentialStore.ConnectionCredentialStore, credentialStore),
       Context.add(TokenStore.RemoteDpopAccessTokenStore, remoteTokenStore),
+      Context.add(SelfHostedRelayAccountStore, relayAccount),
     );
   }),
 );

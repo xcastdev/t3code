@@ -1956,6 +1956,7 @@ describe("image asset requests", () => {
       previewUrl: "https://server.test/renewed",
     });
     expect(displayed.attachments?.[0]).toMatchObject({ previewUrl: "https://server.test/image" });
+    expect(row(ready, () => "").attachments?.[0]).toMatchObject({ previewUrl: "" });
     expect(row(released, () => undefined)).toBe(message);
   });
 });

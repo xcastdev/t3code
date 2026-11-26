@@ -32,14 +32,16 @@ import * as DesktopManagedPolicy from "../../app/DesktopManagedPolicy.ts";
 import * as DesktopWslEnvironment from "../../wsl/DesktopWslEnvironment.ts";
 import * as ElectronDialog from "../../electron/ElectronDialog.ts";
 import * as ElectronWindow from "../../electron/ElectronWindow.ts";
+import { parseVerifiedRouteEnrollments } from "../../electron/VerifiedRoute.ts";
 import * as IpcChannels from "../channels.ts";
 import * as DesktopIpc from "../DesktopIpc.ts";
 import {
   getLocalEnvironmentBootstraps,
   installRelayTelemetryEnabled,
+  makeGetVerifiedRouteBinding,
+  makeReadMedia,
   pickProjectFavicon,
   probeRemoteEditors,
-  readMedia,
   syncHtmlFullscreen,
   toLocalBackendPath,
 } from "./window.ts";
@@ -329,7 +331,7 @@ describe("readMedia", () => {
         webContents: { id: 1, session: { fetch } },
       } as unknown as Electron.BrowserWindow;
       const read = (url: string, senderId: number) =>
-        readMedia
+        makeReadMedia()
           .handler(url, { sender: { id: senderId } })
           .pipe(
             Effect.provide(
@@ -355,6 +357,89 @@ describe("readMedia", () => {
         mimeType: "",
         data: new Uint8Array(),
       });
+    }),
+  );
+
+  it.effect("looks up installed desktop transport roles by exact origin", () =>
+    Effect.gen(function* () {
+      const environmentId = "environment";
+      const alias = "https://relay.example.com:8443";
+      const direct = "https://direct.example.com";
+      const spkiSha256 = Buffer.alloc(32, 1).toString("base64");
+      const read = makeGetVerifiedRouteBinding(
+        parseVerifiedRouteEnrollments(
+          JSON.stringify([
+            { origin: alias, environmentId, spkiSha256, transportRole: "relay" },
+            { origin: direct, environmentId, spkiSha256 },
+          ]),
+        ),
+      ).handler;
+      assert.deepEqual(yield* read(alias), {
+        environmentId,
+        httpsOrigin: alias,
+        leafSpkiSha256: spkiSha256,
+        transportRole: "relay",
+      });
+      assert.deepEqual(yield* read(direct), {
+        environmentId,
+        httpsOrigin: direct,
+        leafSpkiSha256: spkiSha256,
+        transportRole: "direct",
+      });
+      assert.deepEqual(yield* read(undefined), yield* read(alias));
+      assert.strictEqual(yield* read("https://relay.example.com"), null);
+    }),
+  );
+
+  it.effect("reads signed enrolled media without ambient cookies and preserves direct reads", () =>
+    Effect.gen(function* () {
+      const fetch = vi.fn<Electron.Session["fetch"]>(
+        async () => new Response(new Uint8Array([1, 2])),
+      );
+      const enrollment = parseVerifiedRouteEnrollments(
+        JSON.stringify({
+          origin: "https://relay.example.com:8443",
+          spkiSha256: Buffer.alloc(32, 1).toString("base64"),
+        }),
+      );
+      const main = {
+        webContents: { id: 1, session: { fetch } },
+      } as unknown as Electron.BrowserWindow;
+      const read = (url: string) =>
+        makeReadMedia(enrollment)
+          .handler(url, { sender: { id: 1 } })
+          .pipe(
+            Effect.provide(
+              Layer.mock(ElectronWindow.ElectronWindow)({ main: Effect.succeedSome(main) }),
+            ),
+          );
+
+      assert.strictEqual(yield* read("http://relay.example.com:8443/file?signature=proof"), null);
+      assert.strictEqual(yield* read("https://relay.example.com/file?signature=proof"), null);
+      assert.strictEqual(yield* read("blob:https://relay.example.com:8443/file"), null);
+      assert.strictEqual(yield* read("https://user@relay.example.com:8443/file"), null);
+      assert.deepEqual(yield* read("https://relay.example.com:8443/file?signature=proof"), {
+        status: 200,
+        mimeType: "",
+        data: Buffer.from([1, 2]),
+      });
+      assert.deepEqual(yield* read("https://direct.example.com/file"), {
+        status: 200,
+        mimeType: "",
+        data: Buffer.from([1, 2]),
+      });
+      assert.deepEqual(fetch.mock.calls, [
+        [
+          "https://relay.example.com:8443/file?signature=proof",
+          {
+            bypassCustomProtocolHandlers: true,
+            credentials: "omit",
+            redirect: "error",
+            cache: "no-store",
+          },
+        ],
+        ["https://direct.example.com/file", { credentials: "include" }],
+      ]);
     }),
   );
 });

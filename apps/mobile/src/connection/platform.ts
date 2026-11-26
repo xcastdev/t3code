@@ -1,11 +1,14 @@
+import type { VerifiedRouteBinding } from "@t3tools/contracts";
 import { ClientCapabilities, PlatformConnectionSource } from "@t3tools/client-runtime/platform";
 import {
   ConnectionBlockedError,
   ConnectionTransientError,
   Connectivity,
+  VerifiedRoutePolicy,
   Wakeups,
 } from "@t3tools/client-runtime/connection";
 import { managedRelayAccountChanges, managedRelaySessionAtom } from "@t3tools/client-runtime/relay";
+import { SelfHostedRelayManagementFetch } from "@t3tools/client-runtime/self-hosted-relay";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -14,6 +17,7 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import Constants from "expo-constants";
+import { fetch as fetchManagement } from "expo/fetch";
 import * as Network from "expo-network";
 import { AppState } from "react-native";
 
@@ -24,6 +28,8 @@ import { appAtomRegistry } from "../state/atom-registry";
 import { mobileApplicationActiveWakeup } from "./app-state-wakeups";
 import * as EnvironmentOwnedDataCleanup from "./environment-owned-data-cleanup";
 import * as ConnectionStorage from "./storage";
+import { readNativeVerifiedRouteBinding } from "./relay-admission";
+import { supportsVerifiedRoutes } from "./verified-route";
 
 function networkStatus(state: Network.NetworkState): "unknown" | "offline" | "online" {
   if (state.isConnected === false) {
@@ -144,6 +150,18 @@ const layerWakeups = Wakeups.layer({
   ),
 });
 
+const readEnrollment = Effect.fn("MobileVerifiedRoutes.readEnrollment")((httpsOrigin: string) =>
+  Effect.promise(() => readNativeVerifiedRouteBinding(httpsOrigin)),
+);
+
+const enforce = Effect.fn("MobileVerifiedRoutes.enforce")((binding: VerifiedRouteBinding) =>
+  Effect.tryPromise({
+    try: () =>
+      binding.leafSpkiSha256 === undefined ? Promise.resolve(false) : supportsVerifiedRoutes(),
+    catch: () => false,
+  }).pipe(Effect.orElseSucceed(() => false)),
+);
+
 const layerCapabilities = Layer.effectContext(
   Effect.gen(function* () {
     const storage = yield* MobileStorage.MobileStorage;
@@ -180,6 +198,7 @@ const layerCapabilities = Layer.effectContext(
         }),
       }),
     ).pipe(
+      Context.add(VerifiedRoutePolicy, { readEnrollment, enforce }),
       Context.add(
         ClientCapabilities.PrimaryEnvironmentAuth,
         ClientCapabilities.PrimaryEnvironmentAuth.of({
@@ -247,10 +266,12 @@ const layerPlatformConnectionSource = Layer.succeed(
 );
 
 const layerProvidedConnectionStorage = ConnectionStorage.layer.pipe(Layer.provide(Runtime.layer));
+const layerRelayManagementFetch = Layer.succeed(SelfHostedRelayManagementFetch, fetchManagement);
 const layerProvidedCapabilities = layerCapabilities.pipe(Layer.provide(Runtime.layer));
 
 type ConnectionPlatformLayerSource =
   | typeof layerProvidedConnectionStorage
+  | typeof layerRelayManagementFetch
   | typeof Runtime.layer
   | typeof layerConnectivity
   | typeof layerWakeups
@@ -264,6 +285,7 @@ export const layer: Layer.Layer<
   Layer.Services<ConnectionPlatformLayerSource>
 > = Layer.mergeAll(
   layerProvidedConnectionStorage,
+  layerRelayManagementFetch,
   Runtime.layer,
   layerConnectivity,
   layerWakeups,

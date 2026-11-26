@@ -169,6 +169,7 @@ import {
   readEnvironmentScope,
   readPreparedConnection,
   useEnvironmentScope,
+  usePreparedConnection,
 } from "../state/session";
 import { previewEnvironment } from "../state/preview";
 import { useAtomCommand } from "../state/use-atom-command";
@@ -191,8 +192,8 @@ import { textDirection } from "~/textDirection";
 import { useOpenLink } from "../browser/useOpenLink";
 import { writeTextToClipboard } from "../hooks/useCopyToClipboard";
 import { isPreviewAvailableFor } from "../browser/previewRuntime";
+import { filePreviewOpenMode } from "../browser/filePreviewOpenMode";
 import {
-  isBrowserPreviewFile,
   openFileInPreview,
   openUrlInPreview,
   BrowserPreviewUnavailableError,
@@ -581,6 +582,11 @@ function useChatMarkdownState({
   const environmentId = threadRef?.environmentId ?? explicitEnvironmentId ?? null;
   const canOperateHost = useEnvironmentScope(environmentId, AuthOrchestrationOperateScope);
   const canOperatePreview = useEnvironmentScope(environmentId, AuthPreviewOperateScope);
+  const canReadFiles = useEnvironmentScope(environmentId, AuthFilesystemReadScope);
+  const preparedConnection = Option.getOrUndefined(usePreparedConnection(environmentId));
+  const previewAvailable =
+    threadRef !== undefined &&
+    (isPreviewAvailableFor(threadRef.environmentId) || preparedConnection?.learnedRoute === true);
   const isClientHost = useAtomValue(clientHostEnvironmentAtom(environmentId));
   const remoteOpen = useRemoteOpenResolution(environmentId);
   const canUseShellActions =
@@ -763,13 +769,25 @@ function useChatMarkdownState({
     });
   };
   const openMarkdownFileInPreview = (path: string) => {
-    const preparedConnection = threadRef ? readPreparedConnection(threadRef.environmentId) : null;
-    if (!threadRef || !canOperatePreview || preparedConnection === null) {
+    const environment = threadRef?.environmentId;
+    const connection = environment === undefined ? null : readPreparedConnection(environment);
+    const mode =
+      environment === undefined
+        ? null
+        : filePreviewOpenMode({
+            path,
+            httpBaseUrl: connection?.httpBaseUrl,
+            canReadFiles: readEnvironmentScope(environment, AuthFilesystemReadScope),
+            canOperatePreview: readEnvironmentScope(environment, AuthPreviewOperateScope),
+            previewAvailable:
+              isPreviewAvailableFor(environment) || connection?.learnedRoute === true,
+          });
+    if (!threadRef || connection === null || mode === null) {
       return Promise.resolve(
         AsyncResult.failure<void, BrowserPreviewUnavailableError>(
           Cause.fail(
             new BrowserPreviewUnavailableError({
-              message: "Environment is not connected.",
+              message: "File preview access is unavailable for this client.",
             }),
           ),
         ),
@@ -779,7 +797,8 @@ function useChatMarkdownState({
       threadRef,
       filePath: path,
       workspaceRoot: cwd,
-      httpBaseUrl: preparedConnection.httpBaseUrl,
+      httpBaseUrl: connection.httpBaseUrl,
+      requireAdmittedDocument: mode === "admitted-document",
       createAssetUrl,
       openPreview,
     });
@@ -965,9 +984,13 @@ function useChatMarkdownState({
         revealLabel={revealInFileManagerLabel}
         onOpenInBrowser={
           threadRef &&
-          canOperatePreview &&
-          isPreviewAvailableFor(threadRef.environmentId) &&
-          isBrowserPreviewFile(fileLinkMeta.filePath)
+          filePreviewOpenMode({
+            path: fileLinkMeta.filePath,
+            httpBaseUrl: preparedConnection?.httpBaseUrl,
+            canReadFiles,
+            canOperatePreview,
+            previewAvailable,
+          }) !== null
             ? () => openMarkdownFileInPreview(fileLinkMeta.filePath)
             : undefined
         }

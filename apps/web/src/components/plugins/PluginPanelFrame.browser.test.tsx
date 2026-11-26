@@ -7,13 +7,18 @@ import {
   type PluginInstallRecord,
   type PluginManifest,
 } from "@t3tools/contracts";
+import { AsyncResult } from "effect/reactivity";
+import type { ComponentProps } from "react";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { page } from "vite-plus/test/browser";
 
-import { render } from "../../../test/render";
+import { act, render } from "../../../test/render";
+import type { HostedAssetDocument } from "~/components/files/HostedAssetDocument";
+import { setAppearanceMode } from "~/hooks/useTheme";
 import type { PluginPanelInstall } from "../../plugins/pluginInstalls";
 import { PluginPanelFrame } from "./PluginPanelFrame";
 import {
+  PluginPanelSurface,
   PluginPanelView,
   type PluginPanelActions,
   type PluginPanelServices,
@@ -22,7 +27,60 @@ import { collectPanelProbes, pluginPanelTestHtml } from "./pluginPanelTestHtml";
 
 const mocks = vi.hoisted(() => ({
   urls: new Map<string, string>(),
+  install: undefined as PluginPanelInstall | undefined,
+  waitForConnection: vi.fn<() => Promise<void>>(),
+  mutate: vi.fn(),
   minted: [] as Array<{ readonly version: string }>,
+  rendered: vi.fn<(props: ComponentProps<typeof HostedAssetDocument>) => void>(),
+}));
+
+const hostedUrl = "https://widget-relay.example/api/assets/signed.grant/main.html";
+const desktopUrl = "https://desktop-relay.example/api/assets/signed.grant/main.html";
+
+vi.mock(import("~/plugins/pluginInstalls"), async (importOriginal) => ({
+  ...(await importOriginal()),
+  usePluginPanelInstall: () => {
+    if (!mocks.install) throw new Error("Expected a plugin install.");
+    return mocks.install;
+  },
+}));
+
+vi.mock(import("@t3tools/client-runtime/state/connections"), async (importOriginal) => ({
+  ...(await importOriginal()),
+  waitForEnvironmentConnection: mocks.waitForConnection,
+}));
+
+vi.mock(import("~/state/plugins"), async (importOriginal) => {
+  const { pluginEnvironment } = await importOriginal();
+  return {
+    pluginEnvironment: {
+      ...pluginEnvironment,
+      mutate: {
+        ...pluginEnvironment.mutate,
+        run: async (_registry, input) => {
+          mocks.mutate(input);
+          return AsyncResult.success(null);
+        },
+      },
+    },
+  };
+});
+
+vi.mock(import("~/connection/hostedRelayAdmission"), async (importOriginal) => ({
+  ...(await importOriginal()),
+  hostedAdmissionRequired: (url) => url === hostedUrl,
+}));
+
+vi.mock(import("~/lib/desktopRelayTransport"), async (importOriginal) => ({
+  ...(await importOriginal()),
+  desktopRelayAdmissionRequired: (url) => url === desktopUrl,
+}));
+
+vi.mock(import("~/components/files/HostedAssetDocument"), () => ({
+  HostedAssetDocument: (props) => {
+    mocks.rendered(props);
+    return <div aria-label={props.title} />;
+  },
 }));
 
 vi.mock("~/assets/longLivedAssetUrls", () => ({
@@ -39,8 +97,10 @@ vi.mock("~/assets/longLivedAssetUrls", () => ({
 }));
 
 function setup() {
+  setAppearanceMode("dark");
   mocks.urls.clear();
   mocks.minted.length = 0;
+  mocks.rendered.mockClear();
 }
 
 function panelUrl(version: string, html: string): Disposable {
@@ -117,6 +177,167 @@ const noActions: PluginPanelActions = {
 };
 
 describe("PluginPanelFrame", () => {
+  it.each([
+    { kind: "hosted web", url: hostedUrl },
+    { kind: "enrolled Electron", url: desktopUrl },
+  ])("keeps $kind backend calls and subscriptions inside the panel bridge", async ({ url }) => {
+    setup();
+    mocks.urls.set("1", url);
+    if (url === desktopUrl) {
+      vi.stubGlobal("desktopBridge", { relayTransport: {} });
+    }
+    using _desktop = { [Symbol.dispose]: () => vi.unstubAllGlobals() };
+    const subscribed = vi.fn();
+    const unsubscribe = vi.fn();
+    const clipboard = vi.fn();
+    const installedManifest = { ...manifest("1.0.0"), capabilities: ["clipboard.write" as const] };
+    const install = environmentInstall("1", { manifest: installedManifest });
+    const backend = vi.fn(() => ({
+      call: async () => null,
+      subscribe: (...args: Parameters<ReturnType<PluginPanelServices["backend"]>["subscribe"]>) => {
+        subscribed(...args);
+        return unsubscribe;
+      },
+    }));
+    await using screen = await render(
+      <PluginPanelView
+        panelKey={PANEL_KEY}
+        install={install}
+        chatTarget={null}
+        services={memoryServices({ backend })}
+        actions={noActions}
+      />,
+    );
+    using _clipboard = vi.spyOn(navigator.clipboard, "writeText").mockImplementation(clipboard);
+    expect(document.documentElement.classList.contains("dark")).toBe(true);
+    expect(screen.container.querySelector("iframe")).toBeNull();
+    expect(mocks.rendered).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        environmentId: ENVIRONMENT,
+        src: url,
+        widget: expect.objectContaining({ kind: "plugin-panel" }),
+      }),
+    );
+    const widget = mocks.rendered.mock.lastCall?.[0].widget;
+    if (!widget) throw new Error("Expected a hosted plugin panel.");
+    const post = vi.fn();
+    const connection = widget.connect(post);
+    await act(() => {
+      connection.receive(
+        { jsonrpc: "2.0", id: 1, method: "t3/initialize", params: { apiVersion: "1.0" } },
+        false,
+      );
+      connection.receive(
+        { jsonrpc: "2.0", id: 2, method: "t3/backend.subscribe", params: { topic: "events" } },
+        false,
+      );
+      connection.receive(
+        {
+          jsonrpc: "2.0",
+          id: 3,
+          method: "t3/clipboard.write",
+          params: { text: "blocked" },
+          activated: true,
+        },
+        false,
+      );
+    });
+    expect(backend).toHaveBeenCalledWith(
+      expect.objectContaining({ environmentId: ENVIRONMENT, pluginId: PLUGIN, version: "1" }),
+    );
+    expect(subscribed).toHaveBeenCalledExactlyOnceWith("events", {}, expect.any(Function));
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 1,
+        result: expect.objectContaining({
+          pluginId: PLUGIN,
+          panelId: "main",
+          hostContext: expect.objectContaining({ theme: "dark" }),
+        }),
+      }),
+    );
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 3,
+        error: expect.objectContaining({ message: expect.stringContaining("Copying was blocked") }),
+      }),
+    );
+    expect(clipboard).not.toHaveBeenCalled();
+    connection.dispose();
+    connection.receive(
+      { jsonrpc: "2.0", id: 4, method: "t3/backend.subscribe", params: { topic: "events" } },
+      true,
+    );
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    expect(subscribed).toHaveBeenCalledOnce();
+  });
+
+  it("withdraws a pending backend mutation when the widget closes during reconnect", async () => {
+    setup();
+    mocks.urls.set("1", hostedUrl);
+    const installedManifest = manifest("1.0.0");
+    const backend = installedManifest.backend!;
+    mocks.install = environmentInstall("1", {
+      manifest: {
+        ...installedManifest,
+        backend: {
+          ...backend,
+          operations: [
+            {
+              name: "write",
+              title: "Write",
+              description: "Write plugin state",
+              inputSchema: {},
+              mutates: true,
+              agent: false,
+            },
+          ],
+        },
+      },
+    });
+    const reconnect = Promise.withResolvers<void>();
+    mocks.waitForConnection.mockReset().mockReturnValue(reconnect.promise);
+    mocks.mutate.mockClear();
+    await using screen = await render(
+      <PluginPanelSurface panelKey={PANEL_KEY} chatTarget={null} />,
+    );
+    expect(screen.container.querySelector("iframe")).toBeNull();
+    const widget = mocks.rendered.mock.lastCall?.[0].widget;
+    if (!widget) throw new Error("Expected a hosted plugin panel.");
+    const post = vi.fn();
+    const connection = widget.connect(post);
+    connection.receive(
+      { jsonrpc: "2.0", id: 1, method: "t3/initialize", params: { apiVersion: "1.0" } },
+      false,
+    );
+    const request = {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "t3/backend.call",
+      params: { operation: "write", input: {} },
+    };
+    connection.receive(request, false);
+    expect(mocks.waitForConnection).toHaveBeenCalledOnce();
+    expect(mocks.mutate).not.toHaveBeenCalled();
+    connection.dispose();
+    await act(async () => reconnect.resolve());
+    expect(mocks.mutate).not.toHaveBeenCalled();
+    expect(post).not.toHaveBeenCalledWith(expect.objectContaining({ id: 2 }));
+
+    const reopened = widget.connect(post);
+    try {
+      reopened.receive(
+        { jsonrpc: "2.0", id: 3, method: "t3/initialize", params: { apiVersion: "1.0" } },
+        false,
+      );
+      await act(() => reopened.receive({ ...request, id: 4 }, false));
+      expect(mocks.mutate).toHaveBeenCalledOnce();
+      expect(post).toHaveBeenCalledWith({ jsonrpc: "2.0", id: 4, result: null });
+    } finally {
+      reopened.dispose();
+    }
+  });
+
   it("ignores messages from other windows", async () => {
     const getState = vi.fn(async () => null);
     await using screen = await render(
